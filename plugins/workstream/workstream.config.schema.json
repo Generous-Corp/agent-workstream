@@ -11,7 +11,7 @@
     "planning_url": {
       "type": "string",
       "format": "uri",
-      "pattern": "^[A-Za-z][A-Za-z0-9+.-]*://[^\\s]+$"
+      "pattern": "^[A-Za-z][A-Za-z0-9+.-]*://[^\\s/?#]+(?:[/?#][^\\s]*)?$"
     },
     "ledger": {
       "type": "object",

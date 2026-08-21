@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -68,6 +69,21 @@ class WorkstreamCtlTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         with self.assertRaisesRegex(ValueError, "absolute URL"):
             MODULE.validate_config(path)
+
+    def test_planning_url_requires_authority_in_runtime_and_schema(self):
+        schema = json.loads(
+            (Path(__file__).parents[1] / "plugins/workstream/workstream.config.schema.json").read_text()
+        )
+        schema_pattern = schema["properties"]["planning_url"]["pattern"]
+        for planning_url in ("file:///tmp/plan.md", "https:///path"):
+            with self.subTest(planning_url=planning_url):
+                value = self.config()
+                value["planning_url"] = planning_url
+                temp, path = self.write(value)
+                self.addCleanup(temp.cleanup)
+                with self.assertRaisesRegex(ValueError, "absolute URL"):
+                    MODULE.validate_config(path)
+                self.assertIsNone(re.fullmatch(schema_pattern, planning_url))
 
     def test_unknown_fields_fail_closed(self):
         value = self.config()

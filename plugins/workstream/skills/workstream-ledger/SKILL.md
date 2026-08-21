@@ -253,7 +253,9 @@ Linear, second-machine, process-death, or deletion-resistance canary.
    - completed parent with nonterminal children;
    - cancelled decision still present in acceptance criteria;
    - PR without a workstream, exact head, provenance, or landing owner.
-5. Recover turns that arrived after the last structured checkpoint:
+5. Only when a stable external ingress integration and its private transport
+   are already configured, recover turns that arrived after the last structured
+   checkpoint:
 
    ```sh
    python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" flush
@@ -264,6 +266,9 @@ Linear, second-machine, process-death, or deletion-resistance canary.
    Promote each material event into the issue graph, then mark it processed.
    A repeated event ID is one event. An unprocessed event is evidence that the
    next agent must triage it, not evidence that the request was accepted.
+   A normal plugin installation skips this step and resumes from the last
+   durable checkpoint. Do not invoke ingress merely to probe whether it is
+   configured: that can create local state or fail for missing configuration.
 
 ## Maintain on substantive turns
 
