@@ -11,6 +11,13 @@ codex plugin marketplace add Generous-Corp/agent-workstream --ref main
 codex plugin add workstream@generous-workstream
 ```
 
+If the owner/repository form cannot authenticate over HTTPS, use SSH:
+
+```sh
+codex plugin marketplace add git@github.com:Generous-Corp/agent-workstream.git --ref main
+codex plugin add workstream@generous-workstream
+```
+
 Start a new Codex thread after installation. To update or remove it:
 
 ```sh
