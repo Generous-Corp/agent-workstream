@@ -42,4 +42,4 @@ managed stable capture integration.
 
 See [INSTALL.md](INSTALL.md) for installation and configuration.
 
-This repository is intended to remain private. No public license is granted.
+Licensed under the [MIT License](LICENSE).

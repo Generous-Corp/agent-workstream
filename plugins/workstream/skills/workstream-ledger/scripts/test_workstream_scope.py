@@ -81,7 +81,7 @@ class WorkstreamScopeTests(unittest.TestCase):
                                                         "resolved_slug": "github.com/danielraffel/pulp"}]},
                                       "identity_updates": [], "evidence": []})
         validate_scope(scope, root_id="GEN-37", child_ids={"GEN-38", "GEN-39"})
-        scope["repositories"][-1]["path"] = "/Users/danielraffel/Code/pulp"
+        scope["repositories"][-1]["path"] = "/workspace/project"
         with self.assertRaisesRegex(ScopeError, "local_path_is_not_repository_identity"):
             validate_scope(scope, root_id="GEN-37", child_ids={"GEN-38", "GEN-39"})
 

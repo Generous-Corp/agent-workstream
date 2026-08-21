@@ -4,7 +4,7 @@
     "name": "Generous Corp",
     "url": "https://github.com/Generous-Corp"
   },
-  "description": "Private Generous Corp agent workstream tools.",
+  "description": "Durable agent workstreams across sessions, machines, and changing scope.",
   "plugins": [
     {
       "name": "workstream",

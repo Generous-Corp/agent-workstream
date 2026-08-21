@@ -9,6 +9,7 @@
   },
   "homepage": "https://github.com/Generous-Corp/agent-workstream#readme",
   "repository": "https://github.com/Generous-Corp/agent-workstream",
+  "license": "MIT",
   "keywords": ["agents", "workstreams", "linear", "continuity", "evidence"],
   "skills": "./skills/"
 }
