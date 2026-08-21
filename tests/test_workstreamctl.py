@@ -26,12 +26,10 @@ class WorkstreamCtlTests(unittest.TestCase):
                 "team_id": "team-id",
                 "project_id": "project-id",
             },
-            "repositories": [{
-                "provider": "github",
-                "repository_id": "R_example",
+            "repositories": {"github:R_example": {
                 "coordinate": "github.com/example/project",
                 "acceptance_commands": ["make test"],
-            }],
+            }},
         }
 
     def write(self, value):
@@ -46,11 +44,29 @@ class WorkstreamCtlTests(unittest.TestCase):
         self.assertEqual(MODULE.validate_config(path)["namespace"], "example")
 
     def test_duplicate_immutable_repository_identity_fails(self):
+        raw = json.dumps(self.config()).replace(
+            '"repositories": {',
+            '"repositories": {"github:R_example":{"coordinate":"git.example/renamed"},',
+        )
+        temp = tempfile.TemporaryDirectory()
+        path = Path(temp.name) / "config.json"
+        path.write_text(raw)
+        self.addCleanup(temp.cleanup)
+        with self.assertRaisesRegex(ValueError, "duplicate JSON key: github:R_example"):
+            MODULE.validate_config(path)
+
+    def test_whitespace_and_non_hierarchical_url_fail(self):
         value = self.config()
-        value["repositories"].append(dict(value["repositories"][0], coordinate="git.example/renamed"))
+        value["namespace"] = "   "
         temp, path = self.write(value)
         self.addCleanup(temp.cleanup)
-        with self.assertRaisesRegex(ValueError, "duplicate repository identity"):
+        with self.assertRaisesRegex(ValueError, "namespace"):
+            MODULE.validate_config(path)
+        value = self.config()
+        value["planning_url"] = "mailto:plans@example.com"
+        temp, path = self.write(value)
+        self.addCleanup(temp.cleanup)
+        with self.assertRaisesRegex(ValueError, "absolute URL"):
             MODULE.validate_config(path)
 
     def test_unknown_fields_fail_closed(self):

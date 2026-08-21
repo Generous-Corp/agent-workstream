@@ -26,10 +26,10 @@ class WorkstreamIngressTests(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {
             "WORKSTREAM_INGRESS_STATE_DIR": str(self.root / "state"),
             "WORKSTREAM_INGRESS_CONFIG": str(self.root / "config/config.json"),
-            "WHENCE_WORKSTREAM_ID": "GEN-12",
-            "WORKSTREAM_CONTEXT_URL": "https://linear.app/x/GEN-12",
-            "CMUX_SURFACE_ID": "surface:92",
-            "CMUX_WORKSPACE_ID": "workspace:9",
+            "WORKSTREAM_ID": "ABC-12",
+            "WORKSTREAM_CONTEXT_URL": "https://linear.app/x/ABC-12",
+            "WORKSTREAM_SURFACE_ID": "surface:92",
+            "WORKSTREAM_WORKSPACE_ID": "workspace:9",
         }, clear=False)
         self.env.start()
 
@@ -42,15 +42,20 @@ class WorkstreamIngressTests(unittest.TestCase):
         first = MODULE.event_record(payload, "codex")
         second = MODULE.event_record(payload, "codex")
         self.assertEqual(first["event_id"], second["event_id"])
-        self.assertEqual(first["workstream_id"], "GEN-12")
+        self.assertEqual(first["workstream_id"], "ABC-12")
 
     def test_redacts_credentials_and_oauth_query_values(self):
         prompt, count, truncated = MODULE.redact_prompt(
             "Authorization: Bearer abcdef token=topsecret "
-            "https://example.test/callback?code=abc&safe=yes&state=xyz"
+            "https://user:password@example.test/callback?code=abc&safe=yes&state=xyz "
+            "postgres://dbuser:dbpassword@db.example/app"
         )
         self.assertNotIn("abcdef", prompt)
         self.assertNotIn("topsecret", prompt)
+        self.assertNotIn("user:password", prompt)
+        self.assertNotIn("dbuser:dbpassword", prompt)
+        self.assertIn("https://[REDACTED]@example.test", prompt)
+        self.assertIn("postgres://[REDACTED]@db.example", prompt)
         self.assertIn("code=[REDACTED]", prompt)
         self.assertIn("safe=yes", prompt)
         self.assertIn("state=[REDACTED]", prompt)
@@ -102,7 +107,7 @@ class WorkstreamIngressTests(unittest.TestCase):
         self.assertIsNotNone(row[1])
 
     def test_remote_recovery_deduplicates_and_hides_processed(self):
-        capture = {"event_id": "e1", "captured_at": "2026-08-14T01:00:00Z", "workstream_id": "GEN-12"}
+        capture = {"event_id": "e1", "captured_at": "2026-08-14T01:00:00Z", "workstream_id": "ABC-12"}
         processed = {"event_id": "e1", "processed_at": "2026-08-14T02:00:00Z"}
         comments = [
             {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture), "html_url": "u1"},
@@ -112,11 +117,11 @@ class WorkstreamIngressTests(unittest.TestCase):
         with mock.patch.object(MODULE, "gh", side_effect=[
             [{"number": 7, "url": "i", "title": "ingress"}], [comments]
         ]):
-            self.assertEqual(MODULE.remote_events("o/r", "GEN-12"), [])
+            self.assertEqual(MODULE.remote_events("o/r", "ABC-12"), [])
 
     def test_remote_binding_promotes_an_initially_unbound_event(self):
         capture = {"event_id": "e1", "captured_at": "2026-08-14T01:00:00Z", "workstream_id": None}
-        binding = {"event_id": "e1", "workstream_id": "GEN-12", "context_url": "https://linear/GEN-12"}
+        binding = {"event_id": "e1", "workstream_id": "ABC-12", "context_url": "https://linear/ABC-12"}
         comments = [
             {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture), "html_url": "u1"},
             {"body": MODULE.comment_body(MODULE.BIND_MARKER, binding), "html_url": "u2"},
@@ -124,13 +129,13 @@ class WorkstreamIngressTests(unittest.TestCase):
         with mock.patch.object(MODULE, "gh", side_effect=[
             [{"number": 7, "url": "i", "title": "ingress"}], [comments]
         ]):
-            events = MODULE.remote_events("o/r", "GEN-12")
+            events = MODULE.remote_events("o/r", "ABC-12")
         self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["context_url"], "https://linear/GEN-12")
+        self.assertEqual(events[0]["context_url"], "https://linear/ABC-12")
 
     def test_remote_unbind_supersedes_a_wrong_binding(self):
         capture = {"event_id": "e1", "captured_at": "2026-08-14T01:00:00Z", "workstream_id": None}
-        binding = {"event_id": "e1", "workstream_id": "GEN-12", "context_url": "https://linear/GEN-12"}
+        binding = {"event_id": "e1", "workstream_id": "ABC-12", "context_url": "https://linear/ABC-12"}
         unbinding = {"event_id": "e1", "workstream_id": None, "context_url": None}
         comments = [
             {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture), "html_url": "u1"},
@@ -139,12 +144,12 @@ class WorkstreamIngressTests(unittest.TestCase):
         ]
         side_effect = [[{"number": 7, "url": "i", "title": "ingress"}], [comments]]
         with mock.patch.object(MODULE, "gh", side_effect=side_effect):
-            self.assertEqual(MODULE.remote_events("o/r", "GEN-12"), [])
+            self.assertEqual(MODULE.remote_events("o/r", "ABC-12"), [])
 
     def test_bind_fails_closed_without_exact_identity(self):
         args = mock.Mock(
-            workstream="GEN-12",
-            context_url="https://linear/GEN-12",
+            workstream="ABC-12",
+            context_url="https://linear/ABC-12",
             event=None,
             session=None,
             surface=None,
@@ -163,8 +168,8 @@ class WorkstreamIngressTests(unittest.TestCase):
             )
         conn.commit()
         args = mock.Mock(
-            workstream="GEN-12",
-            context_url="https://linear/GEN-12",
+            workstream="ABC-12",
+            context_url="https://linear/ABC-12",
             event=None,
             session="session-a",
             surface=None,
@@ -175,18 +180,18 @@ class WorkstreamIngressTests(unittest.TestCase):
         rows = MODULE.connect().execute(
             "SELECT event_id,workstream_id FROM events ORDER BY event_id"
         ).fetchall()
-        self.assertEqual(rows, [("mine", "GEN-12"), ("sibling", None)])
+        self.assertEqual(rows, [("mine", "ABC-12"), ("sibling", None)])
 
     def test_unbind_requires_expected_workstream_and_exact_identity(self):
         conn = MODULE.connect()
         for event_id, session in (("mine", "session-a"), ("sibling", "session-b")):
             conn.execute(
                 "INSERT INTO events (event_id,captured_at,provider,session_id,workstream_id,prompt,prompt_sha256,redactions,truncated) VALUES (?,?,?,?,?,?,?,?,?)",
-                (event_id, "2026-08-14T00:00:00Z", "codex", session, "GEN-12", "p", "h", 0, 0),
+                (event_id, "2026-08-14T00:00:00Z", "codex", session, "ABC-12", "p", "h", 0, 0),
             )
         conn.commit()
         args = mock.Mock(
-            workstream="GEN-12",
+            workstream="ABC-12",
             event=None,
             session="session-a",
             surface=None,
@@ -197,7 +202,7 @@ class WorkstreamIngressTests(unittest.TestCase):
         rows = MODULE.connect().execute(
             "SELECT event_id,workstream_id FROM events ORDER BY event_id"
         ).fetchall()
-        self.assertEqual(rows, [("mine", None), ("sibling", "GEN-12")])
+        self.assertEqual(rows, [("mine", None), ("sibling", "ABC-12")])
 
     def test_new_remote_issue_uses_create_response_without_search_index(self):
         created = {
@@ -222,16 +227,6 @@ class WorkstreamIngressTests(unittest.TestCase):
             issue = MODULE.ensure_remote_issue("o/r", "m5")
         self.assertEqual(issue["number"], 4)
         self.assertNotIn("--search", gh.call_args.args[0])
-
-    def test_hook_install_is_additive_and_idempotent(self):
-        path = self.root / "hooks.json"
-        path.write_text(json.dumps({"hooks": {"UserPromptSubmit": [{"hooks": [{"command": "cmux", "type": "command"}]}]}}))
-        command = "python3 /x/workstream_ingress.py capture --provider codex"
-        self.assertTrue(MODULE.install_hook(path, "codex", command))
-        self.assertFalse(MODULE.install_hook(path, "codex", command))
-        entries = json.loads(path.read_text())["hooks"]["UserPromptSubmit"]
-        self.assertEqual(len(entries), 2)
-        self.assertEqual(entries[0]["hooks"][0]["command"], "cmux")
 
     def test_prune_keeps_unuploaded_events(self):
         conn = MODULE.connect()
@@ -272,11 +267,7 @@ class WorkstreamIngressTests(unittest.TestCase):
 
 
 class CredentialPathTests(unittest.TestCase):
-    """The hook's remote leg must work in the shells it actually runs in.
-
-    Every one of these mirrors a real failure recorded in failures.jsonl on M5
-    between 2026-08-15 and 2026-08-17, where 55 rows were never acknowledged.
-    """
+    """A non-interactive capture launcher must diagnose credential failures."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -301,7 +292,7 @@ class CredentialPathTests(unittest.TestCase):
 
     # --- failure classification ------------------------------------------
     def test_classifies_the_three_observed_remote_failures(self):
-        # Verbatim shapes from the M5 failure log.
+        # Representative remote failure shapes.
         self.assertEqual(
             MODULE.classify_remote_failure("[Errno 2] No such file or directory: 'gh'"),
             "gh-missing",
@@ -389,6 +380,15 @@ class CredentialPathTests(unittest.TestCase):
         self.assertTrue(log.exists())
         self.assertNotIn("ghp_supersecretvalue", log.read_text())
 
+    def test_exception_secrets_never_reach_the_failure_log(self):
+        secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+        url = "postgres://dbuser:dbpassword@db.example/app"
+        MODULE.record_failure("remote-upload", RuntimeError(f"failed {secret} at {url}"))
+        text = (MODULE.state_root() / "failures.jsonl").read_text()
+        self.assertNotIn(secret, text)
+        self.assertNotIn("dbuser:dbpassword", text)
+        self.assertIn("[REDACTED]", text)
+
     # --- backlog drain ----------------------------------------------------
     def _seed(self, conn, *event_ids):
         for index, event_id in enumerate(event_ids):
@@ -442,9 +442,9 @@ class FlushReportingTests(unittest.TestCase):
     """A flush that stops must say why, in its own output.
 
     Stopping at the first refusal is correct. Stopping silently is the same
-    defect as a capture that fails without saying so: draining the 55-row
-    backlog on M5 meant reading failures.jsonl in a separate command to learn
-    that GitHub was returning 503s, because the flush itself printed only
+    defect as a capture that fails without saying so: an operator should not
+    need a separate failures.jsonl read to learn that GitHub returned 503,
+    while the flush itself printed only
     `{"pending_before": 58, "uploaded": 0}`.
     """
 
@@ -489,6 +489,20 @@ class FlushReportingTests(unittest.TestCase):
         self.assertEqual(summary["stopped_because"], "github-unavailable")
         self.assertEqual(summary["remaining"], 3)
         self.assertIn("503", summary["stopped_detail"])
+
+    def test_a_stopped_flush_never_returns_or_persists_secrets(self):
+        secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+        url = "https://user:password@example.test/private"
+        with mock.patch.object(MODULE, "upload_event",
+                               side_effect=RuntimeError(f"failed {secret} at {url}")):
+            code, summary = self._flush()
+        rendered = json.dumps(summary)
+        persisted = (MODULE.state_root() / "failures.jsonl").read_text()
+        for value in (secret, "user:password"):
+            self.assertNotIn(value, rendered)
+            self.assertNotIn(value, persisted)
+        self.assertEqual(code, 1)
+        self.assertIn("[REDACTED]", rendered)
 
     def test_a_stopped_flush_records_the_failure(self):
         with mock.patch.object(MODULE, "upload_event",
@@ -538,8 +552,7 @@ class PersistedBindingTests(unittest.TestCase):
 
     Before this, `bind` only backfilled the events that already existed, so
     every LATER turn of the same session was captured unbound again and nothing
-    revisited it. That is the whole mechanism behind GEN-27: 36 legacy events,
-    then 315 more, behind a feature that looked like it was working.
+    revisited it.
     """
 
     def setUp(self):
@@ -550,17 +563,18 @@ class PersistedBindingTests(unittest.TestCase):
             "WORKSTREAM_INGRESS_CONFIG": str(self.root / "config/config.json"),
         }, clear=False)
         self.env.start()
-        for leaked in ("WHENCE_WORKSTREAM_ID", "WORKSTREAM_CONTEXT_URL",
-                       "CMUX_SURFACE_ID", "CMUX_WORKSPACE_ID"):
+        for leaked in ("WORKSTREAM_ID", "WORKSTREAM_CONTEXT_URL",
+                       "WORKSTREAM_SURFACE_ID", "WORKSTREAM_WORKSPACE_ID",
+                       "WHENCE_WORKSTREAM_ID", "CMUX_SURFACE_ID", "CMUX_WORKSPACE_ID"):
             os.environ.pop(leaked, None)
 
     def tearDown(self):
         self.env.stop()
         self.temp.cleanup()
 
-    def _capture(self, session_id, cwd="/Users/x/Code/pulp", turn="t1", surface=None):
+    def _capture(self, session_id, cwd="/Users/x/Code/project", turn="t1", surface=None):
         payload = {"session_id": session_id, "turn_id": turn, "cwd": cwd, "prompt": "p"}
-        overrides = {"CMUX_SURFACE_ID": surface} if surface else {}
+        overrides = {"WORKSTREAM_SURFACE_ID": surface} if surface else {}
         with mock.patch.dict(os.environ, overrides), \
                 mock.patch.object(MODULE, "upload_event", return_value=True), \
                 mock.patch.object(MODULE.sys, "stdin", io.StringIO(json.dumps(payload))), \
@@ -592,30 +606,28 @@ class PersistedBindingTests(unittest.TestCase):
     # --- the recurrence this exists to stop --------------------------------
     def test_a_bound_session_binds_its_later_turns_automatically(self):
         self._capture("s1", turn="t1")
-        self._bind("GEN-35", session="s1")
+        self._bind("ABC-35", session="s1")
         self._capture("s1", turn="t2")
         values = list(self._workstreams().values())
         self.assertEqual(len(values), 2)
-        self.assertTrue(all(v == "GEN-35" for v in values),
+        self.assertTrue(all(v == "ABC-35" for v in values),
                         f"a later turn of a bound session was left unbound: {values}")
 
     def test_binding_by_exact_event_persists_that_events_session(self):
         self._capture("s1", turn="t1")
         conn = MODULE.connect()
         event_id = conn.execute("SELECT event_id FROM events").fetchone()[0]
-        self._bind("GEN-35", event=event_id)
+        self._bind("ABC-35", event=event_id)
         self._capture("s1", turn="t2")
-        self.assertTrue(all(v == "GEN-35" for v in self._workstreams().values()))
+        self.assertTrue(all(v == "ABC-35" for v in self._workstreams().values()))
 
-    # --- the constraint that made the GEN-27 binding admissible ------------
+    # --- cwd is not a trusted identity -------------------------------------
     def test_cwd_is_never_used_to_bind(self):
-        # Two sessions in ONE checkout — the exact situation that made the
-        # Spectr session's cwd inadmissible. Binding one must not touch the
-        # other, no matter how identical their working directories look.
-        shared = "/Users/x/Code/pulp"
+        # Two sessions in one checkout must remain independently bindable.
+        shared = "/Users/x/Code/project"
         self._capture("bound-session", cwd=shared)
         self._capture("other-session", cwd=shared)
-        self._bind("GEN-35", session="bound-session")
+        self._bind("ABC-35", session="bound-session")
         self._capture("other-session", cwd=shared, turn="t2")
         conn = MODULE.connect()
         rows = conn.execute(
@@ -630,10 +642,10 @@ class PersistedBindingTests(unittest.TestCase):
     def test_an_earlier_row_with_a_different_workstream_is_not_rewritten(self):
         self._capture("s1", turn="t1")
         conn = MODULE.connect()
-        conn.execute("UPDATE events SET workstream_id='GEN-12' WHERE session_id='s1'")
+        conn.execute("UPDATE events SET workstream_id='ABC-12' WHERE session_id='s1'")
         conn.commit()
-        self._bind("GEN-35", session="s1")
-        self.assertEqual(list(self._workstreams().values()), ["GEN-12"],
+        self._bind("ABC-35", session="s1")
+        self.assertEqual(list(self._workstreams().values()), ["ABC-12"],
                          "a deliberate earlier binding was overwritten")
 
     def test_unbinding_stops_later_turns_from_re_binding(self):
@@ -641,25 +653,25 @@ class PersistedBindingTests(unittest.TestCase):
         # persisted identity, the very next turn would silently re-apply the
         # same wrong workstream.
         self._capture("s1", turn="t1")
-        self._bind("GEN-17", session="s1")
-        self._unbind("GEN-17", session="s1")
+        self._bind("ABC-17", session="s1")
+        self._unbind("ABC-17", session="s1")
         self._capture("s1", turn="t2")
         self.assertTrue(all(v is None for v in self._workstreams().values()),
                         "a corrected binding came back on the next turn")
 
     def test_a_surface_binds_when_there_is_no_session(self):
         self._capture(None, surface="surface:92")
-        self._bind("GEN-35", surface="surface:92")
+        self._bind("ABC-35", surface="surface:92")
         self._capture(None, surface="surface:92", turn="t2")
-        self.assertTrue(all(v == "GEN-35" for v in self._workstreams().values()))
+        self.assertTrue(all(v == "ABC-35" for v in self._workstreams().values()))
 
     def test_an_explicit_workstream_wins_over_a_persisted_binding(self):
         # A caller naming a workstream for THIS turn is making a more specific
         # statement than a binding recorded earlier.
-        self._bind("GEN-35", session="s1")
-        with mock.patch.dict(os.environ, {"WHENCE_WORKSTREAM_ID": "GEN-99"}):
+        self._bind("ABC-35", session="s1")
+        with mock.patch.dict(os.environ, {"WORKSTREAM_ID": "ABC-99"}):
             self._capture("s1")
-        self.assertEqual(list(self._workstreams().values()), ["GEN-99"])
+        self.assertEqual(list(self._workstreams().values()), ["ABC-99"])
 
     # --- the negative: no binding must still capture, and still be visible --
     def test_an_unbound_session_still_captures_and_is_counted(self):
@@ -685,7 +697,7 @@ class PersistedBindingTests(unittest.TestCase):
         for session in ("a", "b", "c"):
             self._capture(session)
             self._capture(session, turn="t2")
-        self._bind("GEN-35", session="a")
+        self._bind("ABC-35", session="a")
         out = io.StringIO()
         with mock.patch.object(MODULE.sys, "stdout", out):
             MODULE.command_status(argparse.Namespace())
@@ -702,19 +714,11 @@ class PersistedBindingTests(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             conn.execute(
                 "INSERT INTO bindings (kind, identity, workstream_id, bound_at) "
-                "VALUES ('cwd', '/Users/x/Code/pulp', 'GEN-35', '2026-08-17T00:00:00Z')")
+                "VALUES ('cwd', '/Users/x/Code/project', 'ABC-35', '2026-08-17T00:00:00Z')")
 
 
 class RatchetTests(unittest.TestCase):
-    """Alert on growth, not on level.
-
-    315 unbound events is history: a known quantity only a triage pass reduces.
-    A check that alerted on it would be permanently red, and a permanently red
-    check gets muted — which is worse than no check, because it looks like
-    coverage. What means something broke is the number going UP, and the
-    sharper form of that is an event left unbound whose session is already
-    bound, which capture-time resolution makes impossible.
-    """
+    """Alert on growth or an invariant violation, not a historical level."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -786,7 +790,7 @@ class RatchetTests(unittest.TestCase):
             self._add_unbound(f"e{index}")
         self._ratchet()
         conn = MODULE.connect()
-        conn.execute("UPDATE events SET workstream_id='GEN-35' WHERE event_id IN ('e0','e1')")
+        conn.execute("UPDATE events SET workstream_id='ABC-35' WHERE event_id IN ('e0','e1')")
         conn.commit()
         code, report = self._ratchet()
         self.assertEqual(code, 0)
@@ -797,7 +801,7 @@ class RatchetTests(unittest.TestCase):
         # combination cannot occur unless resolution regressed.
         self._add_unbound("e1", session_id="bound-session")
         conn = MODULE.connect()
-        MODULE.record_binding(conn, "session", "bound-session", "GEN-35", None)
+        MODULE.record_binding(conn, "session", "bound-session", "ABC-35", None)
         conn.commit()
         code, report = self._ratchet()
         self.assertEqual(code, 1)

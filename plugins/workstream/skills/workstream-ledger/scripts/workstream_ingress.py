@@ -25,16 +25,12 @@ MAX_PROMPT_BYTES = 16 * 1024
 DEFAULT_RETENTION_DAYS = 30
 DEFAULT_REMOTE_RETENTION_DAYS = 90
 DEFAULT_MAX_LOCAL_BYTES = 50 * 1024 * 1024
-#: Where `gh` actually lives when PATH is the one a non-interactive login shell
-#: gets. A hook fires under `codex exec` and agent-spawned shells that never
-#: read an interactive profile, so /opt/homebrew/bin is routinely absent and
-#: the capture died with a bare FileNotFoundError.
+#: Common `gh` locations used when a non-interactive capture launcher has a
+#: minimal PATH. An explicit configured path still wins.
 GH_SEARCH_PATHS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/opt/local/bin")
-#: File-backed token, per the agent-secrets contract: the live path an agent
-#: reads is a 0600 file, never an interactive keyring, because a hook cannot
-#: answer a keychain prompt.
+#: Optional file-backed token for non-interactive capture launchers.
 DEFAULT_TOKEN_FILE = "~/.config/workstream/ingress-token"
-#: Older rows to retry per successful capture. Bounded so the hook stays fast;
+#: Older rows to retry per successful capture. Bounded so capture stays fast;
 #: the point is that a backlog drains on its own instead of waiting for someone
 #: to notice and run `flush`.
 OPPORTUNISTIC_DRAIN = 5
@@ -46,7 +42,7 @@ SECRET_PATTERNS = (
     re.compile(r"-----BEGIN [^-]*(?:PRIVATE KEY|CERTIFICATE)-----.*?-----END [^-]*-----", re.S),
     re.compile(r"(?i)\b(authorization\s*:\s*bearer)\s+\S+"),
     re.compile(r"(?i)\b(token|secret|password|passwd|api[_-]?key)\s*[:=]\s*['\"]?[^\s'\"]+"),
-    re.compile(r"\b(?:sk|ghp|gho|github_pat|xox[baprs])-[-A-Za-z0-9_]{16,}\b"),
+    re.compile(r"\b(?:sk[-_]|ghp[-_]|gho[-_]|github_pat[-_]|xox[baprs][-_])[-A-Za-z0-9_]{16,}\b"),
 )
 SENSITIVE_QUERY_KEYS = re.compile(
     r"(?i)^(?:code|token|access_token|refresh_token|id_token|state|client_secret|key|password)$"
@@ -126,7 +122,7 @@ def gh_binary() -> str:
             return candidate
     raise RuntimeError(
         "gh not found on PATH or in " + ", ".join(GH_SEARCH_PATHS)
-        + " (a hook shell does not read an interactive profile; "
+        + " (a non-interactive launcher may not read an interactive profile; "
         "set gh_bin in the ingress config or WORKSTREAM_INGRESS_GH_BIN)"
     )
 
@@ -136,7 +132,7 @@ def gh_env() -> dict[str, str]:
 
     A token already in the environment is the caller's deliberate choice and is
     left alone. Otherwise a 0600 token file is used, because `gh`'s own keyring
-    store is unavailable in the non-interactive shells where this hook runs —
+    may be unavailable in a non-interactive capture launcher —
     and an unauthenticated request does not fail loudly, it silently spends the
     60/hr anonymous IP budget shared by every tool on the machine.
     """
@@ -154,17 +150,19 @@ def gh_env() -> dict[str, str]:
 
 
 def record_failure(stage: str, error: BaseException) -> None:
-    """Record metadata-only hook failure without persisting the raw prompt."""
+    """Record sanitized failure metadata without persisting raw exception text."""
     try:
         path = state_root() / "failures.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(path.parent, 0o700)
+        raw_message = str(error)
+        safe_message, _, _ = redact_text(raw_message, max_bytes=500)
         entry = {
             "at": utc_now(),
             "stage": stage,
             "error_type": type(error).__name__,
-            "message": str(error)[:500],
-            "cause": classify_remote_failure(str(error)),
+            "message": safe_message,
+            "cause": classify_remote_failure(raw_message),
         }
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(descriptor, "a") as stream:
@@ -226,14 +224,10 @@ def connect() -> sqlite3.Connection:
         )
         """
     )
-    # Persisted bindings. Without these, `bind` only backfilled the rows that
-    # already existed, so every LATER turn of the same session was captured
-    # unbound again and nothing ever revisited it — which is how 36 legacy
-    # events and then 315 more accumulated behind a mechanism that looked like
-    # it was working.
+    # Persisted bindings ensure later turns resolve after a session is bound.
     #
     # `kind` is deliberately limited to identities that are trustworthy:
-    # an exact provider session, or a cmux surface. There is no cwd row and no
+    # an exact provider session or an adapter-provided surface. There is no cwd row and no
     # heuristic row, because several tabs share one checkout and a wrong
     # binding is worse than an obvious gap — a gap is visible in `status`,
     # a wrong binding is invisible forever.
@@ -257,8 +251,9 @@ def redact_url(match: re.Match[str]) -> str:
     raw = match.group(0)
     try:
         parts = urlsplit(raw)
-        if not parts.query:
-            return raw
+        netloc = parts.netloc
+        if "@" in netloc:
+            netloc = "[REDACTED]@" + netloc.rsplit("@", 1)[1]
         pairs = []
         for piece in parts.query.split("&"):
             key, separator, value = piece.partition("=")
@@ -266,14 +261,20 @@ def redact_url(match: re.Match[str]) -> str:
                 pairs.append(f"{key}=[REDACTED]")
             else:
                 pairs.append(piece)
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, "&".join(pairs), parts.fragment))
+        return urlunsplit((parts.scheme, netloc, parts.path, "&".join(pairs), parts.fragment))
     except ValueError:
         return raw
 
 
-def redact_prompt(prompt: str) -> tuple[str, int, bool]:
+def redact_text(text: str, *, max_bytes: int) -> tuple[str, int, bool]:
     redactions = 0
-    value = re.sub(r"https?://[^\s<>]+", redact_url, prompt)
+    def replace_url(match: re.Match[str]) -> str:
+        nonlocal redactions
+        value = redact_url(match)
+        redactions += int(value != match.group(0))
+        return value
+
+    value = re.sub(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s<>]+", replace_url, text)
     for pattern in SECRET_PATTERNS:
         def replace(match: re.Match[str]) -> str:
             nonlocal redactions
@@ -282,10 +283,14 @@ def redact_prompt(prompt: str) -> tuple[str, int, bool]:
             return f"{prefix} [REDACTED]" if prefix else "[REDACTED]"
         value = pattern.sub(replace, value)
     encoded = value.encode("utf-8")
-    truncated = len(encoded) > MAX_PROMPT_BYTES
+    truncated = len(encoded) > max_bytes
     if truncated:
-        value = encoded[:MAX_PROMPT_BYTES].decode("utf-8", errors="ignore") + "\n[TRUNCATED]"
+        value = encoded[:max_bytes].decode("utf-8", errors="ignore") + "\n[TRUNCATED]"
     return value, redactions, truncated
+
+
+def redact_prompt(prompt: str) -> tuple[str, int, bool]:
+    return redact_text(prompt, max_bytes=MAX_PROMPT_BYTES)
 
 
 def first_string(payload: dict[str, Any], *keys: str) -> str | None:
@@ -330,10 +335,10 @@ def event_record(payload: dict[str, Any], provider: str) -> dict[str, Any]:
         "provider": provider,
         "session_id": first_string(payload, "session_id", "sessionId"),
         "turn_id": first_string(payload, "turn_id", "turnId"),
-        "surface_id": os.environ.get("CMUX_SURFACE_ID"),
-        "workspace_id": os.environ.get("CMUX_WORKSPACE_ID"),
+        "surface_id": os.environ.get("WORKSTREAM_SURFACE_ID") or os.environ.get("CMUX_SURFACE_ID"),
+        "workspace_id": os.environ.get("WORKSTREAM_WORKSPACE_ID") or os.environ.get("CMUX_WORKSPACE_ID"),
         "cwd": first_string(payload, "cwd") or os.getcwd(),
-        "workstream_id": os.environ.get("WHENCE_WORKSTREAM_ID"),
+        "workstream_id": os.environ.get("WORKSTREAM_ID") or os.environ.get("WHENCE_WORKSTREAM_ID"),
         "context_url": os.environ.get("WORKSTREAM_CONTEXT_URL"),
         "prompt": prompt,
         "prompt_sha256": prompt_hash,
@@ -347,14 +352,14 @@ def resolve_binding(conn: sqlite3.Connection, event: dict[str, Any]) -> None:
     """Fill in a workstream for an event that arrived without one.
 
     Only exact identities are consulted, most specific first: the provider
-    session, then the cmux surface. `cwd` is deliberately NOT a fallback — many
+    session, then an adapter-provided surface. `cwd` is deliberately NOT a fallback — many
     tabs share one checkout, so binding on it would attach turns to whatever
     workstream happened to run there last. An unbound event is a visible gap;
     a wrongly bound one is a silent lie.
 
-    An explicit WHENCE_WORKSTREAM_ID still wins, because a caller that names a
-    workstream for this turn is making a more specific statement than a binding
-    recorded earlier.
+    An explicit `WORKSTREAM_ID` still wins. The legacy `WHENCE_WORKSTREAM_ID`
+    is accepted only as an optional adapter input; either explicit value is
+    more specific than a binding recorded earlier.
     """
     if event.get("workstream_id"):
         return
@@ -571,7 +576,9 @@ def command_bind(args: argparse.Namespace) -> int:
     values: list[Any] = []
     event = args.event
     session = args.session
-    surface = args.surface or (None if event or session else os.environ.get("CMUX_SURFACE_ID"))
+    surface = args.surface or (None if event or session else (
+        os.environ.get("WORKSTREAM_SURFACE_ID") or os.environ.get("CMUX_SURFACE_ID")
+    ))
     if event:
         clauses.append("event_id=?")
         values.append(event)
@@ -583,7 +590,7 @@ def command_bind(args: argparse.Namespace) -> int:
         values.append(surface)
     else:
         raise ValueError(
-            "bind requires an explicit --event/--session or a trusted cmux surface; "
+            "bind requires an explicit --event/--session or a trusted adapter surface; "
             "cwd-only binding is unsafe when multiple tabs share a checkout"
         )
     # Persist the identity BEFORE backfilling, so a session whose next turn
@@ -698,31 +705,13 @@ def command_unbind(args: argparse.Namespace) -> int:
     return 0
 
 
-def install_hook(config_file: Path, provider: str, command: str) -> bool:
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-    data = json.loads(config_file.read_text()) if config_file.exists() else {}
-    hooks = data.setdefault("hooks", {})
-    entries = hooks.setdefault("UserPromptSubmit", [])
-    for entry in entries:
-        for hook in entry.get("hooks", []):
-            if "workstream_ingress.py capture" in hook.get("command", ""):
-                return False
-    entries.append({
-        "hooks": [{"type": "command", "command": command, "timeout": 5}]
-    })
-    temp = config_file.with_suffix(config_file.suffix + ".tmp")
-    temp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    temp.replace(config_file)
-    return True
-
-
 def drain_pending(
     conn: sqlite3.Connection, config: dict[str, Any], exclude: str, limit: int
 ) -> int:
     """Upload up to `limit` older unacknowledged rows, oldest first.
 
     Stops at the first failure: if the remote just started refusing, the rest
-    of the backlog will fail the same way and a hook must not spend the user's
+    of the backlog will fail the same way and capture must not spend the user's
     latency proving it.
     """
     rows = conn.execute(
@@ -744,7 +733,7 @@ def command_capture(args: argparse.Namespace) -> int:
     try:
         payload = json.load(sys.stdin)
         if not isinstance(payload, dict):
-            raise ValueError("hook payload must be an object")
+            raise ValueError("capture payload must be an object")
         event = event_record(payload, args.provider)
         conn = connect()
         resolve_binding(conn, event)
@@ -758,12 +747,11 @@ def command_capture(args: argparse.Namespace) -> int:
             # This turn proved the credential path works right now, so spend a
             # little of it on the backlog. Without this a transient outage or a
             # credential-less shell leaves rows unacknowledged until a human
-            # notices and runs `flush` — which is how 55 rows accumulated
-            # across 55 one-shot sessions before anyone looked.
+            # notices and runs `flush`.
             drain_pending(conn, config, event["event_id"], OPPORTUNISTIC_DRAIN)
         enforce_bound(conn, config)
     except Exception as error:
-        # An observability hook must never block the user's agent prompt.
+        # An observability capture must never block the user's agent prompt.
         record_failure("local-capture", error)
     print("{}")
     return 0
@@ -786,23 +774,6 @@ def command_configure(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_install_hooks(args: argparse.Namespace) -> int:
-    script = Path(__file__).resolve()
-    home = Path.home()
-    changed = {
-        "codex": install_hook(
-            home / ".codex/hooks.json", "codex",
-            f"env WORKSTREAM_INGRESS_PROVIDER=codex python3 {script} capture --provider codex",
-        ),
-        "claude": install_hook(
-            home / ".claude/settings.json", "claude",
-            f"env WORKSTREAM_INGRESS_PROVIDER=claude python3 {script} capture --provider claude",
-        ),
-    }
-    print(json.dumps({"changed": changed, "script": str(script)}, indent=2, sort_keys=True))
-    return 0
-
-
 def command_flush(args: argparse.Namespace) -> int:
     """Upload every unacknowledged row, stopping at the first refusal.
 
@@ -811,9 +782,7 @@ def command_flush(args: argparse.Namespace) -> int:
     SILENTLY is not: a flush that printed `{"pending_before": 58, "uploaded": 0}`
     and nothing else was indistinguishable from a flush with nothing to do, and
     the operator had to go read failures.jsonl separately to learn that GitHub
-    was returning 503s. That is the same defect class as the hook that captured
-    55 events and never said it could not upload them, so the reason is both
-    recorded and reported here.
+    was returning 503s, so the sanitized reason is both recorded and reported.
     """
     conn = connect()
     config = load_config()
@@ -829,7 +798,7 @@ def command_flush(args: argparse.Namespace) -> int:
         except (OSError, RuntimeError, subprocess.SubprocessError) as error:
             record_failure("flush", error)
             stopped_because = classify_remote_failure(str(error))
-            stopped_detail = str(error)[:200]
+            stopped_detail, _, _ = redact_text(str(error), max_bytes=200)
             break
     summary: dict[str, Any] = {"pending_before": len(rows), "uploaded": uploaded}
     if stopped_because:
@@ -878,7 +847,7 @@ def command_status(args: argparse.Namespace) -> int:
     ).fetchone()
     # Unbound volume is the number that matters and the one nobody was
     # watching: an unbound event is an open obligation no recovery pass can
-    # find by workstream, and 36 of them became 315 without anything saying so.
+    # find by workstream.
     # Report it by session and by age, because "many sessions, days old" and
     # "one session, minutes old" call for opposite responses.
     unbound = conn.execute(
@@ -1052,8 +1021,6 @@ def parser() -> argparse.ArgumentParser:
     unbind_identity.add_argument("--surface")
     unbind.add_argument("--limit", type=int, default=100)
     unbind.set_defaults(func=command_unbind)
-    install = sub.add_parser("install-hooks")
-    install.set_defaults(func=command_install_hooks)
     flush = sub.add_parser("flush")
     flush.set_defaults(func=command_flush)
     recover = sub.add_parser("recover")

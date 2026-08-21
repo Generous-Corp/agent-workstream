@@ -1,6 +1,6 @@
 ---
 name: workstream-ledger
-description: Preserve evolving project goals, tasks, decisions, dependencies, PR state, and next actions in a durable Linear-backed workstream across Codex/Claude sessions and machines. Use when executing a planning file, starting substantive or PR-bound work, adding or changing requirements during conversation, cancelling or superseding earlier decisions, handing a PR to Shipyard, detecting stale work, recovering after quota/session loss, or preparing/restoring a cmux successor session.
+description: Preserve evolving project goals, tasks, decisions, dependencies, PR state, and next actions in a durable Linear-backed workstream across agent sessions and machines. Use when executing a plan, starting substantive or PR-bound work, changing requirements, recording superseded decisions, detecting stale work, resuming from a stable issue handle, or deciding whether work can close.
 ---
 
 # Workstream ledger
@@ -200,7 +200,7 @@ agent may resume from a cwd, stale transcript, or title metadata alone.
 The current paginated Linear transport obtains next actions from durable root
 and child descriptions without synthesizing them. It still returns empty
 decisions and provenance and does not fetch typed choices, scope, relations,
-evidence contracts, owner, history, execution identity, or live GitHub/Shipyard
+evidence contracts, owner, history, execution identity, or live source-control
 truth. Therefore its output is a validated bounded snapshot, not yet a physical
 cross-machine recovery proof. Resume must recover and reduce every durable
 choice event, then reconcile its plan revision, repository scope, and exact
@@ -244,8 +244,9 @@ Linear, second-machine, process-death, or deletion-resistance canary.
    canonical repository coordinates, child repository ownership, and typed
    cross-workstream relations before mutation.
 3. On recovery, read the full nonterminal issue graph, dependencies, decisions,
-   comments, plan link/revision, and next action. Then query live GitHub and
-   Shipyard state; neither old comments nor local state are PR truth.
+   comments, plan link/revision, and next action. Then query live source-control
+   and landing-controller state when those capabilities exist; neither old
+   comments nor local state are PR truth.
 4. Report stale contradictions before implementation:
    - open issue whose PR is merged/closed or whose head changed;
    - waiting issue with no blocker/owner/review date;
@@ -277,21 +278,22 @@ Perform a tiny delta update without a second model:
 | Rejected work | Cancel/supersede with date and reason; never erase it |
 | New dependency/blocker | Add the relation, exact blocker, owner, and next action |
 | PR created/head changed | Attach PR and exact head; invalidate prior-head evidence |
-| Shipyard accepts landing | Attach the exact-head controller receipt |
+| A landing controller accepts the PR | Attach its exact-head controller receipt |
 | PR merged | Close only acceptance that actually passed; retain follow-ups |
 | No material delta | Do not write to Linear |
 
 After creating the first durable issue for a session that began unbound, bind
-the already-captured turns using the exact current cmux surface:
+already-captured turns only when an explicitly configured ingress integration
+provides an exact event, session, or trusted surface identity:
 
 ```sh
 python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" \
   bind --workstream ABC-123 --context-url https://linear.app/example/issue/ABC-123/example \
-  --surface "$CMUX_SURFACE_ID"
+  --surface "$WORKSTREAM_SURFACE_ID"
 ```
 
-For a legacy process with no trusted cmux surface metadata, use the exact
-provider session ID from `recover`; never bind by repository cwd. Multiple tabs
+Without trusted surface metadata, use the exact provider session ID from
+`recover`; never bind by repository cwd. Multiple sessions
 may share one checkout. A bind is persisted, so the session's LATER turns bind
 themselves — you do not need to re-bind as the session continues. If a binding
 was wrong, correct it without processing the event (this also forgets the
@@ -309,12 +311,12 @@ before the corresponding Linear mutation succeeds when one is needed.
 Issue titles must be understandable outside the project view and use a
 plan/workstream-derived prefix. Every issue independently includes the stable
 workstream ID, plan section when present, namespace, canonical repository
-coordinate, why, completion gate, PR, repository-qualified head, Shipyard
-receipt, evidence, current blockers, and next action.
+coordinate, why, completion gate, PR, repository-qualified head, optional
+landing-controller receipt, evidence, current blockers, and next action.
 
 ## Checkpoint before continuation
 
-Before invoking `cmux-continue-session`:
+Before continuing in another agent session:
 
 1. Promote every material delta through the current user turn. Reduce and
    reconcile typed choices; do not close with an active must-fix, unaudited
@@ -326,31 +328,38 @@ Before invoking `cmux-continue-session`:
 4. Build the material-boundary checkpoint and persist it through the remote
    adapter. Do not proceed on a local-only or unacknowledged checkpoint.
 5. Record one next action and the durable context's current `updatedAt`.
-6. Pass `--workstream`, `--context-url`, and `--context-updated-at` to the cmux
-   continuation script. Include `--plan-url`, `--head`, and `--pr-url` when they
-   exist.
+6. Pass the workstream handle, context URL/update time, plan URL, exact head,
+   and PR URL to a continuation adapter only when that capability exists.
 7. Require the new session to reread the durable graph and live PR state and
    acknowledge the restored objective, decisions, open items, head, and next
    action. Do not close the source beforehand.
 
 ## Abrupt termination
 
-Native transcript resume is useful but not cross-machine task authority. If a
-user turn lacks a remote processed acknowledgement, treat it as an open
-obligation during recovery. The ingress hook synchronously writes a private
-SQLite outbox before trying the private GitHub remote. GitHub downtime leaves a
-local unacknowledged row for `flush`; if the entire source machine is offline
-before remote acknowledgement, another machine cannot recover that row. State
-that physical limit honestly.
+Native transcript resume is useful but not cross-machine task authority. The
+plugin installs no capture hook, so turns after the last remote acknowledgement
+are not recoverable unless the user has separately configured a stable external
+capture integration. With that optional integration, a local unacknowledged row
+still cannot be recovered after its source machine disappears. State that
+physical limit honestly.
 
 The ingress is an at-least-once transport, not a second task tracker. Remote
 consumers deduplicate by `event_id`; Linear holds the promoted business logic.
 Local remote-acknowledged rows rotate after 30 days, remote issues rotate by
-machine/month, prompts are capped at 16 KiB, and credential-like values are
-redacted. See [durable ingress](references/durable-ingress.md).
+machine/month, prompts are capped at 16 KiB, and documented credential patterns
+are sanitized. See [durable ingress](references/durable-ingress.md) for the
+exact privacy and mutation boundary.
 
 Never store credentials, account identities, private filesystem paths, or raw
 transcripts in public PR metadata.
+
+## Optional adapters
+
+Session managers may provide stable surface identity and continuation UX;
+landing controllers may provide exact-head ownership and receipts. cmux and
+Shipyard are examples only. Check that the capability is installed and
+configured before using it, and never treat an adapter as the workstream
+authority.
 
 Future backup work may add a read-only private flat-file snapshot, but it must
 not become an import/sync path or second authority.

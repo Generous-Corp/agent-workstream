@@ -27,7 +27,7 @@ class WorkstreamE2ETests(unittest.TestCase):
         snapshot["children"][0].update({"status": "Done", "owner": "agent", "next_action": "complete"})
         result = review(snapshot, expected_plan_revision="sha-demo", criteria=["a"], evidence={
             "a": {"satisfied": True}, "decisions": [], "followups": [], "prs": [],
-            "shipyard_receipts": [], "tests": [], "artifacts": [],
+            "landing_receipts": [], "tests": [], "artifacts": [],
         })
         self.assertFalse(result["ok"])
         self.assertIn("transport_unimplemented:scope", result["errors"])

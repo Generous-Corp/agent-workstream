@@ -45,19 +45,23 @@ codex plugin add workstream@generous-workstream
 claude --plugin-dir /absolute/path/to/agent-workstream/plugins/workstream
 ```
 
-Validate project routing with a checked-in or local `.workstream.json`:
+Optionally validate a static project declaration in `.workstream.json`:
 
 ```sh
 plugins/workstream/bin/workstreamctl config validate .workstream.json
 ```
 
-The file contains identifiers and routing, not credentials. See
+The file is a preflight declaration only; current live adapters do not consume
+it for routing. It may be checked in because it contains identifiers and
+acceptance commands, not credentials. See
 [`workstream.config.schema.json`](plugins/workstream/workstream.config.schema.json).
 Runtime credentials stay outside the repository: `LINEAR_API_KEY` for the
 authenticated Linear operations and normal Git/hosting credentials for private
-plans and repositories. The optional ingress transport requires an explicitly
-configured private repository and either existing GitHub CLI authentication or
-`WORKSTREAM_INGRESS_TOKEN_FILE`; it has no personal or Pulp-specific default.
+plans and repositories. The optional ingress transport is inactive unless a
+separately managed stable capture integration invokes it. Operating
+`configure`, `capture`, `bind`, `unbind`, `process`, or `flush` can write local
+state and private GitHub issues or comments; read the skill's ingress reference
+before use.
 
 Neither plugin installs hooks, services, MCP servers, monitors, or background
 workers. Installing it does not mutate Linear or GitHub.

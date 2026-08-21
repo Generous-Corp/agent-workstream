@@ -78,7 +78,11 @@ def review(snapshot: dict[str, Any], *, expected_plan_revision: str,
         item = evidence.get(criterion)
         if not item or not item.get("satisfied"):
             errors.append(f"criterion_not_proven:{criterion}")
-    for key in ("decisions", "followups", "prs", "shipyard_receipts", "tests", "artifacts"):
+    for key in ("decisions", "followups", "prs", "landing_receipts", "tests", "artifacts"):
+        # Read old snapshots without making a particular landing controller part
+        # of the portable contract.
+        if key == "landing_receipts" and "shipyard_receipts" in evidence:
+            continue
         if key not in evidence:
             errors.append(f"missing_evidence_category:{key}")
     if semantic_review_passed and not semantic_review_invoked:
@@ -167,7 +171,7 @@ def review(snapshot: dict[str, Any], *, expected_plan_revision: str,
     receipt = {
         "criteria_checked": criteria,
         "children_checked": identifiers,
-        "evidence_categories_checked": ["decisions", "followups", "prs", "shipyard_receipts", "tests", "artifacts"],
+        "evidence_categories_checked": ["decisions", "followups", "prs", "landing_receipts", "tests", "artifacts"],
         "excluded": excluded or [],
         "deterministic_checks_passed": True,
         "semantic_review_invoked": semantic_review_invoked,

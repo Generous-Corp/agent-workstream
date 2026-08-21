@@ -7,7 +7,7 @@ from workstream_choices import record_choice
 
 class ClosureTests(unittest.TestCase):
     def evidence(self):
-        return {"a": {"satisfied": True}, "decisions": [], "followups": [], "prs": [], "shipyard_receipts": [], "tests": [], "artifacts": []}
+        return {"a": {"satisfied": True}, "decisions": [], "followups": [], "prs": [], "landing_receipts": [], "tests": [], "artifacts": []}
 
     def factory_snapshot(self, snapshot):
         head = "a" * 40
@@ -235,7 +235,7 @@ class ClosureTests(unittest.TestCase):
         }
         result = review(
             snapshot, expected_plan_revision="sha", criteria=[], evidence={
-                "decisions": [], "followups": [], "prs": [], "shipyard_receipts": [],
+                "decisions": [], "followups": [], "prs": [], "landing_receipts": [],
                 "tests": [], "artifacts": [],
             }, repository_heads={}, semantic_review_invoked=True,
             semantic_review_passed=True,

@@ -35,9 +35,10 @@ Adversarially check whether ABC-123 can close.
 The local contracts and tested Linear transports are usable, but this is not a
 hosted orchestration service. Some resume surfaces and live cross-machine proof
 remain explicitly unimplemented and therefore block closure. The plugin does
-not install hooks, MCP servers, monitors, or background workers. Shipyard and
-other delivery systems remain optional external adapters, not owners of the
-workstream.
+not install hooks, MCP servers, monitors, or background workers. Optional
+session and landing adapters are external capabilities, not owners of the
+workstream. Prompt ingress is unavailable by default and requires a separately
+managed stable capture integration.
 
 See [INSTALL.md](INSTALL.md) for installation and configuration.
 

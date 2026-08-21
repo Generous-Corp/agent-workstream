@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Dispatch the deterministic Workstream helpers and validate project routing."""
+"""Dispatch deterministic helpers and validate a static project declaration."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
@@ -20,9 +21,18 @@ def fail(message: str) -> int:
     return 2
 
 
+def unique_object(pairs: list[tuple[str, object]]) -> dict:
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
 def validate_config(path: Path) -> dict:
     try:
-        value = json.loads(path.read_text())
+        value = json.loads(path.read_text(), object_pairs_hook=unique_object)
     except OSError as error:
         raise ValueError(f"cannot read config: {error}") from error
     except json.JSONDecodeError as error:
@@ -42,7 +52,8 @@ def validate_config(path: Path) -> dict:
         if not isinstance(planning_url, str):
             raise ValueError("planning_url must be an absolute URL")
         parsed = urlparse(planning_url)
-        if not parsed.scheme or not parsed.netloc:
+        if (not parsed.scheme or not parsed.netloc or re.search(r"\s", planning_url)
+                or not re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", parsed.scheme)):
             raise ValueError("planning_url must be an absolute URL")
     ledger = value.get("ledger")
     if not isinstance(ledger, dict):
@@ -54,25 +65,21 @@ def validate_config(path: Path) -> dict:
         if not isinstance(ledger.get(key), str) or not ledger[key].strip():
             raise ValueError(f"ledger.{key} must be a non-empty string")
     repositories = value.get("repositories")
-    if not isinstance(repositories, list) or not repositories:
-        raise ValueError("repositories must be a non-empty array")
-    seen: set[tuple[str, str]] = set()
-    for index, repository in enumerate(repositories):
+    if not isinstance(repositories, dict) or not repositories:
+        raise ValueError("repositories must be a non-empty object keyed by provider:repository_id")
+    for identity, repository in repositories.items():
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*:[^\s:]+", identity):
+            raise ValueError(f"invalid repository identity: {identity}")
         if not isinstance(repository, dict):
-            raise ValueError(f"repositories[{index}] must be an object")
-        allowed_repo = {"provider", "repository_id", "coordinate", "acceptance_commands"}
+            raise ValueError(f"repositories.{identity} must be an object")
+        allowed_repo = {"coordinate", "acceptance_commands"}
         if set(repository) - allowed_repo:
-            raise ValueError(f"repositories[{index}] contains unknown fields")
-        for key in ("provider", "repository_id", "coordinate"):
-            if not isinstance(repository.get(key), str) or not repository[key].strip():
-                raise ValueError(f"repositories[{index}].{key} must be a non-empty string")
-        identity = (repository["provider"], repository["repository_id"])
-        if identity in seen:
-            raise ValueError(f"duplicate repository identity: {identity[0]}:{identity[1]}")
-        seen.add(identity)
+            raise ValueError(f"repositories.{identity} contains unknown fields")
+        if not isinstance(repository.get("coordinate"), str) or not repository["coordinate"].strip():
+            raise ValueError(f"repositories.{identity}.coordinate must be a non-empty string")
         commands = repository.get("acceptance_commands", [])
         if not isinstance(commands, list) or any(not isinstance(c, str) or not c.strip() for c in commands):
-            raise ValueError(f"repositories[{index}].acceptance_commands must contain non-empty strings")
+            raise ValueError(f"repositories.{identity}.acceptance_commands must contain non-empty strings")
     return value
 
 
