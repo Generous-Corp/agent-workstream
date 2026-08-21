@@ -30,6 +30,11 @@ Resume ABC-123 and reconcile it with live repository state.
 Adversarially check whether ABC-123 can close.
 ```
 
+[cmux](https://cmux.com/) is optional. When available, Agent Workstream can
+carry the stable token in a tab title and help coordinate a successor session.
+Without cmux, resume from the same Linear token or URL in any agent or terminal;
+only the tab and session conveniences are skipped.
+
 ## Current boundary
 
 The local contracts and tested Linear transports are usable, but this is not a

@@ -47,6 +47,12 @@ Resume GEN-123. Reconcile the durable graph with live repository and landing
 state before editing, then continue the recorded next action.
 ```
 
+If you use [cmux](https://cmux.com/), the token can also be carried in a tab
+title and passed into a successor session. This is optional integration: without
+cmux, paste the same token or Linear URL into any new agent or terminal. Durable
+state remains in Linear in either case. See the [cmux API](https://cmux.com/docs/api)
+for its tab and workspace automation surface.
+
 Useful follow-ups are:
 
 ```text
