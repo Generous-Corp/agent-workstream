@@ -1,8 +1,6 @@
 # Install
 
-The repository is private. Authenticate Git access to `Generous-Corp` before
-installing. The marketplace name is `generous-workstream`; the plugin name is
-`workstream`.
+The marketplace name is `generous-workstream`; the plugin name is `workstream`.
 
 ## Codex
 
@@ -11,7 +9,7 @@ codex plugin marketplace add Generous-Corp/agent-workstream --ref main
 codex plugin add workstream@generous-workstream
 ```
 
-If the owner/repository form cannot authenticate over HTTPS, use SSH:
+If your Git setup prefers SSH, use:
 
 ```sh
 codex plugin marketplace add git@github.com:Generous-Corp/agent-workstream.git --ref main

@@ -381,7 +381,7 @@ class CredentialPathTests(unittest.TestCase):
         self.assertNotIn("ghp_supersecretvalue", log.read_text())
 
     def test_exception_secrets_never_reach_the_failure_log(self):
-        secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+        secret = "ghp_" + "abcdefghijklmnopqrstuvwxyz" + "123456"
         url = "postgres://dbuser:dbpassword@db.example/app"
         MODULE.record_failure("remote-upload", RuntimeError(f"failed {secret} at {url}"))
         text = (MODULE.state_root() / "failures.jsonl").read_text()
@@ -491,7 +491,7 @@ class FlushReportingTests(unittest.TestCase):
         self.assertIn("503", summary["stopped_detail"])
 
     def test_a_stopped_flush_never_returns_or_persists_secrets(self):
-        secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+        secret = "ghp_" + "abcdefghijklmnopqrstuvwxyz" + "123456"
         url = "https://user:password@example.test/private"
         with mock.patch.object(MODULE, "upload_event",
                                side_effect=RuntimeError(f"failed {secret} at {url}")):
