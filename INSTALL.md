@@ -74,5 +74,45 @@ separately managed stable capture integration invokes it. Operating
 state and private GitHub issues or comments; read the skill's ingress reference
 before use.
 
-Neither plugin installs hooks, services, MCP servers, monitors, or background
-workers. Installing it does not mutate Linear or GitHub.
+Neither plugin silently installs hooks, services, MCP servers, monitors, or
+background workers. Installing it does not mutate Linear or GitHub. See
+[BOUNDARIES.md](BOUNDARIES.md) for the rationale and planned optional companion
+layers.
+
+## Exact-version updates
+
+For one host, update both integrations and emit an immutable verification
+receipt with:
+
+```sh
+python3 scripts/workstream_plugin_manager.py update \
+  --expected-commit <full-main-commit> \
+  --expected-version <plugin-version> \
+  --host-id <stable-machine-name> \
+  --source-root <durable-clean-exact-checkout> \
+  --codex-home <absolute-codex-home> \
+  --claude-config-dir <absolute-claude-config-dir>
+```
+
+The command uses the official Codex and Claude marketplace operations, then
+refuses unless the marketplace Git head, manifest version, enabled installation,
+and installed-tree digest all match. `doctor` performs the same verification
+without changing anything:
+
+```sh
+python3 scripts/workstream_plugin_manager.py doctor \
+  --expected-commit <full-main-commit> \
+  --expected-version <plugin-version> \
+  --host-id <stable-machine-name> \
+  --source-root <durable-clean-exact-checkout> \
+  --codex-home <absolute-codex-home> \
+  --claude-config-dir <absolute-claude-config-dir>
+```
+
+The source checkout must be durable because the clients retain its local path.
+The updater uses a per-host lock and per-client recovery journal, skips clients
+that already verify exactly, and emits partial receipts when another client
+fails. Fleet controllers such as Shipyard should run this one-host command at
+an exact approved commit, collect its JSON receipt, stage rollout, and retain
+explicit offline/failed hosts for catch-up. The updater does not schedule itself
+and does not hold fleet authority.

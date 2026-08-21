@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Spark Routing"
+  short_description: "Route bounded coding slices to Codex Spark"
+  default_prompt: "Use Codex Spark for a bounded implementation slice when it is the right fit, while preserving a stronger owner for integration and verification."

@@ -1,6 +1,24 @@
 # Future integrations
 
-## Optional Harbormaster notifications and ingress
+This file is the canonical appendix for ideas intentionally deferred beyond the
+current acceptance plan. An entry here is not implemented behavior, landing
+authority, or permission to expand an active workstream. Current P0 recovery and
+closure gates remain in the tracked plan and must not be moved here merely to
+close the pilot.
+
+## Roadmap at a glance
+
+- **Conversation plane:** actionable Discord notifications, read-only status,
+  and safely typed workstream requests through Harbormaster.
+- **Managed ingress:** durable opt-in capture of requests across agent clients.
+- **Control plane:** optional hosted or self-hosted scheduling, health, and
+  centralized visibility without replacing Linear or Shipyard authority.
+- **Portability and archives:** more planning/source providers plus deterministic
+  export after the live schema stabilizes.
+- **Fleet expansion:** more profiles, platforms, clients, and a
+  provider-neutral controller API.
+
+## Conversation plane: Harbormaster and Discord
 
 A future adapter may project durable workstream lifecycle events into Discord
 through Harbormaster. It should be disabled by default and configurable by:
@@ -29,3 +47,54 @@ not become direct execution authority. Read-only intents may run immediately;
 mutating intents require an idempotency key, durable receipt, bounded typed
 payload, and risk-appropriate confirmation. No path may translate free-form
 Discord text directly into a shell command.
+
+## Managed prompt ingress
+
+A future opt-in package may install and maintain stable prompt-capture hooks for
+Codex, Claude, and other agents. It must keep credentials outside public
+repositories, acknowledge capture durably before local deletion, support
+at-least-once replay and explicit binding to a reviewed workstream, and remain
+inactive by default. Captured text is evidence of a user turn, not authority to
+classify, mutate, execute, or close a workstream.
+
+## Hosted control plane
+
+Agent Workstream may eventually gain an optional hosted or self-hosted control
+plane for scheduling adapters, fleet health, and centralized status. Linear
+should remain the portable execution ledger, while Shipyard or an equivalent
+controller remains the authority for exact-head execution and landing. The
+service must be replaceable: installing the plugin alone should continue to
+provide local start, status, resume, and closure contracts without requiring a
+vendor daemon.
+
+## Provider and repository portability
+
+Future adapters should support additional source-control and planning providers
+without inferring identity from a local path or repository name. Durable
+identity must include provider, host, owner or organization, repository, and
+workstream ID. Projects remain isolated by explicit Linear workspace, team, and
+project IDs; cross-project or cross-repository dependencies use typed links
+rather than shared numbering or naming conventions.
+
+The portable configuration may later move into a conventional repository-local
+directory when more than one config artifact is justified. Migration must keep
+the current `.workstream.json` route unambiguous and avoid introducing a second
+authority.
+
+## Export and archival
+
+After the live schema and pilot workflow stabilize, add a deterministic export
+to logical flat files and/or SQLite for backup, audit, offline inspection, and
+provider migration. Preserve immutable event and decision history and derive
+current views; do not rewrite history into a second mutable project authority.
+Import, bidirectional sync, and disaster recovery should be designed only after
+the export format has real compatibility fixtures.
+
+## Additional client and fleet automation
+
+Future fleet support may enumerate multiple named Codex/Claude profiles per
+host, support non-macOS workers, and expose a provider-neutral controller API.
+Each target still requires explicit identity and an independent exact-version
+receipt. A global agent may route natural-language requests to that API, but it
+must not collapse profile, machine, repository, or workstream identities into a
+single ambient default.
