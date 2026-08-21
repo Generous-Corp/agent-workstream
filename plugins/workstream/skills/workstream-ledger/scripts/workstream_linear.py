@@ -12,19 +12,27 @@ CAS/replay boundary before concurrent mutations can be enabled.
 from __future__ import annotations
 
 import json
-import os
 import re
+import ssl
 import urllib.request
 from typing import Any, Protocol
 
+from workstream_http import default_ssl_context
 from workstream_graph import GraphReviewRequired, build_operations
 
 
 MARKER = re.compile(r"<!-- workstream-key:([^ >]+) -->")
-PLAN_REVISION = re.compile(r"^Plan revision:\s*(\S+)$", re.MULTILINE)
-ROOT_REVISION = re.compile(r"^Ledger revision:\s*(\d+)$", re.MULTILINE)
+PLAN_REVISION = re.compile(
+    r"(?:^Plan revision:\s*`?([^`\s]+)`?\s*$|"
+    r"\bplan revision SHA-256\s+`?([a-f0-9]{64})`?)",
+    re.IGNORECASE | re.MULTILINE,
+)
+ROOT_REVISION = re.compile(
+    r"^Ledger(?: CAS)? revision:\s*(\d+)\s*(?:\([^\n]*\))?\.?\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 NEXT_ACTION = re.compile(
-    r"^\s*(?:[-*]\s+)?(?:\*\*)?Current next action"
+    r"(?:^|(?<=\.)[ \t]+)(?:[-*]\s+)?(?:\*\*)?(?:Current\s+)?next action"
     r"(?:\s*\([^)]*\))?\s*:\s*(?:\*\*)?\s*(.+?)\s*(?:\*\*)?\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
@@ -39,11 +47,18 @@ class GraphQLClient(Protocol):
 
 
 class HttpGraphQLClient:
-    def __init__(self, token: str, endpoint: str = "https://api.linear.app/graphql"):
+    def __init__(
+        self,
+        token: str,
+        endpoint: str = "https://api.linear.app/graphql",
+        *,
+        ssl_context: ssl.SSLContext | None = None,
+    ):
         if not token:
             raise ValueError("Linear API token is required")
         self.token = token
         self.endpoint = endpoint
+        self.ssl_context = ssl_context or default_ssl_context()
 
     def execute(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps({"query": query, "variables": variables}).encode()
@@ -51,7 +66,9 @@ class HttpGraphQLClient:
             self.endpoint, data=body,
             headers={"Authorization": self.token, "Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(
+            request, timeout=20, context=self.ssl_context
+        ) as response:
             payload = json.load(response)
         if payload.get("errors"):
             raise LinearTransportError(json.dumps(payload["errors"], sort_keys=True))
@@ -93,6 +110,16 @@ def parse_next_action(description: str | None) -> str | None:
     if value.endswith("**"):
         value = value[:-2].rstrip()
     return value or None
+
+
+def parse_plan_revision(description: str | None) -> str | None:
+    match = PLAN_REVISION.search(description or "")
+    return next((value for value in match.groups() if value), None) if match else None
+
+
+def parse_root_revision(description: str | None) -> int:
+    match = ROOT_REVISION.search(description or "")
+    return int(match.group(1)) if match else 0
 
 
 def durable_description(
@@ -141,8 +168,7 @@ class LinearGraphQLTransport:
         if not root:
             raise LinearTransportError(f"Linear root not found: {token}")
         description = root.get("description") or ""
-        revision = ROOT_REVISION.search(description)
-        plan_revision = PLAN_REVISION.search(description)
+        plan_revision = parse_plan_revision(description)
         children = []
         for issue in issues:
             if (issue.get("parent") or {}).get("id") != root.get("id"):
@@ -156,8 +182,8 @@ class LinearGraphQLTransport:
         return {
             "root": {
                 "identifier": root["identifier"], "url": root.get("url"),
-                "plan_revision": plan_revision.group(1) if plan_revision else None,
-                "revision": int(revision.group(1)) if revision else 0,
+                "plan_revision": plan_revision,
+                "revision": parse_root_revision(description),
                 "status": root_state.get("name") or root_state.get("type"),
                 "next_action": parse_next_action(description),
             },
@@ -188,12 +214,12 @@ class LinearGraphQLTransport:
         if expected_revision is not None:
             raise LinearTransportError("remote_cas_unavailable")
         if existing_root:
-            current_revision = PLAN_REVISION.search(existing_root.get("description") or "")
+            current_revision = parse_plan_revision(existing_root.get("description"))
             plan_revision = plan["root"]["plan_revision"]
             has_missing_child = any(
                 operation["action"] == "create_child" for operation in operations
             )
-            if current_revision and current_revision.group(1) == plan_revision and not has_missing_child:
+            if current_revision == plan_revision and not has_missing_child:
                 return {"root": existing_root, "issues": []}
             raise LinearTransportError("remote_cas_unavailable")
         applied: list[dict[str, Any]] = []

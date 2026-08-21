@@ -18,6 +18,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from workstream_http import default_ssl_context
 
 SCHEMA_VERSION = 1
 HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
@@ -33,7 +34,9 @@ def source_bytes(source: str, identity: str | None = None) -> tuple[bytes, str]:
     parsed = urlparse(source)
     if parsed.scheme in {"http", "https"}:
         request = Request(source, headers={"User-Agent": "workstream-ledger/1"})
-        with urlopen(request, timeout=15) as response:  # noqa: S310 - explicit user source
+        with urlopen(  # noqa: S310 - explicit user source
+            request, timeout=15, context=default_ssl_context()
+        ) as response:
             return response.read(), identity or source
     path = Path(source).expanduser().resolve()
     return path.read_bytes(), identity or str(path)

@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "namespace": "example-project",
+  "planning_url": "https://github.com/example/plans/blob/main/PLAN.md",
+  "ledger": {
+    "provider": "linear",
+    "workspace_id": "replace-with-linear-workspace-id",
+    "team_id": "replace-with-linear-team-id",
+    "project_id": "replace-with-linear-project-id"
+  },
+  "repositories": {
+    "github:replace-with-provider-repository-id": {
+      "coordinate": "github.com/example/project",
+      "acceptance_commands": [
+        "python3 -m unittest"
+      ]
+    }
+  }
+}

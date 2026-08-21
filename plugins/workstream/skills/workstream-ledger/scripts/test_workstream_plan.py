@@ -15,6 +15,20 @@ SPEC.loader.exec_module(MODULE)
 
 
 class PlanIntakeTests(unittest.TestCase):
+    def test_remote_plan_fetch_uses_verified_tls_context(self):
+        context = object()
+        response = mock.MagicMock()
+        response.read.return_value = b"# Remote plan\n"
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        with mock.patch.object(MODULE, "default_ssl_context", return_value=context), \
+             mock.patch.object(MODULE, "urlopen", return_value=response) as urlopen:
+            raw, identity = MODULE.source_bytes("https://example.test/plan.md")
+
+        self.assertEqual(raw, b"# Remote plan\n")
+        self.assertEqual(identity, "https://example.test/plan.md")
+        self.assertIs(urlopen.call_args.kwargs["context"], context)
+
     def test_exact_revision_and_stable_graph(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "plan.md"

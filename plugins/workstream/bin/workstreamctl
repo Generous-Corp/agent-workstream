@@ -86,6 +86,7 @@ def validate_config(path: Path) -> dict:
 def usage() -> int:
     print(
         "usage: workstreamctl {plan|resume|ingress} [args...]\n"
+        "       workstreamctl linear inspect [--team-id ID --project-id ID]\n"
         "       workstreamctl config validate [path]\n\n"
         "These commands expose existing deterministic helpers. They do not claim a hosted live-status service."
     )
@@ -104,6 +105,9 @@ def main(argv: list[str]) -> int:
     if command in scripts:
         script = SCRIPTS / scripts[command]
         os.execv(sys.executable, [sys.executable, str(script), *rest])
+    if command == "linear" and rest[:1] == ["inspect"]:
+        script = SCRIPTS / "workstream_linear_setup.py"
+        os.execv(sys.executable, [sys.executable, str(script), *rest[1:]])
     if command == "config" and rest[:1] == ["validate"]:
         if len(rest) > 2:
             return fail("config validate accepts at most one path")

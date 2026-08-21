@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
+import os
+import ssl
 import unittest
+from unittest import mock
 
-from workstream_linear import LinearGraphQLTransport, LinearTransportError, MARKER, parse_next_action
+from workstream_http import default_ssl_context
+from workstream_linear import (
+    HttpGraphQLClient,
+    LinearGraphQLTransport,
+    LinearTransportError,
+    MARKER,
+    parse_next_action,
+    parse_plan_revision,
+    parse_root_revision,
+)
 
 
 class FakeClient:
@@ -29,6 +41,41 @@ class FakeClient:
 
 
 class LinearTransportTests(unittest.TestCase):
+    def test_http_client_passes_an_explicit_ssl_context(self):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        with mock.patch("workstream_linear.urllib.request.urlopen", return_value=response) as urlopen, \
+             mock.patch("workstream_linear.json.load", return_value={"data": {"ok": True}}):
+            result = HttpGraphQLClient("token", ssl_context=context).execute("query { ok }", {})
+
+        self.assertEqual(result, {"ok": True})
+        self.assertIs(urlopen.call_args.kwargs["context"], context)
+
+    def test_macos_framework_python_uses_system_ca_bundle(self):
+        paths = ssl.DefaultVerifyPaths(None, None, "SSL_CERT_FILE", "/missing", "SSL_CERT_DIR", "/missing-dir")
+        fallback = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        with mock.patch("workstream_http.sys.platform", "darwin"), \
+             mock.patch("workstream_http.ssl.get_default_verify_paths", return_value=paths), \
+             mock.patch("workstream_http.os.path.isfile", side_effect=lambda path: path == "/etc/ssl/cert.pem"), \
+             mock.patch("workstream_http.ssl.create_default_context", return_value=fallback) as create:
+            self.assertIs(default_ssl_context(), fallback)
+
+        create.assert_called_once_with(cafile="/etc/ssl/cert.pem")
+
+    def test_existing_default_ca_configuration_is_preserved(self):
+        paths = ssl.DefaultVerifyPaths("/configured.pem", None, "SSL_CERT_FILE", "/configured.pem", "SSL_CERT_DIR", "/certs")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        with mock.patch("workstream_http.sys.platform", "darwin"), \
+             mock.patch("workstream_http.ssl.get_default_verify_paths", return_value=paths), \
+             mock.patch("workstream_http.os.path.isfile") as isfile, \
+             mock.patch("workstream_http.ssl.create_default_context", return_value=context) as create:
+            self.assertIs(default_ssl_context(), context)
+
+        create.assert_called_once_with()
+        isfile.assert_not_called()
+
     def plan(self):
         return {"graph_review_required": True, "root": {"stable_key": "source-demo", "title": "Demo", "plan_revision": "sha-demo"}, "children": [{"key": "a", "stable_key": "a", "title": "Build"}]}
 
@@ -181,6 +228,29 @@ class LinearTransportTests(unittest.TestCase):
             parse_next_action("- **Current next action:** Resume from the root."),
             "Resume from the root.",
         )
+        self.assertEqual(
+            parse_next_action("Next action: Continue the live proof."),
+            "Continue the live proof.",
+        )
+        self.assertEqual(
+            parse_next_action(
+                "Acceptance: preserve durable state. Next action: Run the canary."
+            ),
+            "Run the canary.",
+        )
+        self.assertIsNone(parse_next_action("MCP transport next action: not canonical"))
+
+    def test_live_root_legacy_revision_labels_are_readable(self):
+        description = (
+            "Exact intake identity: plan revision SHA-256 "
+            "`458a99c16cec2cdc649e26bb973fcfb0eb28f7a9e1b05335a78272db8745ffa1`.\n\n"
+            "Ledger CAS revision: 1 (adapter-owned material-state revision)."
+        )
+        self.assertEqual(
+            parse_plan_revision(description),
+            "458a99c16cec2cdc649e26bb973fcfb0eb28f7a9e1b05335a78272db8745ffa1",
+        )
+        self.assertEqual(parse_root_revision(description), 1)
 
     def test_live_snapshot_resume_uses_next_actions_from_descriptions(self):
         fake = FakeClient()

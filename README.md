@@ -41,5 +41,8 @@ workstream. Prompt ingress is unavailable by default and requires a separately
 managed stable capture integration.
 
 See [INSTALL.md](INSTALL.md) for installation and configuration.
+See [LINEAR_SETUP.md](LINEAR_SETUP.md) for the one-time Linear route and
+authentication setup.
+See [USAGE.md](USAGE.md) for the start, resume, status, and closure workflow.
 
 Licensed under the [MIT License](LICENSE).
