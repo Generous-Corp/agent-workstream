@@ -11,13 +11,22 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 from typing import Any
 
-from workstream_config import resolve_linear_route
+from workstream_config import load_linear_api_key, resolve_linear_route
+from workstream_checkpoint import CheckpointError, recover_latest
 from workstream_linear import HttpGraphQLClient, LinearGraphQLTransport, LinearTransportError
+from workstream_linear_checkpoints import (
+    LinearCheckpointError,
+    reduce_checkpoint_comments,
+)
+from workstream_linear_events import (
+    LinearCommentEventAdapter,
+    LinearEventError,
+    reduce_event_comments,
+)
 from workstream_choices import ChoiceError, reduce_choices
 from workstream_evidence import evidence_errors
 from workstream_scope import repository_key, ScopeError, validate_relations, validate_scope
@@ -29,6 +38,95 @@ TERMINAL = {"done", "cancelled", "canceled", "superseded"}
 
 class ResumeError(ValueError):
     pass
+
+
+def _event_record(event: Any) -> dict[str, Any]:
+    return {
+        "event_id": event.event_id,
+        "workstream_id": event.workstream_id,
+        "kind": event.kind,
+        "source": event.source,
+        "payload": event.payload,
+        "expected_revision": event.expected_revision,
+        "created_at": event.created_at,
+    }
+
+
+def _event_next_actions(event: dict[str, Any]) -> set[str]:
+    payloads = [event["payload"]]
+    if event["kind"] == "material_boundary":
+        changes = event["payload"].get("changes")
+        if not isinstance(changes, list):
+            raise ResumeError(f"malformed_material_boundary:{event['event_id']}")
+        for change in changes:
+            if (
+                not isinstance(change, dict)
+                or not isinstance(change.get("kind"), str)
+                or not change["kind"]
+                or not isinstance(change.get("payload"), dict)
+            ):
+                raise ResumeError(f"malformed_material_boundary:{event['event_id']}")
+            payloads.append(change["payload"])
+    actions = {
+        value.strip()
+        for payload in payloads
+        for value in [payload.get("next_action")]
+        if isinstance(value, str) and value.strip()
+    }
+    if len(actions) > 1:
+        raise ResumeError(f"conflicting_event_next_action:{event['event_id']}")
+    return actions
+
+
+def add_material_history(
+    snapshot: dict[str, Any], comments: list[dict[str, Any]], token: str
+) -> dict[str, Any]:
+    """Join one complete Linear comment read to the issue-graph snapshot."""
+    result = dict(snapshot)
+    result["root"] = dict(snapshot.get("root") or {})
+    event_log = reduce_event_comments(comments, workstream_id=token)
+    checkpoint_log = reduce_checkpoint_comments(comments, workstream_id=token)
+    events = [_event_record(event) for event in event_log.events]
+
+    result["material_events"] = events
+    result["material_event_revision"] = event_log.revision
+    result["root"]["issue_revision"] = result["root"].get("revision", 0)
+    result["root"]["revision"] = event_log.revision
+    next_actions_by_revision: dict[int, set[str]] = {}
+    for event in events:
+        for value in _event_next_actions(event):
+            actions = next_actions_by_revision.setdefault(
+                event["expected_revision"], set()
+            )
+            actions.add(value)
+            if len(actions) > 1:
+                raise ResumeError(
+                    f"conflicting_concurrent_next_action:{event['expected_revision']}"
+                )
+            result["root"]["next_action"] = value
+
+    result["latest_checkpoint"] = None
+    current_checkpoints = [
+        checkpoint for checkpoint in checkpoint_log.checkpoints
+        if checkpoint["plan_revision"] == result["root"].get("plan_revision")
+    ]
+    stale_checkpoint_count = len(checkpoint_log.checkpoints) - len(current_checkpoints)
+    result["checkpoint_recovery"] = {
+        "state": (
+            "current" if current_checkpoints
+            else "stale_plan" if stale_checkpoint_count
+            else "not_found"
+        ),
+        "stale_plan_count": stale_checkpoint_count,
+    }
+    if current_checkpoints:
+        result["latest_checkpoint"] = recover_latest(
+            current_checkpoints, token,
+            expected_plan_revision=result["root"].get("plan_revision"),
+        )
+        if result["latest_checkpoint"]["root_revision"] > event_log.revision:
+            raise ResumeError("checkpoint_ahead_of_material_event_log")
+    return result
 
 
 def extract_token(value: str) -> str:
@@ -55,8 +153,100 @@ def validate_snapshot(snapshot: dict[str, Any], token: str | None = None) -> dic
             raise ResumeError(f"root missing {field}")
     if not isinstance(root["revision"], int) or root["revision"] < 0:
         raise ResumeError("root revision must be a non-negative integer")
+    if "issue_revision" in root and (
+        not isinstance(root["issue_revision"], int) or root["issue_revision"] < 0
+    ):
+        raise ResumeError("issue revision must be a non-negative integer")
     if str(root.get("status", "")).lower() not in TERMINAL and not root.get("next_action"):
         raise ResumeError("nonterminal root missing next_action")
+    events_present = "material_events" in snapshot
+    revision_present = "material_event_revision" in snapshot
+    if events_present != revision_present:
+        raise ResumeError("material_event_surface_incomplete")
+    material_events = snapshot.get("material_events", [])
+    if not isinstance(material_events, list):
+        raise ResumeError("material_events must be a list")
+    event_ids: set[str] = set()
+    for index, event in enumerate(material_events):
+        if not isinstance(event, dict):
+            raise ResumeError(f"invalid_material_event:{index}")
+        required = {
+            "event_id", "workstream_id", "kind", "source", "payload",
+            "expected_revision", "created_at",
+        }
+        if set(event) != required:
+            raise ResumeError(f"invalid_material_event_fields:{index}")
+        if event["workstream_id"] != identifier.upper():
+            raise ResumeError(f"material_event_workstream_mismatch:{index}")
+        if not all(
+            isinstance(event[field], str) and event[field]
+            for field in ("event_id", "kind", "source", "created_at")
+        ) or not isinstance(event["payload"], dict):
+            raise ResumeError(f"invalid_material_event:{index}")
+        if event["event_id"] in event_ids:
+            raise ResumeError(f"duplicate_material_event:{event['event_id']}")
+        event_ids.add(event["event_id"])
+        expected = event["expected_revision"]
+        if not isinstance(expected, int) or expected < 0 or expected > index:
+            raise ResumeError(f"invalid_material_event_revision:{event['event_id']}")
+    material_revision = snapshot.get("material_event_revision")
+    if events_present and (
+        material_revision != len(material_events) or root["revision"] != material_revision
+    ):
+        raise ResumeError("material_event_revision_mismatch")
+    latest_checkpoint = snapshot.get("latest_checkpoint")
+    checkpoint_recovery = snapshot.get("checkpoint_recovery")
+    if checkpoint_recovery is not None:
+        if (
+            not isinstance(checkpoint_recovery, dict)
+            or set(checkpoint_recovery) != {"state", "stale_plan_count"}
+            or checkpoint_recovery.get("state") not in {"current", "stale_plan", "not_found"}
+            or not isinstance(checkpoint_recovery.get("stale_plan_count"), int)
+            or checkpoint_recovery["stale_plan_count"] < 0
+        ):
+            raise ResumeError("invalid_checkpoint_recovery")
+        if checkpoint_recovery["state"] == "current" and latest_checkpoint is None:
+            raise ResumeError("current_checkpoint_missing")
+        if checkpoint_recovery["state"] != "current" and latest_checkpoint is not None:
+            raise ResumeError("unexpected_latest_checkpoint")
+    if latest_checkpoint is not None:
+        if not isinstance(latest_checkpoint, dict):
+            raise ResumeError("latest_checkpoint must be an object or null")
+        if latest_checkpoint.get("workstream_id") != identifier.upper():
+            raise ResumeError("checkpoint_workstream_mismatch")
+        if latest_checkpoint.get("plan_revision") != root["plan_revision"]:
+            raise ResumeError("checkpoint_plan_drift")
+        required_checkpoint = {
+            "workstream_id", "checkpoint_event_id", "root_revision", "plan_revision",
+            "status", "exact_head", "evidence", "blocker", "next_action", "worktree",
+            "acknowledgement", "provenance_chain",
+        }
+        if set(latest_checkpoint) != required_checkpoint:
+            raise ResumeError("invalid_latest_checkpoint_fields")
+        checkpoint_revision = latest_checkpoint.get("root_revision")
+        acknowledgement = latest_checkpoint.get("acknowledgement")
+        provenance_chain = latest_checkpoint.get("provenance_chain")
+        if (
+            not isinstance(checkpoint_revision, int)
+            or checkpoint_revision < 0
+            or checkpoint_revision > root["revision"]
+            or not isinstance(latest_checkpoint.get("next_action"), str)
+            or not latest_checkpoint["next_action"].strip()
+            or not isinstance(latest_checkpoint.get("evidence"), list)
+            or not isinstance(latest_checkpoint.get("worktree"), dict)
+            or not isinstance(acknowledgement, dict)
+            or acknowledgement.get("state") != "remote_acknowledged"
+            or not isinstance(acknowledgement.get("remote_id"), str)
+            or not acknowledgement["remote_id"]
+            or not isinstance(acknowledgement.get("applied_revision"), int)
+            or acknowledgement["applied_revision"] < checkpoint_revision
+            or not isinstance(provenance_chain, list)
+            or not provenance_chain
+            or provenance_chain[-1].get("event_id")
+            != latest_checkpoint.get("checkpoint_event_id")
+            or provenance_chain[-1].get("worktree") != latest_checkpoint["worktree"]
+        ):
+            raise ResumeError("invalid_latest_checkpoint")
     children = snapshot.get("children")
     if not isinstance(children, list):
         raise ResumeError("children must be a list")
@@ -127,8 +317,14 @@ def validate_snapshot(snapshot: dict[str, Any], token: str | None = None) -> dic
         availability = {
             field: "available" if field in snapshot and snapshot.get(field) is not None
             else "transport_unimplemented"
-            for field in ("scope", "relations", "choice_events", "evidence_contracts")
+            for field in (
+                "scope", "relations", "choice_events", "evidence_contracts",
+                "material_events",
+            )
         }
+        availability["latest_checkpoint"] = (
+            "available" if "latest_checkpoint" in snapshot else "transport_unimplemented"
+        )
     except (ChoiceError, ScopeError) as error:
         raise ResumeError(str(error)) from error
     return {"root": root, "children": children, "decisions": snapshot.get("decisions", []),
@@ -136,6 +332,10 @@ def validate_snapshot(snapshot: dict[str, Any], token: str | None = None) -> dic
             "relations": relations, "evidence_contracts": evidence_contracts,
             "surface_availability": availability,
             "provenance": snapshot.get("provenance", []),
+            "material_events": material_events,
+            "material_event_revision": material_revision,
+            "latest_checkpoint": latest_checkpoint,
+            "checkpoint_recovery": checkpoint_recovery,
             "source": snapshot.get("source")}
 
 
@@ -155,6 +355,7 @@ def compact_context(
         "context_url": root["url"],
         "plan_revision": root["plan_revision"],
         "root_revision": root["revision"],
+        "issue_revision": root.get("issue_revision"),
         "status": root.get("status"),
         "next_action": root.get("next_action"),
         "children": children,
@@ -165,13 +366,18 @@ def compact_context(
         "evidence_contracts": clean["evidence_contracts"],
         "surface_availability": clean["surface_availability"],
         "provenance": clean["provenance"],
+        "material_events": clean["material_events"],
+        "material_event_revision": clean["material_event_revision"],
+        "latest_checkpoint": clean["latest_checkpoint"],
+        "checkpoint_recovery": clean["checkpoint_recovery"],
         "source": clean.get("source"),
     }
     item_count = sum(
         len(value) for value in (
             context["children"], context["decisions"], context["choice_events"],
             context["relations"], context["provenance"],
-            context["evidence_contracts"],
+            context["evidence_contracts"], context["material_events"],
+            (context["latest_checkpoint"] or {}).get("provenance_chain", []),
         )
     )
     if max_items < 0 or item_count > max_items:
@@ -207,21 +413,38 @@ def main() -> int:
                 raise ResumeError(
                     "snapshot, repository-root .workstream.json, or explicit Linear route is required"
                 )
-            api_key = os.environ.get("LINEAR_API_KEY")
+            api_key = load_linear_api_key()
             if not api_key:
-                raise ResumeError("LINEAR_API_KEY is required for live Linear resume")
+                raise ResumeError(
+                    "Linear auth is required: set LINEAR_API_KEY, LINEAR_API_KEY_FILE, "
+                    "or install ~/.config/agent-workstream/linear.token"
+                )
+            client = HttpGraphQLClient(api_key, args.linear_endpoint)
             transport = LinearGraphQLTransport(
-                HttpGraphQLClient(api_key, args.linear_endpoint),
+                client,
                 team_id=route["team_id"],
                 workspace_id=route.get("workspace_id"),
                 project_id=route.get("project_id"),
             )
             snapshot = transport.snapshot_for_root(token)
+            complete_route = route if all(
+                route.get(field) for field in ("workspace_id", "team_id", "project_id")
+            ) else {}
+            comments = LinearCommentEventAdapter(
+                client, issue_id=token,
+                team_id=complete_route.get("team_id"),
+                workspace_id=complete_route.get("workspace_id"),
+                project_id=complete_route.get("project_id"),
+            ).comments()
+            snapshot = add_material_history(snapshot, comments, token)
         else:
             raw = sys.stdin.read() if args.snapshot == "-" else open(args.snapshot, encoding="utf-8").read()
             snapshot = json.loads(raw)
         output = compact_context(snapshot, token, args.max_bytes, args.max_items)
-    except (OSError, json.JSONDecodeError, ResumeError, LinearTransportError, ValueError) as error:
+    except (
+        OSError, json.JSONDecodeError, ResumeError, LinearTransportError,
+        LinearEventError, LinearCheckpointError, CheckpointError, ValueError,
+    ) as error:
         print(f"workstream resume refused: {error}", file=sys.stderr)
         return 2
     json.dump(output, sys.stdout, ensure_ascii=False, sort_keys=True, indent=2)

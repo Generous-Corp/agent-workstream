@@ -65,9 +65,10 @@ consume this file from the exact repository root. Initial graph callers can use
 The file may be checked in because it contains identifiers and acceptance
 commands, not credentials. See
 [`workstream.config.schema.json`](plugins/workstream/workstream.config.schema.json).
-Runtime credentials stay outside the repository: `LINEAR_API_KEY` for the
-authenticated Linear operations and normal Git/hosting credentials for private
-plans and repositories. The optional ingress transport is inactive unless a
+Runtime credentials stay outside the repository: a protected
+`~/.config/agent-workstream/linear.token`, `LINEAR_API_KEY_FILE`, or
+`LINEAR_API_KEY` for authenticated Linear operations, plus normal Git/hosting
+credentials for private plans and repositories. The optional ingress transport is inactive unless a
 separately managed stable capture integration invokes it. Operating
 `configure`, `capture`, `bind`, `unbind`, `process`, or `flush` can write local
 state and private GitHub issues or comments; read the skill's ingress reference

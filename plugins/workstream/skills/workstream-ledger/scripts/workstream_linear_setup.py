@@ -5,11 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from typing import Any
 
-from workstream_config import linear_route, load_config
+from workstream_config import linear_route, load_config, load_linear_api_key
 from workstream_linear import GraphQLClient, HttpGraphQLClient, LinearTransportError
 
 
@@ -110,9 +109,13 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     if bool(args.team_id) != bool(args.project_id):
         parser.error("--team-id and --project-id must be supplied together")
-    token = os.environ.get("LINEAR_API_KEY", "").strip()
+    token = load_linear_api_key()
     if not token:
-        print("workstream-linear-setup: LINEAR_API_KEY is required", file=sys.stderr)
+        print(
+            "workstream-linear-setup: Linear auth is required: set LINEAR_API_KEY, "
+            "LINEAR_API_KEY_FILE, or install ~/.config/agent-workstream/linear.token",
+            file=sys.stderr,
+        )
         return 2
     try:
         loaded = load_config(args.config)

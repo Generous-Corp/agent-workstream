@@ -12,6 +12,52 @@ from urllib.parse import urlparse
 
 
 CONFIG_NAME = ".workstream.json"
+LINEAR_TOKEN_RELATIVE_PATH = Path("agent-workstream") / "linear.token"
+
+
+def load_linear_api_key(*, env: Mapping[str, str] | None = None) -> str | None:
+    """Load unattended Linear auth without requiring shell initialization."""
+    values = os.environ if env is None else env
+    direct = values.get("LINEAR_API_KEY", "").strip()
+    if direct:
+        return direct
+    requested = values.get("LINEAR_API_KEY_FILE", "").strip()
+    if requested:
+        if requested == "~" or requested.startswith("~/"):
+            home = values.get("HOME", "").strip()
+            if not home:
+                raise ValueError("HOME is required to expand LINEAR_API_KEY_FILE")
+            path = Path(home) / requested.removeprefix("~/")
+        elif requested.startswith("~"):
+            raise ValueError("LINEAR_API_KEY_FILE does not support named-user expansion")
+        else:
+            path = Path(requested)
+    else:
+        config_home = values.get("XDG_CONFIG_HOME", "").strip()
+        home = values.get("HOME", "").strip()
+        if config_home:
+            path = Path(config_home) / LINEAR_TOKEN_RELATIVE_PATH
+        elif home:
+            path = Path(home) / ".config" / LINEAR_TOKEN_RELATIVE_PATH
+        else:
+            return None
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise ValueError(f"Linear token path is not a file: {path}")
+    mode = path.stat().st_mode & 0o777
+    if not mode & 0o400 or mode & 0o077:
+        raise ValueError(
+            f"Linear token file must be owner-readable and inaccessible to group/world: {path}"
+        )
+    if path.parent.stat().st_mode & 0o077:
+        raise ValueError(
+            f"Linear token directory must not be group/world accessible: {path.parent}"
+        )
+    token = path.read_text(encoding="utf-8").strip()
+    if not token:
+        raise ValueError(f"Linear token file is empty: {path}")
+    return token
 
 
 def unique_object(pairs: list[tuple[str, object]]) -> dict:

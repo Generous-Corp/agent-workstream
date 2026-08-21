@@ -215,10 +215,11 @@ class LinearCommentEventAdapter:
         config_path: str | None = None,
     ) -> "LinearCommentEventAdapter":
         values = os.environ if env is None else env
-        token = values.get("LINEAR_API_KEY", "").strip()
+        from workstream_config import load_linear_api_key, resolve_linear_route
+
+        token = load_linear_api_key(env=values)
         if not token:
             raise LinearEventError("linear_auth_unavailable")
-        from workstream_config import resolve_linear_route
 
         route, _resolved = resolve_linear_route(config_path=config_path, env=values)
         route = route or {}
@@ -257,6 +258,10 @@ class LinearCommentEventAdapter:
             if not isinstance(after, str) or not after or after in seen_cursors:
                 raise LinearEventError("invalid Linear comment pagination cursor")
             seen_cursors.add(after)
+
+    def comments(self) -> list[dict[str, Any]]:
+        """Return the complete route-validated comment snapshot."""
+        return self._comments()
 
     def _state(self, workstream_id: str) -> ReducedEventLog:
         return reduce_event_comments(self._comments(), workstream_id=workstream_id)

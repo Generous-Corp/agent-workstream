@@ -74,7 +74,7 @@ class LinearSetupTests(unittest.TestCase):
         with mock.patch.object(module, "load_config", return_value=(configured, Path(".workstream.json"))), \
              mock.patch.object(module, "HttpGraphQLClient", return_value=mock.Mock()), \
              mock.patch.object(module, "inspect_route", inspect), \
-             mock.patch.object(module.os, "environ", {"LINEAR_API_KEY": "secret"}), \
+             mock.patch.object(module, "load_linear_api_key", return_value="secret"), \
              mock.patch.object(module.sys, "stdout"):
             self.assertEqual(module.main([]), 0)
         self.assertEqual(inspect.call_args.kwargs, {"team_id": "team-1", "project_id": "project-1"})

@@ -158,10 +158,10 @@ requires an explicit audit verdict before closure. Any active `must_fix` choice
 blocks landing; reversible low-risk choices may receive a provisional verdict
 with a review trigger.
 
-This is currently a deterministic logical contract only. The generic material
-delta transport remains unchanged. A future adapter must connect choice events
-to fully paginated Linear comments and resume readback before cross-machine
-recovery can be claimed.
+This is currently a deterministic logical contract only. Material deltas and
+checkpoints use fully paginated Linear comments and resume readback, but choice
+events do not yet have that adapter. A future adapter must connect choice events
+before complete cross-machine recovery can be claimed.
 
 ### Slice evidence contract
 
@@ -207,16 +207,21 @@ uniqueness, and root/child next actions, then enforces both item and byte caps
 while excluding terminal children. A tab title is only a token carrier; no
 agent may resume from a cwd, stale transcript, or title metadata alone.
 
-The current paginated Linear transport obtains next actions from durable root
-and child descriptions without synthesizing them. It still returns empty
-decisions and provenance and does not fetch typed choices, scope, relations,
-evidence contracts, owner, history, execution identity, or live source-control
-truth. Therefore its output is a validated bounded snapshot, not yet a physical
-cross-machine recovery proof. Resume must recover and reduce every durable
-choice event, then reconcile its plan revision, repository scope, and exact
-head before implementation. Resume emits `transport_unimplemented` for each
-unfetched surface; closure treats every such marker as a blocker. Absence is a
-named pilot gate, not evidence that no choices exist and never closure-ready.
+The current paginated Linear transport obtains the issue graph and reads the
+root comment connection once to reduce both append-only material events and
+remote checkpoints. A newer material-event `next_action` supersedes stale root
+description prose. An acknowledged checkpoint restores its bounded provenance,
+machine, worktree, exact head, evidence, blocker, and next action; an empty
+checkpoint log is reported as empty rather than fabricated. The transport still
+returns empty decisions and provenance and does not fetch typed choices, scope,
+relations, evidence contracts, owner, live source-control truth, or every other
+Linear history surface. Therefore its output is a validated bounded snapshot,
+not yet complete physical cross-machine recovery proof. Resume must recover and
+reduce every durable choice event, then reconcile its plan revision, repository
+scope, and exact head before implementation. Resume emits
+`transport_unimplemented` for each unfetched surface; closure treats every such
+marker as a blocker. Absence is a named pilot gate, not evidence that no choices
+exist and never closure-ready.
 
 ### Linear graph operations
 
