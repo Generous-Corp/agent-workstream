@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""Transport-neutral repository scope and cross-workstream relation contract."""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+from urllib.parse import urlparse
+from datetime import datetime
+
+
+TOKEN = re.compile(r"^[A-Z][A-Z0-9]*-\d+$")
+REPOSITORY = re.compile(r"^[A-Za-z0-9.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+NAMESPACE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
+HEAD = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+RELATION_TYPES = {"blocks", "blocked_by", "related"}
+UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
+
+
+class ScopeError(ValueError):
+    pass
+
+
+def is_issue_token(value: Any) -> bool:
+    return isinstance(value, str) and TOKEN.fullmatch(value) is not None
+
+
+def is_full_oid(value: Any) -> bool:
+    return isinstance(value, str) and HEAD.fullmatch(value) is not None
+
+
+def is_namespace(value: Any) -> bool:
+    return isinstance(value, str) and NAMESPACE.fullmatch(value) is not None
+
+
+def canonical_repository(value: str) -> str:
+    """Normalize common Git remotes to host/owner/repository identity."""
+    if not isinstance(value, str) or not value.strip():
+        raise ScopeError("invalid_repository_slug")
+    raw = value.strip()
+    scp = re.fullmatch(r"(?:[^@/]+@)?([^:/]+):([^/]+)/(.+)", raw)
+    if scp and "://" not in raw:
+        host, owner, repository = scp.groups()
+    elif "://" in raw:
+        parsed = urlparse(raw)
+        parts = [part for part in parsed.path.split("/") if part]
+        if parsed.scheme not in {"http", "https", "ssh", "git"} or not parsed.hostname or len(parts) != 2:
+            raise ScopeError("invalid_repository_slug")
+        host, owner, repository = parsed.hostname, parts[0], parts[1]
+    else:
+        parts = raw.split("/")
+        if len(parts) != 3:
+            raise ScopeError("invalid_repository_slug")
+        host, owner, repository = parts
+    repository = repository[:-4] if repository.endswith(".git") else repository
+    host = host.lower()
+    if not all((host, owner, repository)):
+        raise ScopeError("invalid_repository_slug")
+    if host == "github.com":
+        owner, repository = owner.lower(), repository.lower()
+    result = f"{host}/{owner}/{repository}"
+    if not REPOSITORY.fullmatch(result):
+        raise ScopeError("invalid_repository_slug")
+    return result
+
+
+def _observed_at(value: Any, error: str) -> datetime:
+    try:
+        observed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ScopeError(error) from exc
+    if observed.tzinfo is None:
+        raise ScopeError(error)
+    return observed
+
+
+def _repository_resolution(repository: dict[str, Any]) -> dict[str, Any]:
+    slug = repository["slug"]
+    provider_id = repository.get("provider_repository_id")
+    resolution = repository.get("identity_resolution")
+    if not isinstance(resolution, dict):
+        raise ScopeError(f"repository_equivalence_unproven:{slug}")
+    if resolution.get("provider_repository_id") != provider_id:
+        raise ScopeError(f"provider_repository_id_mismatch:{slug}")
+    if resolution.get("resolved_slug") != slug:
+        raise ScopeError(f"stale_repository_resolution:{slug}")
+    _observed_at(
+        resolution.get("observed_at"),
+        f"invalid_repository_resolution_timestamp:{slug}",
+    )
+    evidence = resolution.get("evidence")
+    if not isinstance(evidence, list) or not any(
+        isinstance(item, dict)
+        and item.get("kind") == "authenticated_provider_readback"
+        and item.get("authenticated") is True
+        and item.get("provider_repository_id") == provider_id
+        and item.get("resolved_slug") == slug
+        for item in evidence
+    ):
+        raise ScopeError(f"repository_equivalence_unproven:{slug}")
+    return resolution
+
+
+def repository_key(repository: dict[str, Any]) -> str:
+    """Return immutable provider identity, or a verified coordinate fallback."""
+    slug = repository.get("slug")
+    if not isinstance(slug, str) or canonical_repository(slug) != slug:
+        raise ScopeError("invalid_repository_slug")
+    host = slug.split("/", 1)[0]
+    provider_id = repository.get("provider_repository_id")
+    _repository_resolution(repository)
+    if provider_id is not None:
+        if not isinstance(provider_id, str) or not provider_id.strip():
+            raise ScopeError(f"invalid_provider_repository_id:{slug}")
+        return f"{host}:id:{provider_id}"
+    return f"{host}:coordinate:{slug}"
+
+
+def _validate_identity_history(repository: dict[str, Any], key: str) -> list[str]:
+    slug = repository["slug"]
+    aliases = repository.get("aliases", [])
+    if not isinstance(aliases, list):
+        raise ScopeError(f"invalid_repository_aliases:{slug}")
+    canonical_aliases: list[str] = []
+    for alias in aliases:
+        canonical = canonical_repository(alias)
+        if canonical != alias:
+            raise ScopeError(f"repository_alias_not_canonical:{alias}")
+        if canonical == slug or canonical in canonical_aliases:
+            raise ScopeError(f"duplicate_repository_alias:{canonical}")
+        canonical_aliases.append(canonical)
+    updates = repository.get("identity_updates", [])
+    if not isinstance(updates, list):
+        raise ScopeError(f"invalid_identity_updates:{slug}")
+    covered: set[str] = set()
+    for update in updates:
+        if not isinstance(update, dict):
+            raise ScopeError(f"invalid_identity_update:{slug}")
+        previous = update.get("from")
+        current = update.get("to")
+        if previous not in canonical_aliases or current != slug:
+            raise ScopeError(f"stale_alias_routing:{previous}")
+        _observed_at(update.get("observed_at"), f"invalid_identity_update_timestamp:{slug}")
+        evidence = update.get("evidence")
+        if (
+            update.get("repository_key") != key
+            or update.get("provider_repository_id") != repository.get("provider_repository_id")
+            or not isinstance(evidence, list)
+            or not any(
+                isinstance(item, dict)
+                and item.get("kind") == "authenticated_provider_readback"
+                and item.get("authenticated") is True
+                and item.get("repository_key") == key
+                and item.get("provider_repository_id") == repository.get("provider_repository_id")
+                and item.get("requested_slug") == previous
+                and item.get("resolved_slug") == slug
+                for item in evidence
+            )
+        ):
+            raise ScopeError(f"unverified_identity_update:{previous}")
+        if previous in covered:
+            raise ScopeError(f"duplicate_identity_update:{previous}")
+        covered.add(previous)
+    if covered != set(canonical_aliases):
+        raise ScopeError(f"alias_without_identity_update:{slug}")
+    return canonical_aliases
+
+
+def validate_scope(scope: dict[str, Any], *, root_id: str,
+                   child_ids: set[str] | None = None) -> None:
+    if not is_issue_token(root_id):
+        raise ScopeError("invalid_root_id")
+    namespace = scope.get("namespace")
+    if not is_namespace(namespace):
+        raise ScopeError("invalid_namespace")
+    linear = scope.get("linear")
+    if not isinstance(linear, dict):
+        raise ScopeError("linear_destination_required")
+    for field in ("workspace_id", "team_id", "project_id"):
+        if not isinstance(linear.get(field), str) or not linear[field].strip():
+            raise ScopeError(f"linear_destination_missing:{field}")
+    if not isinstance(linear.get("root_issue_id"), str) or not UUID.fullmatch(linear["root_issue_id"]):
+        raise ScopeError("linear_destination_missing:root_issue_id")
+    route = linear.get("route_verification")
+    route_fields = ("workspace_id", "team_id", "project_id", "root_issue_id")
+    if not isinstance(route, dict) or any(route.get(field) != linear[field] for field in route_fields):
+        raise ScopeError("linear_route_readback_mismatch")
+    _observed_at(route.get("observed_at"), "invalid_linear_route_timestamp")
+    route_evidence = route.get("evidence")
+    if not isinstance(route_evidence, list) or not any(
+        isinstance(item, dict)
+        and item.get("kind") == "authenticated_linear_readback"
+        and item.get("authenticated") is True
+        and all(item.get(field) == linear[field] for field in route_fields)
+        for item in route_evidence
+    ):
+        raise ScopeError("linear_route_unverified")
+    primary = scope.get("primary_repository")
+    repositories = scope.get("repositories")
+    if not isinstance(repositories, list) or not repositories:
+        raise ScopeError("repositories_required")
+    slugs: set[str] = set()
+    keys: set[str] = set()
+    routes: dict[str, str] = {}
+    for repository in repositories:
+        if not isinstance(repository, dict):
+            raise ScopeError("invalid_repository")
+        if "path" in repository or "worktree" in repository:
+            raise ScopeError("local_path_is_not_repository_identity")
+        slug = repository.get("slug")
+        if not isinstance(slug, str) or not REPOSITORY.fullmatch(slug):
+            raise ScopeError("invalid_repository_slug")
+        if canonical_repository(slug) != slug:
+            raise ScopeError(f"repository_not_canonical:{slug}")
+        if slug in slugs:
+            raise ScopeError(f"duplicate_repository:{slug}")
+        slugs.add(slug)
+        key = repository_key(repository)
+        if key in keys:
+            raise ScopeError(f"duplicate_repository_identity:{key}")
+        keys.add(key)
+        aliases = _validate_identity_history(repository, key)
+        for route in [slug, *aliases]:
+            existing = routes.get(route)
+            if existing is not None and existing != key:
+                raise ScopeError(f"repository_alias_collision:{route}")
+            routes[route] = key
+        head = repository.get("exact_head")
+        if not is_full_oid(head):
+            raise ScopeError(f"invalid_repository_head:{slug}")
+        if not isinstance(repository.get("evidence", []), list):
+            raise ScopeError(f"invalid_repository_evidence:{slug}")
+    if primary not in keys:
+        raise ScopeError("primary_repository_not_participating")
+    ownership = scope.get("child_ownership")
+    if not isinstance(ownership, dict):
+        raise ScopeError("child_ownership_required")
+    expected = child_ids or set()
+    if set(ownership) != expected:
+        missing = sorted(expected - set(ownership))
+        unknown = sorted(set(ownership) - expected)
+        if missing:
+            raise ScopeError("unowned_children:" + ",".join(missing))
+        raise ScopeError("unknown_owned_children:" + ",".join(unknown))
+    for child_id, slug in ownership.items():
+        if not is_issue_token(child_id):
+            raise ScopeError(f"invalid_child_id:{child_id}")
+        if slug not in keys:
+            raise ScopeError(f"child_repository_not_participating:{child_id}")
+
+
+def validate_relations(relations: list[dict[str, Any]], *, root_id: str,
+                       workspace_id: str | None = None,
+                       root_issue_id: str | None = None) -> None:
+    if not isinstance(relations, list):
+        raise ScopeError("relations_must_be_list")
+    observed: set[tuple[str, str, str]] = set()
+    for relation in relations:
+        if not isinstance(relation, dict):
+            raise ScopeError("invalid_relation")
+        relation_type = relation.get("type")
+        target = relation.get("target")
+        if relation_type not in RELATION_TYPES:
+            raise ScopeError(f"unknown_relation_type:{relation_type}")
+        if not isinstance(target, dict):
+            raise ScopeError("invalid_relation_target")
+        target_workspace = target.get("workspace_id")
+        target_issue = target.get("issue_id")
+        target_identifier = target.get("identifier")
+        if not isinstance(target_workspace, str) or not target_workspace.strip():
+            raise ScopeError("invalid_relation_workspace")
+        if not isinstance(target_issue, str) or not UUID.fullmatch(target_issue):
+            raise ScopeError("invalid_relation_issue_id")
+        if not is_issue_token(target_identifier):
+            raise ScopeError("invalid_relation_identifier")
+        if (
+            workspace_id is not None and root_issue_id is not None
+            and target_workspace == workspace_id and target_issue == root_issue_id
+        ) or (
+            (workspace_id is None or root_issue_id is None)
+            and target_identifier == root_id
+        ):
+            raise ScopeError("self_relation")
+        key = (relation_type, target_workspace, target_issue)
+        if key in observed:
+            raise ScopeError(f"duplicate_relation:{relation_type}:{target_workspace}:{target_issue}")
+        observed.add(key)

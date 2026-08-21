@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Dispatch the deterministic Workstream helpers and validate project routing."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+from urllib.parse import urlparse
+
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+SKILL_ROOT = PLUGIN_ROOT / "skills" / "workstream-ledger"
+SCRIPTS = SKILL_ROOT / "scripts"
+
+
+def fail(message: str) -> int:
+    print(f"workstreamctl: {message}", file=sys.stderr)
+    return 2
+
+
+def validate_config(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text())
+    except OSError as error:
+        raise ValueError(f"cannot read config: {error}") from error
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError("config must be an object")
+    allowed = {"schema_version", "namespace", "planning_url", "ledger", "repositories"}
+    extra = set(value) - allowed
+    if extra:
+        raise ValueError("unknown config fields: " + ", ".join(sorted(extra)))
+    if value.get("schema_version") != 1:
+        raise ValueError("schema_version must be 1")
+    if not isinstance(value.get("namespace"), str) or not value["namespace"].strip():
+        raise ValueError("namespace must be a non-empty string")
+    planning_url = value.get("planning_url")
+    if planning_url is not None:
+        if not isinstance(planning_url, str):
+            raise ValueError("planning_url must be an absolute URL")
+        parsed = urlparse(planning_url)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError("planning_url must be an absolute URL")
+    ledger = value.get("ledger")
+    if not isinstance(ledger, dict):
+        raise ValueError("ledger must be an object")
+    ledger_allowed = {"provider", "workspace_id", "team_id", "project_id"}
+    if set(ledger) - ledger_allowed:
+        raise ValueError("ledger contains unknown fields")
+    for key in ledger_allowed:
+        if not isinstance(ledger.get(key), str) or not ledger[key].strip():
+            raise ValueError(f"ledger.{key} must be a non-empty string")
+    repositories = value.get("repositories")
+    if not isinstance(repositories, list) or not repositories:
+        raise ValueError("repositories must be a non-empty array")
+    seen: set[tuple[str, str]] = set()
+    for index, repository in enumerate(repositories):
+        if not isinstance(repository, dict):
+            raise ValueError(f"repositories[{index}] must be an object")
+        allowed_repo = {"provider", "repository_id", "coordinate", "acceptance_commands"}
+        if set(repository) - allowed_repo:
+            raise ValueError(f"repositories[{index}] contains unknown fields")
+        for key in ("provider", "repository_id", "coordinate"):
+            if not isinstance(repository.get(key), str) or not repository[key].strip():
+                raise ValueError(f"repositories[{index}].{key} must be a non-empty string")
+        identity = (repository["provider"], repository["repository_id"])
+        if identity in seen:
+            raise ValueError(f"duplicate repository identity: {identity[0]}:{identity[1]}")
+        seen.add(identity)
+        commands = repository.get("acceptance_commands", [])
+        if not isinstance(commands, list) or any(not isinstance(c, str) or not c.strip() for c in commands):
+            raise ValueError(f"repositories[{index}].acceptance_commands must contain non-empty strings")
+    return value
+
+
+def usage() -> int:
+    print(
+        "usage: workstreamctl {plan|resume|ingress} [args...]\n"
+        "       workstreamctl config validate [path]\n\n"
+        "These commands expose existing deterministic helpers. They do not claim a hosted live-status service."
+    )
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in {"-h", "--help", "help"}:
+        return usage()
+    command, *rest = argv
+    scripts = {
+        "plan": "workstream_plan.py",
+        "resume": "workstream_resume.py",
+        "ingress": "workstream_ingress.py",
+    }
+    if command in scripts:
+        script = SCRIPTS / scripts[command]
+        os.execv(sys.executable, [sys.executable, str(script), *rest])
+    if command == "config" and rest[:1] == ["validate"]:
+        if len(rest) > 2:
+            return fail("config validate accepts at most one path")
+        path = Path(rest[1]) if len(rest) == 2 else Path(os.environ.get("WORKSTREAM_CONFIG", ".workstream.json"))
+        try:
+            value = validate_config(path)
+        except ValueError as error:
+            return fail(str(error))
+        print(json.dumps({"valid": True, "path": str(path), "namespace": value["namespace"]}, sort_keys=True))
+        return 0
+    return fail(f"unknown command: {command}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

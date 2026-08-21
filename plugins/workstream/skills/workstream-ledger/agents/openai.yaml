@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workstream Ledger"
+  short_description: "Preserve evolving tasks and decisions across agent sessions"
+  default_prompt: "Restore or update this workstream from its durable plan, Linear issue graph, and live PR state before continuing."

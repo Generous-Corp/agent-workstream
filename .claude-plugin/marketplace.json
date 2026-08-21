@@ -1,0 +1,17 @@
+{
+  "name": "generous-workstream",
+  "owner": {
+    "name": "Generous Corp",
+    "url": "https://github.com/Generous-Corp"
+  },
+  "description": "Private Generous Corp agent workstream tools.",
+  "plugins": [
+    {
+      "name": "workstream",
+      "source": "./plugins/workstream",
+      "description": "Durable project workstreams across agents, sessions, and machines.",
+      "category": "productivity",
+      "strict": true
+    }
+  ]
+}

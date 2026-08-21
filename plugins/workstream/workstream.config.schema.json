@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Generous-Corp/agent-workstream/blob/main/plugins/workstream/workstream.config.schema.json",
+  "title": "Agent Workstream project routing",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "namespace", "ledger", "repositories"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "namespace": {"type": "string", "minLength": 1},
+    "planning_url": {"type": "string", "format": "uri"},
+    "ledger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "workspace_id", "team_id", "project_id"],
+      "properties": {
+        "provider": {"type": "string", "minLength": 1},
+        "workspace_id": {"type": "string", "minLength": 1},
+        "team_id": {"type": "string", "minLength": 1},
+        "project_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "repositories": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["provider", "repository_id", "coordinate"],
+        "properties": {
+          "provider": {"type": "string", "minLength": 1},
+          "repository_id": {"type": "string", "minLength": 1},
+          "coordinate": {"type": "string", "minLength": 1},
+          "acceptance_commands": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    }
+  }
+}

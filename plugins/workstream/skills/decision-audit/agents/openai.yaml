@@ -1,0 +1,4 @@
+interface:
+  display_name: "Decision Audit"
+  short_description: "Read-only audit of choices left open by a specification"
+  default_prompt: "Independently audit the spec-silent choices in this exact-head change and return a landing verdict without editing anything."

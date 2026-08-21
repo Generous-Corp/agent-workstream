@@ -1,0 +1,20 @@
+{
+  "name": "generous-workstream",
+  "interface": {
+    "displayName": "Generous Workstream"
+  },
+  "plugins": [
+    {
+      "name": "workstream",
+      "source": {
+        "source": "local",
+        "path": "./plugins/workstream"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

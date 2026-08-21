@@ -1,0 +1,27 @@
+{
+  "name": "workstream",
+  "version": "0.1.0",
+  "description": "Durable project workstreams that survive agent sessions, machines, and changing scope.",
+  "author": {
+    "name": "Generous Corp",
+    "url": "https://github.com/Generous-Corp"
+  },
+  "homepage": "https://github.com/Generous-Corp/agent-workstream#readme",
+  "repository": "https://github.com/Generous-Corp/agent-workstream",
+  "keywords": ["agents", "workstreams", "linear", "continuity", "evidence"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Workstream",
+    "shortDescription": "Keep project truth durable across agent sessions",
+    "longDescription": "Track evolving scope, decisions, repositories, evidence, and next actions behind a stable workstream handle.",
+    "developerName": "Generous Corp",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "websiteURL": "https://github.com/Generous-Corp/agent-workstream",
+    "defaultPrompt": [
+      "Start a tracked workstream for this plan.",
+      "Resume this workstream from its durable handle.",
+      "Check whether this workstream can close."
+    ]
+  }
+}
