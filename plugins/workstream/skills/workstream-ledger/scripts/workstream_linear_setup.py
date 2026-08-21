@@ -9,6 +9,7 @@ import os
 import sys
 from typing import Any
 
+from workstream_config import linear_route, load_config
 from workstream_linear import GraphQLClient, HttpGraphQLClient, LinearTransportError
 
 
@@ -102,6 +103,7 @@ def inspect_route(
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", help="workstream config path; defaults to repository-root .workstream.json")
     parser.add_argument("--team-id", help="validate this immutable Linear team ID")
     parser.add_argument("--project-id", help="validate this immutable Linear project ID")
     parser.add_argument("--endpoint", default="https://api.linear.app/graphql")
@@ -113,10 +115,19 @@ def main(argv: list[str]) -> int:
         print("workstream-linear-setup: LINEAR_API_KEY is required", file=sys.stderr)
         return 2
     try:
+        loaded = load_config(args.config)
+        configured = linear_route(loaded[0]) if loaded else None
+        if configured:
+            if args.team_id and args.team_id != configured["team_id"]:
+                raise LinearTransportError("explicit Linear team_id conflicts with workstream config")
+            if args.project_id and args.project_id != configured["project_id"]:
+                raise LinearTransportError("explicit Linear project_id conflicts with workstream config")
+        team_id = configured["team_id"] if configured else args.team_id
+        project_id = configured["project_id"] if configured else args.project_id
         result = inspect_route(
             HttpGraphQLClient(token, args.endpoint),
-            team_id=args.team_id,
-            project_id=args.project_id,
+            team_id=team_id,
+            project_id=project_id,
         )
     except (OSError, LinearTransportError, ValueError) as error:
         print(f"workstream-linear-setup: {error}", file=sys.stderr)

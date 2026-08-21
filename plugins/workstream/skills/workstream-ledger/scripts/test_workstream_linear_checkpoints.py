@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from workstream_checkpoint import acknowledge_checkpoint, build_checkpoint
 from workstream_linear_checkpoints import (
@@ -60,6 +61,8 @@ class FakeCommentClient:
                     "issue": {
                         "id": "issue-37",
                         "identifier": self.identifier,
+                        "team": {"id": "team", "organization": {"id": "workspace"}},
+                        "project": {"id": "project"},
                         "comments": {
                             "nodes": nodes,
                             "pageInfo": {
@@ -74,6 +77,8 @@ class FakeCommentClient:
                 "issue": {
                     "id": "issue-37",
                     "identifier": self.identifier,
+                    "team": {"id": "team", "organization": {"id": "workspace"}},
+                    "project": {"id": "project"},
                     "comments": {
                         "nodes": nodes,
                         "pageInfo": {"hasNextPage": False, "endCursor": None},
@@ -199,6 +204,29 @@ class LinearCheckpointAdapterTests(unittest.TestCase):
             LinearCheckpointAdapter.from_env(
                 issue_id="issue-37", workstream_id="GEN-37", env={}
             )
+
+    def test_configured_route_fences_checkpoint_writes(self):
+        client = FakeCommentClient()
+        adapter = LinearCheckpointAdapter(
+            client, issue_id="issue-37", workstream_id="GEN-37",
+            workspace_id="workspace", team_id="team", project_id="wrong",
+        )
+        with self.assertRaisesRegex(LinearCheckpointError, "configured project"):
+            adapter.persist(checkpoint(1))
+        self.assertFalse(any("commentCreate" in query for query, _ in client.calls))
+
+    def test_from_env_consumes_config_route(self):
+        route = {"workspace_id": "workspace", "team_id": "team", "project_id": "project"}
+        client = mock.Mock()
+        with mock.patch("workstream_config.resolve_linear_route", return_value=(route, None)), \
+             mock.patch("workstream_linear_checkpoints.HttpGraphQLClient", return_value=client):
+            adapter = LinearCheckpointAdapter.from_env(
+                issue_id="issue-37", workstream_id="GEN-37",
+                env={"LINEAR_API_KEY": "secret"},
+            )
+        self.assertIs(adapter.client, client)
+        self.assertEqual(adapter.workspace_id, "workspace")
+        self.assertEqual(adapter.project_id, "project")
 
 
 if __name__ == "__main__":

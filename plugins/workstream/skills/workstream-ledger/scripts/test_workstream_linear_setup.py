@@ -1,6 +1,9 @@
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from workstream_linear import LinearTransportError
+import workstream_linear_setup as module
 from workstream_linear_setup import inspect_route
 
 
@@ -52,6 +55,29 @@ class LinearSetupTests(unittest.TestCase):
     def test_rejects_cross_team_project(self):
         with self.assertRaisesRegex(LinearTransportError, "not associated"):
             inspect_route(FakeClient(), team_id="team-1", project_id="project-2")
+
+    def test_cli_automatically_inspects_configured_route(self):
+        configured = {
+            "ledger": {
+                "provider": "linear",
+                "workspace_id": "workspace-1",
+                "team_id": "team-1",
+                "project_id": "project-1",
+            }
+        }
+        result = {
+            "authenticated_as": {"id": "user-1", "name": "Ada"},
+            "workspaces": [], "teams": [], "projects": [],
+            "selection": {"valid": True},
+        }
+        inspect = mock.Mock(return_value=result)
+        with mock.patch.object(module, "load_config", return_value=(configured, Path(".workstream.json"))), \
+             mock.patch.object(module, "HttpGraphQLClient", return_value=mock.Mock()), \
+             mock.patch.object(module, "inspect_route", inspect), \
+             mock.patch.object(module.os, "environ", {"LINEAR_API_KEY": "secret"}), \
+             mock.patch.object(module.sys, "stdout"):
+            self.assertEqual(module.main([]), 0)
+        self.assertEqual(inspect.call_args.kwargs, {"team_id": "team-1", "project_id": "project-1"})
 
 
 if __name__ == "__main__":

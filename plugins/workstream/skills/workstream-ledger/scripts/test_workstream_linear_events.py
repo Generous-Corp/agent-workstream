@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import unittest
+from unittest import mock
 
 from workstream_delta import Delta, DeltaJournal
 from workstream_linear_events import (
@@ -48,6 +49,8 @@ class FakeCommentClient:
             return {
                 "issue": {
                     "id": "issue-37", "identifier": "GEN-37",
+                    "team": {"id": "team", "organization": {"id": "workspace"}},
+                    "project": {"id": "project"},
                     "comments": {
                         "nodes": nodes,
                         "pageInfo": {"hasNextPage": False, "endCursor": None},
@@ -154,6 +157,28 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
     def test_unavailable_auth_fails_before_client_or_network_exists(self):
         with self.assertRaisesRegex(LinearEventError, "linear_auth_unavailable"):
             LinearCommentEventAdapter.from_env(issue_id="GEN-37", env={})
+
+    def test_configured_route_fences_comment_writes(self):
+        client = FakeCommentClient()
+        adapter = LinearCommentEventAdapter(
+            client, issue_id="GEN-37", workspace_id="wrong",
+            team_id="team", project_id="project",
+        )
+        with self.assertRaisesRegex(LinearEventError, "configured workspace"):
+            adapter.apply(delta("event-a", {"order": 1}))
+        self.assertFalse(any("commentCreate" in query for query, _ in client.calls))
+
+    def test_from_env_consumes_config_route(self):
+        route = {"workspace_id": "workspace", "team_id": "team", "project_id": "project"}
+        client = mock.Mock()
+        with mock.patch("workstream_config.resolve_linear_route", return_value=(route, None)), \
+             mock.patch("workstream_linear_events.HttpGraphQLClient", return_value=client):
+            adapter = LinearCommentEventAdapter.from_env(
+                issue_id="GEN-37", env={"LINEAR_API_KEY": "secret"}
+            )
+        self.assertIs(adapter.client, client)
+        self.assertEqual(adapter.workspace_id, "workspace")
+        self.assertEqual(adapter.project_id, "project")
 
 
 if __name__ == "__main__":

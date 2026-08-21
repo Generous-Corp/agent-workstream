@@ -16,6 +16,7 @@ import re
 import sys
 from typing import Any
 
+from workstream_config import resolve_linear_route
 from workstream_linear import HttpGraphQLClient, LinearGraphQLTransport, LinearTransportError
 from workstream_choices import ChoiceError, reduce_choices
 from workstream_evidence import evidence_errors
@@ -185,7 +186,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("token", help="stable Linear root issue identifier")
     parser.add_argument("snapshot", nargs="?", help="JSON path or - for a Linear snapshot")
-    parser.add_argument("--linear-team-id", help="Fetch the root and children from Linear instead of a local snapshot")
+    parser.add_argument("--config", help="workstream config path; defaults to repository-root .workstream.json")
+    parser.add_argument("--linear-workspace-id", help="explicit immutable Linear workspace ID")
+    parser.add_argument("--linear-team-id", help="explicit immutable Linear team ID")
+    parser.add_argument("--linear-project-id", help="explicit immutable Linear project ID")
     parser.add_argument("--linear-endpoint", default="https://api.linear.app/graphql")
     parser.add_argument("--max-bytes", type=int, default=16 * 1024)
     parser.add_argument("--max-items", type=int, default=100)
@@ -193,12 +197,25 @@ def main() -> int:
     try:
         token = extract_token(args.token)
         if args.snapshot is None:
-            if not args.linear_team_id:
-                raise ResumeError("snapshot or --linear-team-id is required")
+            route, _config_path = resolve_linear_route(
+                config_path=args.config,
+                workspace_id=args.linear_workspace_id,
+                team_id=args.linear_team_id,
+                project_id=args.linear_project_id,
+            )
+            if not route:
+                raise ResumeError(
+                    "snapshot, repository-root .workstream.json, or explicit Linear route is required"
+                )
             api_key = os.environ.get("LINEAR_API_KEY")
             if not api_key:
                 raise ResumeError("LINEAR_API_KEY is required for live Linear resume")
-            transport = LinearGraphQLTransport(HttpGraphQLClient(api_key, args.linear_endpoint), team_id=args.linear_team_id)
+            transport = LinearGraphQLTransport(
+                HttpGraphQLClient(api_key, args.linear_endpoint),
+                team_id=route["team_id"],
+                workspace_id=route.get("workspace_id"),
+                project_id=route.get("project_id"),
+            )
             snapshot = transport.snapshot_for_root(token)
         else:
             raw = sys.stdin.read() if args.snapshot == "-" else open(args.snapshot, encoding="utf-8").read()

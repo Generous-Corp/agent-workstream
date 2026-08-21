@@ -15,9 +15,9 @@ it with:
 plugins/workstream/bin/workstreamctl config validate .workstream.json
 ```
 
-The declaration is currently a checked preflight surface, not an automatically
-consumed routing authority. Give the agent the same exact workspace, team,
-project, and repository IDs when starting work.
+The repository-root declaration is consumed automatically for live Linear
+routing. An explicit `--config` or `WORKSTREAM_CONFIG` may select a declaration
+elsewhere; explicit route arguments must match it.
 
 ## 2. Start once
 
@@ -25,8 +25,7 @@ In Codex, say:
 
 ```text
 Start a tracked workstream for ./PLAN.md. Use
-https://github.com/example/plans/blob/main/PLAN.md as the canonical plan
-identity and use the exact Linear and repository IDs in .workstream.json.
+https://github.com/example/plans/blob/main/PLAN.md as the canonical plan identity.
 ```
 
 In Claude Code, use the same request after invoking:
@@ -75,8 +74,7 @@ plugins/workstream/bin/workstreamctl plan ./PLAN.md \
   --identity https://github.com/example/plans/blob/main/PLAN.md
 
 # Resolve and validate one live Linear root and its nonterminal children.
-plugins/workstream/bin/workstreamctl resume GEN-123 \
-  --linear-team-id replace-with-linear-team-id
+plugins/workstream/bin/workstreamctl resume GEN-123
 ```
 
 The plugin is not a hosted orchestration service. It installs no hooks,

@@ -79,10 +79,22 @@ ISSUES_QUERY = """
 query WorkstreamIssues($teamId: String!, $after: String) {
   team(id: $teamId) {
     issues(first: 250, after: $after) {
-      nodes { id identifier title description url updatedAt parent { id identifier } state { name type } }
+      nodes {
+        id identifier title description url updatedAt
+        parent { id identifier }
+        project { id }
+        state { name type }
+      }
       pageInfo { hasNextPage endCursor }
     }
   }
+}
+"""
+
+ROUTE_QUERY = """
+query WorkstreamRoute($teamId: String!, $projectId: String!) {
+  team(id: $teamId) { id organization { id } }
+  project(id: $projectId) { id teams { nodes { id } } }
 }
 """
 
@@ -122,6 +134,27 @@ def parse_root_revision(description: str | None) -> int:
     return int(match.group(1)) if match else 0
 
 
+def validate_issue_route(
+    issue: dict[str, Any],
+    *,
+    workspace_id: str | None,
+    team_id: str | None,
+    project_id: str | None,
+) -> None:
+    route = (workspace_id, team_id, project_id)
+    if not any(route):
+        return
+    if not all(route):
+        raise ValueError("Linear workspace, team, and project IDs must be supplied together")
+    team = issue.get("team") or {}
+    if team.get("id") != team_id:
+        raise LinearTransportError("Linear issue is not in the configured team")
+    if (team.get("organization") or {}).get("id") != workspace_id:
+        raise LinearTransportError("Linear issue is not in the configured workspace")
+    if (issue.get("project") or {}).get("id") != project_id:
+        raise LinearTransportError("Linear issue is not in the configured project")
+
+
 def durable_description(
     key: str,
     plan_revision: str,
@@ -138,11 +171,69 @@ def durable_description(
 
 
 class LinearGraphQLTransport:
-    def __init__(self, client: GraphQLClient, *, team_id: str):
+    def __init__(
+        self,
+        client: GraphQLClient,
+        *,
+        team_id: str,
+        workspace_id: str | None = None,
+        project_id: str | None = None,
+    ):
+        if bool(workspace_id) != bool(project_id):
+            raise ValueError("Linear workspace_id and project_id must be supplied together")
         self.client = client
         self.team_id = team_id
+        self.workspace_id = workspace_id
+        self.project_id = project_id
+        self._route_verified = False
+
+    @classmethod
+    def from_config(
+        cls,
+        client: GraphQLClient,
+        config_path: str | None = None,
+    ) -> "LinearGraphQLTransport":
+        from workstream_config import resolve_linear_route
+
+        route, _resolved = resolve_linear_route(config_path=config_path)
+        if not route or not route.get("workspace_id") or not route.get("project_id"):
+            raise ValueError("a complete workstream config Linear route is required")
+        return cls(
+            client,
+            team_id=route["team_id"],
+            workspace_id=route["workspace_id"],
+            project_id=route["project_id"],
+        )
+
+    def _ensure_route(self) -> None:
+        if not self.project_id or self._route_verified:
+            return
+        result = self.client.execute(
+            ROUTE_QUERY, {"teamId": self.team_id, "projectId": self.project_id}
+        )
+        team = result.get("team")
+        project = result.get("project")
+        if not isinstance(team, dict) or team.get("id") != self.team_id:
+            raise LinearTransportError("configured Linear team was not found")
+        if (team.get("organization") or {}).get("id") != self.workspace_id:
+            raise LinearTransportError("configured Linear team is not in the configured workspace")
+        if not isinstance(project, dict) or project.get("id") != self.project_id:
+            raise LinearTransportError("configured Linear project was not found")
+        project_team_ids = {
+            item.get("id") for item in ((project.get("teams") or {}).get("nodes") or [])
+        }
+        if self.team_id not in project_team_ids:
+            raise LinearTransportError("configured Linear project is not associated with the configured team")
+        self._route_verified = True
+
+    def _create_input(self, **values: Any) -> dict[str, Any]:
+        payload = {"teamId": self.team_id, **values}
+        if self.project_id:
+            payload["projectId"] = self.project_id
+        return payload
 
     def snapshot(self) -> dict[str, Any]:
+        self._ensure_route()
         issues: list[dict[str, Any]] = []
         after: str | None = None
         seen_cursors: set[str] = set()
@@ -150,8 +241,17 @@ class LinearGraphQLTransport:
             result = self.client.execute(
                 ISSUES_QUERY, {"teamId": self.team_id, "after": after}
             )
-            connection = result.get("team", {}).get("issues", {})
-            issues.extend(connection.get("nodes", []))
+            team = result.get("team")
+            if not isinstance(team, dict):
+                raise LinearTransportError("configured Linear team was not found")
+            connection = team.get("issues", {})
+            nodes = connection.get("nodes", [])
+            if self.project_id:
+                nodes = [
+                    issue for issue in nodes
+                    if (issue.get("project") or {}).get("id") == self.project_id
+                ]
+            issues.extend(nodes)
             page_info = connection.get("pageInfo") or {}
             if not page_info.get("hasNextPage"):
                 return {"issues": issues}
@@ -233,13 +333,17 @@ class LinearGraphQLTransport:
                 ledger_revision=0 if operation["action"] == "create_root" else None,
             )
             if operation["action"] == "create_root":
-                response = self.client.execute(CREATE_MUTATION, {"input": {"teamId": self.team_id, "title": operation["title"], "description": description}})
+                response = self.client.execute(CREATE_MUTATION, {"input": self._create_input(
+                    title=operation["title"], description=description,
+                )})
                 issue = response.get("issueCreate", {}).get("issue")
                 if not issue:
                     raise LinearTransportError("Linear root creation returned no issue")
                 root_id = issue["id"]
             elif operation["action"] == "create_child":
-                response = self.client.execute(CREATE_MUTATION, {"input": {"teamId": self.team_id, "title": operation["title"], "description": description, "parentId": root_id}})
+                response = self.client.execute(CREATE_MUTATION, {"input": self._create_input(
+                    title=operation["title"], description=description, parentId=root_id,
+                )})
                 issue = response.get("issueCreate", {}).get("issue")
             else:
                 raise LinearTransportError("remote_cas_unavailable")

@@ -16,6 +16,9 @@ Its goals are to:
 
 Linear is the pilot durable ledger. Deterministic Python reducers validate plan
 intake, scope, deltas, checkpoints, evidence, resume snapshots, and closure.
+An optional repository-root `.workstream.json` is the fail-closed routing
+authority for its Linear workspace, team, and project; explicit overrides must
+match it.
 The [workstream-ledger skill](plugins/workstream/skills/workstream-ledger/SKILL.md)
 guides normal execution; [decision-audit](plugins/workstream/skills/decision-audit/SKILL.md)
 provides a fresh-context, read-only challenge to choices the specification left
@@ -49,5 +52,6 @@ See [INSTALL.md](INSTALL.md) for installation and configuration.
 See [LINEAR_SETUP.md](LINEAR_SETUP.md) for the one-time Linear route and
 authentication setup.
 See [USAGE.md](USAGE.md) for the start, resume, status, and closure workflow.
+See [FUTURE.md](FUTURE.md) for explicitly deferred optional integrations.
 
 Licensed under the [MIT License](LICENSE).

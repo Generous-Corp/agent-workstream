@@ -59,9 +59,11 @@ plugins/workstream/bin/workstreamctl config validate .workstream.json
 For the one-time authentication and route-discovery steps, follow
 [LINEAR_SETUP.md](LINEAR_SETUP.md).
 
-The file is a preflight declaration only; current live adapters do not consume
-it for routing. It may be checked in because it contains identifiers and
-acceptance commands, not credentials. See
+Live Linear inspection, resume, event, and checkpoint adapters automatically
+consume this file from the exact repository root. Initial graph callers can use
+`LinearGraphQLTransport.from_config`; conflicting explicit routes fail closed.
+The file may be checked in because it contains identifiers and acceptance
+commands, not credentials. See
 [`workstream.config.schema.json`](plugins/workstream/workstream.config.schema.json).
 Runtime credentials stay outside the repository: `LINEAR_API_KEY` for the
 authenticated Linear operations and normal Git/hosting credentials for private
