@@ -26,7 +26,9 @@ from workstream_checkpoint import (
     recover_latest,
     validate_checkpoint,
 )
-from workstream_linear import GraphQLClient, HttpGraphQLClient, LinearTransportError
+from workstream_linear import (
+    GraphQLClient, HttpGraphQLClient, LinearTransportError, validate_issue_route,
+)
 from workstream_linear_events import COMMENT_CREATE_MUTATION, COMMENTS_QUERY
 
 
@@ -169,7 +171,16 @@ class LinearCheckpointAdapter:
     supports_atomic_cas = False
     supports_append_only_events = True
 
-    def __init__(self, client: GraphQLClient, *, issue_id: str, workstream_id: str):
+    def __init__(
+        self,
+        client: GraphQLClient,
+        *,
+        issue_id: str,
+        workstream_id: str,
+        workspace_id: str | None = None,
+        team_id: str | None = None,
+        project_id: str | None = None,
+    ):
         if not issue_id:
             raise ValueError("Linear issue ID is required")
         if not workstream_id:
@@ -177,6 +188,11 @@ class LinearCheckpointAdapter:
         self.client = client
         self.issue_id = issue_id
         self.workstream_id = workstream_id.upper()
+        self.workspace_id = workspace_id
+        self.team_id = team_id
+        self.project_id = project_id
+        if any((workspace_id, team_id, project_id)) and not all((workspace_id, team_id, project_id)):
+            raise ValueError("Linear workspace, team, and project IDs must be supplied together")
 
     @classmethod
     def from_env(
@@ -185,15 +201,23 @@ class LinearCheckpointAdapter:
         issue_id: str,
         workstream_id: str,
         env: dict[str, str] | None = None,
+        config_path: str | None = None,
     ) -> "LinearCheckpointAdapter":
         values = os.environ if env is None else env
         token = values.get("LINEAR_API_KEY", "").strip()
         if not token:
             raise LinearCheckpointError("linear_auth_unavailable")
+        from workstream_config import resolve_linear_route
+
+        route, _resolved = resolve_linear_route(config_path=config_path, env=values)
+        route = route or {}
         return cls(
             HttpGraphQLClient(token),
             issue_id=issue_id,
             workstream_id=workstream_id,
+            workspace_id=route.get("workspace_id"),
+            team_id=route.get("team_id"),
+            project_id=route.get("project_id"),
         )
 
     def _comments(self) -> list[dict[str, Any]]:
@@ -209,6 +233,13 @@ class LinearCheckpointAdapter:
                 raise LinearCheckpointError("Linear workstream issue not found")
             if issue.get("identifier") != self.workstream_id:
                 raise LinearCheckpointError("workstream_id_mismatch")
+            try:
+                validate_issue_route(
+                    issue, workspace_id=self.workspace_id, team_id=self.team_id,
+                    project_id=self.project_id,
+                )
+            except LinearTransportError as error:
+                raise LinearCheckpointError(str(error)) from error
             connection = issue.get("comments")
             if not isinstance(connection, dict):
                 raise LinearCheckpointError("invalid Linear comment connection")

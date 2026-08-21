@@ -5,6 +5,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "plugins/workstream/bin/workstreamctl"
@@ -92,6 +93,13 @@ class WorkstreamCtlTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         with self.assertRaisesRegex(ValueError, "unknown config fields"):
             MODULE.validate_config(path)
+
+    def test_config_validate_without_path_uses_repository_discovery(self):
+        loaded = (self.config(), Path("/repo/.workstream.json"))
+        with mock.patch.object(MODULE, "load_config", return_value=loaded) as load, \
+             mock.patch.object(MODULE.sys, "stdout"):
+            self.assertEqual(MODULE.main(["config", "validate"]), 0)
+        load.assert_called_once_with(None, required=True)
 
 
 if __name__ == "__main__":

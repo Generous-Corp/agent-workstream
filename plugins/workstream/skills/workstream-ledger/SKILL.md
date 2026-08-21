@@ -44,12 +44,14 @@ a route/display value). `scripts/workstream_scope.py` validates this logical
 contract and rejects missing destinations, unowned children, self-links,
 duplicates, and unknown relation types.
 
-The live Linear graph transport currently neither assigns a project nor reads
-or writes these relations. Treat that as a transport gap: validate and preserve
-the logical scope, but do not claim live routing/relation proof until a
-paginated, authenticated read-back-verified adapter exists. Until then it emits
-`transport_unimplemented`. The deterministic validator rejects missing or
-mismatched receipts; the transport remains responsible for their authenticity.
+The live Linear graph transport verifies the declared workspace/team/project
+relationship, fences reads to that project, and assigns the project on creates.
+It does not yet read or write typed cross-workstream relations. Treat relations
+as a transport gap: validate and preserve the logical scope, but do not claim
+live relation proof until a paginated, authenticated read-back-verified adapter
+exists. Until then it emits `transport_unimplemented`. The deterministic
+validator rejects missing or mismatched receipts; the transport remains
+responsible for their authenticity.
 
 ### Markdown plan intake
 
@@ -82,7 +84,13 @@ on the single Linear root. This helper is intentionally side-effect free and
 sets `graph_review_required=true`: Markdown structure can produce deterministic
 candidates, but cannot prove which sections are independently actionable. The
 active agent must review completeness before creating the root and accepted
-children. The current GraphQL transport can create an initial graph and treats
+children. When the repository root contains `.workstream.json`, load its
+validated Linear workspace/team/project route automatically; an explicit
+`--config` or `WORKSTREAM_CONFIG` may select a deliberate external declaration.
+Use `LinearGraphQLTransport.from_config` for initial graph operations. Explicit
+route arguments must match the declaration, and authenticated route validation
+must pass before any issue read or write. The current GraphQL transport can
+create an initial graph and treats
 an exact same-revision repeat with all accepted children present as a zero-write
 no-op. It cannot serialize concurrent first creation or safely rewrite an
 existing graph: those paths fail `remote_cas_unavailable` until a remote
@@ -118,8 +126,10 @@ same revision append independent comments, so neither replaces the other.
 Replay returns the existing receipt; duplicate or conflicting event IDs,
 malformed markers, causal revision gaps, incomplete pagination, missing auth,
 and unobserved writes fail closed. Configure it with `LINEAR_API_KEY` and the
-exact root issue identifier. Do not use a locally cached comment subset as the
-reducer input.
+exact root issue identifier. `from_env` also consumes the validated
+repository-root `.workstream.json` route when present and refuses an issue
+outside that workspace/team/project. Do not use a locally cached comment subset
+as the reducer input.
 
 This is logical transport proof, not physical remote proof: deterministic fake
 tests cover concurrency and no-loss behavior, but they do not prove a live
@@ -227,8 +237,10 @@ persists that schema as a distinct immutable marker over the same authenticated,
 fully paginated Linear comment boundary as material-delta events. It derives an
 acknowledgement only after readback, replays an already observed event without a
 second write, and fails closed on ambiguous or malformed remote state. This is
-logical transport proof: do not call the deterministic fake-client tests a live
-Linear, second-machine, process-death, or deletion-resistance canary.
+logical transport proof. Its `from_env` constructor consumes the same validated
+repository-root route and refuses a root outside it. Do not call the
+deterministic fake-client tests a live Linear, second-machine, process-death, or
+deletion-resistance canary.
 
 ## Start or restore
 
@@ -243,17 +255,20 @@ Linear, second-machine, process-death, or deletion-resistance canary.
    Record the namespace, explicit Linear workspace/team/project destination,
    canonical repository coordinates, child repository ownership, and typed
    cross-workstream relations before mutation.
-3. On recovery, read the full nonterminal issue graph, dependencies, decisions,
+3. Load validated `.workstream.json` from the exact repository root when it
+   exists. Treat it as declared routing authority, not as a cwd-based guess; do
+   not substitute similarly named workspaces, projects, teams, or repositories.
+4. On recovery, read the full nonterminal issue graph, dependencies, decisions,
    comments, plan link/revision, and next action. Then query live source-control
    and landing-controller state when those capabilities exist; neither old
    comments nor local state are PR truth.
-4. Report stale contradictions before implementation:
+5. Report stale contradictions before implementation:
    - open issue whose PR is merged/closed or whose head changed;
    - waiting issue with no blocker/owner/review date;
    - completed parent with nonterminal children;
    - cancelled decision still present in acceptance criteria;
    - PR without a workstream, exact head, provenance, or landing owner.
-5. Only when a stable external ingress integration and its private transport
+6. Only when a stable external ingress integration and its private transport
    are already configured, recover turns that arrived after the last structured
    checkpoint:
 

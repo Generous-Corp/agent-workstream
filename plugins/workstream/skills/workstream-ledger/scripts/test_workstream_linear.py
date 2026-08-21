@@ -24,11 +24,19 @@ class FakeClient:
 
     def execute(self, query, variables):
         self.calls.append((query, variables))
+        if "query WorkstreamRoute" in query:
+            return {
+                "team": {"id": variables["teamId"], "organization": {"id": "workspace"}},
+                "project": {
+                    "id": variables["projectId"],
+                    "teams": {"nodes": [{"id": variables["teamId"]}]},
+                },
+            }
         if "query WorkstreamIssues" in query:
             return {"team": {"issues": {"nodes": self.issues[:]}}}
         if "issueCreate" in query:
             data = variables["input"]
-            issue = {"id": f"id-{self.next_id}", "identifier": f"GEN-{self.next_id}", "title": data["title"], "description": data["description"], "url": f"https://linear.test/{self.next_id}", "updatedAt": "now", "state": {"name": "Todo", "type": "unstarted"}, "parent": {"id": data.get("parentId")} if data.get("parentId") else None}
+            issue = {"id": f"id-{self.next_id}", "identifier": f"GEN-{self.next_id}", "title": data["title"], "description": data["description"], "url": f"https://linear.test/{self.next_id}", "updatedAt": "now", "state": {"name": "Todo", "type": "unstarted"}, "parent": {"id": data.get("parentId")} if data.get("parentId") else None, "project": {"id": data["projectId"]} if data.get("projectId") else None}
             self.next_id += 1
             self.issues.append(issue)
             return {"issueCreate": {"success": True, "issue": issue}}
@@ -84,6 +92,58 @@ class LinearTransportTests(unittest.TestCase):
         result = LinearGraphQLTransport(fake, team_id="team").apply_reviewed_plan(self.plan(), accepted_keys={"a"})
         self.assertEqual(len(fake.issues), 2)
         self.assertEqual(result["root"]["description"].splitlines()[0], MARKER.pattern.replace("([^ >]+)", "source-demo"))
+
+    def test_configured_route_is_verified_and_applied_to_every_create(self):
+        fake = FakeClient()
+        transport = LinearGraphQLTransport(
+            fake, team_id="team", workspace_id="workspace", project_id="project"
+        )
+        transport.apply_reviewed_plan(self.plan(), accepted_keys={"a"})
+
+        route_calls = [variables for query, variables in fake.calls if "WorkstreamRoute" in query]
+        create_inputs = [variables["input"] for query, variables in fake.calls if "issueCreate" in query]
+        self.assertEqual(route_calls, [{"teamId": "team", "projectId": "project"}])
+        self.assertEqual(len(create_inputs), 2)
+        self.assertTrue(all(item["projectId"] == "project" for item in create_inputs))
+
+    def test_from_config_requires_and_consumes_complete_route(self):
+        fake = FakeClient()
+        route = {
+            "workspace_id": "workspace", "team_id": "team", "project_id": "project"
+        }
+        with mock.patch("workstream_config.resolve_linear_route", return_value=(route, None)):
+            transport = LinearGraphQLTransport.from_config(fake)
+        self.assertEqual(transport.workspace_id, "workspace")
+        self.assertEqual(transport.team_id, "team")
+        self.assertEqual(transport.project_id, "project")
+
+    def test_workspace_mismatch_fails_before_issue_read_or_write(self):
+        fake = FakeClient()
+        transport = LinearGraphQLTransport(
+            fake, team_id="team", workspace_id="wrong", project_id="project"
+        )
+        with self.assertRaisesRegex(LinearTransportError, "not in the configured workspace"):
+            transport.snapshot()
+        self.assertFalse(any("WorkstreamIssues" in query or "issueCreate" in query for query, _ in fake.calls))
+
+    def test_project_fence_excludes_same_marker_from_another_project(self):
+        fake = FakeClient()
+        other = {
+            "id": "other-root", "identifier": "GEN-99", "title": "Demo",
+            "description": "<!-- workstream-key:source-demo -->\nPlan revision: sha-demo",
+            "url": "https://linear.test/99", "updatedAt": "now",
+            "state": {"name": "Todo", "type": "unstarted"}, "parent": None,
+            "project": {"id": "other-project"},
+        }
+        fake.issues.append(other)
+        transport = LinearGraphQLTransport(
+            fake, team_id="team", workspace_id="workspace", project_id="project"
+        )
+
+        result = transport.apply_reviewed_plan(self.plan(), accepted_keys={"a"})
+
+        self.assertNotEqual(result["root"]["id"], "other-root")
+        self.assertEqual(len(fake.issues), 3)
 
     def test_repeated_intake_uses_existing_markers(self):
         fake = FakeClient()

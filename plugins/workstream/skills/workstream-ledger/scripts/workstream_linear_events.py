@@ -20,7 +20,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from workstream_delta import Delta, MutationReceipt, RevisionConflict
-from workstream_linear import GraphQLClient, HttpGraphQLClient, LinearTransportError
+from workstream_linear import (
+    GraphQLClient, HttpGraphQLClient, LinearTransportError, validate_issue_route,
+)
 
 
 EVENT_PREFIX = "<!-- workstream-delta:v1:"
@@ -32,6 +34,8 @@ query WorkstreamDeltaComments($issueId: String!, $after: String) {
   issue(id: $issueId) {
     id
     identifier
+    team { id organization { id } }
+    project { id }
     comments(first: 250, after: $after) {
       nodes { id body createdAt updatedAt }
       pageInfo { hasNextPage endCursor }
@@ -183,21 +187,46 @@ class LinearCommentEventAdapter:
     supports_atomic_cas = False
     supports_append_only_events = True
 
-    def __init__(self, client: GraphQLClient, *, issue_id: str):
+    def __init__(
+        self,
+        client: GraphQLClient,
+        *,
+        issue_id: str,
+        workspace_id: str | None = None,
+        team_id: str | None = None,
+        project_id: str | None = None,
+    ):
         if not issue_id:
             raise ValueError("Linear issue ID is required")
         self.client = client
         self.issue_id = issue_id
+        self.workspace_id = workspace_id
+        self.team_id = team_id
+        self.project_id = project_id
+        if any((workspace_id, team_id, project_id)) and not all((workspace_id, team_id, project_id)):
+            raise ValueError("Linear workspace, team, and project IDs must be supplied together")
 
     @classmethod
     def from_env(
-        cls, *, issue_id: str, env: dict[str, str] | None = None
+        cls,
+        *,
+        issue_id: str,
+        env: dict[str, str] | None = None,
+        config_path: str | None = None,
     ) -> "LinearCommentEventAdapter":
         values = os.environ if env is None else env
         token = values.get("LINEAR_API_KEY", "").strip()
         if not token:
             raise LinearEventError("linear_auth_unavailable")
-        return cls(HttpGraphQLClient(token), issue_id=issue_id)
+        from workstream_config import resolve_linear_route
+
+        route, _resolved = resolve_linear_route(config_path=config_path, env=values)
+        route = route or {}
+        return cls(
+            HttpGraphQLClient(token), issue_id=issue_id,
+            workspace_id=route.get("workspace_id"), team_id=route.get("team_id"),
+            project_id=route.get("project_id"),
+        )
 
     def _comments(self) -> list[dict[str, Any]]:
         comments: list[dict[str, Any]] = []
@@ -210,6 +239,15 @@ class LinearCommentEventAdapter:
             issue = result.get("issue")
             if not issue:
                 raise LinearEventError("Linear workstream issue not found")
+            if issue.get("identifier") != self.issue_id:
+                raise LinearEventError("workstream_id_mismatch")
+            try:
+                validate_issue_route(
+                    issue, workspace_id=self.workspace_id, team_id=self.team_id,
+                    project_id=self.project_id,
+                )
+            except LinearTransportError as error:
+                raise LinearEventError(str(error)) from error
             connection = issue.get("comments") or {}
             comments.extend(connection.get("nodes") or [])
             page_info = connection.get("pageInfo") or {}

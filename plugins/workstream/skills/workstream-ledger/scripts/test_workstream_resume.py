@@ -131,6 +131,27 @@ class ResumeTests(unittest.TestCase):
             self.assertEqual(MODULE.main(), 0)
         transport.snapshot_for_root.assert_called_once_with("GEN-37")
 
+    def test_live_cli_automatically_uses_repository_config_route(self):
+        transport = mock.Mock()
+        transport.snapshot_for_root.return_value = self.snapshot()
+        client = mock.Mock()
+        route = {
+            "workspace_id": "workspace", "team_id": "team", "project_id": "project"
+        }
+        constructor = mock.Mock(return_value=transport)
+        with mock.patch.object(MODULE, "resolve_linear_route", return_value=(route, Path(".workstream.json"))), \
+             mock.patch.object(MODULE, "HttpGraphQLClient", return_value=client), \
+             mock.patch.object(MODULE, "LinearGraphQLTransport", constructor), \
+             mock.patch.object(MODULE.os, "environ", {"LINEAR_API_KEY": "secret"}), \
+             mock.patch.object(MODULE.sys, "argv", ["workstream_resume.py", "GEN-37"]), \
+             mock.patch.object(MODULE.sys, "stdout"):
+            self.assertEqual(MODULE.main(), 0)
+
+        constructor.assert_called_once_with(
+            client, team_id="team", workspace_id="workspace", project_id="project"
+        )
+        transport.snapshot_for_root.assert_called_once_with("GEN-37")
+
 
 if __name__ == "__main__":
     unittest.main()

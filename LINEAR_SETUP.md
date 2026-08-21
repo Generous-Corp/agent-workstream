@@ -45,9 +45,10 @@ using [examples/workstream.json](examples/workstream.json), then validate it:
 plugins/workstream/bin/workstreamctl config validate .workstream.json
 ```
 
-The declaration is currently a checked preflight surface. Until live adapters
-consume it directly, include the same exact IDs in the request that starts the
-workstream.
+The repository-root declaration is the routing authority. Live inspection and
+resume commands load it automatically; explicit route arguments must match it.
+Set `WORKSTREAM_CONFIG` or pass `--config` only when the declaration deliberately
+lives somewhere else.
 
 ## 3. Required access
 
