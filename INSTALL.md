@@ -56,6 +56,9 @@ Optionally validate a static project declaration in `.workstream.json`:
 plugins/workstream/bin/workstreamctl config validate .workstream.json
 ```
 
+For the one-time authentication and route-discovery steps, follow
+[LINEAR_SETUP.md](LINEAR_SETUP.md).
+
 The file is a preflight declaration only; current live adapters do not consume
 it for routing. It may be checked in because it contains identifiers and
 acceptance commands, not credentials. See
