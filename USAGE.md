@@ -3,9 +3,10 @@
 ## 1. Install and authenticate
 
 Install the plugin using [INSTALL.md](INSTALL.md), complete the short
-[Linear setup](LINEAR_SETUP.md), then start a new agent session. Supply
-`LINEAR_API_KEY` through your shell or secret manager when live Linear reads or
-writes are required. Never commit it.
+[Linear setup](LINEAR_SETUP.md), then start a new agent session. For seamless
+unattended access, install the token once at
+`~/.config/agent-workstream/linear.token`; environment and alternate protected
+file options are also supported. Never commit it.
 
 Optionally copy [the example declaration](examples/workstream.json) to
 `.workstream.json` and replace its route and repository identifiers. Validate
@@ -76,6 +77,12 @@ plugins/workstream/bin/workstreamctl plan ./PLAN.md \
 # Resolve and validate one live Linear root and its nonterminal children.
 plugins/workstream/bin/workstreamctl resume GEN-123
 ```
+
+Live resume also reduces the root's complete append-only material-event and
+checkpoint history. It uses the latest durable event next action and, when one
+exists, returns the acknowledged checkpoint's machine, worktree, exact head,
+evidence, blocker, and provenance chain. Unimplemented surfaces remain named in
+`surface_availability` instead of being inferred from local session state.
 
 The plugin is not a hosted orchestration service. It installs no hooks,
 monitors, MCP servers, or background workers. Optional ingress and landing

@@ -204,10 +204,11 @@ class LinearCheckpointAdapter:
         config_path: str | None = None,
     ) -> "LinearCheckpointAdapter":
         values = os.environ if env is None else env
-        token = values.get("LINEAR_API_KEY", "").strip()
+        from workstream_config import load_linear_api_key, resolve_linear_route
+
+        token = load_linear_api_key(env=values)
         if not token:
             raise LinearCheckpointError("linear_auth_unavailable")
-        from workstream_config import resolve_linear_route
 
         route, _resolved = resolve_linear_route(config_path=config_path, env=values)
         route = route or {}
