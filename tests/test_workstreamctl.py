@@ -110,6 +110,15 @@ class WorkstreamCtlTests(unittest.TestCase):
             [MODULE.sys.executable, str(script), "GEN-37", "manifest.json"],
         )
 
+    def test_intake_dispatches_reviewed_linear_intake_command(self):
+        with mock.patch.object(MODULE.os, "execv") as execute:
+            MODULE.main(["intake", "plan.md", "--identity", "plan:demo", "--plan-revision", "abc", "--accept-none"])
+        script = MODULE.SCRIPTS / "workstream_intake.py"
+        execute.assert_called_once_with(
+            MODULE.sys.executable,
+            [MODULE.sys.executable, str(script), "plan.md", "--identity", "plan:demo", "--plan-revision", "abc", "--accept-none"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

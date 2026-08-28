@@ -90,6 +90,13 @@ From a checkout of this repository:
 plugins/workstream/bin/workstreamctl plan ./PLAN.md \
   --identity https://github.com/example/plans/blob/<40-hex-commit>/PLAN.md
 
+# After reviewing that preview, create exactly the accepted candidates.
+plugins/workstream/bin/workstreamctl intake ./PLAN.md \
+  --identity https://github.com/example/plans/blob/<40-hex-commit>/PLAN.md \
+  --plan-revision copy-source-sha256-from-preview \
+  --accept-key section-copy-from-preview \
+  --accept-key section-copy-another-key
+
 # Resolve one live root with full authority, fetching its projected plan bytes.
 plugins/workstream/bin/workstreamctl resume GEN-123
 
@@ -106,6 +113,15 @@ exact 40-hex commit returns 404, it can use existing noninteractive GitHub SSH
 access in a temporary isolated repository. Mutable refs and failed or timed-out
 SSH retrieval refuse authority; no API token is forwarded to the Git process.
 The fallback requires POSIX process-group cleanup; HTTPS remains portable.
+
+`intake` requires an authenticated, complete workspace/team/project route and
+an explicit review (`--accept-key` for each child, or `--accept-none`). It
+also requires the preview's exact source SHA-256, so changed bytes force a new
+review, and returns exact root and child receipts. Concurrent identical intake calls use
+the same deterministic issue IDs and converge only after full readback; an ID
+or field collision fails closed. A later call may add a newly reviewed missing
+child from the same plan revision, but changed-plan and other update paths still
+refuse without remote CAS.
 
 Live resume also reduces the root's complete append-only material-event and
 checkpoint history. It uses the latest durable event next action and, when one
