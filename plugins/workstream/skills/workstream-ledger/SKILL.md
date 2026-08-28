@@ -219,9 +219,28 @@ cannot emit `Done`.
 
 ### Fresh-session resume
 
-When a new agent receives only `ABC-123` (or its Linear URL), obtain one root
-snapshot plus its nonterminal children from Linear and pass it through
-`scripts/workstream_resume.py`. The resolver extracts exactly one distinct
+When a new agent receives `ABC-123` (or its Linear URL/tab title), with or
+without continuation instructions, the first action is the default bounded
+resume helper:
+
+```sh
+python3 "<absolute directory of the SKILL.md loaded for this turn>/scripts/workstream_resume.py" ABC-123
+```
+
+Substitute the runtime-supplied loaded skill path directly. Do not search the
+filesystem, inspect cwd/environment, probe `PATH`, or execute the placeholder
+or an unset variable. Run it before reading repository instructions, memory,
+local worktree lists, or PR state: the result identifies the repositories and
+nonterminal work that are actually in scope. Do not probe `workstreamctl` on `PATH`; it is a
+repository-local convenience command and plugin installation does not add a
+global executable. The initial recovery command always omits
+`--include-history`, even when the request ultimately includes audit or closure.
+The default validates the complete history and returns the actionable current
+view. Run a second full-history invocation only when actually beginning that
+later audit or closure pass.
+
+The helper obtains one root snapshot plus its nonterminal children from Linear.
+The resolver extracts exactly one distinct
 token from a bare token, Linear URL, natural-language request, or copied tab
 title. It validates the context URL, exact plan revision, root revision, child
 uniqueness, and root/child next actions, then enforces both item and byte caps
@@ -243,7 +262,7 @@ empty rather than fabricated.
 When no local config is available, authenticated token-only bootstrap resolves
 the root's exact workspace/team/project route before the fenced read.
 
-`workstreamctl resume` is full-authority by default and fetches the projected
+The direct resume helper is full-authority by default and fetches the projected
 source identity. `--plan-source` overrides the fetch location for an
 authenticated checkout; `--plan-identity` preserves its durable identity. It
 refuses success unless those exact bytes match the root and projection.
@@ -252,9 +271,10 @@ current child details and exact uncheckpointed requirements, blockers,
 decisions, and follow-ups, keeps actionable checkpoint evidence and routing,
 then returns digests/counts for acknowledged history and validated routing
 evidence instead of duplicating them into every agent prompt.
-Use `--include-history` for an audit or closure pass and raise the explicit
-byte/item caps when that complete history is known to exceed the normal resume
-budget; required current state is never truncated.
+After initial bounded recovery, an explicitly requested audit or closure pass
+may use a second `--include-history` invocation and raise the explicit byte/item
+caps when that complete history is known to exceed the normal resume budget;
+required current state is never truncated.
 For an immutable `github.com/.../blob/<40-hex-commit>/<path>` source, HTTPS is
 tried first; a 404 may fall back to existing noninteractive GitHub SSH access
 in a temporary isolated repository. Mutable refs, malformed paths, prompts,

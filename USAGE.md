@@ -81,6 +81,22 @@ The Linear URL may be used wherever the stable token is accepted. Starting from
 a local Markdown file is supported, but provide a durable plan identity when
 other machines must be able to retrieve the original artifact.
 
+### Continue with the token
+
+For a handle/URL/tab-title resume request, with or without additional
+instructions, the agent's first command is:
+
+```sh
+python3 "<absolute directory of the SKILL.md loaded for this turn>/scripts/workstream_resume.py" GEN-123
+```
+
+The agent substitutes the runtime-supplied loaded skill path directly; it does
+not search the filesystem, inspect cwd/environment, probe `PATH`, or execute the
+placeholder. Initial recovery always omits `--include-history` and runs before
+memory, worktree, repository, or PR inspection. A second full-history call is
+reserved for the point when an explicitly requested audit or closure pass
+actually begins.
+
 ## Deterministic helpers
 
 From a checkout of this repository:
@@ -108,6 +124,9 @@ plugins/workstream/bin/workstreamctl resume GEN-123 \
 # Inspect an older root without claiming authority to continue it.
 plugins/workstream/bin/workstreamctl resume GEN-123 --inspection-only
 ```
+
+Those are secondary repository-local CLI examples; installation does not add
+`workstreamctl` to global `PATH`.
 
 Token-only resume tries HTTPS first. If an immutable GitHub blob URL at an
 exact 40-hex commit returns 404, it can use existing noninteractive GitHub SSH
