@@ -463,6 +463,10 @@ def reduce_projection_comments(
     if modern:
         activation = modern[0]
         if activation["expected_revision"] == 0:
+            if activation["kind"] == "cas_activation":
+                raise LinearProjectionError(
+                    "projection_v2_activation_without_legacy"
+                )
             accepted_legacy = []
             quarantined = legacy
         else:
@@ -480,6 +484,14 @@ def reduce_projection_comments(
                     item["expected_revision"], item["created_at"], item["event_id"],
                 ),
             )
+            if (
+                "legacy_digest_kind" in activation["value"]
+                and reviewed_ids
+                != [event["event_id"] for event in accepted_legacy]
+            ):
+                raise LinearProjectionError(
+                    "projection_v2_activation_legacy_order_mismatch"
+                )
             reviewed = set(reviewed_ids)
             quarantined = [event for event in legacy if event["event_id"] not in reviewed]
             if not _activation_legacy_digest_is_valid(

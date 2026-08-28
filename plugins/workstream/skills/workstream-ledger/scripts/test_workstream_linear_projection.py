@@ -366,6 +366,62 @@ class ProjectionTests(unittest.TestCase):
                 authenticated_route=AUTHORITY,
             )
 
+    def test_tagged_activation_at_zero_rejects_unreviewed_digest(self):
+        activation = build_projection_event(
+            workstream_id="GEN-37", kind="cas_activation", key="root",
+            value={
+                "legacy_digest_kind": (
+                    projection_module.LEGACY_DIGEST_KIND_FULL_EVENTS
+                ),
+                "legacy_event_ids": [],
+                "legacy_events_sha256": "a" * 64,
+            },
+            plan_revision=PLAN, expected_revision=0,
+            created_at="2026-08-27T18:00:00Z", authority=AUTHORITY,
+        )
+        with self.assertRaisesRegex(
+            LinearProjectionError, "activation_without_legacy",
+        ):
+            reduce_projection_comments(
+                [projection_comment(activation)], workstream_id="GEN-37",
+                expected_plan_revision=PLAN, authenticated_route=AUTHORITY,
+            )
+
+    def test_tagged_activation_rejects_reversed_reviewed_id_order(self):
+        first = legacy_event(
+            "scope", "root", scope(), 0, "2026-08-27T17:00:00Z",
+        )
+        second = legacy_event(
+            "scope", "ordered", scope(), 1,
+            "2026-08-27T17:01:00Z",
+        )
+        activation = build_projection_event(
+            workstream_id="GEN-37", kind="cas_activation", key="root",
+            value={
+                "legacy_digest_kind": (
+                    projection_module.LEGACY_DIGEST_KIND_FULL_EVENTS
+                ),
+                "legacy_event_ids": [second["event_id"], first["event_id"]],
+                "legacy_events_sha256": hashlib.sha256(
+                    projection_module._canonical([first, second])
+                ).hexdigest(),
+            },
+            plan_revision=PLAN, expected_revision=2,
+            created_at="2026-08-27T18:00:00Z", authority=AUTHORITY,
+        )
+        with self.assertRaisesRegex(
+            LinearProjectionError, "activation_legacy_order_mismatch",
+        ):
+            reduce_projection_comments(
+                [
+                    legacy_comment(first, "legacy-0"),
+                    legacy_comment(second, "legacy-1"),
+                    projection_comment(activation),
+                ],
+                workstream_id="GEN-37", expected_plan_revision=PLAN,
+                authenticated_route=AUTHORITY,
+            )
+
     def test_untagged_activation_rejects_neither_and_ambiguous_both(self):
         legacy = legacy_event(
             "scope", "root", scope(), 0, "2026-08-27T17:00:00Z",
