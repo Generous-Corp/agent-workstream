@@ -89,7 +89,7 @@ class WorkstreamIntakeTests(unittest.TestCase):
         fake = FakeClient()
         revision = workstream_intake.plan_payload(str(path), "plan:demo")["root"]["plan_revision"]
         with mock.patch.object(workstream_intake, "load_linear_api_key", return_value="secret"):
-            with self.assertRaisesRegex(GraphReviewRequired, "not present"):
+            with self.assertRaisesRegex(ValueError, "not present"):
                 workstream_intake.run([
                     str(path), "--identity", "plan:demo",
                     "--plan-revision", revision,
