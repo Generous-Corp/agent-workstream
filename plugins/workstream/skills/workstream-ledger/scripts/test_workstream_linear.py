@@ -3,6 +3,7 @@ import os
 import ssl
 import threading
 import unittest
+import uuid
 from unittest import mock
 
 from workstream_http import default_ssl_context
@@ -53,6 +54,22 @@ class FakeClient:
             issue.update({k: v for k, v in variables["input"].items() if k in {"title", "description"}})
             return {"issueUpdate": {"success": True, "issue": issue}}
         raise AssertionError("unexpected mutation")
+
+
+class UUIDv4ValidatingFakeClient(FakeClient):
+    """Mirror Linear's live client-supplied issue-ID constraint."""
+
+    def execute(self, query, variables):
+        if "issueCreate" in query:
+            issue_id = variables["input"]["id"]
+            parsed = uuid.UUID(issue_id)
+            if (
+                str(parsed) != issue_id
+                or parsed.version != 4
+                or parsed.variant != uuid.RFC_4122
+            ):
+                raise LinearTransportError("id must be a UUID")
+        return super().execute(query, variables)
 
 
 class LinearTransportTests(unittest.TestCase):
@@ -148,7 +165,9 @@ class LinearTransportTests(unittest.TestCase):
             workspace_id="workspace", team_id="team", project_id="project",
             root_stable_key="source-demo",
         )
-        self.assertEqual(root, "eac384c6-5f7c-5afc-bbd9-618cedf902a2")
+        self.assertEqual(root, "eac384c6-5f7c-4afc-bbd9-618cedf902a2")
+        self.assertEqual(uuid.UUID(root).version, 4)
+        self.assertEqual(uuid.UUID(root).variant, uuid.RFC_4122)
         self.assertEqual(
             root,
             deterministic_issue_id(
@@ -160,7 +179,9 @@ class LinearTransportTests(unittest.TestCase):
             workspace_id="workspace", team_id="team", project_id="project",
             root_stable_key="source-demo", child_stable_key="a",
         )
-        self.assertEqual(child, "e94bc97d-505d-55ba-a8e7-4b6002c785b0")
+        self.assertEqual(child, "e94bc97d-505d-45ba-a8e7-4b6002c785b0")
+        self.assertEqual(uuid.UUID(child).version, 4)
+        self.assertEqual(uuid.UUID(child).variant, uuid.RFC_4122)
         self.assertNotEqual(root, child)
         self.assertNotEqual(
             child,
@@ -184,6 +205,24 @@ class LinearTransportTests(unittest.TestCase):
             ),
         )
 
+    def test_routed_intake_uses_linear_compatible_uuid_v4_ids(self):
+        fake = UUIDv4ValidatingFakeClient()
+        result = self.routed_transport(fake).intake_reviewed_plan(
+            self.plan(), accepted_keys={"a"}
+        )
+
+        self.assertEqual(len(fake.issues), 2)
+        self.assertTrue(all(uuid.UUID(issue["id"]).version == 4 for issue in fake.issues))
+        self.assertEqual(result["receipts"]["root"]["id"], fake.issues[0]["id"])
+
+    def test_live_uuid_contract_fake_rejects_legacy_uuid_v5(self):
+        fake = UUIDv4ValidatingFakeClient()
+        with self.assertRaisesRegex(LinearTransportError, "id must be a UUID"):
+            fake.execute("mutation { issueCreate }", {"input": {
+                "id": "eac384c6-5f7c-5afc-bbd9-618cedf902a2",
+            }})
+        self.assertEqual(fake.issues, [])
+
     def test_routed_intake_is_idempotent_and_returns_exact_receipts(self):
         fake = FakeClient()
         transport = self.routed_transport(fake)
@@ -198,7 +237,7 @@ class LinearTransportTests(unittest.TestCase):
         self.assertEqual(sum("issueCreate" in query for query, _ in fake.calls), 2)
 
     def test_concurrent_first_intake_converges_without_duplicate_or_delete(self):
-        class ConcurrentFake(FakeClient):
+        class ConcurrentFake(UUIDv4ValidatingFakeClient):
             def __init__(self):
                 super().__init__()
                 self.lock = threading.Lock()
@@ -247,7 +286,7 @@ class LinearTransportTests(unittest.TestCase):
         self.assertFalse(any("issueUpdate" in query or "issueDelete" in query for query, _ in fake.calls))
 
     def test_committed_create_with_lost_response_converges_by_readback(self):
-        class LostResponseFake(FakeClient):
+        class LostResponseFake(UUIDv4ValidatingFakeClient):
             def __init__(self):
                 super().__init__()
                 self.lose_next_create = True

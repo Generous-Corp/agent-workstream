@@ -108,8 +108,9 @@ validated Linear workspace/team/project route automatically; an explicit
 `--config` or `WORKSTREAM_CONFIG` may select a deliberate external declaration.
 Explicit route arguments must match the declaration, and authenticated route
 validation must pass before any issue read or write. Initial root and child IDs
-are deterministic UUIDs scoped by immutable workspace/team/project plus stable
-plan keys. Concurrent duplicate creates reload and validate every owned field,
+are deterministic UUIDv4-shaped values scoped by immutable
+workspace/team/project plus stable plan keys, matching Linear's live validator.
+Concurrent duplicate creates reload and validate every owned field,
 converging only on an exact match; they never lock by time, update, or delete.
 An exact repeat is a zero-write no-op, and the same plan revision may add a
 newly reviewed missing child. Changed-plan and other existing-graph mutations
