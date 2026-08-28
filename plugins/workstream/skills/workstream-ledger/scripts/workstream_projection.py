@@ -30,7 +30,7 @@ from workstream_successor import choose_disposition, SuccessorError
 REQUIRED_KINDS = {"scope", "source", "provenance"}
 
 
-def _value_digest(value: dict[str, Any]) -> str:
+def _value_digest(value: Any) -> str:
     encoded = json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
@@ -58,11 +58,27 @@ def _latest_heads(state: Any) -> dict[tuple[str, str], dict[str, Any]]:
 
 def projection_review_contract(state: Any) -> dict[str, Any]:
     """Return the exact remote projection surface a manifest must review."""
-    return _contract_from_heads(state.revision, _active_heads(state))
+    legacy_events = (
+        list(state.events)
+        if state.events and all(event["schema_version"] == 1 for event in state.events)
+        else []
+    )
+    quarantine = state.snapshot.get("projection_quarantined") or []
+    return _contract_from_heads(
+        state.revision, _active_heads(state),
+        legacy_event_ids=[event["event_id"] for event in legacy_events],
+        legacy_events_sha256=(
+            _value_digest(legacy_events) if legacy_events else None
+        ),
+        quarantine_count=len(quarantine),
+        quarantine_sha256=_value_digest(quarantine),
+    )
 
 
 def _contract_from_heads(
     revision: int, active: dict[tuple[str, str], dict[str, Any]],
+    *, legacy_event_ids: list[str], legacy_events_sha256: str | None,
+    quarantine_count: int, quarantine_sha256: str,
 ) -> dict[str, Any]:
     return {
         "expected_projection_revision": revision,
@@ -75,13 +91,19 @@ def _contract_from_heads(
             }
             for (kind, key), event in sorted(active.items())
         ],
+        "expected_legacy_v1_event_ids": list(legacy_event_ids),
+        "expected_legacy_v1_events_sha256": legacy_events_sha256,
+        "expected_projection_quarantine_count": quarantine_count,
+        "expected_projection_quarantine_sha256": quarantine_sha256,
     }
 
 
 def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     required = {
         "projection", "retirements", "expected_projection_revision",
-        "expected_active_heads",
+        "expected_active_heads", "expected_legacy_v1_event_ids",
+        "expected_legacy_v1_events_sha256", "expected_projection_quarantine_count",
+        "expected_projection_quarantine_sha256",
     }
     if not isinstance(manifest, dict) or set(manifest) != required:
         raise LinearProjectionError("manifest_review_contract_required")
@@ -109,6 +131,29 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         if not re.fullmatch(r"[0-9a-f]{64}", str(head.get("value_sha256", ""))):
             raise LinearProjectionError(f"invalid_manifest_active_head_digest:{index}")
         identities.add(identity)
+    legacy_ids = manifest["expected_legacy_v1_event_ids"]
+    legacy_digest = manifest["expected_legacy_v1_events_sha256"]
+    if (
+        not isinstance(legacy_ids, list)
+        or legacy_ids != list(dict.fromkeys(legacy_ids))
+        or not all(isinstance(event_id, str) and event_id for event_id in legacy_ids)
+        or (
+            legacy_ids
+            and not re.fullmatch(r"[0-9a-f]{64}", str(legacy_digest or ""))
+        )
+        or (not legacy_ids and legacy_digest is not None)
+    ):
+        raise LinearProjectionError("invalid_manifest_legacy_v1_contract")
+    quarantine_count = manifest["expected_projection_quarantine_count"]
+    if (
+        not isinstance(quarantine_count, int)
+        or quarantine_count < 0
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(manifest["expected_projection_quarantine_sha256"]),
+        )
+    ):
+        raise LinearProjectionError("invalid_manifest_projection_quarantine_contract")
     retirements = manifest["retirements"]
     if not isinstance(retirements, list):
         raise LinearProjectionError("manifest_retirements_must_be_list")
@@ -238,6 +283,16 @@ def reconcile_required_projection(
         "expected_active_heads": sorted(
             manifest["expected_active_heads"], key=lambda item: (item["kind"], item["key"])
         ),
+        "expected_legacy_v1_event_ids": manifest["expected_legacy_v1_event_ids"],
+        "expected_legacy_v1_events_sha256": manifest[
+            "expected_legacy_v1_events_sha256"
+        ],
+        "expected_projection_quarantine_count": manifest[
+            "expected_projection_quarantine_count"
+        ],
+        "expected_projection_quarantine_sha256": manifest[
+            "expected_projection_quarantine_sha256"
+        ],
     }
     if observed_contract != reviewed_contract:
         raise LinearProjectionError("projection_review_stale_reload_required")
@@ -281,7 +336,39 @@ def reconcile_required_projection(
     if projection_review_contract(adapter.state()) != observed_contract:
         raise LinearProjectionError("projection_review_stale_reload_required")
 
-    receipts: list[dict[str, Any]] = []
+    activation_receipt = None
+    if initial.events and all(
+        event["schema_version"] == 1 for event in initial.events
+    ):
+        legacy_event_ids = manifest["expected_legacy_v1_event_ids"]
+        activation_receipt = adapter.activate_v2(
+            created_at=created_at, expected_revision=initial.revision,
+            expected_legacy_event_ids=legacy_event_ids,
+            expected_legacy_events_sha256=manifest[
+                "expected_legacy_v1_events_sha256"
+            ],
+        )
+        activated = adapter.state()
+        activated_contract = projection_review_contract(activated)
+        if (
+            activated.revision != initial.revision + 1
+            or [event["event_id"] for event in activated.events[:initial.revision]]
+            != legacy_event_ids
+            or activated.events[-1]["kind"] != "cas_activation"
+            or activated.events[-1]["value"].get("legacy_event_ids") != legacy_event_ids
+            or activated_contract["expected_legacy_v1_event_ids"] != []
+            or activated_contract["expected_legacy_v1_events_sha256"] is not None
+            or activated_contract["expected_projection_quarantine_count"] != 0
+        ):
+            raise LinearProjectionError("projection_v2_activation_readback_mismatch")
+        initial = activated
+        observed_contract = activated_contract
+        active_heads = _active_heads(initial)
+        latest_heads = _latest_heads(initial)
+
+    receipts: list[dict[str, Any]] = (
+        [activation_receipt] if activation_receipt is not None else []
+    )
     expected_revision = initial.revision
     expected_active_heads = dict(active_heads)
     expected_latest_heads = dict(latest_heads)
@@ -289,6 +376,16 @@ def reconcile_required_projection(
         state = adapter.state()
         if projection_review_contract(state) != _contract_from_heads(
             expected_revision, expected_active_heads,
+            legacy_event_ids=observed_contract["expected_legacy_v1_event_ids"],
+            legacy_events_sha256=observed_contract[
+                "expected_legacy_v1_events_sha256"
+            ],
+            quarantine_count=observed_contract[
+                "expected_projection_quarantine_count"
+            ],
+            quarantine_sha256=observed_contract[
+                "expected_projection_quarantine_sha256"
+            ],
         ):
             raise LinearProjectionError("projection_changed_during_reconcile")
         identity = (item["kind"], item["key"])
@@ -306,7 +403,15 @@ def reconcile_required_projection(
             ),
             authority=adapter.authority,
         )
-        receipts.append(adapter.append(event))
+        receipts.append(adapter.append(
+            event,
+            expected_quarantine_count=observed_contract[
+                "expected_projection_quarantine_count"
+            ],
+            expected_quarantine_sha256=observed_contract[
+                "expected_projection_quarantine_sha256"
+            ],
+        ))
         expected_revision += 1
         expected_latest_heads[identity] = event
         if item["value"] == TOMBSTONE:
@@ -315,10 +420,34 @@ def reconcile_required_projection(
             expected_active_heads[identity] = event
         if projection_review_contract(adapter.state()) != _contract_from_heads(
             expected_revision, expected_active_heads,
+            legacy_event_ids=observed_contract["expected_legacy_v1_event_ids"],
+            legacy_events_sha256=observed_contract[
+                "expected_legacy_v1_events_sha256"
+            ],
+            quarantine_count=observed_contract[
+                "expected_projection_quarantine_count"
+            ],
+            quarantine_sha256=observed_contract[
+                "expected_projection_quarantine_sha256"
+            ],
         ):
             raise LinearProjectionError("projection_changed_during_reconcile")
 
     final = adapter.state()
+    if projection_review_contract(final) != _contract_from_heads(
+        expected_revision, expected_active_heads,
+        legacy_event_ids=observed_contract["expected_legacy_v1_event_ids"],
+        legacy_events_sha256=observed_contract[
+            "expected_legacy_v1_events_sha256"
+        ],
+        quarantine_count=observed_contract[
+            "expected_projection_quarantine_count"
+        ],
+        quarantine_sha256=observed_contract[
+            "expected_projection_quarantine_sha256"
+        ],
+    ):
+        raise LinearProjectionError("projection_final_contract_mismatch")
     active: dict[tuple[str, str], dict[str, Any]] = {}
     for event in final.events:
         identity = (event["kind"], event["key"])

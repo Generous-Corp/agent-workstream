@@ -1,0 +1,14 @@
+# Agent Workstream's release gate. The suites are platform-neutral and fast;
+# this target lets Shipyard durably own exact-head validation and landing.
+
+[project]
+name = "agent-workstream"
+type = "python"
+platforms = ["macos"]
+
+[validation.default]
+command = "python3 -m unittest discover -s tests && python3 -m unittest discover -s plugins/workstream/skills/workstream-ledger/scripts"
+
+[targets.mac]
+backend = "local"
+platform = "macos-arm64"

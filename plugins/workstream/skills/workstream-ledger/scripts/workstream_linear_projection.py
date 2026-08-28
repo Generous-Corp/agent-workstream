@@ -153,9 +153,9 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             or not isinstance(legacy_ids, list)
             or len(legacy_ids) != len(set(legacy_ids))
             or not all(isinstance(item, str) and item for item in legacy_ids)
-            or value["legacy_events_sha256"] != hashlib.sha256(
-                _canonical(sorted(legacy_ids))
-            ).hexdigest()
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(value["legacy_events_sha256"])
+            )
         ):
             raise LinearProjectionError("invalid_projection_cas_activation")
     if event["kind"] == "quarantine_disposition":
@@ -450,6 +450,10 @@ def reduce_projection_comments(
             )
             reviewed = set(reviewed_ids)
             quarantined = [event for event in legacy if event["event_id"] not in reviewed]
+            if activation["value"]["legacy_events_sha256"] != hashlib.sha256(
+                _canonical(accepted_legacy)
+            ).hexdigest():
+                raise LinearProjectionError("projection_v2_activation_legacy_digest_mismatch")
     for index, event in enumerate(accepted_legacy):
         if event["expected_revision"] > index:
             raise LinearProjectionError(
@@ -614,19 +618,34 @@ class LinearProjectionAdapter:
             raise LinearProjectionError("linear_comment_create_id_capability_unavailable")
         self._comment_id_capability_verified = True
 
-    def activate_v2(self, *, created_at: str) -> dict[str, Any] | None:
+    def activate_v2(
+        self, *, created_at: str, expected_revision: int | None = None,
+        expected_legacy_event_ids: list[str] | None = None,
+        expected_legacy_events_sha256: str | None = None,
+    ) -> dict[str, Any] | None:
         """Fence reviewed v1 history before accepting any v2 CAS writes."""
         before = self.state()
         if any(event["schema_version"] == 2 for event in before.events) or not before.events:
             return None
         legacy_ids = [event["event_id"] for event in before.events]
+        legacy_events_sha256 = hashlib.sha256(
+            _canonical(list(before.events))
+        ).hexdigest()
+        if (
+            expected_revision is not None and before.revision != expected_revision
+        ) or (
+            expected_legacy_event_ids is not None
+            and legacy_ids != expected_legacy_event_ids
+        ) or (
+            expected_legacy_events_sha256 is not None
+            and legacy_events_sha256 != expected_legacy_events_sha256
+        ):
+            raise LinearProjectionError("projection_v2_activation_stale_reload_required")
         event = build_projection_event(
             workstream_id=self.workstream_id, kind="cas_activation", key="root",
             value={
                 "legacy_event_ids": legacy_ids,
-                "legacy_events_sha256": hashlib.sha256(
-                    _canonical(sorted(legacy_ids))
-                ).hexdigest(),
+                "legacy_events_sha256": legacy_events_sha256,
             },
             plan_revision=self.plan_revision, expected_revision=before.revision,
             created_at=created_at, authority=self.authority,
@@ -695,11 +714,29 @@ class LinearProjectionAdapter:
             } if all((self.workspace_id, self.team_id, self.project_id, self.root_issue_id)) else None,
         )
 
-    def append(self, event: dict[str, Any]) -> dict[str, Any]:
+    def append(
+        self, event: dict[str, Any], *,
+        expected_quarantine_count: int | None = None,
+        expected_quarantine_sha256: str | None = None,
+    ) -> dict[str, Any]:
         validate_projection_event(event)
+        if (expected_quarantine_count is None) != (
+            expected_quarantine_sha256 is None
+        ):
+            raise LinearProjectionError("projection_quarantine_fence_incomplete")
         if event["workstream_id"] != self.workstream_id or event["plan_revision"] != self.plan_revision:
             raise LinearProjectionError("projection_route_or_plan_mismatch")
         before = self.state()
+        if expected_quarantine_count is not None or expected_quarantine_sha256 is not None:
+            quarantine = before.snapshot.get("projection_quarantined") or []
+            if (
+                len(quarantine) != expected_quarantine_count
+                or hashlib.sha256(_canonical(quarantine)).hexdigest()
+                != expected_quarantine_sha256
+            ):
+                raise LinearProjectionError(
+                    "projection_quarantine_changed_reload_required"
+                )
         existing_id = before.remote_ids.get(event["event_id"])
         if existing_id:
             existing = next(item for item in before.events if item["event_id"] == event["event_id"])
@@ -767,6 +804,16 @@ class LinearProjectionAdapter:
                 or comment.get("id") != slot_id):
             raise LinearProjectionError("Linear comment creation returned no durable receipt")
         after = self.state()
+        if expected_quarantine_count is not None or expected_quarantine_sha256 is not None:
+            quarantine = after.snapshot.get("projection_quarantined") or []
+            if (
+                len(quarantine) != expected_quarantine_count
+                or hashlib.sha256(_canonical(quarantine)).hexdigest()
+                != expected_quarantine_sha256
+            ):
+                raise LinearProjectionError(
+                    "projection_quarantine_changed_reload_required"
+                )
         if after.remote_ids.get(event["event_id"]) != comment["id"]:
             raise LinearProjectionError("projection_append_not_observed")
         return {"event_id": event["event_id"], "remote_id": comment["id"], "revision": after.revision}
