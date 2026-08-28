@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,10 @@ COMMAND_TIMEOUT_SECONDS = 180
 TERMINATION_TIMEOUT_SECONDS = 5
 STATE_ROOT = Path.home() / ".local/state/agent-workstream"
 MANIFESTS = {"codex": ".codex-plugin/plugin.json", "claude": ".claude-plugin/plugin.json"}
+MIRROR_MARKER = ".agent-workstream-skill-sync.json"
+MIRROR_TRANSACTION_PREFIX = ".agent-workstream-skill-txn-"
+MIRROR_OWNERSHIP = ".agent-workstream-skill-ownership.json"
+MIRROR_SCHEMA = 1
 
 
 class InstallError(RuntimeError):
@@ -97,6 +102,374 @@ def tree_digest(path: Path) -> str:
         elif item.is_dir():
             digest.update(b"dir\0")
     return digest.hexdigest()
+
+
+def safe_skill_digest(path: Path) -> str:
+    """Digest one skill tree while refusing links and non-regular content."""
+    if path.is_symlink() or not path.is_dir():
+        raise InstallError(f"unsafe_skill_directory:{path}")
+    for walk_root, directories, files in os.walk(path, followlinks=False):
+        root_path = Path(walk_root)
+        for name in directories + files:
+            item = root_path / name
+            if item.is_symlink():
+                raise InstallError(f"unsafe_skill_symlink:{item}")
+            if not item.is_dir() and not item.is_file():
+                raise InstallError(f"unsafe_skill_entry:{item}")
+    return tree_digest(path)
+
+
+def plugin_skill_digests(plugin_root: Path) -> dict[str, str]:
+    skills_root = plugin_root / "skills"
+    if skills_root.is_symlink() or not skills_root.is_dir():
+        raise InstallError(f"source_skills_missing_or_unsafe:{skills_root}")
+    result: dict[str, str] = {}
+    for item in sorted(skills_root.iterdir(), key=lambda value: value.name):
+        if not _safe_skill_name(item.name) or item.is_symlink() or not item.is_dir():
+            raise InstallError(f"unsafe_source_skill_entry:{item}")
+        result[item.name] = safe_skill_digest(item)
+    if not result:
+        raise InstallError("source_skills_empty")
+    return result
+
+
+def _safe_skill_name(name: Any) -> bool:
+    return isinstance(name, str) and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name))
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("x") as handle:
+            handle.write(json.dumps(value, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _remove_tree(path: Path) -> None:
+    if path.is_symlink():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def _unlink_and_fsync(path: Path) -> None:
+    path.unlink()
+    _fsync_directory(path.parent)
+
+
+def _open_safe_mirror_root(mirror_root: Path, *, create: bool) -> tuple[Path, int]:
+    raw = mirror_root.expanduser()
+    if not raw.is_absolute():
+        raise InstallError("skill_mirror_root_must_be_absolute")
+    if ".." in raw.parts or raw == Path("/"):
+        raise InstallError(f"unsafe_skill_mirror_root:{raw}")
+    root = Path(os.path.abspath(raw))
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open("/", flags)
+    try:
+        for component in root.parts[1:]:
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise InstallError(f"skill_mirror_root_missing:{root}")
+                os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                os.fsync(descriptor)
+                child = os.open(component, flags, dir_fd=descriptor)
+            except OSError as error:
+                raise InstallError(f"unsafe_skill_mirror_ancestry:{root}:{component}") from error
+            os.close(descriptor)
+            descriptor = child
+        return root, descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _assert_mirror_root(root: Path, descriptor: int) -> None:
+    observed = os.stat(root, follow_symlinks=False)
+    opened = os.fstat(descriptor)
+    if (not stat.S_ISDIR(observed.st_mode) or
+            (observed.st_dev, observed.st_ino) != (opened.st_dev, opened.st_ino)):
+        raise InstallError(f"skill_mirror_root_redirected:{root}")
+
+
+def _validated_digest_map(value: Any, *, label: str) -> dict[str, str | None]:
+    if not isinstance(value, dict):
+        raise InstallError(f"skill_mirror_{label}_invalid")
+    result: dict[str, str | None] = {}
+    for name, digest in value.items():
+        if not _safe_skill_name(name) or (digest is not None and not re.fullmatch(r"[0-9a-f]{64}", digest)):
+            raise InstallError(f"skill_mirror_{label}_invalid")
+        result[name] = digest
+    return result
+
+
+def _read_ownership(root: Path, *, required: bool) -> dict[str, str] | None:
+    path = root / MIRROR_OWNERSHIP
+    if path.is_symlink():
+        raise InstallError(f"unsafe_skill_mirror_ownership:{path}")
+    if not path.exists():
+        if required:
+            raise InstallError("skill_mirror_ownership_missing")
+        return None
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise InstallError(f"skill_mirror_ownership_invalid:{path}") from error
+    if not isinstance(value, dict) or value.get("schema") != MIRROR_SCHEMA or value.get("plugin") != "workstream":
+        raise InstallError(f"skill_mirror_ownership_invalid:{path}")
+    skills = _validated_digest_map(value.get("skills"), label="ownership")
+    if any(digest is None for digest in skills.values()):
+        raise InstallError(f"skill_mirror_ownership_invalid:{path}")
+    return {name: digest for name, digest in skills.items() if digest is not None}
+
+
+def _write_ownership(root: Path, skills: dict[str, str] | None) -> None:
+    path = root / MIRROR_OWNERSHIP
+    if skills is None:
+        if path.exists():
+            _unlink_and_fsync(path)
+        return
+    _write_json_atomic(path, {"schema": MIRROR_SCHEMA, "plugin": "workstream",
+                              "skills": skills})
+
+
+def _observed_targets(root: Path, names: set[str]) -> dict[str, str | None]:
+    result: dict[str, str | None] = {}
+    for name in sorted(names):
+        target = root / name
+        if target.is_symlink():
+            raise InstallError(f"unsafe_skill_mirror_target_symlink:{target}")
+        if not target.exists():
+            result[name] = None
+        elif not target.is_dir():
+            raise InstallError(f"unsafe_skill_mirror_target:{target}")
+        else:
+            result[name] = safe_skill_digest(target)
+    return result
+
+
+def _mirror_partial_paths(root: Path) -> list[Path]:
+    return sorted([*root.glob(f"{MIRROR_TRANSACTION_PREFIX}*"),
+                   *root.glob(f".{MIRROR_MARKER}.*.tmp"),
+                   *root.glob(f".{MIRROR_OWNERSHIP}.*.tmp")])
+
+
+def _read_journal(root: Path) -> dict[str, Any]:
+    marker = root / MIRROR_MARKER
+    if marker.is_symlink():
+        raise InstallError(f"unsafe_skill_mirror_marker:{marker}")
+    try:
+        value = json.loads(marker.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise InstallError(f"skill_mirror_journal_invalid:{marker}") from error
+    if (not isinstance(value, dict) or value.get("schema") != MIRROR_SCHEMA or
+            value.get("root") != str(root) or
+            value.get("phase") not in {"prepared", "publishing", "committed"}):
+        raise InstallError(f"skill_mirror_journal_invalid:{marker}")
+    transaction = value.get("transaction")
+    if not isinstance(transaction, str) or not transaction.startswith(MIRROR_TRANSACTION_PREFIX):
+        raise InstallError(f"skill_mirror_journal_invalid:{marker}")
+    value["before"] = _validated_digest_map(value.get("before"), label="journal_before")
+    value["after"] = _validated_digest_map(value.get("after"), label="journal_after")
+    affected = value.get("affected")
+    if (not isinstance(affected, list) or not all(_safe_skill_name(name) for name in affected) or
+            len(set(affected)) != len(affected)):
+        raise InstallError(f"skill_mirror_journal_invalid:{marker}")
+    before_ownership = value.get("ownership_before")
+    if before_ownership is not None:
+        before_ownership = _validated_digest_map(before_ownership, label="journal_ownership_before")
+        if any(item is None for item in before_ownership.values()):
+            raise InstallError(f"skill_mirror_journal_invalid:{marker}")
+    after_ownership = _validated_digest_map(value.get("ownership_after"), label="journal_ownership_after")
+    if any(item is None for item in after_ownership.values()):
+        raise InstallError(f"skill_mirror_journal_invalid:{marker}")
+    value["ownership_before"] = before_ownership
+    value["ownership_after"] = after_ownership
+    if set(value["before"]) != set(value["after"]):
+        raise InstallError(f"skill_mirror_journal_invalid:{marker}")
+    if set(affected) != {name for name in value["before"]
+                         if value["before"][name] != value["after"][name]}:
+        raise InstallError(f"skill_mirror_journal_invalid:{marker}")
+    value["affected"] = affected
+    return value
+
+
+def _journal_phase(root: Path, record: dict[str, Any], phase: str) -> None:
+    updated = {**record, "phase": phase}
+    _write_json_atomic(root / MIRROR_MARKER, updated)
+    record["phase"] = phase
+
+
+def _recover_skill_mirror(root: Path, descriptor: int) -> str:
+    record = _read_journal(root)
+    transaction = root / record["transaction"]
+    current = _observed_targets(root, set(record["after"]))
+    ownership = _read_ownership(root, required=False)
+    after_exact = current == record["after"] and ownership == record["ownership_after"]
+    before_exact = current == record["before"] and ownership == record["ownership_before"]
+    transaction_present = transaction.exists() or transaction.is_symlink()
+    if after_exact:
+        if transaction_present:
+            if transaction.is_symlink() or not transaction.is_dir():
+                raise InstallError(f"skill_mirror_transaction_unsafe:{transaction}")
+            _remove_tree(transaction)
+        _unlink_and_fsync(root / MIRROR_MARKER)
+        return "finalized"
+    if not transaction_present and before_exact:
+        _unlink_and_fsync(root / MIRROR_MARKER)
+        return "rolled_back"
+    if record["phase"] == "committed":
+        raise InstallError("skill_mirror_committed_state_mismatch")
+    if transaction.is_symlink() or not transaction.is_dir():
+        raise InstallError(f"skill_mirror_recovery_missing:{transaction}")
+    backup = transaction / "backup"
+    for name in record["affected"]:
+        digest = record["before"][name]
+        saved = backup / name
+        if digest is None:
+            if saved.exists() or saved.is_symlink():
+                raise InstallError(f"skill_mirror_unexpected_backup:{saved}")
+        elif safe_skill_digest(saved) != digest:
+            raise InstallError(f"skill_mirror_backup_mismatch:{name}")
+    rollback = transaction / "rollback"
+    rollback.mkdir(exist_ok=True)
+    for name in record["affected"]:
+        digest = record["before"][name]
+        _assert_mirror_root(root, descriptor)
+        target = root / name
+        if target.exists():
+            _remove_tree(rollback / name)
+            os.replace(target, rollback / name)
+        if digest is not None:
+            shutil.copytree(backup / name, target, symlinks=False)
+        _fsync_directory(root)
+    restored = _observed_targets(root, set(record["before"]))
+    if any(restored[name] != record["before"][name] for name in record["affected"]):
+        raise InstallError("skill_mirror_rollback_verification_failed")
+    _write_ownership(root, record["ownership_before"])
+    _remove_tree(transaction)
+    _unlink_and_fsync(root / MIRROR_MARKER)
+    return "rolled_back"
+
+
+def sync_skill_mirror(plugin_root: Path, mirror_root: Path, *, update: bool,
+                      expected_plugin_digest: str | None = None) -> dict[str, Any]:
+    """Verify or transactionally synchronize plugin-owned global skills."""
+    plugin_digest = tree_digest(plugin_root)
+    if expected_plugin_digest is not None and plugin_digest != expected_plugin_digest:
+        raise InstallError("skill_mirror_source_digest_mismatch")
+    expected = plugin_skill_digests(plugin_root)
+    root, descriptor = _open_safe_mirror_root(mirror_root, create=update)
+    try:
+        recovery = "none"
+        marker = root / MIRROR_MARKER
+        if marker.exists() or marker.is_symlink():
+            if not update:
+                raise InstallError(f"skill_mirror_recovery_required:{marker}")
+            recovery = _recover_skill_mirror(root, descriptor)
+        partial = _mirror_partial_paths(root)
+        if partial:
+            raise InstallError(f"skill_mirror_partial_state:{partial[0]}")
+        ownership = _read_ownership(root, required=not update)
+        prior = ownership or {}
+        obsolete = set(prior) - set(expected)
+        observed = _observed_targets(root, set(expected) | obsolete)
+        if obsolete and not update:
+            raise InstallError(f"skill_mirror_obsolete_owned:{','.join(sorted(obsolete))}")
+        for name in obsolete:
+            if observed[name] is None:
+                raise InstallError(f"skill_mirror_obsolete_owned_missing:{name}")
+            if observed[name] != prior[name]:
+                raise InstallError(f"skill_mirror_obsolete_owned_modified:{name}")
+        exact = (ownership == expected and
+                 all(observed.get(name) == digest for name, digest in expected.items()) and
+                 not obsolete)
+        if exact:
+            if tree_digest(plugin_root) != plugin_digest:
+                raise InstallError("skill_mirror_source_changed_during_verification")
+            return {"status": "verified", "root": str(root), "changed": False,
+                    "recovery": recovery, "plugin_tree_sha256": plugin_digest,
+                    "skills": expected, "retired": []}
+        if not update:
+            mismatches = sorted(name for name, digest in expected.items()
+                                if observed.get(name) != digest)
+            raise InstallError(f"skill_mirror_digest_mismatch:{','.join(mismatches)}")
+
+        affected = {name for name, digest in expected.items() if observed.get(name) != digest} | obsolete
+        transaction = Path(tempfile.mkdtemp(prefix=MIRROR_TRANSACTION_PREFIX, dir=root))
+        stage = transaction / "stage"
+        backup = transaction / "backup"
+        stage.mkdir()
+        backup.mkdir()
+        before = {name: observed.get(name) for name in sorted(set(expected) | obsolete)}
+        after = {name: expected.get(name) for name in sorted(set(expected) | obsolete)}
+        record: dict[str, Any] = {
+            "schema": MIRROR_SCHEMA, "root": str(root), "phase": "prepared",
+            "transaction": transaction.name, "before": before, "after": after,
+            "affected": sorted(affected),
+            "ownership_before": ownership, "ownership_after": expected,
+        }
+        try:
+            for name in affected:
+                if name in expected:
+                    shutil.copytree(plugin_root / "skills" / name, stage / name, symlinks=False)
+                    if safe_skill_digest(stage / name) != expected[name]:
+                        raise InstallError(f"skill_mirror_stage_mismatch:{name}")
+                if before[name] is not None:
+                    shutil.copytree(root / name, backup / name, symlinks=False)
+                    if safe_skill_digest(backup / name) != before[name]:
+                        raise InstallError(f"skill_mirror_backup_mismatch:{name}")
+            _write_json_atomic(marker, record)
+            _journal_phase(root, record, "publishing")
+            retired = transaction / "retired"
+            retired.mkdir()
+            for name in sorted(affected):
+                _assert_mirror_root(root, descriptor)
+                target = root / name
+                if target.exists():
+                    os.replace(target, retired / name)
+                if after[name] is not None:
+                    os.replace(stage / name, target)
+                _fsync_directory(root)
+            if _observed_targets(root, set(after)) != after:
+                raise InstallError("skill_mirror_post_update_mismatch")
+            if tree_digest(plugin_root) != plugin_digest:
+                raise InstallError("skill_mirror_source_changed_during_update")
+            _write_ownership(root, expected)
+            _journal_phase(root, record, "committed")
+        except Exception:
+            if marker.exists():
+                try:
+                    _recover_skill_mirror(root, descriptor)
+                except Exception as rollback_error:
+                    raise InstallError(f"skill_mirror_rollback_failed:{rollback_error}") from rollback_error
+            else:
+                _remove_tree(transaction)
+            raise
+        _remove_tree(transaction)
+        _unlink_and_fsync(marker)
+        return {"status": "verified", "root": str(root), "changed": True,
+                "recovery": recovery, "plugin_tree_sha256": plugin_digest,
+                "skills": expected, "retired": sorted(obsolete)}
+    finally:
+        os.close(descriptor)
 
 
 def manifest_version(plugin_root: Path, client: str) -> str:
@@ -462,16 +835,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--codex-home", type=Path)
     parser.add_argument("--claude-config-dir", type=Path)
+    parser.add_argument(
+        "--skill-mirror-root", type=Path,
+        help="explicit shared/global skill root to verify or synchronize",
+    )
     parser.add_argument("--client", action="append", choices=CLIENTS, dest="clients")
     args = parser.parse_args(argv)
     clients = tuple(dict.fromkeys(args.clients or CLIENTS))
     try:
         validate_identity(args.expected_commit, args.expected_version, args.host_id)
+        if args.skill_mirror_root is not None and set(clients) != set(CLIENTS):
+            raise InstallError("skill_mirror_requires_both_clients")
         source = verify_source(args.source_root, expected_commit=args.expected_commit,
                                expected_version=args.expected_version)
         source_root = Path(source["path"])
         with ProcessLock(STATE_ROOT / "plugin-update.lock",
                          exclusive=args.mode == "update"):
+            mirror_receipt = None
             receipts: list[dict[str, Any]] = []
             for client in clients:
                 journal: TransactionJournal | None = None
@@ -556,16 +936,37 @@ def main(argv: list[str] | None = None) -> int:
                             item["recovery"] = "required"
                             item["journal_error"] = str(journal_error)
                     receipts.append(item)
+            if args.skill_mirror_root is not None:
+                if all(item["status"] == "verified" for item in receipts):
+                    try:
+                        mirror_receipt = sync_skill_mirror(
+                            source_root / "plugins/workstream", args.skill_mirror_root,
+                            update=args.mode == "update",
+                            expected_plugin_digest=source["tree_sha256"],
+                        )
+                    except (InstallError, OSError, ValueError) as error:
+                        mirror_receipt = {
+                            "status": "refused", "root": str(args.skill_mirror_root),
+                            "changed": False, "error": str(error),
+                        }
+                else:
+                    mirror_receipt = {
+                        "status": "preserved", "root": str(args.skill_mirror_root),
+                        "changed": False, "error": "clients_not_verified",
+                    }
     except (InstallError, OSError, ValueError) as error:
         print(json.dumps({"status": "refused", "host_id": args.host_id,
                           "error": str(error)}, sort_keys=True))
         return 2
     verified_count = sum(item["status"] == "verified" for item in receipts)
-    status = "verified" if verified_count == len(receipts) else ("partial" if verified_count else "refused")
+    all_surfaces_verified = (verified_count == len(receipts) and
+                             (mirror_receipt is None or mirror_receipt["status"] == "verified"))
+    status = "verified" if all_surfaces_verified else ("partial" if verified_count else "refused")
     print(json.dumps({"status": status, "host_id": args.host_id,
                       "expected_commit": args.expected_commit,
                       "expected_version": args.expected_version,
-                      "source": source, "clients": receipts},
+                      "source": source, "skill_mirror": mirror_receipt,
+                      "clients": receipts},
                      indent=2, sort_keys=True))
     return 0 if status == "verified" else 2
 

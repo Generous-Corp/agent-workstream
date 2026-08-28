@@ -130,6 +130,12 @@ checkpoint history. It uses the latest durable event next action and, when one
 exists, returns the acknowledged checkpoint's machine, worktree, exact head,
 evidence, blocker, and provenance chain. Unimplemented surfaces remain named in
 `surface_availability` instead of being inferred from local session state.
+Normal resume validates the complete history, preserves current child details
+and exact uncheckpointed requirements/blockers/decisions/follow-ups. It keeps
+actionable checkpoint evidence while binding evidence, provenance, validated
+routing detail, and older history with counts/digests. Add `--include-history`
+for an audit or closure pass; explicit
+byte/item caps still fail loudly rather than truncating required current state.
 Full-authority output requires the append-only scope, source, provenance, and
 attach/successor disposition projection. A reviewed projection manifest can be
 applied idempotently with `workstreamctl projection GEN-123 manifest.json

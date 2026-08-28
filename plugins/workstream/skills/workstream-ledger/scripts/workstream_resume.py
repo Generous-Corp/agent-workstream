@@ -10,6 +10,7 @@ before an agent edits anything.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -44,6 +45,11 @@ from workstream_scope import repository_key, ScopeError, validate_relations, val
 
 TOKEN = re.compile(r"\b[A-Z][A-Z0-9]*-\d+\b", re.I)
 TERMINAL = {"done", "cancelled", "canceled", "superseded"}
+MATERIAL_OBLIGATION_TERMS = ("requirement", "blocker", "blocked", "followup", "decision")
+MATERIAL_OBLIGATION_KEYS = {
+    "requirement", "requirements", "blocker", "blockers",
+    "followup", "followups", "decision", "decisions",
+}
 
 
 class ResumeError(ValueError):
@@ -86,6 +92,98 @@ def _event_next_actions(event: dict[str, Any]) -> set[str]:
     if len(actions) > 1:
         raise ResumeError(f"conflicting_event_next_action:{event['event_id']}")
     return actions
+
+
+def _uncheckpointed_material_obligations(
+    events: list[dict[str, Any]], checkpoint_revision: int,
+) -> list[dict[str, Any]]:
+    """Preserve unresolved intent after the last acknowledged checkpoint.
+
+    Evidence and progress remain available through the history digest/full audit
+    mode. Requirements, blockers, follow-ups, and decisions cannot be replaced
+    by a digest because a fresh agent must be able to act on their exact text.
+    """
+    result: list[dict[str, Any]] = []
+
+    def append(event: dict[str, Any], kind: str, payload: dict[str, Any]) -> None:
+        lowered = kind.lower()
+        selected = payload if any(term in lowered for term in MATERIAL_OBLIGATION_TERMS) else {
+            key: value for key, value in payload.items() if key in MATERIAL_OBLIGATION_KEYS
+        }
+        if selected:
+            result.append({
+                "event_id": event["event_id"], "kind": kind, "payload": selected,
+            })
+
+    for index, event in enumerate(events):
+        # expected_revision is the writer's observation and may be shared by
+        # concurrent appenders. The canonical reduced-log position is what a
+        # checkpoint root_revision actually fences.
+        if index < checkpoint_revision:
+            continue
+        append(event, event["kind"], event["payload"])
+        if event["kind"] == "material_boundary":
+            for change in event["payload"]["changes"]:
+                append(event, change["kind"], change["payload"])
+    return result
+
+
+def _compact_checkpoint(checkpoint: dict[str, Any] | None) -> dict[str, Any] | None:
+    if checkpoint is None:
+        return None
+    evidence = checkpoint["evidence"]
+    provenance = checkpoint["provenance_chain"]
+    result = {
+        key: checkpoint[key]
+        for key in (
+            "workstream_id", "checkpoint_event_id", "root_revision", "plan_revision",
+            "status", "exact_head", "blocker", "next_action", "worktree",
+            "acknowledgement",
+        )
+    }
+    result["evidence"] = {
+        "count": len(evidence),
+        "items": evidence,
+        "sha256": hashlib.sha256(json.dumps(
+            evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest(),
+    }
+    result["provenance"] = {
+        "count": len(provenance),
+        "latest": provenance[-1],
+        "sha256": hashlib.sha256(json.dumps(
+            provenance, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest(),
+    }
+    return result
+
+
+def _compact_scope(scope: dict[str, Any] | None) -> dict[str, Any] | None:
+    if scope is None:
+        return None
+    linear = scope["linear"]
+    repositories = []
+    for repository in scope["repositories"]:
+        repositories.append({
+            key: repository[key]
+            for key in (
+                "slug", "aliases", "exact_head", "provider_repository_id",
+            )
+            if key in repository
+        })
+    return {
+        "namespace": scope["namespace"],
+        "linear": {
+            key: linear[key]
+            for key in ("workspace_id", "team_id", "project_id", "root_issue_id")
+        },
+        "primary_repository": scope["primary_repository"],
+        "repositories": repositories,
+        "child_ownership": scope["child_ownership"],
+        "validated_sha256": hashlib.sha256(json.dumps(
+            scope, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest(),
+    }
 
 
 def add_material_history(
@@ -166,9 +264,10 @@ def validate_snapshot(
     snapshot: dict[str, Any], token: str | None = None, *,
     require_projection_authority: bool = False,
 ) -> dict[str, Any]:
-    root = snapshot.get("root")
-    if not isinstance(root, dict):
+    source_root = snapshot.get("root")
+    if not isinstance(source_root, dict):
         raise ResumeError("missing root")
+    root = dict(source_root)
     identifier = root.get("identifier") or root.get("id")
     if not isinstance(identifier, str) or not TOKEN.fullmatch(identifier.upper()):
         raise ResumeError("root must contain one Linear issue identifier")
@@ -193,6 +292,7 @@ def validate_snapshot(
     if not isinstance(material_events, list):
         raise ResumeError("material_events must be a list")
     event_ids: set[str] = set()
+    next_actions_by_revision: dict[int, set[str]] = {}
     for index, event in enumerate(material_events):
         if not isinstance(event, dict):
             raise ResumeError(f"invalid_material_event:{index}")
@@ -215,6 +315,12 @@ def validate_snapshot(
         expected = event["expected_revision"]
         if not isinstance(expected, int) or expected < 0 or expected > index:
             raise ResumeError(f"invalid_material_event_revision:{event['event_id']}")
+        for value in _event_next_actions(event):
+            actions = next_actions_by_revision.setdefault(expected, set())
+            actions.add(value)
+            if len(actions) > 1:
+                raise ResumeError(f"conflicting_concurrent_next_action:{expected}")
+            root["next_action"] = value
     material_revision = snapshot.get("material_event_revision")
     if events_present and (
         material_revision != len(material_events) or root["revision"] != material_revision
@@ -474,6 +580,7 @@ def validate_snapshot(
 def compact_context(
     snapshot: dict[str, Any], token: str, max_bytes: int = 16 * 1024,
     max_items: int = 100, *, require_projection_authority: bool = False,
+    include_history: bool = False,
 ) -> dict[str, Any]:
     normalized_token = extract_token(token)
     clean = validate_snapshot(
@@ -481,10 +588,43 @@ def compact_context(
         require_projection_authority=require_projection_authority,
     )
     root = clean["root"]
-    children = [
-        child for child in clean["children"]
-        if str(child.get("status", "")).lower() not in TERMINAL
-    ]
+    children = []
+    for child in clean["children"]:
+        if str(child.get("status", "")).lower() in TERMINAL:
+            continue
+        children.append(dict(child) if include_history else {
+            key: value for key, value in child.items()
+            if key not in {"parent", "project", "team"}
+        })
+
+    def history_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+        encoded = json.dumps(
+            events, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()
+        latest = events[-1] if events else None
+        return {
+            "count": len(events),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "latest": ({
+                key: latest[key]
+                for key in ("event_id", "kind", "key", "created_at")
+                if latest.get(key) is not None
+            } if latest else None),
+        }
+
+    history = {
+        "included": include_history,
+        "material_events": history_summary(clean["material_events"]),
+        "projection_events": history_summary(clean["projection_events"]),
+        "projection_history": history_summary(clean["projection_history"]),
+    }
+    checkpoint_revision = (
+        clean["latest_checkpoint"]["root_revision"]
+        if clean["latest_checkpoint"] is not None else 0
+    )
+    material_obligations = _uncheckpointed_material_obligations(
+        clean["material_events"], checkpoint_revision,
+    )
     context = {
         "workstream_id": root["identifier"].upper(),
         "context_url": root["url"],
@@ -496,34 +636,42 @@ def compact_context(
         "children": children,
         "decisions": clean["decisions"],
         "choice_events": clean["choice_events"],
-        "scope": clean["scope"],
+        "scope": clean["scope"] if include_history else _compact_scope(clean["scope"]),
         "relations": clean["relations"],
         "evidence_contracts": clean["evidence_contracts"],
         "surface_availability": clean["surface_availability"],
         "provenance": clean["provenance"],
-        "material_events": clean["material_events"],
         "material_event_revision": clean["material_event_revision"],
-        "latest_checkpoint": clean["latest_checkpoint"],
+        "latest_checkpoint": (
+            clean["latest_checkpoint"] if include_history
+            else _compact_checkpoint(clean["latest_checkpoint"])
+        ),
         "checkpoint_recovery": clean["checkpoint_recovery"],
+        "uncheckpointed_material_obligations": material_obligations,
         "source": clean.get("source"),
         "disposition": clean.get("disposition"),
-        "projection_events": clean["projection_events"],
-        "projection_history": clean["projection_history"],
         "projection_revision": clean["projection_revision"],
         "projection_recovery": clean["projection_recovery"],
         "authenticated_route": clean["authenticated_route"],
         "authenticated_source": clean["authenticated_source"],
+        "history": history,
         "resume_authority": (
             "full" if require_projection_authority else "inspection_only"
         ),
     }
+    if include_history:
+        context["material_events"] = clean["material_events"]
+        context["projection_events"] = clean["projection_events"]
+        context["projection_history"] = clean["projection_history"]
     item_count = sum(
         len(value) for value in (
             context["children"], context["decisions"], context["choice_events"],
             context["relations"], context["provenance"],
-            context["evidence_contracts"], context["material_events"],
-            context["projection_events"],
-            context["projection_history"],
+            context["evidence_contracts"],
+            context["uncheckpointed_material_obligations"],
+            context.get("material_events", []),
+            context.get("projection_events", []),
+            context.get("projection_history", []),
             (context["latest_checkpoint"] or {}).get("provenance_chain", []),
         )
     )
@@ -546,6 +694,10 @@ def main() -> int:
     parser.add_argument("--linear-endpoint", default="https://api.linear.app/graphql")
     parser.add_argument("--max-bytes", type=int, default=16 * 1024)
     parser.add_argument("--max-items", type=int, default=100)
+    parser.add_argument(
+        "--include-history", action="store_true",
+        help="include complete validated material/projection history instead of digests and counts",
+    )
     parser.add_argument(
         "--plan-source",
         help="authenticated path or URL whose exact bytes must match the projected source",
@@ -623,6 +775,7 @@ def main() -> int:
         output = compact_context(
             snapshot, token, args.max_bytes, args.max_items,
             require_projection_authority=not args.inspection_only,
+            include_history=args.include_history,
         )
     except (
         OSError, json.JSONDecodeError, ResumeError, LinearTransportError,

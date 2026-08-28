@@ -30,9 +30,19 @@ class ResumeTests(unittest.TestCase):
                 "decisions": [{"id": "D1", "status": "accepted"}], "provenance": [{"machine": "M3"}]}
 
     def test_compact_context_keeps_root_and_only_nonterminal_children(self):
-        context = MODULE.compact_context(self.snapshot(), "GEN-37")
+        snapshot = self.snapshot()
+        snapshot["children"][0]["description"] = "large redundant prose"
+        snapshot["children"][0]["owner"] = "agent"
+        snapshot["children"][0]["blocker"] = {"text": "waiting"}
+        context = MODULE.compact_context(snapshot, "GEN-37")
         self.assertEqual(context["workstream_id"], "GEN-37")
         self.assertEqual([c["identifier"] for c in context["children"]], ["GEN-38"])
+        self.assertEqual(context["children"][0]["description"], "large redundant prose")
+        self.assertEqual(context["children"][0]["owner"], "agent")
+        self.assertEqual(context["children"][0]["blocker"], {"text": "waiting"})
+
+        full = MODULE.compact_context(snapshot, "GEN-37", include_history=True)
+        self.assertEqual(full["children"][0], snapshot["children"][0])
 
     def test_token_mismatch_fails_closed(self):
         with self.assertRaises(MODULE.ResumeError):
@@ -108,7 +118,16 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(context["material_event_revision"], 2)
         self.assertEqual(context["next_action"], "current")
         self.assertEqual(enriched["root"]["issue_revision"], 91)
-        self.assertEqual([event["event_id"] for event in context["material_events"]], ["event-a", "event-b"])
+        self.assertNotIn("material_events", context)
+        self.assertEqual(context["history"]["material_events"]["count"], 2)
+        self.assertEqual(context["history"]["material_events"]["latest"]["event_id"], "event-b")
+
+        full = MODULE.compact_context(enriched, "GEN-37", include_history=True)
+        self.assertEqual(
+            [event["event_id"] for event in full["material_events"]],
+            ["event-a", "event-b"],
+        )
+        self.assertTrue(full["history"]["included"])
 
     def test_material_history_recovers_latest_checkpoint_provenance(self):
         snapshot = self.snapshot()
@@ -138,8 +157,17 @@ class ResumeTests(unittest.TestCase):
         )
 
         self.assertEqual(context["latest_checkpoint"]["worktree"]["path"], "/repo/worktree")
-        self.assertEqual(context["latest_checkpoint"]["provenance_chain"][0]["machine"], "M5")
+        self.assertEqual(context["latest_checkpoint"]["provenance"]["latest"]["machine"], "M5")
+        self.assertEqual(context["latest_checkpoint"]["evidence"]["items"], [
+            {"kind": "test", "id": "unit"},
+        ])
+        self.assertRegex(context["latest_checkpoint"]["provenance"]["sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(context["surface_availability"]["latest_checkpoint"], "available")
+        full = MODULE.compact_context(
+            MODULE.add_material_history(snapshot, comments, "GEN-37"), "GEN-37",
+            include_history=True,
+        )
+        self.assertEqual(full["latest_checkpoint"]["provenance_chain"][0]["machine"], "M5")
 
     def test_material_history_exposes_absent_checkpoint_without_fabrication(self):
         context = MODULE.compact_context(
@@ -267,6 +295,63 @@ class ResumeTests(unittest.TestCase):
                 "GEN-37",
             )
 
+    def test_direct_snapshot_malformed_material_boundary_fails_closed(self):
+        snapshot = self.snapshot()
+        snapshot["root"]["revision"] = 1
+        snapshot["material_events"] = [{
+            "event_id": "event-boundary", "workstream_id": "GEN-37",
+            "kind": "material_boundary", "source": "user_turn",
+            "payload": {"boundary_id": "turn-1", "changes": "not-a-list"},
+            "expected_revision": 0, "created_at": "2026-08-21T00:00:00Z",
+        }]
+        snapshot["material_event_revision"] = 1
+        with self.assertRaisesRegex(MODULE.ResumeError, "malformed_material_boundary"):
+            MODULE.compact_context(snapshot, "GEN-37")
+
+    def test_uncheckpointed_requirement_payload_is_not_replaced_by_digest(self):
+        snapshot = self.snapshot()
+        snapshot["root"]["revision"] = 1
+        snapshot["material_events"] = [{
+            "event_id": "requirement-1", "workstream_id": "GEN-37",
+            "kind": "requirement", "source": "user_turn",
+            "payload": {"requirement": "must preserve offline recovery"},
+            "expected_revision": 0, "created_at": "2026-08-21T00:00:00Z",
+        }]
+        snapshot["material_event_revision"] = 1
+        context = MODULE.compact_context(snapshot, "GEN-37")
+        self.assertEqual(context["uncheckpointed_material_obligations"], [{
+            "event_id": "requirement-1", "kind": "requirement",
+            "payload": {"requirement": "must preserve offline recovery"},
+        }])
+
+    def test_checkpoint_fence_uses_ordered_position_not_stale_writer_revision(self):
+        prefix = {
+            "event_id": "progress-1", "workstream_id": "GEN-37", "kind": "progress",
+            "source": "agent", "payload": {}, "expected_revision": 0,
+            "created_at": "2026-08-21T00:00:00Z",
+        }
+        cases = (
+            ("requirement", {"requirement": "R"}, "requirement"),
+            ("blocker", {"blocker": "B"}, "blocker"),
+            ("decision", {"decision": "D"}, "decision"),
+            ("followup", {"followup": "F"}, "followup"),
+            ("material_boundary", {"boundary_id": "b", "changes": [
+                {"kind": "requirement", "payload": {"requirement": "nested"}},
+            ]}, "requirement"),
+        )
+        for kind, payload, expected_kind in cases:
+            with self.subTest(kind=kind):
+                concurrent = {
+                    "event_id": f"{kind}-2", "workstream_id": "GEN-37", "kind": kind,
+                    "source": "agent", "payload": payload, "expected_revision": 0,
+                    "created_at": "2026-08-21T00:00:01Z",
+                }
+                obligations = MODULE._uncheckpointed_material_obligations(
+                    [prefix, concurrent], checkpoint_revision=1,
+                )
+                self.assertEqual(len(obligations), 1)
+                self.assertEqual(obligations[0]["kind"], expected_kind)
+
     def test_material_history_counts_toward_item_budget(self):
         snapshot = MODULE.add_material_history(
             self.snapshot(), [{"id": "event", "body": encode_event_comment(Delta(
@@ -275,7 +360,9 @@ class ResumeTests(unittest.TestCase):
             ))}], "GEN-37",
         )
         with self.assertRaisesRegex(MODULE.ResumeError, "over_item_budget"):
-            MODULE.compact_context(snapshot, "GEN-37", max_items=2)
+            MODULE.compact_context(
+                snapshot, "GEN-37", max_items=2, include_history=True,
+            )
 
     def test_resume_preserves_typed_choice_scope_and_relations_when_supplied(self):
         snapshot = self.snapshot()
@@ -320,6 +407,8 @@ class ResumeTests(unittest.TestCase):
         }
         context = MODULE.compact_context(snapshot, "GEN-37")
         self.assertEqual(context["scope"]["linear"]["project_id"], "project")
+        self.assertNotIn("route_verification", context["scope"]["linear"])
+        self.assertRegex(context["scope"]["validated_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(context["relations"][0]["target"]["identifier"], "GEN-50")
         self.assertTrue(all(value == "available" for value in context["surface_availability"].values()))
 
