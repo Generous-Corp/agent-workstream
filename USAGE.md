@@ -65,6 +65,22 @@ The agent records material changes only. Diagnostic conversation with no scope,
 decision, blocker, evidence, or next-action change should produce no ledger
 write.
 
+## Common scenarios
+
+| You want to | Ask the agent to |
+| --- | --- |
+| Start from a plan | `Start a tracked workstream for ./PLAN.md.` |
+| Start from a durable plan URL | `Start a tracked workstream for <URL>.` |
+| Resume elsewhere | `Resume GEN-123 and reconcile live state before continuing.` |
+| Change the work | `Record this new requirement in GEN-123 and continue.` |
+| Inspect progress | `Show status, blockers, and changes since the last checkpoint for GEN-123.` |
+| Hand off safely | `Checkpoint GEN-123 with exact location, head, evidence, and next action.` |
+| Attempt completion | `Adversarially verify whether GEN-123 can close.` |
+
+The Linear URL may be used wherever the stable token is accepted. Starting from
+a local Markdown file is supported, but provide a durable plan identity when
+other machines must be able to retrieve the original artifact.
+
 ## Deterministic helpers
 
 From a checkout of this repository:
@@ -84,7 +100,7 @@ exists, returns the acknowledged checkpoint's machine, worktree, exact head,
 evidence, blocker, and provenance chain. Unimplemented surfaces remain named in
 `surface_availability` instead of being inferred from local session state.
 
-The plugin is not a hosted orchestration service. It installs no hooks,
-monitors, MCP servers, or background workers. Optional ingress and landing
-adapters must be configured separately, and unavailable live surfaces remain
-explicit rather than being inferred from a checkout or transcript.
+Unavailable live surfaces remain explicit rather than being inferred from a
+checkout or transcript. See [BOUNDARIES.md](BOUNDARIES.md) for why the plugin
+does not silently install always-on orchestration and what optional companion
+layers are planned.
