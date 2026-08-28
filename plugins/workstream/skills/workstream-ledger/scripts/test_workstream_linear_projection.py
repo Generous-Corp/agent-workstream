@@ -833,6 +833,129 @@ class ProjectionTests(unittest.TestCase):
             )
         self.assertEqual(len(client.comments), writes_before)
 
+    def test_retired_relation_and_evidence_can_reactivate_same_key(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, workspace_id="workspace", team_id="team",
+            project_id="project", root_issue_id=ROOT_UUID,
+        )
+        base = [
+            {"kind": "scope", "key": "root", "value": scope()},
+            {"kind": "source", "key": "root", "value": {
+                "sha256": PLAN, "identity": "https://example.test/plan",
+            }},
+            {"kind": "provenance", "key": "session", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "session",
+            }},
+        ]
+        relation = {"type": "blocks", "target": {
+            "workspace_id": "workspace", "issue_id": "target-uuid",
+            "identifier": "GEN-14",
+        }}
+        projected = [
+            *base,
+            {"kind": "relation", "key": "blocks:GEN-14", "value": relation},
+            {"kind": "evidence_contract", "key": "gen37-resume",
+             "value": evidence_contract()},
+        ]
+        source = {"identity": "https://example.test/plan", "sha256": PLAN}
+        snapshot = {"root": {"identifier": "GEN-37"}}
+        reconcile_required_projection(
+            adapter, snapshot, reviewed_manifest(adapter, projected),
+            remote_head=HEAD, created_at="2026-08-27T18:00:00Z",
+            authenticated_source=source,
+        )
+        retirements = [
+            reviewed_retirement(adapter, "relation", "blocks:GEN-14"),
+            reviewed_retirement(adapter, "evidence_contract", "gen37-resume"),
+        ]
+        reconcile_required_projection(
+            adapter, snapshot, reviewed_manifest(adapter, base, retirements),
+            remote_head=HEAD, created_at="2026-08-27T19:00:00Z",
+            authenticated_source=source,
+        )
+        retired_state = adapter.state()
+        tombstones = {
+            (event["kind"], event["key"]): event["event_id"]
+            for event in retired_state.events if event["value"] == TOMBSTONE
+        }
+        result = reconcile_required_projection(
+            adapter, snapshot, reviewed_manifest(adapter, projected),
+            remote_head=HEAD, created_at="2026-08-27T20:00:00Z",
+            authenticated_source=source,
+        )
+        state = adapter.state()
+        self.assertEqual(state.snapshot["relations"], [relation])
+        self.assertEqual(state.snapshot["evidence_contracts"], [evidence_contract()])
+        reactivated = {
+            (event["kind"], event["key"]): event
+            for event in state.events
+            if (event["kind"], event["key"]) in tombstones
+            and event["value"] != TOMBSTONE
+        }
+        self.assertEqual(set(reactivated), set(tombstones))
+        for identity, event in reactivated.items():
+            self.assertEqual(event["supersedes_event_id"], tombstones[identity])
+        self.assertEqual(len(result["writes"]), 2)
+
+    def test_reactivation_refuses_stale_tombstone_head_without_writing(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, workspace_id="workspace", team_id="team",
+            project_id="project", root_issue_id=ROOT_UUID,
+        )
+        base = [
+            {"kind": "scope", "key": "root", "value": scope()},
+            {"kind": "source", "key": "root", "value": {
+                "sha256": PLAN, "identity": "https://example.test/plan",
+            }},
+            {"kind": "provenance", "key": "session", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "session",
+            }},
+        ]
+        relation = {"type": "blocks", "target": {
+            "workspace_id": "workspace", "issue_id": "target-uuid",
+            "identifier": "GEN-14",
+        }}
+        projected = [*base, {
+            "kind": "relation", "key": "blocks:GEN-14", "value": relation,
+        }]
+        source = {"identity": "https://example.test/plan", "sha256": PLAN}
+        snapshot = {"root": {"identifier": "GEN-37"}}
+        reconcile_required_projection(
+            adapter, snapshot, reviewed_manifest(adapter, projected),
+            remote_head=HEAD, created_at="2026-08-27T18:00:00Z",
+            authenticated_source=source,
+        )
+        reconcile_required_projection(
+            adapter, snapshot, reviewed_manifest(adapter, base, [
+                reviewed_retirement(adapter, "relation", "blocks:GEN-14"),
+            ]), remote_head=HEAD, created_at="2026-08-27T19:00:00Z",
+            authenticated_source=source,
+        )
+        stale_manifest = reviewed_manifest(adapter, projected)
+        tombstone = next(
+            event for event in reversed(adapter.state().events)
+            if event["kind"] == "relation" and event["key"] == "blocks:GEN-14"
+        )
+        competitor = build_projection_event(
+            workstream_id="GEN-37", kind="relation", key="blocks:GEN-14",
+            value=relation, plan_revision=PLAN,
+            expected_revision=adapter.state().revision,
+            created_at="2026-08-27T19:30:00Z",
+            supersedes_event_id=tombstone["event_id"],
+        )
+        adapter.append(competitor)
+        writes_before = len(client.comments)
+        with self.assertRaisesRegex(LinearProjectionError, "stale_reload_required"):
+            reconcile_required_projection(
+                adapter, snapshot, stale_manifest, remote_head=HEAD,
+                created_at="2026-08-27T20:00:00Z", authenticated_source=source,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+
     def test_product_reconcile_refuses_unverified_source_bytes(self):
         client = FakeProjectionClient()
         adapter = LinearProjectionAdapter(

@@ -48,6 +48,14 @@ def _active_heads(state: Any) -> dict[tuple[str, str], dict[str, Any]]:
     return active
 
 
+def _latest_heads(state: Any) -> dict[tuple[str, str], dict[str, Any]]:
+    """Return the latest event for every key, including tombstone heads."""
+    latest: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in state.events:
+        latest[(event["kind"], event["key"])] = event
+    return latest
+
+
 def projection_review_contract(state: Any) -> dict[str, Any]:
     """Return the exact remote projection surface a manifest must review."""
     return _contract_from_heads(state.revision, _active_heads(state))
@@ -234,6 +242,7 @@ def reconcile_required_projection(
     if observed_contract != reviewed_contract:
         raise LinearProjectionError("projection_review_stale_reload_required")
     active_heads = _active_heads(initial)
+    latest_heads = _latest_heads(initial)
     retirements: list[dict[str, Any]] = []
     for retirement in reviewed_retirements:
         identity = (retirement["kind"], retirement["key"])
@@ -273,32 +282,37 @@ def reconcile_required_projection(
 
     receipts: list[dict[str, Any]] = []
     expected_revision = initial.revision
-    expected_heads = dict(active_heads)
+    expected_active_heads = dict(active_heads)
+    expected_latest_heads = dict(latest_heads)
     for item in [*desired, *retirements]:
         state = adapter.state()
         if projection_review_contract(state) != _contract_from_heads(
-            expected_revision, expected_heads,
+            expected_revision, expected_active_heads,
         ):
             raise LinearProjectionError("projection_changed_during_reconcile")
         identity = (item["kind"], item["key"])
-        current = expected_heads.get(identity)
-        if current is not None and current["value"] == item["value"]:
+        active_current = expected_active_heads.get(identity)
+        if active_current is not None and active_current["value"] == item["value"]:
             continue
+        latest_current = expected_latest_heads.get(identity)
         event = build_projection_event(
             workstream_id=adapter.workstream_id,
             kind=item["kind"], key=item["key"], value=item["value"],
             plan_revision=adapter.plan_revision,
             expected_revision=expected_revision, created_at=created_at,
-            supersedes_event_id=current["event_id"] if current else None,
+            supersedes_event_id=(
+                latest_current["event_id"] if latest_current else None
+            ),
         )
         receipts.append(adapter.append(event))
         expected_revision += 1
+        expected_latest_heads[identity] = event
         if item["value"] == TOMBSTONE:
-            expected_heads.pop(identity, None)
+            expected_active_heads.pop(identity, None)
         else:
-            expected_heads[identity] = event
+            expected_active_heads[identity] = event
         if projection_review_contract(adapter.state()) != _contract_from_heads(
-            expected_revision, expected_heads,
+            expected_revision, expected_active_heads,
         ):
             raise LinearProjectionError("projection_changed_during_reconcile")
 
