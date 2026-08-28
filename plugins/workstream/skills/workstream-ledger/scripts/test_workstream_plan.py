@@ -2,8 +2,11 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -59,11 +62,16 @@ class PlanIntakeTests(unittest.TestCase):
             f"{commit}/plans/continuity.md"
         )
         missing = self.http_error(source, 404, "Not Found")
-        completed = [
-            subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
-            subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
-            subprocess.CompletedProcess([], 0, stdout=b"# Private exact plan\n", stderr=b""),
-        ]
+        calls = []
+
+        def run(arguments, *, environment, timeout):
+            calls.append((arguments, dict(environment), timeout))
+            wrapper = Path(environment["GIT_SSH"])
+            self.assertTrue(wrapper.is_file())
+            self.assertEqual(wrapper.read_text(encoding="utf-8"), MODULE.SSH_WRAPPER)
+            self.assertEqual(wrapper.stat().st_mode & 0o777, 0o700)
+            return b"# Private exact plan\n" if len(calls) == 3 else b""
+
         with mock.patch.dict(
             MODULE.os.environ,
             {
@@ -73,39 +81,38 @@ class PlanIntakeTests(unittest.TestCase):
             },
             clear=True,
         ), mock.patch.object(MODULE, "urlopen", side_effect=missing), \
-             mock.patch.object(MODULE.subprocess, "run", side_effect=completed) as run:
+             mock.patch.object(MODULE, "_run_bounded", side_effect=run):
             raw, identity = MODULE.source_bytes(source)
 
         self.assertEqual(raw, b"# Private exact plan\n")
         self.assertEqual(identity, source)
-        self.assertEqual(run.call_count, 3)
-        init, fetch, show = run.call_args_list
-        isolated = init.args[0][-1]
-        self.assertEqual(init.args[0][0:4], ["git", "init", "--bare", "--quiet"])
-        self.assertEqual(fetch.args[0], [
+        self.assertEqual(len(calls), 3)
+        init, fetch, show = calls
+        isolated = init[0][-1]
+        self.assertEqual(init[0][0:4], ["git", "init", "--bare", "--quiet"])
+        self.assertEqual(Path(isolated).name, "repository.git")
+        self.assertEqual(fetch[0], [
             "git", "-C", isolated, "fetch", "--quiet", "--no-tags",
             "--depth=1", "git@github.com:Generous-Corp/pulp-planning.git", commit,
         ])
-        self.assertEqual(show.args[0], [
+        self.assertEqual(show[0], [
             "git", "-C", isolated, "show", "--no-ext-diff", "--no-textconv",
             f"{commit}:plans/continuity.md",
         ])
-        self.assertFalse(Path(isolated).exists())
-        for call in run.call_args_list:
-            self.assertIsInstance(call.args[0], list)
-            self.assertNotIn("shell", call.kwargs)
-            self.assertTrue(call.kwargs["check"])
-            self.assertTrue(call.kwargs["capture_output"])
-            self.assertIs(call.kwargs["stdin"], subprocess.DEVNULL)
-            self.assertEqual(call.kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
-            self.assertEqual(call.kwargs["env"]["GIT_CONFIG_NOSYSTEM"], "1")
-            self.assertEqual(call.kwargs["env"]["GIT_CONFIG_GLOBAL"], os.devnull)
-            self.assertNotIn("GITHUB_TOKEN", call.kwargs["env"])
-            self.assertNotIn("GH_TOKEN", call.kwargs["env"])
-            self.assertNotIn("GIT_SSH_COMMAND", call.kwargs["env"])
-        self.assertEqual(init.kwargs["timeout"], MODULE.GIT_SHOW_TIMEOUT_SECONDS)
-        self.assertEqual(fetch.kwargs["timeout"], MODULE.GIT_FETCH_TIMEOUT_SECONDS)
-        self.assertEqual(show.kwargs["timeout"], MODULE.GIT_SHOW_TIMEOUT_SECONDS)
+        self.assertFalse(Path(isolated).parent.exists())
+        for arguments, environment, _timeout in calls:
+            self.assertIsInstance(arguments, list)
+            self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
+            self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
+            self.assertEqual(environment["GIT_CONFIG_GLOBAL"], os.devnull)
+            self.assertEqual(environment["GIT_SSH_VARIANT"], "ssh")
+            self.assertNotIn("GITHUB_TOKEN", environment)
+            self.assertNotIn("GH_TOKEN", environment)
+            self.assertNotIn("GIT_SSH_COMMAND", environment)
+        self.assertEqual(init[2], MODULE.GIT_SHOW_TIMEOUT_SECONDS)
+        self.assertEqual(fetch[2], MODULE.GIT_FETCH_TIMEOUT_SECONDS)
+        self.assertEqual(show[2], MODULE.GIT_SHOW_TIMEOUT_SECONDS)
+        self.assertIn('"-oBatchMode=yes"', MODULE.SSH_WRAPPER)
 
     def test_github_ssh_fallback_refuses_mutable_or_malformed_blob_urls(self):
         invalid = [
@@ -122,10 +129,10 @@ class PlanIntakeTests(unittest.TestCase):
                  mock.patch.object(
                      MODULE, "urlopen",
                      side_effect=self.http_error(source, 404, "Not Found"),
-                 ), mock.patch.object(MODULE.subprocess, "run") as run:
+                 ), mock.patch.object(MODULE, "_github_ssh_blob_bytes") as fallback:
                 with self.assertRaises(MODULE.HTTPError):
                     MODULE.source_bytes(source)
-                run.assert_not_called()
+                fallback.assert_not_called()
 
     def test_github_ssh_fallback_only_handles_https_404(self):
         source = (
@@ -135,19 +142,18 @@ class PlanIntakeTests(unittest.TestCase):
         with mock.patch.object(
             MODULE, "urlopen",
             side_effect=self.http_error(source, 403, "Forbidden"),
-        ), mock.patch.object(MODULE.subprocess, "run") as run:
+        ), mock.patch.object(MODULE, "_github_ssh_blob_bytes") as fallback:
             with self.assertRaises(MODULE.HTTPError):
                 MODULE.source_bytes(source)
-        run.assert_not_called()
+        fallback.assert_not_called()
 
     def test_github_ssh_fallback_timeout_fails_closed(self):
         commit = "a" * 40
         source = f"https://github.com/acme/plans/blob/{commit}/PLAN.md"
         missing = self.http_error(source, 404, "Not Found")
         with mock.patch.object(MODULE, "urlopen", side_effect=missing), \
-             mock.patch.object(MODULE.subprocess, "run", side_effect=[
-                 subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
-                 subprocess.TimeoutExpired(["git", "fetch"], 20),
+             mock.patch.object(MODULE, "_run_bounded", side_effect=[
+                 b"", TimeoutError("immutable GitHub SSH plan fetch timed out"),
              ]):
             with self.assertRaisesRegex(TimeoutError, "timed out"):
                 MODULE.source_bytes(source)
@@ -158,11 +164,70 @@ class PlanIntakeTests(unittest.TestCase):
         missing = self.http_error(source, 404, "Not Found")
         with mock.patch.object(MODULE, "urlopen", side_effect=missing), \
              mock.patch.object(
-                 MODULE.subprocess, "run",
-                 side_effect=subprocess.CalledProcessError(128, ["git", "init"]),
+                 MODULE, "_run_bounded",
+                 side_effect=OSError("immutable GitHub SSH plan fetch failed"),
              ):
             with self.assertRaisesRegex(OSError, "fetch failed"):
                 MODULE.source_bytes(source)
+
+    def test_bounded_runner_kills_and_reaps_descendant_process_group(self):
+        child_code = """
+import pathlib
+import subprocess
+import sys
+import time
+
+grandchild = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+pathlib.Path(sys.argv[1]).write_text(str(grandchild.pid), encoding="utf-8")
+time.sleep(60)
+"""
+        parent_code = """
+import pathlib
+import subprocess
+import sys
+import time
+
+child = subprocess.Popen([sys.executable, "-c", sys.argv[3], sys.argv[2]])
+pathlib.Path(sys.argv[1]).write_text(str(child.pid), encoding="utf-8")
+time.sleep(60)
+"""
+        observed = []
+        with tempfile.TemporaryDirectory() as directory:
+            child_pid = Path(directory) / "child.pid"
+            grandchild_pid = Path(directory) / "grandchild.pid"
+            try:
+                with self.assertRaisesRegex(TimeoutError, "timed out"):
+                    MODULE._run_bounded(
+                        [
+                            sys.executable, "-c", parent_code, str(child_pid),
+                            str(grandchild_pid), child_code,
+                        ],
+                        environment=dict(os.environ), timeout=1.0,
+                    )
+                self.assertTrue(child_pid.is_file())
+                self.assertTrue(grandchild_pid.is_file())
+                observed = [int(child_pid.read_text()), int(grandchild_pid.read_text())]
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and any(
+                    self.process_exists(pid) for pid in observed
+                ):
+                    time.sleep(0.02)
+                self.assertEqual(
+                    [pid for pid in observed if self.process_exists(pid)], [],
+                    "timed-out descendant process survived group cleanup",
+                )
+            finally:
+                for pid in observed:
+                    if self.process_exists(pid):
+                        os.kill(pid, signal.SIGKILL)
+
+    @staticmethod
+    def process_exists(pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
 
     def test_exact_revision_and_stable_graph(self):
         with tempfile.TemporaryDirectory() as directory:

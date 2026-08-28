@@ -105,6 +105,7 @@ Token-only resume tries HTTPS first. If an immutable GitHub blob URL at an
 exact 40-hex commit returns 404, it can use existing noninteractive GitHub SSH
 access in a temporary isolated repository. Mutable refs and failed or timed-out
 SSH retrieval refuse authority; no API token is forwarded to the Git process.
+The fallback requires POSIX process-group cleanup; HTTPS remains portable.
 
 Live resume also reduces the root's complete append-only material-event and
 checkpoint history. It uses the latest durable event next action and, when one

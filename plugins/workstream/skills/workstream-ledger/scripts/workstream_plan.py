@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,13 @@ GITHUB_PATH_SEGMENT = re.compile(r"[A-Za-z0-9._+@,-]+")
 EXACT_GIT_COMMIT = re.compile(r"[0-9a-f]{40}")
 GIT_FETCH_TIMEOUT_SECONDS = 20
 GIT_SHOW_TIMEOUT_SECONDS = 5
+PROCESS_REAP_TIMEOUT_SECONDS = 2
+SSH_WRAPPER = """#!/usr/bin/env python3
+import os
+import sys
+
+os.execvp("ssh", ["ssh", "-oBatchMode=yes", *sys.argv[1:]])
+"""
 
 
 def _immutable_github_blob(source: str) -> tuple[str, str, str, str] | None:
@@ -85,43 +93,91 @@ def _git_ssh_environment() -> dict[str, str]:
     return environment
 
 
+def _run_bounded(
+    arguments: list[str], *, environment: dict[str, str], timeout: float,
+) -> bytes:
+    """Run one command in an owned process group and reap its whole tree."""
+    if not hasattr(os, "killpg") or not hasattr(signal, "SIGKILL"):
+        raise OSError("immutable GitHub SSH plan fetch requires process-group support")
+    try:
+        process = subprocess.Popen(
+            arguments,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            start_new_session=True,
+        )
+    except OSError as error:
+        raise OSError("immutable GitHub SSH plan fetch failed") from error
+    try:
+        stdout, _stderr = process.communicate(timeout=timeout)
+    except BaseException as error:
+        _kill_and_reap(process)
+        if isinstance(error, subprocess.TimeoutExpired):
+            raise TimeoutError("immutable GitHub SSH plan fetch timed out") from error
+        raise
+    if process.returncode != 0:
+        _kill_and_reap(process)
+        raise OSError("immutable GitHub SSH plan fetch failed")
+    return stdout
+
+
+def _kill_and_reap(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.communicate(timeout=PROCESS_REAP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.communicate(timeout=PROCESS_REAP_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as error:
+            raise OSError(
+                "immutable GitHub SSH plan process tree could not be reaped"
+            ) from error
+
+
+def _write_ssh_wrapper(directory: str) -> str:
+    """Create a fixed no-shell SSH launcher that forbids interactive auth."""
+    wrapper = Path(directory) / "workstream-ssh"
+    wrapper.write_text(SSH_WRAPPER, encoding="utf-8")
+    wrapper.chmod(0o700)
+    return str(wrapper)
+
+
 def _github_ssh_blob_bytes(
     owner: str, repository: str, commit: str, path: str,
 ) -> bytes:
     """Fetch one exact GitHub object over SSH in a disposable bare repo."""
     remote = f"git@github.com:{owner}/{repository}.git"
-    environment = _git_ssh_environment()
-    try:
-        with tempfile.TemporaryDirectory(prefix="workstream-plan-") as directory:
-            subprocess.run(
-                ["git", "init", "--bare", "--quiet", directory],
-                check=True, capture_output=True, stdin=subprocess.DEVNULL,
-                env=environment,
-                timeout=GIT_SHOW_TIMEOUT_SECONDS,
-            )
-            subprocess.run(
-                [
-                    "git", "-C", directory, "fetch", "--quiet", "--no-tags",
-                    "--depth=1", remote, commit,
-                ],
-                check=True, capture_output=True, stdin=subprocess.DEVNULL,
-                env=environment,
-                timeout=GIT_FETCH_TIMEOUT_SECONDS,
-            )
-            result = subprocess.run(
-                [
-                    "git", "-C", directory, "show", "--no-ext-diff",
-                    "--no-textconv", f"{commit}:{path}",
-                ],
-                check=True, capture_output=True, stdin=subprocess.DEVNULL,
-                env=environment,
-                timeout=GIT_SHOW_TIMEOUT_SECONDS,
-            )
-            return result.stdout
-    except subprocess.TimeoutExpired as error:
-        raise TimeoutError("immutable GitHub SSH plan fetch timed out") from error
-    except subprocess.CalledProcessError as error:
-        raise OSError("immutable GitHub SSH plan fetch failed") from error
+    with tempfile.TemporaryDirectory(prefix="workstream-plan-") as directory:
+        repository_path = str(Path(directory) / "repository.git")
+        environment = _git_ssh_environment()
+        environment.update({
+            "GIT_SSH": _write_ssh_wrapper(directory),
+            "GIT_SSH_VARIANT": "ssh",
+        })
+        _run_bounded(
+            ["git", "init", "--bare", "--quiet", repository_path],
+            environment=environment, timeout=GIT_SHOW_TIMEOUT_SECONDS,
+        )
+        _run_bounded(
+            [
+                "git", "-C", repository_path, "fetch", "--quiet", "--no-tags",
+                "--depth=1", remote, commit,
+            ],
+            environment=environment, timeout=GIT_FETCH_TIMEOUT_SECONDS,
+        )
+        return _run_bounded(
+            [
+                "git", "-C", repository_path, "show", "--no-ext-diff",
+                "--no-textconv", f"{commit}:{path}",
+            ],
+            environment=environment, timeout=GIT_SHOW_TIMEOUT_SECONDS,
+        )
 
 
 def source_bytes(source: str, identity: str | None = None) -> tuple[bytes, str]:
