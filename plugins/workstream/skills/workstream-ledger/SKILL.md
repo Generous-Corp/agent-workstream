@@ -1,6 +1,6 @@
 ---
 name: workstream-ledger
-description: Preserve evolving project goals, tasks, decisions, dependencies, PR state, and next actions in a durable Linear-backed workstream across agent sessions and machines. Use when executing a plan, starting substantive or PR-bound work, changing requirements, recording superseded decisions, detecting stale work, resuming from a stable issue handle, or deciding whether work can close.
+description: Preserve and update evolving project goals, tasks, decisions, dependencies, PR state, evidence, and closure in a durable Linear-backed workstream. Use directly for new plan intake, or after workstream-resume has returned a bounded authoritative snapshot in this turn. For any handle-led turn, including mutation, audit, or closure, do not load this skill first.
 ---
 
 # Workstream ledger
@@ -218,6 +218,9 @@ semantic review remains `Landed — acceptance review required`; invocation alon
 cannot emit `Done`.
 
 ### Fresh-session resume
+
+If `workstream-resume` already returned the bounded authoritative snapshot in
+this turn, retain it and do not repeat initial recovery.
 
 When a new agent receives `ABC-123` (or its Linear URL/tab title), with or
 without continuation instructions, the first action is the default bounded

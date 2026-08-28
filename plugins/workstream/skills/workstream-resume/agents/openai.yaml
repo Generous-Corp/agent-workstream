@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workstream Resume"
+  short_description: "Recover a workstream from one stable handle"
+  default_prompt: "Use $workstream-resume to recover this handle's bounded current authority before doing anything else."

@@ -32,8 +32,9 @@ claude plugin marketplace add Generous-Corp/agent-workstream
 claude plugin install workstream@generous-workstream
 ```
 
-Use `/workstream:workstream-ledger` or let Claude select the skill. To update or
-remove it:
+Use `/workstream:workstream-resume GEN-123` for an existing handle,
+`/workstream:workstream-ledger` for lifecycle work, or let Claude select the
+skill. To update or remove it:
 
 ```sh
 claude plugin marketplace update generous-workstream
