@@ -94,6 +94,7 @@ plugins/workstream/bin/workstreamctl plan ./PLAN.md \
 plugins/workstream/bin/workstreamctl intake ./PLAN.md \
   --identity https://github.com/example/plans/blob/<40-hex-commit>/PLAN.md \
   --plan-revision copy-source-sha256-from-preview \
+  --root-stable-key copy-root-stable-key-from-preview \
   --accept-key section-copy-from-preview \
   --accept-key section-copy-another-key
 
@@ -116,8 +117,9 @@ The fallback requires POSIX process-group cleanup; HTTPS remains portable.
 
 `intake` requires an authenticated, complete workspace/team/project route and
 an explicit review (`--accept-key` for each child, or `--accept-none`). It
-also requires the preview's exact source SHA-256, so changed bytes force a new
-review, and returns exact root and child receipts. Concurrent identical intake calls use
+also requires the preview's exact source SHA-256 and root stable key, so changed
+bytes or source identity force a new review, and returns exact root and child
+receipts. Concurrent identical intake calls use
 the same deterministic issue IDs and converge only after full readback; an ID
 or field collision fails closed. A later call may add a newly reviewed missing
 child from the same plan revision, but changed-plan and other update paths still

@@ -248,6 +248,11 @@ def stable_key(kind: str, ancestry: list[str], title: str, occurrence: int) -> s
     return f"{kind}-{hashlib.sha256(material).hexdigest()[:16]}"
 
 
+def root_stable_key(identity: str) -> str:
+    """Bind one root identity to its exact canonical source identity."""
+    return f"source-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16]}"
+
+
 def extract_children(markdown: str) -> list[dict[str, object]]:
     lines = markdown.splitlines()
     children: list[dict[str, object]] = []
@@ -307,11 +312,10 @@ def plan_payload(source: str, identity: str | None = None) -> dict[str, object]:
     title_heading = first_heading(text)
     title = clean_title(title_heading.group(2)) if title_heading else "Untitled workstream"
     digest = hashlib.sha256(raw).hexdigest()
-    identity_digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     return {
         "schema_version": SCHEMA_VERSION,
         "source": {"identity": identity, "sha256": digest, "bytes": len(raw)},
-        "root": {"stable_key": f"source-{identity_digest[:16]}", "title": title, "plan_revision": digest},
+        "root": {"stable_key": root_stable_key(identity), "title": title, "plan_revision": digest},
         "children": extract_children(text),
         "graph_review_required": True,
     }

@@ -29,7 +29,8 @@ class WorkstreamIntakeTests(unittest.TestCase):
         with self.assertRaises(GraphReviewRequired):
             workstream_intake.run(
                 ["/does/not/exist.md", "--identity", "plan:demo",
-                 "--plan-revision", "0" * 64, *self.route_args()]
+                 "--plan-revision", "0" * 64, "--root-stable-key", "source-demo",
+                 *self.route_args()]
             )
 
     def test_intake_requires_a_complete_explicit_route(self):
@@ -38,6 +39,9 @@ class WorkstreamIntakeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "complete Linear"):
             workstream_intake.run([
                 str(path), "--identity", "plan:demo", "--plan-revision", revision,
+                "--root-stable-key", workstream_intake.plan_payload(
+                    str(path), "plan:demo"
+                )["root"]["stable_key"],
                 "--accept-none",
             ])
 
@@ -49,6 +53,7 @@ class WorkstreamIntakeTests(unittest.TestCase):
             result = workstream_intake.run([
                 str(path), "--identity", "plan:demo",
                 "--plan-revision", preview["root"]["plan_revision"],
+                "--root-stable-key", preview["root"]["stable_key"],
                 "--accept-none", *self.route_args(),
             ], client_factory=lambda token: fake)
 
@@ -64,6 +69,7 @@ class WorkstreamIntakeTests(unittest.TestCase):
             result = workstream_intake.run([
                 str(path), "--identity", "plan:demo",
                 "--plan-revision", preview["root"]["plan_revision"],
+                "--root-stable-key", preview["root"]["stable_key"],
                 "--accept-key", accepted, *self.route_args(),
             ], client_factory=lambda token: fake)
 
@@ -87,6 +93,9 @@ class WorkstreamIntakeTests(unittest.TestCase):
                 workstream_intake.run([
                     str(path), "--identity", "plan:demo",
                     "--plan-revision", revision,
+                    "--root-stable-key", workstream_intake.plan_payload(
+                        str(path), "plan:demo"
+                    )["root"]["stable_key"],
                     "--accept-key", "not-a-candidate", *self.route_args(),
                 ], client_factory=lambda token: fake)
         self.assertEqual(fake.calls, [])
@@ -99,9 +108,34 @@ class WorkstreamIntakeTests(unittest.TestCase):
                 workstream_intake.run([
                     str(path), "--identity", "plan:demo",
                     "--plan-revision", "0" * 64,
+                    "--root-stable-key", workstream_intake.root_stable_key(
+                        "plan:demo"
+                    ),
                     "--accept-none", *self.route_args(),
                 ], client_factory=lambda token: fake)
         auth.assert_not_called()
+        self.assertEqual(fake.calls, [])
+
+    def test_changed_identity_after_review_refuses_before_auth_client_or_network(self):
+        fake = FakeClient()
+        client_factory = mock.Mock(return_value=fake)
+
+        with mock.patch.object(workstream_intake, "load_linear_api_key") as auth, \
+             mock.patch.object(workstream_intake, "plan_payload") as source_read:
+            with self.assertRaisesRegex(GraphReviewRequired, "identity changed"):
+                workstream_intake.run([
+                    "https://should-not-fetch.invalid/plan.md",
+                    "--identity", "plan:drifted",
+                    "--plan-revision", "0" * 64,
+                    "--root-stable-key", workstream_intake.root_stable_key(
+                        "plan:reviewed"
+                    ),
+                    "--accept-none", *self.route_args(),
+                ], client_factory=client_factory)
+
+        auth.assert_not_called()
+        source_read.assert_not_called()
+        client_factory.assert_not_called()
         self.assertEqual(fake.calls, [])
 
 

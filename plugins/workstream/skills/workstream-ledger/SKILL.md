@@ -98,6 +98,7 @@ children. Apply that explicit review with:
 ```sh
 workstreamctl intake ./PLAN.md --identity <canonical-url> \
   --plan-revision <source-sha256-from-preview> \
+  --root-stable-key <root-stable-key-from-preview> \
   --accept-key <stable-key-from-preview>
 ```
 

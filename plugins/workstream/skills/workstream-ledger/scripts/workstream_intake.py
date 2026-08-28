@@ -15,7 +15,7 @@ from workstream_linear import (
     LinearGraphQLTransport,
     LinearTransportError,
 )
-from workstream_plan import plan_payload
+from workstream_plan import plan_payload, root_stable_key
 
 
 def parser() -> argparse.ArgumentParser:
@@ -28,6 +28,10 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument(
         "--plan-revision", required=True, metavar="SHA256",
         help="exact source SHA-256 from the reviewed workstreamctl plan preview",
+    )
+    value.add_argument(
+        "--root-stable-key", required=True, metavar="KEY",
+        help="exact root stable key from the reviewed workstreamctl plan preview",
     )
     review = value.add_mutually_exclusive_group()
     review.add_argument(
@@ -57,12 +61,18 @@ def run(
         )
     if not args.identity.strip():
         raise ValueError("plan identity must be non-empty")
+    if root_stable_key(args.identity) != args.root_stable_key:
+        raise GraphReviewRequired(
+            "plan identity changed after review; generate and review a new plan preview"
+        )
     accepted_keys = set(args.accept_key or [])
     plan = plan_payload(args.source, args.identity)
     if plan["root"]["plan_revision"] != args.plan_revision:
         raise GraphReviewRequired(
             "plan bytes changed after review; generate and review a new plan preview"
         )
+    if plan["root"]["stable_key"] != args.root_stable_key:
+        raise GraphReviewRequired("reviewed root identity did not reproduce")
     route, _config_path = resolve_linear_route(
         config_path=args.config,
         workspace_id=args.workspace_id,

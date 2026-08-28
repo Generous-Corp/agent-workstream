@@ -112,11 +112,11 @@ class WorkstreamCtlTests(unittest.TestCase):
 
     def test_intake_dispatches_reviewed_linear_intake_command(self):
         with mock.patch.object(MODULE.os, "execv") as execute:
-            MODULE.main(["intake", "plan.md", "--identity", "plan:demo", "--plan-revision", "abc", "--accept-none"])
+            MODULE.main(["intake", "plan.md", "--identity", "plan:demo", "--plan-revision", "abc", "--root-stable-key", "source-abc", "--accept-none"])
         script = MODULE.SCRIPTS / "workstream_intake.py"
         execute.assert_called_once_with(
             MODULE.sys.executable,
-            [MODULE.sys.executable, str(script), "plan.md", "--identity", "plan:demo", "--plan-revision", "abc", "--accept-none"],
+            [MODULE.sys.executable, str(script), "plan.md", "--identity", "plan:demo", "--plan-revision", "abc", "--root-stable-key", "source-abc", "--accept-none"],
         )
 
 
