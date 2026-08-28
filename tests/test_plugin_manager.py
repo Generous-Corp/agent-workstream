@@ -39,6 +39,7 @@ class PluginManagerTests(unittest.TestCase):
     def skill_source(self, root: Path) -> Path:
         plugin = root / "plugin"
         for name, body in (("workstream-ledger", "current"),
+                           ("workstream-resume", "resume"),
                            ("decision-audit", "audit")):
             skill = plugin / "skills" / name
             skill.mkdir(parents=True)
@@ -66,6 +67,7 @@ class PluginManagerTests(unittest.TestCase):
             receipt = MODULE.sync_skill_mirror(plugin, mirror, update=True)
             self.assertTrue(receipt["changed"])
             self.assertEqual((mirror / "workstream-ledger/SKILL.md").read_text(), "current")
+            self.assertEqual((mirror / "workstream-resume/SKILL.md").read_text(), "resume")
             self.assertEqual((mirror / "decision-audit/SKILL.md").read_text(), "audit")
             self.assertEqual((mirror / "unrelated/SKILL.md").read_text(), "keep")
             self.assertFalse((mirror / MODULE.MIRROR_MARKER).exists())
@@ -123,6 +125,7 @@ class PluginManagerTests(unittest.TestCase):
                              "old-workstream-ledger")
             self.assertEqual((mirror / "decision-audit/SKILL.md").read_text(),
                              "old-decision-audit")
+            self.assertFalse((mirror / "workstream-resume").exists())
             self.assertEqual(MODULE._mirror_partial_paths(mirror), [])
             self.assertFalse((mirror / MODULE.MIRROR_MARKER).exists())
 
