@@ -35,6 +35,7 @@ KINDS = {
     "provenance", "disposition",
 }
 SINGLETON_KINDS = {"scope", "source", "disposition"}
+TOMBSTONE = {"_projection_tombstone": True}
 
 
 class LinearProjectionError(LinearTransportError):
@@ -94,17 +95,18 @@ def validate_projection_event(event: dict[str, Any]) -> None:
     if not isinstance(event.get("value"), dict):
         raise LinearProjectionError("invalid_projection_value")
     value = event["value"]
-    if event["kind"] == "source":
+    tombstone = value == TOMBSTONE
+    if event["kind"] == "source" and not tombstone:
         if not re.fullmatch(r"[0-9a-f]{64}", str(value.get("sha256", ""))):
             raise LinearProjectionError("invalid_projection_source_digest")
         if not any(isinstance(value.get(field), str) and value[field].strip()
                    for field in ("url", "identity")):
             raise LinearProjectionError("invalid_projection_source_identity")
-    if event["kind"] == "provenance":
+    if event["kind"] == "provenance" and not tombstone:
         for field in ("agent", "machine", "session_id"):
             if not isinstance(value.get(field), str) or not value[field].strip():
                 raise LinearProjectionError(f"invalid_projection_provenance:{field}")
-    if event["kind"] == "disposition":
+    if event["kind"] == "disposition" and not tombstone:
         if value.get("disposition") not in {"attach", "create_successor"}:
             raise LinearProjectionError("invalid_projection_disposition")
         if not isinstance(value.get("remote_head"), str) or not re.fullmatch(
@@ -116,9 +118,9 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             and not isinstance(value["recovered_from_checkpoint"], str)
         ):
             raise LinearProjectionError("invalid_projection_disposition_checkpoint")
-    if event["kind"] == "choice" and value.get("event_id") != event["key"]:
+    if event["kind"] == "choice" and not tombstone and value.get("event_id") != event["key"]:
         raise LinearProjectionError("projection_choice_key_mismatch")
-    if event["kind"] == "evidence_contract":
+    if event["kind"] == "evidence_contract" and not tombstone:
         if value.get("slice_id") != event["key"]:
             raise LinearProjectionError("projection_evidence_key_mismatch")
         if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", str(value.get("owning_child", ""))):
@@ -177,6 +179,7 @@ def reduce_projection_comments(
     comments: list[dict[str, Any]], *, workstream_id: str,
     expected_plan_revision: str,
     authenticated_route: dict[str, str] | None = None,
+    authenticated_source: dict[str, Any] | None = None,
 ) -> ReducedProjection:
     observed: dict[str, tuple[dict[str, Any], str, bytes]] = {}
     for comment in comments:
@@ -201,28 +204,39 @@ def reduce_projection_comments(
             raise LinearProjectionError("projection_comment_missing_remote_id")
         observed[event["event_id"]] = (event, remote_id, signature)
 
-    events = sorted(
+    history = sorted(
         (item[0] for item in observed.values()),
+        key=lambda item: (
+            item["plan_revision"], item["expected_revision"],
+            item["created_at"], item["event_id"],
+        ),
+    )
+    events = sorted(
+        (event for event in history if event["plan_revision"] == expected_plan_revision),
         key=lambda item: (item["expected_revision"], item["created_at"], item["event_id"]),
     )
+    stale_events = [
+        event for event in history if event["plan_revision"] != expected_plan_revision
+    ]
     active: dict[tuple[str, str], dict[str, Any]] = {}
-    history: list[dict[str, Any]] = []
+    heads: dict[tuple[str, str], dict[str, Any]] = {}
     for index, event in enumerate(events):
         if event["expected_revision"] > index:
             raise LinearProjectionError(
                 f"projection_revision_gap:{event['event_id']}:{event['expected_revision']}:{index}"
             )
-        if event["plan_revision"] != expected_plan_revision:
-            raise LinearProjectionError(f"projection_plan_drift:{event['event_id']}")
         identity = (event["kind"], event["key"])
-        current = active.get(identity)
+        current = heads.get(identity)
         supersedes = event["supersedes_event_id"]
         if current is None and supersedes is not None:
             raise LinearProjectionError(f"projection_supersedes_missing:{event['event_id']}")
         if current is not None and supersedes != current["event_id"]:
             raise LinearProjectionError(f"projection_concurrent_conflict:{event['kind']}:{event['key']}")
-        active[identity] = event
-        history.append(deepcopy(event))
+        heads[identity] = event
+        if event["value"] == TOMBSTONE:
+            active.pop(identity, None)
+        else:
+            active[identity] = event
 
     by_kind: dict[str, list[dict[str, Any]]] = {kind: [] for kind in KINDS}
     for (kind, _key), event in active.items():
@@ -235,10 +249,16 @@ def reduce_projection_comments(
     source = by_kind["source"][0] if by_kind["source"] else None
     if source is not None and source.get("sha256") != expected_plan_revision:
         raise LinearProjectionError("projection_source_plan_mismatch")
+    if authenticated_source is not None and source is not None:
+        source_identity = source.get("identity") or source.get("url")
+        if source_identity != authenticated_source.get("identity"):
+            raise LinearProjectionError("projection_source_identity_mismatch")
+        if source.get("sha256") != authenticated_source.get("sha256"):
+            raise LinearProjectionError("projection_source_bytes_mismatch")
     scope = by_kind["scope"][0] if by_kind["scope"] else None
     if authenticated_route is not None and scope is not None:
         linear = scope.get("linear") or {}
-        for field in ("workspace_id", "team_id", "project_id"):
+        for field in ("workspace_id", "team_id", "project_id", "root_issue_id"):
             if linear.get(field) != authenticated_route.get(field):
                 raise LinearProjectionError(f"projection_route_mismatch:{field}")
 
@@ -250,15 +270,20 @@ def reduce_projection_comments(
         "source": source,
         "provenance": by_kind["provenance"],
         "disposition": by_kind["disposition"][0] if by_kind["disposition"] else None,
-        "projection_events": history,
+        "projection_events": [deepcopy(event) for event in events],
+        "projection_history": [deepcopy(event) for event in stale_events],
         "projection_revision": len(events),
         "projection_recovery": {
-            "state": "current" if any(by_kind.values()) else "not_found",
-            "stale_plan_count": 0,
+            "state": (
+                "current" if any(by_kind.values())
+                else "stale_plan" if stale_events
+                else "not_found"
+            ),
+            "stale_plan_count": len(stale_events),
         },
     }
     return ReducedProjection(
-        workstream_id=workstream_id, revision=len(events), events=tuple(history),
+        workstream_id=workstream_id, revision=len(events), events=tuple(events),
         remote_ids={event_id: item[1] for event_id, item in observed.items()},
         snapshot=snapshot,
     )
@@ -272,6 +297,7 @@ class LinearProjectionAdapter:
         self, client: GraphQLClient, *, issue_id: str, workstream_id: str,
         plan_revision: str, workspace_id: str | None = None,
         team_id: str | None = None, project_id: str | None = None,
+        root_issue_id: str | None = None,
     ):
         self.client = client
         self.issue_id = issue_id
@@ -280,8 +306,11 @@ class LinearProjectionAdapter:
         self.workspace_id = workspace_id
         self.team_id = team_id
         self.project_id = project_id
-        if any((workspace_id, team_id, project_id)) and not all((workspace_id, team_id, project_id)):
-            raise ValueError("Linear workspace, team, and project IDs must be supplied together")
+        self.root_issue_id = root_issue_id
+        if any((workspace_id, team_id, project_id, root_issue_id)) and not all(
+            (workspace_id, team_id, project_id, root_issue_id)
+        ):
+            raise ValueError("Linear workspace, team, project, and root issue IDs must be supplied together")
 
     @classmethod
     def from_env(
@@ -302,6 +331,7 @@ class LinearProjectionAdapter:
             client, issue_id=issue_id, workstream_id=workstream_id,
             plan_revision=plan_revision, workspace_id=route.get("workspace_id"),
             team_id=route.get("team_id"), project_id=route.get("project_id"),
+            root_issue_id=route.get("root_issue_id"),
         )
 
     def _comments(self) -> list[dict[str, Any]]:
@@ -313,6 +343,8 @@ class LinearProjectionAdapter:
             issue = result.get("issue")
             if not issue or issue.get("identifier") != self.workstream_id:
                 raise LinearProjectionError("Linear workstream issue not found or mismatched")
+            if self.root_issue_id and issue.get("id") != self.root_issue_id:
+                raise LinearProjectionError("projection_route_mismatch:root_issue_id")
             validate_issue_route(
                 issue, workspace_id=self.workspace_id, team_id=self.team_id,
                 project_id=self.project_id,
@@ -338,7 +370,8 @@ class LinearProjectionAdapter:
                 "workspace_id": self.workspace_id,
                 "team_id": self.team_id,
                 "project_id": self.project_id,
-            } if all((self.workspace_id, self.team_id, self.project_id)) else None,
+                "root_issue_id": self.root_issue_id,
+            } if all((self.workspace_id, self.team_id, self.project_id, self.root_issue_id)) else None,
         )
 
     def append(self, event: dict[str, Any]) -> dict[str, Any]:

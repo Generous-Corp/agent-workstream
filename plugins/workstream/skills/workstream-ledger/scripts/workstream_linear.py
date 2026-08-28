@@ -193,6 +193,19 @@ def bootstrap_linear_route(client: GraphQLClient, token: str) -> dict[str, str]:
     }
 
 
+def resolve_authenticated_issue_route(
+    client: GraphQLClient, token: str,
+    configured_route: dict[str, str] | None,
+) -> dict[str, str]:
+    """Bind configured routing to the authenticated issue, including its UUID."""
+    observed = bootstrap_linear_route(client, token)
+    if configured_route:
+        for field in ("workspace_id", "team_id", "project_id"):
+            if configured_route.get(field) != observed[field]:
+                raise LinearTransportError(f"configured Linear route mismatches root:{field}")
+    return observed
+
+
 def durable_description(
     key: str,
     plan_revision: str,

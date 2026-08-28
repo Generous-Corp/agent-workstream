@@ -51,9 +51,13 @@ relations as immutable Linear comments and derives their current view from a
 complete paginated readback. Replacing a keyed projection must name the exact
 event it supersedes; ambiguous concurrent replacements fail closed. The
 source digest must equal the root plan revision, and the projected
-workspace/team/project route must equal the authenticated token readback.
-Mixed or stale plan revisions fail closed instead of silently changing or
-omitting current state. Evidence contracts are keyed by stable slice ID, so
+workspace/team/project/root-issue route must equal the authenticated token
+readback. Projection events are reduced within the current root plan revision:
+older generations remain immutable history and are counted as stale, but
+cannot supersede or conflict with the current generation. Conflicting writes
+within the current generation still fail closed. Full-authority resume also
+fetches the exact plan bytes and requires their digest and immutable identity
+to match the projected source. Evidence contracts are keyed by stable slice ID, so
 one child may own several independently verifiable slices. The
 deterministic validator rejects missing or mismatched receipts; the transport
 remains responsible for their authenticity.
@@ -227,6 +231,16 @@ an ambiguous placeholder is not executable. An empty surface is reported as
 empty rather than fabricated.
 When no local config is available, authenticated token-only bootstrap resolves
 the root's exact workspace/team/project route before the fenced read.
+
+`workstreamctl resume` is full-authority by default and fetches the projected
+source identity. `--plan-source` overrides the fetch location for an
+authenticated checkout; `--plan-identity` preserves its durable identity. It
+refuses success unless those exact bytes match the root and projection.
+`--inspection-only` is an explicit legacy diagnostic mode
+and labels its output `inspection_only`; it is not authority to continue work.
+`workstreamctl projection` idempotently appends a reviewed projection manifest,
+computes the concrete attach/successor disposition against a verified remote
+head, and rereads the complete comment stream before reporting success.
 
 This remains a validated bounded snapshot, not complete physical cross-machine
 recovery proof. Resume does not itself fetch owner, live source-control truth,

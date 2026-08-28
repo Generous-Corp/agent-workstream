@@ -18,8 +18,9 @@ from typing import Any
 from workstream_config import load_linear_api_key, resolve_linear_route
 from workstream_checkpoint import CheckpointError, recover_latest
 from workstream_linear import (
-    bootstrap_linear_route, HttpGraphQLClient, LinearGraphQLTransport,
+    HttpGraphQLClient, LinearGraphQLTransport,
     LinearTransportError,
+    resolve_authenticated_issue_route,
 )
 from workstream_linear_checkpoints import (
     LinearCheckpointError,
@@ -31,8 +32,10 @@ from workstream_linear_events import (
     reduce_event_comments,
 )
 from workstream_linear_projection import (
-    LinearProjectionError, reduce_projection_comments, validate_projection_event,
+    LinearProjectionError, reduce_projection_comments, TOMBSTONE,
+    validate_projection_event,
 )
+from workstream_plan import plan_payload
 from workstream_choices import ChoiceError, reduce_choices
 from workstream_evidence import evidence_errors
 from workstream_scope import repository_key, ScopeError, validate_relations, validate_scope
@@ -87,6 +90,7 @@ def _event_next_actions(event: dict[str, Any]) -> set[str]:
 def add_material_history(
     snapshot: dict[str, Any], comments: list[dict[str, Any]], token: str,
     *, authenticated_route: dict[str, str] | None = None,
+    authenticated_source: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Join one complete Linear comment read to the issue-graph snapshot."""
     result = dict(snapshot)
@@ -97,14 +101,17 @@ def add_material_history(
     projection_log = reduce_projection_comments(
         comments, workstream_id=token, expected_plan_revision=plan_revision,
         authenticated_route=authenticated_route,
+        authenticated_source=authenticated_source,
     )
     events = [_event_record(event) for event in event_log.events]
 
     result["material_events"] = events
     result["material_event_revision"] = event_log.revision
-    if projection_log.revision:
-        result.update(projection_log.snapshot)
-        result["authenticated_route"] = dict(authenticated_route) if authenticated_route else None
+    result.update(projection_log.snapshot)
+    result["authenticated_route"] = dict(authenticated_route) if authenticated_route else None
+    result["authenticated_source"] = (
+        dict(authenticated_source) if authenticated_source else None
+    )
     result["root"]["issue_revision"] = result["root"].get("revision", 0)
     result["root"]["revision"] = event_log.revision
     next_actions_by_revision: dict[int, set[str]] = {}
@@ -154,7 +161,10 @@ def extract_token(value: str) -> str:
     return next(iter(tokens))
 
 
-def validate_snapshot(snapshot: dict[str, Any], token: str | None = None) -> dict[str, Any]:
+def validate_snapshot(
+    snapshot: dict[str, Any], token: str | None = None, *,
+    require_projection_authority: bool = False,
+) -> dict[str, Any]:
     root = snapshot.get("root")
     if not isinstance(root, dict):
         raise ResumeError("missing root")
@@ -279,18 +289,24 @@ def validate_snapshot(snapshot: dict[str, Any], token: str | None = None) -> dic
     if not isinstance(choice_events, list):
         raise ResumeError("choice_events must be a list")
     projection_events = snapshot.get("projection_events", [])
+    projection_history = snapshot.get("projection_history", [])
     projection_revision = snapshot.get("projection_revision")
     if not isinstance(projection_events, list):
         raise ResumeError("projection_events must be a list")
+    if not isinstance(projection_history, list):
+        raise ResumeError("projection_history must be a list")
     if projection_revision is not None and projection_revision != len(projection_events):
         raise ResumeError("projection_revision_mismatch")
-    for index, event in enumerate(projection_events):
+    for index, event in enumerate(projection_history):
         try:
             validate_projection_event(event)
         except LinearProjectionError as error:
             raise ResumeError(f"invalid_projection_event:{index}:{error}") from error
         if event["workstream_id"] != identifier.upper():
             raise ResumeError(f"projection_workstream_mismatch:{index}")
+    if any(event["plan_revision"] == root["plan_revision"] for event in projection_history):
+        raise ResumeError("projection_stale_history_contains_current_generation")
+    for index, event in enumerate(projection_events):
         if event["plan_revision"] != root["plan_revision"]:
             raise ResumeError(f"projection_plan_drift:{index}")
         if event["expected_revision"] > index:
@@ -311,8 +327,10 @@ def validate_snapshot(snapshot: dict[str, Any], token: str | None = None) -> dic
             for field in ("workspace_id", "team_id", "project_id")
         ):
             raise ResumeError("projection_authenticated_route_missing")
-        if projection_recovery != {"state": "current", "stale_plan_count": 0}:
+        if projection_recovery.get("state") != "current":
             raise ResumeError("projection_not_current")
+        if projection_recovery["stale_plan_count"] != len(projection_history):
+            raise ResumeError("projection_stale_plan_count_mismatch")
         if snapshot.get("scope") is None or snapshot.get("source") is None:
             raise ResumeError("projection_authority_missing")
         if not snapshot.get("provenance"):
@@ -320,14 +338,19 @@ def validate_snapshot(snapshot: dict[str, Any], token: str | None = None) -> dic
         if snapshot.get("disposition") is None:
             raise ResumeError("projection_disposition_missing")
         active: dict[tuple[str, str], dict[str, Any]] = {}
+        heads: dict[tuple[str, str], dict[str, Any]] = {}
         for event in projection_events:
             identity = (event["kind"], event["key"])
-            current = active.get(identity)
+            current = heads.get(identity)
             if current is None and event["supersedes_event_id"] is not None:
                 raise ResumeError(f"projection_supersedes_missing:{event['event_id']}")
             if current is not None and event["supersedes_event_id"] != current["event_id"]:
                 raise ResumeError(f"projection_concurrent_conflict:{event['kind']}:{event['key']}")
-            active[identity] = event
+            heads[identity] = event
+            if event["value"] == TOMBSTONE:
+                active.pop(identity, None)
+            else:
+                active[identity] = event
         for kind, field in (("scope", "scope"), ("source", "source"),
                             ("disposition", "disposition")):
             values = [event["value"] for (event_kind, _), event in active.items()
@@ -350,13 +373,20 @@ def validate_snapshot(snapshot: dict[str, Any], token: str | None = None) -> dic
         if scope is not None:
             validate_scope(scope, root_id=identifier.upper(), child_ids=keys)
             if authenticated_route:
-                for field in ("workspace_id", "team_id", "project_id"):
+                for field in ("workspace_id", "team_id", "project_id", "root_issue_id"):
                     if scope["linear"].get(field) != authenticated_route.get(field):
                         raise ResumeError(f"projection_route_mismatch:{field}")
         source = snapshot.get("source")
         if source is not None:
             if not isinstance(source, dict) or source.get("sha256") != root["plan_revision"]:
                 raise ResumeError("projection_source_plan_mismatch")
+            authenticated_source = snapshot.get("authenticated_source")
+            if authenticated_source is not None:
+                source_identity = source.get("identity") or source.get("url")
+                if source_identity != authenticated_source.get("identity"):
+                    raise ResumeError("projection_source_identity_mismatch")
+                if source.get("sha256") != authenticated_source.get("sha256"):
+                    raise ResumeError("projection_source_bytes_mismatch")
         relations = snapshot.get("relations", [])
         validate_relations(
             relations, root_id=identifier.upper(),
@@ -416,6 +446,11 @@ def validate_snapshot(snapshot: dict[str, Any], token: str | None = None) -> dic
         )
     except (ChoiceError, ScopeError) as error:
         raise ResumeError(str(error)) from error
+    if require_projection_authority:
+        if not projection_events:
+            raise ResumeError("projection_authority_absent")
+        if snapshot.get("authenticated_source") is None:
+            raise ResumeError("projection_source_bytes_unverified")
     return {"root": root, "children": children, "decisions": snapshot.get("decisions", []),
             "choice_events": choice_events, "scope": scope,
             "relations": relations, "evidence_contracts": evidence_contracts,
@@ -428,17 +463,22 @@ def validate_snapshot(snapshot: dict[str, Any], token: str | None = None) -> dic
             "source": snapshot.get("source"),
             "disposition": snapshot.get("disposition"),
             "projection_events": projection_events,
+            "projection_history": projection_history,
             "projection_revision": projection_revision,
             "projection_recovery": projection_recovery,
-            "authenticated_route": authenticated_route}
+            "authenticated_route": authenticated_route,
+            "authenticated_source": snapshot.get("authenticated_source")}
 
 
 def compact_context(
     snapshot: dict[str, Any], token: str, max_bytes: int = 16 * 1024,
-    max_items: int = 100,
+    max_items: int = 100, *, require_projection_authority: bool = False,
 ) -> dict[str, Any]:
     normalized_token = extract_token(token)
-    clean = validate_snapshot(snapshot, normalized_token)
+    clean = validate_snapshot(
+        snapshot, normalized_token,
+        require_projection_authority=require_projection_authority,
+    )
     root = clean["root"]
     children = [
         child for child in clean["children"]
@@ -467,9 +507,14 @@ def compact_context(
         "source": clean.get("source"),
         "disposition": clean.get("disposition"),
         "projection_events": clean["projection_events"],
+        "projection_history": clean["projection_history"],
         "projection_revision": clean["projection_revision"],
         "projection_recovery": clean["projection_recovery"],
         "authenticated_route": clean["authenticated_route"],
+        "authenticated_source": clean["authenticated_source"],
+        "resume_authority": (
+            "full" if require_projection_authority else "inspection_only"
+        ),
     }
     item_count = sum(
         len(value) for value in (
@@ -477,6 +522,7 @@ def compact_context(
             context["relations"], context["provenance"],
             context["evidence_contracts"], context["material_events"],
             context["projection_events"],
+            context["projection_history"],
             (context["latest_checkpoint"] or {}).get("provenance_chain", []),
         )
     )
@@ -499,9 +545,22 @@ def main() -> int:
     parser.add_argument("--linear-endpoint", default="https://api.linear.app/graphql")
     parser.add_argument("--max-bytes", type=int, default=16 * 1024)
     parser.add_argument("--max-items", type=int, default=100)
+    parser.add_argument(
+        "--plan-source",
+        help="authenticated path or URL whose exact bytes must match the projected source",
+    )
+    parser.add_argument(
+        "--plan-identity",
+        help="immutable canonical identity for --plan-source (defaults to the source argument)",
+    )
+    parser.add_argument(
+        "--inspection-only", action="store_true",
+        help="inspect legacy/incomplete state without claiming full-authority resume",
+    )
     args = parser.parse_args()
     try:
         token = extract_token(args.token)
+        authenticated_source = None
         if args.snapshot is None:
             route, _config_path = resolve_linear_route(
                 config_path=args.config,
@@ -516,8 +575,7 @@ def main() -> int:
                     "or install ~/.config/agent-workstream/linear.token"
                 )
             client = HttpGraphQLClient(api_key, args.linear_endpoint)
-            if not route:
-                route = bootstrap_linear_route(client, token)
+            route = resolve_authenticated_issue_route(client, token, route)
             transport = LinearGraphQLTransport(
                 client,
                 team_id=route["team_id"],
@@ -540,7 +598,26 @@ def main() -> int:
         else:
             raw = sys.stdin.read() if args.snapshot == "-" else open(args.snapshot, encoding="utf-8").read()
             snapshot = json.loads(raw)
-        output = compact_context(snapshot, token, args.max_bytes, args.max_items)
+        if not args.inspection_only:
+            projected_source = snapshot.get("source") or {}
+            projected_identity = projected_source.get("identity") or projected_source.get("url")
+            source_location = args.plan_source or projected_identity
+            if not source_location:
+                raise ResumeError("full-authority resume has no projected plan source")
+            authenticated_source = plan_payload(
+                source_location, args.plan_identity or projected_identity
+            )["source"]
+            if args.snapshot is None:
+                snapshot = add_material_history(
+                    snapshot, comments, token, authenticated_route=route,
+                    authenticated_source=authenticated_source,
+                )
+            else:
+                snapshot["authenticated_source"] = authenticated_source
+        output = compact_context(
+            snapshot, token, args.max_bytes, args.max_items,
+            require_projection_authority=not args.inspection_only,
+        )
     except (
         OSError, json.JSONDecodeError, ResumeError, LinearTransportError,
         LinearEventError, LinearCheckpointError, LinearProjectionError,

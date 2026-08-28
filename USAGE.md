@@ -90,8 +90,15 @@ From a checkout of this repository:
 plugins/workstream/bin/workstreamctl plan ./PLAN.md \
   --identity https://github.com/example/plans/blob/main/PLAN.md
 
-# Resolve and validate one live Linear root and its nonterminal children.
+# Resolve one live root with full authority, fetching its projected plan bytes.
 plugins/workstream/bin/workstreamctl resume GEN-123
+
+# For a private checkout, override only the fetch location.
+plugins/workstream/bin/workstreamctl resume GEN-123 \
+  --plan-source ./PLAN.md
+
+# Inspect an older root without claiming authority to continue it.
+plugins/workstream/bin/workstreamctl resume GEN-123 --inspection-only
 ```
 
 Live resume also reduces the root's complete append-only material-event and
@@ -99,6 +106,11 @@ checkpoint history. It uses the latest durable event next action and, when one
 exists, returns the acknowledged checkpoint's machine, worktree, exact head,
 evidence, blocker, and provenance chain. Unimplemented surfaces remain named in
 `surface_availability` instead of being inferred from local session state.
+Full-authority output requires the append-only scope, source, provenance, and
+attach/successor disposition projection. A reviewed projection manifest can be
+applied idempotently with `workstreamctl projection GEN-123 manifest.json
+--remote-head <40-or-64-hex-head> --plan-source ./PLAN.md --plan-identity <URL>`;
+the command writes only changed keys and verifies a complete live readback.
 
 Unavailable live surfaces remain explicit rather than being inferred from a
 checkout or transcript. See [BOUNDARIES.md](BOUNDARIES.md) for why the plugin

@@ -55,6 +55,12 @@ def choose_disposition(snapshot: dict[str, Any], *, remote_head: str | None = No
     if checkpoint:
         worktree = checkpoint.get("worktree") or {}
         recovered_from = checkpoint.get("checkpoint_event_id")
+    elif isinstance(provenance, list):
+        candidates = [item for item in provenance if isinstance(item, dict) and item.get("worktree")]
+        if len(candidates) > 1:
+            raise SuccessorError("multiple projected worktree authorities")
+        worktree = (candidates[0] if candidates else {}).get("worktree") or {}
+        recovered_from = None
     elif isinstance(provenance, dict):
         worktree = provenance.get("worktree") or {}
         recovered_from = None

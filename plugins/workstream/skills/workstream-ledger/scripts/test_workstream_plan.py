@@ -29,6 +29,22 @@ class PlanIntakeTests(unittest.TestCase):
         self.assertEqual(identity, "https://example.test/plan.md")
         self.assertIs(urlopen.call_args.kwargs["context"], context)
 
+    def test_github_blob_fetches_exact_raw_bytes_with_optional_auth(self):
+        response = mock.MagicMock()
+        response.read.return_value = b"# Private plan\n"
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        source = "https://github.com/acme/plans/blob/deadbeef/PLAN.md"
+        with mock.patch.dict(MODULE.os.environ, {"GITHUB_TOKEN": "secret"}, clear=True), \
+             mock.patch.object(MODULE, "urlopen", return_value=response) as urlopen:
+            raw, identity = MODULE.source_bytes(source)
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url,
+                         "https://raw.githubusercontent.com/acme/plans/deadbeef/PLAN.md")
+        self.assertEqual(request.get_header("Authorization"), "Bearer secret")
+        self.assertEqual(raw, b"# Private plan\n")
+        self.assertEqual(identity, source)
+
     def test_exact_revision_and_stable_graph(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "plan.md"

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -33,7 +34,21 @@ def source_bytes(source: str, identity: str | None = None) -> tuple[bytes, str]:
         return raw, identity or f"inline-sha256:{digest}"
     parsed = urlparse(source)
     if parsed.scheme in {"http", "https"}:
-        request = Request(source, headers={"User-Agent": "workstream-ledger/1"})
+        fetch_url = source
+        if parsed.netloc.lower() == "github.com":
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) >= 5 and parts[2] == "blob":
+                fetch_url = (
+                    "https://raw.githubusercontent.com/"
+                    + "/".join((parts[0], parts[1], *parts[3:]))
+                )
+        headers = {"User-Agent": "workstream-ledger/1"}
+        github_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        if github_token and urlparse(fetch_url).netloc.lower() in {
+            "github.com", "raw.githubusercontent.com", "api.github.com",
+        }:
+            headers["Authorization"] = f"Bearer {github_token}"
+        request = Request(fetch_url, headers=headers)
         with urlopen(  # noqa: S310 - explicit user source
             request, timeout=15, context=default_ssl_context()
         ) as response:

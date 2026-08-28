@@ -272,7 +272,7 @@ class ResumeTests(unittest.TestCase):
             ))}], "GEN-37",
         )
         with self.assertRaisesRegex(MODULE.ResumeError, "over_item_budget"):
-            MODULE.compact_context(snapshot, "GEN-37", max_items=3)
+            MODULE.compact_context(snapshot, "GEN-37", max_items=2)
 
     def test_resume_preserves_typed_choice_scope_and_relations_when_supplied(self):
         snapshot = self.snapshot()
@@ -331,11 +331,14 @@ class ResumeTests(unittest.TestCase):
         client = mock.Mock()
         comments = mock.Mock()
         comments.comments.return_value = []
+        authenticated_route = {"workspace_id": "workspace", "team_id": "team",
+                               "project_id": "project", "root_issue_id": "root-uuid"}
         with mock.patch.object(MODULE, "HttpGraphQLClient", return_value=client), \
+             mock.patch.object(MODULE, "resolve_authenticated_issue_route", return_value=authenticated_route), \
              mock.patch.object(MODULE, "LinearGraphQLTransport", return_value=transport), \
              mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
              mock.patch.object(MODULE, "load_linear_api_key", return_value="secret"), \
-             mock.patch.object(MODULE.sys, "argv", ["workstream_resume.py", "pulp GEN-37 #3", "--linear-team-id", "team"]), \
+             mock.patch.object(MODULE.sys, "argv", ["workstream_resume.py", "pulp GEN-37 #3", "--linear-team-id", "team", "--inspection-only"]), \
              mock.patch.object(MODULE.sys, "stdout"):
             self.assertEqual(MODULE.main(), 0)
         transport.snapshot_for_root.assert_called_once_with("GEN-37")
@@ -352,11 +355,12 @@ class ResumeTests(unittest.TestCase):
         comments = mock.Mock()
         comments.comments.return_value = []
         with mock.patch.object(MODULE, "resolve_linear_route", return_value=(route, Path(".workstream.json"))), \
+             mock.patch.object(MODULE, "resolve_authenticated_issue_route", return_value={**route, "root_issue_id": "root-uuid"}), \
              mock.patch.object(MODULE, "HttpGraphQLClient", return_value=client), \
              mock.patch.object(MODULE, "LinearGraphQLTransport", constructor), \
              mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
              mock.patch.object(MODULE, "load_linear_api_key", return_value="secret"), \
-             mock.patch.object(MODULE.sys, "argv", ["workstream_resume.py", "GEN-37"]), \
+             mock.patch.object(MODULE.sys, "argv", ["workstream_resume.py", "GEN-37", "--inspection-only"]), \
              mock.patch.object(MODULE.sys, "stdout"):
             self.assertEqual(MODULE.main(), 0)
 
@@ -376,15 +380,15 @@ class ResumeTests(unittest.TestCase):
                  "project_id": "project", "root_issue_id": "root-uuid"}
         constructor = mock.Mock(return_value=transport)
         with mock.patch.object(MODULE, "resolve_linear_route", return_value=(None, None)), \
-             mock.patch.object(MODULE, "bootstrap_linear_route", return_value=route) as bootstrap, \
+             mock.patch.object(MODULE, "resolve_authenticated_issue_route", return_value=route) as bootstrap, \
              mock.patch.object(MODULE, "HttpGraphQLClient", return_value=client), \
              mock.patch.object(MODULE, "LinearGraphQLTransport", constructor), \
              mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
              mock.patch.object(MODULE, "load_linear_api_key", return_value="secret"), \
-             mock.patch.object(MODULE.sys, "argv", ["workstream_resume.py", "GEN-37"]), \
+             mock.patch.object(MODULE.sys, "argv", ["workstream_resume.py", "GEN-37", "--inspection-only"]), \
              mock.patch.object(MODULE.sys, "stdout"):
             self.assertEqual(MODULE.main(), 0)
-        bootstrap.assert_called_once_with(client, "GEN-37")
+        bootstrap.assert_called_once_with(client, "GEN-37", None)
         constructor.assert_called_once_with(
             client, team_id="team", workspace_id="workspace", project_id="project"
         )
