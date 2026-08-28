@@ -20,18 +20,61 @@ class SuccessorError(ValueError):
     pass
 
 
+def _reconcile_recorded_disposition(
+    snapshot: dict[str, Any], decision: dict[str, Any]
+) -> dict[str, Any]:
+    recorded = snapshot.get("disposition")
+    if recorded is None:
+        return {**decision, "durable_disposition": None,
+                "durable_projection_required": True}
+    if not isinstance(recorded, dict):
+        raise SuccessorError("recorded disposition is malformed")
+    expected = {
+        "disposition": decision["disposition"],
+        "remote_head": decision.get("head") or decision.get("predecessor", {}).get("head"),
+        "recovered_from_checkpoint": decision.get("recovered_from_checkpoint"),
+    }
+    # A successor is created from the verified remote head, not the stale
+    # predecessor head.
+    if decision["disposition"] == "create_successor":
+        expected["remote_head"] = decision.get("verified_remote_head")
+    for field, value in expected.items():
+        if recorded.get(field) != value:
+            raise SuccessorError(f"recorded_disposition_conflict:{field}")
+    return {**decision, "durable_disposition": recorded,
+            "durable_projection_required": False}
+
+
 def choose_disposition(snapshot: dict[str, Any], *, remote_head: str | None = None) -> dict[str, Any]:
     root = snapshot.get("root") or {}
-    token = str(root.get("identifier", "")).upper()
+    token = str(root.get("identifier") or snapshot.get("workstream_id") or "").upper()
     if not TOKEN.fullmatch(token):
         raise SuccessorError("durable root identifier must be a Linear issue token")
+    checkpoint = snapshot.get("latest_checkpoint") or {}
     provenance = snapshot.get("provenance") or {}
-    worktree = provenance.get("worktree") or {}
+    if checkpoint:
+        worktree = checkpoint.get("worktree") or {}
+        recovered_from = checkpoint.get("checkpoint_event_id")
+    elif isinstance(provenance, list):
+        candidates = [item for item in provenance if isinstance(item, dict) and item.get("worktree")]
+        if len(candidates) > 1:
+            raise SuccessorError("multiple projected worktree authorities")
+        worktree = (candidates[0] if candidates else {}).get("worktree") or {}
+        recovered_from = None
+    elif isinstance(provenance, dict):
+        worktree = provenance.get("worktree") or {}
+        recovered_from = None
+    else:
+        worktree = {}
+        recovered_from = None
     state = str(worktree.get("state", "unavailable")).lower()
     local_head = worktree.get("head")
     if state == "safe" and remote_head and local_head == remote_head:
-        return {"disposition": "attach", "workstream": token, "head": remote_head,
-                "reason": "worktree is current and matches remote truth"}
+        return _reconcile_recorded_disposition(snapshot, {
+            "disposition": "attach", "workstream": token, "head": remote_head,
+            "reason": "worktree is current and matches remote truth",
+            "recovered_from_checkpoint": recovered_from,
+        })
     if state == "safe" and not remote_head:
         reason = "current remote head is unavailable"
     elif state == "safe":
@@ -46,8 +89,12 @@ def choose_disposition(snapshot: dict[str, Any], *, remote_head: str | None = No
             "merged": "worktree is merged and not an attach target",
             "archived": "worktree is archived",
         }.get(state, "worktree safety is unknown")
-    return {"disposition": "create_successor", "workstream": token, "reason": reason,
-            "predecessor": {"path": worktree.get("path"), "head": local_head, "state": state}}
+    return _reconcile_recorded_disposition(snapshot, {
+        "disposition": "create_successor", "workstream": token, "reason": reason,
+        "predecessor": {"path": worktree.get("path"), "head": local_head, "state": state},
+        "verified_remote_head": remote_head,
+        "recovered_from_checkpoint": recovered_from,
+    })
 
 
 def successor_command(snapshot: dict[str, Any], *, remote_repo: str, remote_ref: str,
@@ -55,7 +102,6 @@ def successor_command(snapshot: dict[str, Any], *, remote_repo: str, remote_ref:
                       remote_head: str | None = None) -> dict[str, Any]:
     if not remote_head or not GIT_OID.fullmatch(remote_head):
         raise SuccessorError("verified full remote head is required for successor creation")
-    worktree = (snapshot.get("provenance") or {}).get("worktree") or {}
     decision = choose_disposition(
         snapshot,
         remote_head=remote_head,

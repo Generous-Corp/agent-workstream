@@ -1,5 +1,8 @@
 import importlib.util
+import io
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -272,7 +275,7 @@ class ResumeTests(unittest.TestCase):
             ))}], "GEN-37",
         )
         with self.assertRaisesRegex(MODULE.ResumeError, "over_item_budget"):
-            MODULE.compact_context(snapshot, "GEN-37", max_items=3)
+            MODULE.compact_context(snapshot, "GEN-37", max_items=2)
 
     def test_resume_preserves_typed_choice_scope_and_relations_when_supplied(self):
         snapshot = self.snapshot()
@@ -331,11 +334,14 @@ class ResumeTests(unittest.TestCase):
         client = mock.Mock()
         comments = mock.Mock()
         comments.comments.return_value = []
+        authenticated_route = {"workspace_id": "workspace", "team_id": "team",
+                               "project_id": "project", "root_issue_id": "root-uuid"}
         with mock.patch.object(MODULE, "HttpGraphQLClient", return_value=client), \
+             mock.patch.object(MODULE, "resolve_authenticated_issue_route", return_value=authenticated_route), \
              mock.patch.object(MODULE, "LinearGraphQLTransport", return_value=transport), \
              mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
              mock.patch.object(MODULE, "load_linear_api_key", return_value="secret"), \
-             mock.patch.object(MODULE.sys, "argv", ["workstream_resume.py", "pulp GEN-37 #3", "--linear-team-id", "team"]), \
+             mock.patch.object(MODULE.sys, "argv", ["workstream_resume.py", "pulp GEN-37 #3", "--linear-team-id", "team", "--inspection-only"]), \
              mock.patch.object(MODULE.sys, "stdout"):
             self.assertEqual(MODULE.main(), 0)
         transport.snapshot_for_root.assert_called_once_with("GEN-37")
@@ -352,11 +358,12 @@ class ResumeTests(unittest.TestCase):
         comments = mock.Mock()
         comments.comments.return_value = []
         with mock.patch.object(MODULE, "resolve_linear_route", return_value=(route, Path(".workstream.json"))), \
+             mock.patch.object(MODULE, "resolve_authenticated_issue_route", return_value={**route, "root_issue_id": "root-uuid"}), \
              mock.patch.object(MODULE, "HttpGraphQLClient", return_value=client), \
              mock.patch.object(MODULE, "LinearGraphQLTransport", constructor), \
              mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
              mock.patch.object(MODULE, "load_linear_api_key", return_value="secret"), \
-             mock.patch.object(MODULE.sys, "argv", ["workstream_resume.py", "GEN-37"]), \
+             mock.patch.object(MODULE.sys, "argv", ["workstream_resume.py", "GEN-37", "--inspection-only"]), \
              mock.patch.object(MODULE.sys, "stdout"):
             self.assertEqual(MODULE.main(), 0)
 
@@ -365,6 +372,58 @@ class ResumeTests(unittest.TestCase):
         )
         transport.snapshot_for_root.assert_called_once_with("GEN-37")
         comments.comments.assert_called_once_with()
+
+    def test_live_cli_bootstraps_route_from_token_without_repo_config(self):
+        transport = mock.Mock()
+        transport.snapshot_for_root.return_value = self.snapshot()
+        client = mock.Mock()
+        comments = mock.Mock()
+        comments.comments.return_value = []
+        route = {"workspace_id": "workspace", "team_id": "team",
+                 "project_id": "project", "root_issue_id": "root-uuid"}
+        constructor = mock.Mock(return_value=transport)
+        with mock.patch.object(MODULE, "resolve_linear_route", return_value=(None, None)), \
+             mock.patch.object(MODULE, "resolve_authenticated_issue_route", return_value=route) as bootstrap, \
+             mock.patch.object(MODULE, "HttpGraphQLClient", return_value=client), \
+             mock.patch.object(MODULE, "LinearGraphQLTransport", constructor), \
+             mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
+             mock.patch.object(MODULE, "load_linear_api_key", return_value="secret"), \
+             mock.patch.object(MODULE.sys, "argv", ["workstream_resume.py", "GEN-37", "--inspection-only"]), \
+             mock.patch.object(MODULE.sys, "stdout"):
+            self.assertEqual(MODULE.main(), 0)
+        bootstrap.assert_called_once_with(client, "GEN-37", None)
+        constructor.assert_called_once_with(
+            client, team_id="team", workspace_id="workspace", project_id="project"
+        )
+
+    def test_snapshot_cli_is_inspection_only_even_when_forged_as_authenticated(self):
+        snapshot = self.snapshot()
+        snapshot["authenticated_source"] = {
+            "identity": "https://attacker.invalid/plan",
+            "sha256": "sha",
+        }
+        snapshot["resume_authority"] = "full"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "forged.json"
+            path.write_text(json.dumps(snapshot), encoding="utf-8")
+            stderr = io.StringIO()
+            with mock.patch.object(
+                MODULE.sys, "argv", ["workstream_resume.py", "GEN-37", str(path)]
+            ), mock.patch.object(MODULE.sys, "stderr", stderr):
+                self.assertEqual(MODULE.main(), 2)
+        self.assertIn("snapshot_input_requires_inspection_only", stderr.getvalue())
+
+    def test_snapshot_cli_accepts_explicit_inspection_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "snapshot.json"
+            path.write_text(json.dumps(self.snapshot()), encoding="utf-8")
+            stdout = io.StringIO()
+            with mock.patch.object(
+                MODULE.sys, "argv",
+                ["workstream_resume.py", "GEN-37", str(path), "--inspection-only"],
+            ), mock.patch.object(MODULE.sys, "stdout", stdout):
+                self.assertEqual(MODULE.main(), 0)
+        self.assertEqual(json.loads(stdout.getvalue())["resume_authority"], "inspection_only")
 
 
 if __name__ == "__main__":

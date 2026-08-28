@@ -98,6 +98,16 @@ query WorkstreamRoute($teamId: String!, $projectId: String!) {
 }
 """
 
+TOKEN_ROUTE_QUERY = """
+query WorkstreamTokenRoute($issueId: String!) {
+  issue(id: $issueId) {
+    id identifier
+    team { id organization { id } }
+    project { id teams { nodes { id } } }
+  }
+}
+"""
+
 CREATE_MUTATION = """
 mutation WorkstreamIssueCreate($input: IssueCreateInput!) {
   issueCreate(input: $input) { success issue { id identifier title description url updatedAt } }
@@ -153,6 +163,47 @@ def validate_issue_route(
         raise LinearTransportError("Linear issue is not in the configured workspace")
     if (issue.get("project") or {}).get("id") != project_id:
         raise LinearTransportError("Linear issue is not in the configured project")
+
+
+def bootstrap_linear_route(client: GraphQLClient, token: str) -> dict[str, str]:
+    """Resolve a full authenticated route from one unambiguous issue token."""
+    normalized = token.upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", normalized):
+        raise LinearTransportError("invalid Linear issue token")
+    issue = client.execute(TOKEN_ROUTE_QUERY, {"issueId": normalized}).get("issue")
+    if not isinstance(issue, dict) or str(issue.get("identifier", "")).upper() != normalized:
+        raise LinearTransportError("Linear workstream issue not found")
+    team = issue.get("team") or {}
+    project = issue.get("project") or {}
+    workspace_id = (team.get("organization") or {}).get("id")
+    team_id = team.get("id")
+    project_id = project.get("id")
+    project_teams = {
+        item.get("id") for item in ((project.get("teams") or {}).get("nodes") or [])
+    }
+    if not all(isinstance(value, str) and value for value in (workspace_id, team_id, project_id)):
+        raise LinearTransportError("Linear issue has no complete workspace/team/project route")
+    if team_id not in project_teams:
+        raise LinearTransportError("Linear issue project is not associated with its team")
+    return {
+        "workspace_id": workspace_id,
+        "team_id": team_id,
+        "project_id": project_id,
+        "root_issue_id": issue["id"],
+    }
+
+
+def resolve_authenticated_issue_route(
+    client: GraphQLClient, token: str,
+    configured_route: dict[str, str] | None,
+) -> dict[str, str]:
+    """Bind configured routing to the authenticated issue, including its UUID."""
+    observed = bootstrap_linear_route(client, token)
+    if configured_route:
+        for field in ("workspace_id", "team_id", "project_id"):
+            if configured_route.get(field) != observed[field]:
+                raise LinearTransportError(f"configured Linear route mismatches root:{field}")
+    return observed
 
 
 def durable_description(

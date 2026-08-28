@@ -101,6 +101,15 @@ class WorkstreamCtlTests(unittest.TestCase):
             self.assertEqual(MODULE.main(["config", "validate"]), 0)
         load.assert_called_once_with(None, required=True)
 
+    def test_projection_dispatches_product_reconcile_command(self):
+        with mock.patch.object(MODULE.os, "execv") as execute:
+            MODULE.main(["projection", "GEN-37", "manifest.json"])
+        script = MODULE.SCRIPTS / "workstream_projection.py"
+        execute.assert_called_once_with(
+            MODULE.sys.executable,
+            [MODULE.sys.executable, str(script), "GEN-37", "manifest.json"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
