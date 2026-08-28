@@ -281,7 +281,32 @@ def reconcile_required_projection(
     if projection_review_contract(adapter.state()) != observed_contract:
         raise LinearProjectionError("projection_review_stale_reload_required")
 
-    receipts: list[dict[str, Any]] = []
+    activation_receipt = None
+    if initial.events and all(
+        event["schema_version"] == 1 for event in initial.events
+    ):
+        legacy_event_ids = [event["event_id"] for event in initial.events]
+        activation_receipt = adapter.activate_v2(
+            created_at=created_at, expected_revision=initial.revision,
+            expected_legacy_event_ids=legacy_event_ids,
+        )
+        activated = adapter.state()
+        if (
+            activated.revision != initial.revision + 1
+            or [event["event_id"] for event in activated.events[:initial.revision]]
+            != legacy_event_ids
+            or activated.events[-1]["kind"] != "cas_activation"
+            or activated.events[-1]["value"].get("legacy_event_ids") != legacy_event_ids
+        ):
+            raise LinearProjectionError("projection_v2_activation_readback_mismatch")
+        initial = activated
+        observed_contract = projection_review_contract(initial)
+        active_heads = _active_heads(initial)
+        latest_heads = _latest_heads(initial)
+
+    receipts: list[dict[str, Any]] = (
+        [activation_receipt] if activation_receipt is not None else []
+    )
     expected_revision = initial.revision
     expected_active_heads = dict(active_heads)
     expected_latest_heads = dict(latest_heads)

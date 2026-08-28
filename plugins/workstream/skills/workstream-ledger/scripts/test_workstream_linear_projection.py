@@ -772,6 +772,111 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(second["writes"], [])
         self.assertEqual(len(client.comments), 4)
 
+    def test_product_reconcile_activates_exact_reviewed_v1_then_replays_noop(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        projection = [
+            {"kind": "scope", "key": "root", "value": scope()},
+            {"kind": "source", "key": "root", "value": {
+                "sha256": PLAN, "identity": "https://example.test/plan",
+            }},
+            {"kind": "provenance", "key": "session-m5", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "session-m5",
+                "worktree": {"state": "safe", "head": HEAD},
+            }},
+        ]
+        disposition = {
+            "disposition": "attach", "remote_head": HEAD,
+            "recovered_from_checkpoint": "wsc-live",
+        }
+        legacy_values = [
+            *[(item["kind"], item["key"], item["value"]) for item in projection],
+            ("disposition", "root", disposition),
+        ]
+        for revision, (kind, key, value) in enumerate(legacy_values):
+            event = legacy_event(
+                kind, key, value, revision, f"2026-08-27T17:0{revision}:00Z",
+            )
+            client.comments.append(legacy_comment(event, f"legacy-{revision}"))
+        snapshot = {
+            "root": {"identifier": "GEN-37"},
+            "latest_checkpoint": {
+                "checkpoint_event_id": "wsc-live",
+                "worktree": {"state": "safe", "head": HEAD},
+            },
+        }
+        source = {"identity": "https://example.test/plan", "sha256": PLAN}
+        manifest = reviewed_manifest(adapter, projection)
+        first = reconcile_required_projection(
+            adapter, snapshot, manifest, remote_head=HEAD,
+            created_at="2026-08-27T18:00:00Z", authenticated_source=source,
+        )
+        self.assertEqual(len(first["writes"]), 1)
+        self.assertEqual(adapter.state().events[-1]["kind"], "cas_activation")
+        self.assertEqual(len(client.comments), 5)
+
+        replay_manifest = reviewed_manifest(adapter, projection)
+        replay = reconcile_required_projection(
+            adapter, snapshot, replay_manifest, remote_head=HEAD,
+            created_at="2026-08-27T18:01:00Z", authenticated_source=source,
+        )
+        self.assertEqual(replay["writes"], [])
+        self.assertEqual(len(client.comments), 5)
+
+    def test_product_reconcile_refuses_legacy_change_during_activation(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        projection = [
+            {"kind": "scope", "key": "root", "value": scope()},
+            {"kind": "source", "key": "root", "value": {
+                "sha256": PLAN, "identity": "https://example.test/plan",
+            }},
+            {"kind": "provenance", "key": "session-m5", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "session-m5",
+                "worktree": {"state": "safe", "head": HEAD},
+            }},
+        ]
+        for revision, item in enumerate(projection):
+            event = legacy_event(
+                item["kind"], item["key"], item["value"], revision,
+                f"2026-08-27T17:0{revision}:00Z",
+            )
+            client.comments.append(legacy_comment(event, f"legacy-{revision}"))
+        manifest = reviewed_manifest(adapter, projection)
+        late = legacy_event(
+            "relation", "blocks:GEN-99", {"type": "blocks", "target": {
+                "workspace_id": "workspace", "issue_id": "late-uuid",
+                "identifier": "GEN-99",
+            }}, 3, "2026-08-27T17:03:00Z",
+        )
+        activate = adapter.activate_v2
+
+        def race(**kwargs):
+            client.comments.append(legacy_comment(late, "legacy-late"))
+            return activate(**kwargs)
+
+        with mock.patch.object(adapter, "activate_v2", side_effect=race):
+            with self.assertRaisesRegex(
+                LinearProjectionError, "activation_stale_reload_required",
+            ):
+                reconcile_required_projection(
+                    adapter, {"root": {"identifier": "GEN-37"}}, manifest,
+                    remote_head=HEAD, created_at="2026-08-27T18:00:00Z",
+                    authenticated_source={
+                        "identity": "https://example.test/plan", "sha256": PLAN,
+                    },
+                )
+        self.assertEqual(len(client.comments), 4)
+        self.assertFalse(any(
+            event["schema_version"] == 2 for event in adapter.state().events
+        ))
+
     def test_product_reconcile_durably_records_create_successor(self):
         client = FakeProjectionClient()
         adapter = LinearProjectionAdapter(

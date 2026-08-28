@@ -614,12 +614,22 @@ class LinearProjectionAdapter:
             raise LinearProjectionError("linear_comment_create_id_capability_unavailable")
         self._comment_id_capability_verified = True
 
-    def activate_v2(self, *, created_at: str) -> dict[str, Any] | None:
+    def activate_v2(
+        self, *, created_at: str, expected_revision: int | None = None,
+        expected_legacy_event_ids: list[str] | None = None,
+    ) -> dict[str, Any] | None:
         """Fence reviewed v1 history before accepting any v2 CAS writes."""
         before = self.state()
         if any(event["schema_version"] == 2 for event in before.events) or not before.events:
             return None
         legacy_ids = [event["event_id"] for event in before.events]
+        if (
+            expected_revision is not None and before.revision != expected_revision
+        ) or (
+            expected_legacy_event_ids is not None
+            and legacy_ids != expected_legacy_event_ids
+        ):
+            raise LinearProjectionError("projection_v2_activation_stale_reload_required")
         event = build_projection_event(
             workstream_id=self.workstream_id, kind="cas_activation", key="root",
             value={
