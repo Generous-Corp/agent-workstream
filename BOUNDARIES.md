@@ -11,6 +11,12 @@ or credential access, and leaves Linear as the visible durable record. It also
 makes each mutation attributable to an invoked agent rather than an unseen
 local service.
 
+An exact-version update may explicitly mirror the plugin-owned skills into a
+shared/global skill root when client precedence could shadow the plugin. This
+is opt-in, publishes only after both clients verify, preserves unrelated
+skills, and is a verified local copy—not another authority or a background
+updater.
+
 The tradeoff is that the plugin cannot wake itself, continuously reconcile live
 systems, deliver notifications, or accept requests while no agent is running.
 Session and landing adapters can supply live facts, but they do not own the

@@ -98,3 +98,9 @@ Each target still requires explicit identity and an independent exact-version
 receipt. A global agent may route natural-language requests to that API, but it
 must not collapse profile, machine, repository, or workstream identities into a
 single ambient default.
+
+For hostile same-user environments, harden skill-mirror publication further by
+performing every target operation relative to the already verified directory
+descriptor (`openat`-style), eliminating the remaining check/use race if another
+process swaps the mirror root during an update. Current ancestry and inode
+checks cover accidental redirection; this is deferred adversarial hardening.

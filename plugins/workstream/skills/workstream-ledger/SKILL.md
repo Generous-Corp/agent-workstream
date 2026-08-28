@@ -247,6 +247,14 @@ the root's exact workspace/team/project route before the fenced read.
 source identity. `--plan-source` overrides the fetch location for an
 authenticated checkout; `--plan-identity` preserves its durable identity. It
 refuses success unless those exact bytes match the root and projection.
+The default bounded context validates the complete Linear history, preserves
+current child details and exact uncheckpointed requirements, blockers,
+decisions, and follow-ups, keeps actionable checkpoint evidence and routing,
+then returns digests/counts for acknowledged history and validated routing
+evidence instead of duplicating them into every agent prompt.
+Use `--include-history` for an audit or closure pass and raise the explicit
+byte/item caps when that complete history is known to exceed the normal resume
+budget; required current state is never truncated.
 For an immutable `github.com/.../blob/<40-hex-commit>/<path>` source, HTTPS is
 tried first; a 404 may fall back to existing noninteractive GitHub SSH access
 in a temporary isolated repository. Mutable refs, malformed paths, prompts,

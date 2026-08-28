@@ -91,13 +91,21 @@ python3 scripts/workstream_plugin_manager.py update \
   --host-id <stable-machine-name> \
   --source-root <durable-clean-exact-checkout> \
   --codex-home <absolute-codex-home> \
-  --claude-config-dir <absolute-claude-config-dir>
+  --claude-config-dir <absolute-claude-config-dir> \
+  --skill-mirror-root ~/.agents/skills
 ```
 
 The command uses the official Codex and Claude marketplace operations, then
 refuses unless the marketplace Git head, manifest version, enabled installation,
 and installed-tree digest all match. `doctor` performs the same verification
-without changing anything:
+without changing anything. `--skill-mirror-root` is optional and has no
+default; use it only when a shared/global skill directory could otherwise
+shadow the plugin. It transactionally synchronizes only the plugin-owned skill
+directories, records versioned ownership, preserves unrelated skills, and
+includes exact digests in the receipt. Mirror mode requires both clients: it
+publishes only after both verify, so a client failure preserves the last-good
+mirror. Removed skills are retired only while their prior owned digest remains
+unchanged.
 
 ```sh
 python3 scripts/workstream_plugin_manager.py doctor \
@@ -106,7 +114,8 @@ python3 scripts/workstream_plugin_manager.py doctor \
   --host-id <stable-machine-name> \
   --source-root <durable-clean-exact-checkout> \
   --codex-home <absolute-codex-home> \
-  --claude-config-dir <absolute-claude-config-dir>
+  --claude-config-dir <absolute-claude-config-dir> \
+  --skill-mirror-root ~/.agents/skills
 ```
 
 The source checkout must be durable because the clients retain its local path.

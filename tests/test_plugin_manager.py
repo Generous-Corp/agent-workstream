@@ -36,6 +36,15 @@ class PluginManagerTests(unittest.TestCase):
                 "commit": "a" * 40, "version": "1.2.3",
                 "tree_sha256": "d", "enabled": True, "status": "verified"}
 
+    def skill_source(self, root: Path) -> Path:
+        plugin = root / "plugin"
+        for name, body in (("workstream-ledger", "current"),
+                           ("decision-audit", "audit")):
+            skill = plugin / "skills" / name
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(body)
+        return plugin
+
     def test_tree_digest_detects_changed_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -44,6 +53,259 @@ class PluginManagerTests(unittest.TestCase):
             self.assertEqual(MODULE.tree_digest(first), MODULE.tree_digest(second))
             (second / "skills/demo/SKILL.md").write_text("changed")
             self.assertNotEqual(MODULE.tree_digest(first), MODULE.tree_digest(second))
+
+    def test_skill_mirror_updates_stale_owned_skills_and_preserves_unrelated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plugin = self.skill_source(root)
+            mirror = root.resolve() / "global"
+            (mirror / "workstream-ledger").mkdir(parents=True)
+            (mirror / "workstream-ledger/SKILL.md").write_text("stale")
+            (mirror / "unrelated").mkdir()
+            (mirror / "unrelated/SKILL.md").write_text("keep")
+            receipt = MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            self.assertTrue(receipt["changed"])
+            self.assertEqual((mirror / "workstream-ledger/SKILL.md").read_text(), "current")
+            self.assertEqual((mirror / "decision-audit/SKILL.md").read_text(), "audit")
+            self.assertEqual((mirror / "unrelated/SKILL.md").read_text(), "keep")
+            self.assertFalse((mirror / MODULE.MIRROR_MARKER).exists())
+
+    def test_skill_mirror_exact_update_is_noop_and_doctor_verifies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plugin = self.skill_source(root)
+            mirror = root.resolve() / "global"
+            first = MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            before = (mirror / "workstream-ledger/SKILL.md").stat().st_mtime_ns
+            second = MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            doctor = MODULE.sync_skill_mirror(plugin, mirror, update=False)
+            self.assertTrue(first["changed"])
+            self.assertFalse(second["changed"])
+            self.assertFalse(doctor["changed"])
+            self.assertEqual((mirror / "workstream-ledger/SKILL.md").stat().st_mtime_ns, before)
+
+    def test_skill_mirror_doctor_refuses_mismatch_and_unsafe_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plugin = self.skill_source(root)
+            mirror = root.resolve() / "global"
+            MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            (mirror / "workstream-ledger/SKILL.md").write_text("forged")
+            with self.assertRaisesRegex(MODULE.InstallError, "digest_mismatch"):
+                MODULE.sync_skill_mirror(plugin, mirror, update=False)
+            MODULE._remove_tree(mirror / "workstream-ledger")
+            (mirror / "workstream-ledger").symlink_to(plugin / "skills/workstream-ledger")
+            with self.assertRaisesRegex(MODULE.InstallError, "target_symlink"):
+                MODULE.sync_skill_mirror(plugin, mirror, update=True)
+
+    def test_skill_mirror_failure_rolls_back_every_owned_skill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plugin = self.skill_source(root)
+            mirror = root.resolve() / "global"
+            for name in ("workstream-ledger", "decision-audit"):
+                (mirror / name).mkdir(parents=True)
+                (mirror / name / "SKILL.md").write_text(f"old-{name}")
+            real_replace = MODULE.os.replace
+            injected = False
+
+            def replace(source, target):
+                nonlocal injected
+                if not injected and Path(source).parent.name == "stage":
+                    injected = True
+                    raise OSError("planted replace failure")
+                return real_replace(source, target)
+
+            with mock.patch.object(MODULE.os, "replace", side_effect=replace), \
+                 self.assertRaisesRegex(OSError, "planted replace failure"):
+                MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            self.assertEqual((mirror / "workstream-ledger/SKILL.md").read_text(),
+                             "old-workstream-ledger")
+            self.assertEqual((mirror / "decision-audit/SKILL.md").read_text(),
+                             "old-decision-audit")
+            self.assertEqual(MODULE._mirror_partial_paths(mirror), [])
+            self.assertFalse((mirror / MODULE.MIRROR_MARKER).exists())
+
+    def test_skill_mirror_update_recovers_recorded_partial_transaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plugin = self.skill_source(root)
+            mirror = root.resolve() / "global"
+            mirror.mkdir()
+            transaction = mirror / f"{MODULE.MIRROR_TRANSACTION_PREFIX}planted"
+            backup = transaction / "backup/workstream-ledger"
+            backup.mkdir(parents=True)
+            (backup / "SKILL.md").write_text("old")
+            (transaction / "stage").mkdir()
+            (mirror / "workstream-ledger").mkdir()
+            (mirror / "workstream-ledger/SKILL.md").write_text("partial")
+            old_digest = MODULE.safe_skill_digest(backup)
+            expected = MODULE.plugin_skill_digests(plugin)
+            MODULE._write_ownership(mirror, {"workstream-ledger": old_digest})
+            MODULE._write_json_atomic(mirror / MODULE.MIRROR_MARKER, {
+                "schema": MODULE.MIRROR_SCHEMA, "root": str(mirror),
+                "transaction": transaction.name, "phase": "publishing",
+                "before": {"workstream-ledger": old_digest},
+                "after": {"workstream-ledger": expected["workstream-ledger"]},
+                "affected": ["workstream-ledger"],
+                "ownership_before": {"workstream-ledger": old_digest},
+                "ownership_after": expected,
+            })
+            receipt = MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            self.assertEqual(receipt["recovery"], "rolled_back")
+            self.assertEqual((mirror / "workstream-ledger/SKILL.md").read_text(), "current")
+            self.assertEqual((mirror / "decision-audit/SKILL.md").read_text(), "audit")
+
+    def test_skill_mirror_refuses_orphan_partial_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plugin = self.skill_source(root)
+            mirror = root.resolve() / "global"
+            (mirror / f"{MODULE.MIRROR_TRANSACTION_PREFIX}orphan").mkdir(parents=True)
+            with self.assertRaisesRegex(MODULE.InstallError, "partial_state"):
+                MODULE.sync_skill_mirror(plugin, mirror, update=True)
+
+    def test_skill_mirror_binds_to_verified_plugin_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plugin = self.skill_source(root)
+            with self.assertRaisesRegex(MODULE.InstallError, "source_digest_mismatch"):
+                MODULE.sync_skill_mirror(
+                    plugin, root / "global", update=True,
+                    expected_plugin_digest="0" * 64,
+                )
+            self.assertFalse((root / "global").exists())
+
+    def test_skill_mirror_retires_only_exact_prior_owned_skill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            plugin = self.skill_source(root)
+            mirror = root / "global"
+            MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            MODULE._remove_tree(plugin / "skills/decision-audit")
+            with self.assertRaisesRegex(MODULE.InstallError, "obsolete_owned"):
+                MODULE.sync_skill_mirror(plugin, mirror, update=False)
+            receipt = MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            self.assertEqual(receipt["retired"], ["decision-audit"])
+            self.assertFalse((mirror / "decision-audit").exists())
+            self.assertEqual(MODULE._read_ownership(mirror, required=True),
+                             MODULE.plugin_skill_digests(plugin))
+
+    def test_skill_mirror_refuses_modified_obsolete_owned_skill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            plugin = self.skill_source(root)
+            mirror = root / "global"
+            MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            MODULE._remove_tree(plugin / "skills/decision-audit")
+            (mirror / "decision-audit/SKILL.md").write_text("locally modified")
+            with self.assertRaisesRegex(MODULE.InstallError, "obsolete_owned_modified"):
+                MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            self.assertEqual((mirror / "decision-audit/SKILL.md").read_text(),
+                             "locally modified")
+
+    def test_skill_mirror_refuses_missing_obsolete_owned_skill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            plugin = self.skill_source(root)
+            mirror = root / "global"
+            MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            MODULE._remove_tree(plugin / "skills/decision-audit")
+            MODULE._remove_tree(mirror / "decision-audit")
+            with self.assertRaisesRegex(MODULE.InstallError, "obsolete_owned_missing"):
+                MODULE.sync_skill_mirror(plugin, mirror, update=True)
+
+    def test_skill_mirror_recognizes_exact_rollback_with_missing_transaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            plugin = self.skill_source(root)
+            mirror = root / "global"
+            MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            before = MODULE.plugin_skill_digests(plugin)
+            (plugin / "skills/workstream-ledger/SKILL.md").write_text("next")
+            after = MODULE.plugin_skill_digests(plugin)
+            MODULE._write_json_atomic(mirror / MODULE.MIRROR_MARKER, {
+                "schema": MODULE.MIRROR_SCHEMA, "root": str(mirror),
+                "transaction": f"{MODULE.MIRROR_TRANSACTION_PREFIX}missing",
+                "phase": "publishing", "before": before, "after": after,
+                "affected": ["workstream-ledger"],
+                "ownership_before": before, "ownership_after": after,
+            })
+            receipt = MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            self.assertEqual(receipt["recovery"], "rolled_back")
+            self.assertEqual((mirror / "workstream-ledger/SKILL.md").read_text(), "next")
+            self.assertFalse((mirror / MODULE.MIRROR_MARKER).exists())
+
+    def test_skill_mirror_failure_after_marker_recovers_before_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            plugin = self.skill_source(root)
+            mirror = root / "global"
+            MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            ownership_before = MODULE._read_ownership(mirror, required=True)
+            (plugin / "skills/workstream-ledger/SKILL.md").write_text("next")
+
+            with mock.patch.object(
+                    MODULE, "_journal_phase",
+                    side_effect=OSError("planted post-marker failure")), \
+                 self.assertRaisesRegex(OSError, "post-marker"):
+                MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            self.assertEqual((mirror / "workstream-ledger/SKILL.md").read_text(), "current")
+            self.assertEqual(MODULE._read_ownership(mirror, required=True), ownership_before)
+            self.assertFalse((mirror / MODULE.MIRROR_MARKER).exists())
+            self.assertEqual(MODULE._mirror_partial_paths(mirror), [])
+
+    def test_skill_mirror_finalizes_exact_committed_state_without_transaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            plugin = self.skill_source(root)
+            mirror = root / "global"
+            MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            expected = MODULE.plugin_skill_digests(plugin)
+            MODULE._write_json_atomic(mirror / MODULE.MIRROR_MARKER, {
+                "schema": MODULE.MIRROR_SCHEMA, "root": str(mirror),
+                "transaction": f"{MODULE.MIRROR_TRANSACTION_PREFIX}missing",
+                "phase": "committed", "before": expected, "after": expected,
+                "affected": [],
+                "ownership_before": expected, "ownership_after": expected,
+            })
+            receipt = MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            self.assertEqual(receipt["recovery"], "finalized")
+            self.assertFalse((mirror / MODULE.MIRROR_MARKER).exists())
+
+    def test_skill_mirror_recovery_refuses_corrupt_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            plugin = self.skill_source(root)
+            mirror = root / "global"
+            MODULE.sync_skill_mirror(plugin, mirror, update=True)
+            expected = MODULE.plugin_skill_digests(plugin)
+            transaction = mirror / f"{MODULE.MIRROR_TRANSACTION_PREFIX}corrupt"
+            backup = transaction / "backup/workstream-ledger"
+            backup.mkdir(parents=True)
+            (backup / "SKILL.md").write_text("corrupt")
+            (transaction / "stage").mkdir()
+            MODULE._write_json_atomic(mirror / MODULE.MIRROR_MARKER, {
+                "schema": MODULE.MIRROR_SCHEMA, "root": str(mirror),
+                "transaction": transaction.name, "phase": "publishing",
+                "before": {"workstream-ledger": expected["workstream-ledger"]},
+                "after": {"workstream-ledger": "0" * 64},
+                "affected": ["workstream-ledger"],
+                "ownership_before": expected, "ownership_after": expected,
+            })
+            with self.assertRaisesRegex(MODULE.InstallError, "backup_mismatch"):
+                MODULE.sync_skill_mirror(plugin, mirror, update=True)
+
+    def test_skill_mirror_rejects_symlink_in_parent_ancestry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            plugin = self.skill_source(root)
+            actual = root / "actual"
+            actual.mkdir()
+            (root / "redirect").symlink_to(actual, target_is_directory=True)
+            with self.assertRaisesRegex(MODULE.InstallError, "unsafe_skill_mirror_ancestry"):
+                MODULE.sync_skill_mirror(plugin, root / "redirect/skills", update=True)
+            self.assertFalse((actual / "skills").exists())
 
     def test_verify_source_binds_clean_exact_commit_and_both_manifests(self):
         with tempfile.TemporaryDirectory(dir="/Users/danielraffel/Code") as directory:
@@ -368,7 +630,7 @@ class PluginManagerTests(unittest.TestCase):
                  mock.patch.object(MODULE, "update_client",
                                    side_effect=MODULE.InstallError("command_timeout:claude")) as update, \
                  mock.patch.object(MODULE, "STATE_ROOT", root / "state"), \
-                 contextlib.redirect_stdout(output):
+                contextlib.redirect_stdout(output):
                 code = MODULE.main([
                     "update", "--expected-commit", "a" * 40,
                     "--expected-version", "1.2.3", "--host-id", "M5",
@@ -421,8 +683,9 @@ class PluginManagerTests(unittest.TestCase):
                  mock.patch.object(MODULE, "inventory", return_value=({}, {})), \
                  mock.patch.object(MODULE, "verify_client", side_effect=verify), \
                  mock.patch.object(MODULE, "update_client") as update, \
+                 mock.patch.object(MODULE, "sync_skill_mirror") as mirror_sync, \
                  mock.patch.object(MODULE, "STATE_ROOT", root / "state"), \
-                 contextlib.redirect_stdout(io.StringIO()):
+                contextlib.redirect_stdout(io.StringIO()):
                 code = MODULE.main([
                     "doctor", "--expected-commit", "a" * 40,
                     "--expected-version", "1.2.3", "--host-id", "M5",
@@ -432,6 +695,106 @@ class PluginManagerTests(unittest.TestCase):
                 ])
             self.assertEqual(code, 0)
             update.assert_not_called()
+            mirror_sync.assert_not_called()
+
+    def test_main_opt_in_mirror_is_verified_and_emitted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            targets = {"codex": root / "codex", "claude": root / "claude"}
+            for target in targets.values():
+                target.mkdir()
+            proof = {"path": "/durable/source", "commit": "a" * 40,
+                     "tree_sha256": "d"}
+            mirror_receipt = {"status": "verified", "root": str(root / "skills"),
+                              "changed": True, "recovery": "none",
+                              "skills": {"workstream-ledger": "abc"}}
+            output = io.StringIO()
+            def env_for(client, **_kwargs):
+                return ({}, targets[client])
+
+            def verify(client, *_args, **_kwargs):
+                return self.receipt(client, targets[client])
+
+            with mock.patch.object(MODULE, "verify_source", return_value=proof), \
+                 mock.patch.object(MODULE, "target_env", side_effect=env_for), \
+                 mock.patch.object(MODULE, "inventory", return_value=({}, {})), \
+                 mock.patch.object(MODULE, "verify_client", side_effect=verify), \
+                 mock.patch.object(MODULE, "sync_skill_mirror",
+                                   return_value=mirror_receipt) as mirror_sync, \
+                 mock.patch.object(MODULE, "STATE_ROOT", root / "state"), \
+                 contextlib.redirect_stdout(output):
+                code = MODULE.main([
+                    "doctor",
+                    "--expected-commit", "a" * 40,
+                    "--expected-version", "1.2.3", "--host-id", "M5",
+                    "--source-root", "/durable/source",
+                    "--codex-home", str(targets["codex"]),
+                    "--claude-config-dir", str(targets["claude"]),
+                    "--skill-mirror-root", str(root / "skills"),
+                ])
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output.getvalue())["skill_mirror"], mirror_receipt)
+            mirror_sync.assert_called_once_with(
+                Path("/durable/source/plugins/workstream"), root / "skills", update=False,
+                expected_plugin_digest="d",
+            )
+
+    def test_main_mirror_requires_both_clients_before_any_client_call(self):
+        output = io.StringIO()
+        with mock.patch.object(MODULE, "verify_source") as verify_source, \
+             mock.patch.object(MODULE, "target_env") as target_env, \
+             mock.patch.object(MODULE, "sync_skill_mirror") as mirror_sync, \
+             contextlib.redirect_stdout(output):
+            code = MODULE.main([
+                "update", "--client", "codex",
+                "--expected-commit", "a" * 40,
+                "--expected-version", "1.2.3", "--host-id", "M5",
+                "--source-root", "/durable/source", "--codex-home", "/codex",
+                "--skill-mirror-root", "/global/skills",
+            ])
+        self.assertEqual(code, 2)
+        self.assertIn("requires_both_clients", output.getvalue())
+        verify_source.assert_not_called()
+        target_env.assert_not_called()
+        mirror_sync.assert_not_called()
+
+    def test_main_client_failure_preserves_last_good_mirror(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            targets = {"codex": root / "codex", "claude": root / "claude"}
+            for target in targets.values():
+                target.mkdir()
+            proof = {"path": "/durable/source", "commit": "a" * 40,
+                     "tree_sha256": "d"}
+
+            def env_for(client, **_kwargs):
+                return ({}, targets[client])
+
+            def verify(client, *_args, **_kwargs):
+                if client == "claude":
+                    raise MODULE.InstallError("installed_tree_mismatch:claude")
+                return self.receipt(client, targets[client])
+
+            output = io.StringIO()
+            with mock.patch.object(MODULE, "verify_source", return_value=proof), \
+                 mock.patch.object(MODULE, "target_env", side_effect=env_for), \
+                 mock.patch.object(MODULE, "inventory", return_value=({}, {})), \
+                 mock.patch.object(MODULE, "verify_client", side_effect=verify), \
+                 mock.patch.object(MODULE, "sync_skill_mirror") as mirror_sync, \
+                 mock.patch.object(MODULE, "STATE_ROOT", root / "state"), \
+                contextlib.redirect_stdout(output):
+                code = MODULE.main([
+                    "update", "--expected-commit", "a" * 40,
+                    "--expected-version", "1.2.3", "--host-id", "M5",
+                    "--source-root", "/durable/source",
+                    "--codex-home", str(targets["codex"]),
+                    "--claude-config-dir", str(targets["claude"]),
+                    "--skill-mirror-root", str(root / "skills"),
+                ])
+            payload = json.loads(output.getvalue())
+            self.assertEqual(code, 2)
+            self.assertEqual(payload["skill_mirror"]["status"], "preserved")
+            mirror_sync.assert_not_called()
 
     def test_ambiguous_inventory_failure_never_authorizes_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
