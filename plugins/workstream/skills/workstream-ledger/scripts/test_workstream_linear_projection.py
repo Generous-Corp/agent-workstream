@@ -19,17 +19,42 @@ from workstream_linear_events import (
 )
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
-    LinearProjectionError, reduce_projection_comments,
+    LinearProjectionError, reduce_projection_comments, TOMBSTONE,
 )
 from workstream_resume import add_material_history, compact_context, ResumeError
 import workstream_projection
-from workstream_projection import reconcile_required_projection, stable_live_readback
+from workstream_projection import (
+    projection_review_contract, reconcile_required_projection, stable_live_readback,
+)
 from workstream_successor import choose_disposition
 
 
 PLAN = "f38baae4441485b14e5b16ea0255e3a07e42aa94a4fb0e6e04e7aa513693719d"
 HEAD = "a" * 40
 ROOT_UUID = "33333333-3333-4333-8333-333333333333"
+
+
+def reviewed_manifest(adapter, projection, retirements=None):
+    return {
+        **projection_review_contract(adapter.state()),
+        "projection": projection,
+        "retirements": list(retirements or []),
+    }
+
+
+def reviewed_retirement(adapter, kind, key):
+    state = adapter.state()
+    event = next(
+        item for item in reversed(state.events)
+        if item["kind"] == kind and item["key"] == key
+        and item["value"] != {"_projection_tombstone": True}
+    )
+    return {
+        "kind": kind,
+        "key": key,
+        "expected_event_id": event["event_id"],
+        "expected_value_sha256": workstream_projection._value_digest(event["value"]),
+    }
 
 
 class FakeProjectionClient:
@@ -512,7 +537,7 @@ class ProjectionTests(unittest.TestCase):
             plan_revision=PLAN, workspace_id="workspace", team_id="team",
             project_id="project", root_issue_id=ROOT_UUID,
         )
-        manifest = {"projection": [
+        projection = [
             {"kind": "scope", "key": "root", "value": scope()},
             {"kind": "source", "key": "root", "value": {
                 "sha256": PLAN, "identity": "https://example.test/plan",
@@ -521,7 +546,8 @@ class ProjectionTests(unittest.TestCase):
                 "agent": "codex", "machine": "M5", "session_id": "session-m5",
                 "worktree": {"state": "safe", "head": HEAD},
             }},
-        ]}
+        ]
+        manifest = reviewed_manifest(adapter, projection)
         snapshot = {
             "root": {"identifier": "GEN-37"},
             "latest_checkpoint": {
@@ -537,6 +563,7 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(first["disposition"]["disposition"], "attach")
         self.assertTrue(first["readback_verified"])
         self.assertEqual(len(first["writes"]), 4)
+        manifest = reviewed_manifest(adapter, projection)
         second = reconcile_required_projection(
             adapter, snapshot, manifest, remote_head=HEAD,
             created_at="2026-08-27T18:01:00Z", authenticated_source=source,
@@ -551,7 +578,7 @@ class ProjectionTests(unittest.TestCase):
             plan_revision=PLAN, workspace_id="workspace", team_id="team",
             project_id="project", root_issue_id=ROOT_UUID,
         )
-        manifest = {"projection": [
+        manifest = reviewed_manifest(adapter, [
             {"kind": "scope", "key": "root", "value": scope()},
             {"kind": "source", "key": "root", "value": {
                 "sha256": PLAN, "identity": "https://example.test/plan",
@@ -560,7 +587,7 @@ class ProjectionTests(unittest.TestCase):
                 "agent": "claude", "machine": "M3", "session_id": "session-m3",
                 "worktree": {"state": "stale", "head": "b" * 40},
             }},
-        ]}
+        ])
         result = reconcile_required_projection(
             adapter, {"root": {"identifier": "GEN-37"}}, manifest,
             remote_head=HEAD, created_at="2026-08-27T18:00:00Z",
@@ -591,12 +618,12 @@ class ProjectionTests(unittest.TestCase):
             "workspace_id": "workspace", "issue_id": "target-uuid",
             "identifier": "GEN-14",
         }}
-        first_manifest = {"projection": [*base,
+        first_manifest = reviewed_manifest(adapter, [*base,
             {"kind": "provenance", "key": "old", "value": old_provenance},
             {"kind": "relation", "key": "blocks:GEN-14", "value": relation},
             {"kind": "evidence_contract", "key": "gen37-resume",
              "value": evidence_contract()},
-        ]}
+        ])
         snapshot = {"root": {"identifier": "GEN-37"}}
         source = {"identity": "https://example.test/plan", "sha256": PLAN}
         reconcile_required_projection(
@@ -605,9 +632,14 @@ class ProjectionTests(unittest.TestCase):
         )
         new_provenance = {"agent": "claude", "machine": "M3", "session_id": "new",
                           "worktree": {"state": "safe", "head": HEAD}}
-        second_manifest = {"projection": [*base,
+        retirements = [
+            reviewed_retirement(adapter, "relation", "blocks:GEN-14"),
+            reviewed_retirement(adapter, "evidence_contract", "gen37-resume"),
+            reviewed_retirement(adapter, "provenance", "old"),
+        ]
+        second_manifest = reviewed_manifest(adapter, [*base,
             {"kind": "provenance", "key": "new", "value": new_provenance},
-        ]}
+        ], retirements)
         result = reconcile_required_projection(
             adapter, snapshot, second_manifest, remote_head=HEAD,
             created_at="2026-08-27T19:00:00Z", authenticated_source=source,
@@ -625,13 +657,14 @@ class ProjectionTests(unittest.TestCase):
         })
         self.assertTrue(result["readback_verified"])
 
-    def test_product_reconcile_refuses_unverified_source_bytes(self):
+    def test_product_reconcile_refuses_late_key_after_review_with_zero_writes(self):
         client = FakeProjectionClient()
         adapter = LinearProjectionAdapter(
             client, issue_id="GEN-37", workstream_id="GEN-37",
-            plan_revision=PLAN,
+            plan_revision=PLAN, workspace_id="workspace", team_id="team",
+            project_id="project", root_issue_id=ROOT_UUID,
         )
-        manifest = {"projection": [
+        projection = [
             {"kind": "scope", "key": "root", "value": scope()},
             {"kind": "source", "key": "root", "value": {
                 "sha256": PLAN, "identity": "https://example.test/plan",
@@ -639,7 +672,182 @@ class ProjectionTests(unittest.TestCase):
             {"kind": "provenance", "key": "session", "value": {
                 "agent": "codex", "machine": "M5", "session_id": "session",
             }},
-        ]}
+        ]
+        manifest = reviewed_manifest(adapter, projection)
+        late = build_projection_event(
+            workstream_id="GEN-37", kind="relation", key="blocks:GEN-99",
+            value={"type": "blocks", "target": {
+                "workspace_id": "workspace", "issue_id": "late-uuid",
+                "identifier": "GEN-99",
+            }},
+            plan_revision=PLAN, expected_revision=0,
+            created_at="2026-08-27T18:00:01Z",
+        )
+        client.comments.append({
+            "id": "late-comment", "body": encode_projection_comment(late),
+            "createdAt": "now", "updatedAt": "now",
+        })
+        writes_before = len(client.comments)
+        with self.assertRaisesRegex(LinearProjectionError, "stale_reload_required"):
+            reconcile_required_projection(
+                adapter, {"root": {"identifier": "GEN-37"}}, manifest,
+                remote_head=HEAD, created_at="2026-08-27T18:01:00Z",
+                authenticated_source={
+                    "identity": "https://example.test/plan", "sha256": PLAN,
+                },
+            )
+        self.assertEqual(len(client.comments), writes_before)
+        self.assertFalse(any("commentCreate" in query for query, _ in client.calls))
+
+    def test_product_reconcile_preserves_omitted_live_key_without_retirement(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, workspace_id="workspace", team_id="team",
+            project_id="project", root_issue_id=ROOT_UUID,
+        )
+        base = [
+            {"kind": "scope", "key": "root", "value": scope()},
+            {"kind": "source", "key": "root", "value": {
+                "sha256": PLAN, "identity": "https://example.test/plan",
+            }},
+            {"kind": "provenance", "key": "session", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "session",
+            }},
+        ]
+        relation = {"type": "blocks", "target": {
+            "workspace_id": "workspace", "issue_id": "target-uuid",
+            "identifier": "GEN-14",
+        }}
+        source = {"identity": "https://example.test/plan", "sha256": PLAN}
+        reconcile_required_projection(
+            adapter, {"root": {"identifier": "GEN-37"}},
+            reviewed_manifest(adapter, [*base, {
+                "kind": "relation", "key": "blocks:GEN-14", "value": relation,
+            }]), remote_head=HEAD, created_at="2026-08-27T18:00:00Z",
+            authenticated_source=source,
+        )
+        reconcile_required_projection(
+            adapter, {"root": {"identifier": "GEN-37"}},
+            reviewed_manifest(adapter, base), remote_head=HEAD,
+            created_at="2026-08-27T19:00:00Z", authenticated_source=source,
+        )
+        state = adapter.state().snapshot
+        self.assertEqual(state["relations"], [relation])
+        self.assertFalse(any(
+            event["kind"] == "relation" and event["value"] == TOMBSTONE
+            for event in state["projection_events"]
+        ))
+
+    def test_product_reconcile_refuses_stale_explicit_retirement_head(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, workspace_id="workspace", team_id="team",
+            project_id="project", root_issue_id=ROOT_UUID,
+        )
+        base = [
+            {"kind": "scope", "key": "root", "value": scope()},
+            {"kind": "source", "key": "root", "value": {
+                "sha256": PLAN, "identity": "https://example.test/plan",
+            }},
+            {"kind": "provenance", "key": "session", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "session",
+            }},
+            {"kind": "relation", "key": "blocks:GEN-14", "value": {
+                "type": "blocks", "target": {
+                    "workspace_id": "workspace", "issue_id": "target-uuid",
+                    "identifier": "GEN-14",
+                },
+            }},
+        ]
+        source = {"identity": "https://example.test/plan", "sha256": PLAN}
+        reconcile_required_projection(
+            adapter, {"root": {"identifier": "GEN-37"}},
+            reviewed_manifest(adapter, base), remote_head=HEAD,
+            created_at="2026-08-27T18:00:00Z", authenticated_source=source,
+        )
+        retirement = reviewed_retirement(adapter, "relation", "blocks:GEN-14")
+        manifest = reviewed_manifest(adapter, base[:-1], [retirement])
+        current = next(
+            event for event in reversed(adapter.state().events)
+            if event["kind"] == "relation" and event["key"] == "blocks:GEN-14"
+        )
+        changed = build_projection_event(
+            workstream_id="GEN-37", kind="relation", key="blocks:GEN-14",
+            value={"type": "blocks", "target": {
+                "workspace_id": "workspace", "issue_id": "changed-uuid",
+                "identifier": "GEN-14",
+            }},
+            plan_revision=PLAN, expected_revision=adapter.state().revision,
+            created_at="2026-08-27T18:00:30Z",
+            supersedes_event_id=current["event_id"],
+        )
+        adapter.append(changed)
+        writes_before = len(client.comments)
+        with self.assertRaisesRegex(LinearProjectionError, "stale_reload_required"):
+            reconcile_required_projection(
+                adapter, {"root": {"identifier": "GEN-37"}}, manifest,
+                remote_head=HEAD, created_at="2026-08-27T19:00:00Z",
+                authenticated_source=source,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+
+    def test_product_reconcile_retirement_must_name_exact_reviewed_head(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, workspace_id="workspace", team_id="team",
+            project_id="project", root_issue_id=ROOT_UUID,
+        )
+        relation = {"type": "blocks", "target": {
+            "workspace_id": "workspace", "issue_id": "target-uuid",
+            "identifier": "GEN-14",
+        }}
+        base = [
+            {"kind": "scope", "key": "root", "value": scope()},
+            {"kind": "source", "key": "root", "value": {
+                "sha256": PLAN, "identity": "https://example.test/plan",
+            }},
+            {"kind": "provenance", "key": "session", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "session",
+            }},
+        ]
+        source = {"identity": "https://example.test/plan", "sha256": PLAN}
+        reconcile_required_projection(
+            adapter, {"root": {"identifier": "GEN-37"}},
+            reviewed_manifest(adapter, [*base, {
+                "kind": "relation", "key": "blocks:GEN-14", "value": relation,
+            }]), remote_head=HEAD, created_at="2026-08-27T18:00:00Z",
+            authenticated_source=source,
+        )
+        retirement = reviewed_retirement(adapter, "relation", "blocks:GEN-14")
+        retirement["expected_event_id"] = "wsp_stale"
+        manifest = reviewed_manifest(adapter, base, [retirement])
+        writes_before = len(client.comments)
+        with self.assertRaisesRegex(LinearProjectionError, "retirement_stale"):
+            reconcile_required_projection(
+                adapter, {"root": {"identifier": "GEN-37"}}, manifest,
+                remote_head=HEAD, created_at="2026-08-27T19:00:00Z",
+                authenticated_source=source,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+
+    def test_product_reconcile_refuses_unverified_source_bytes(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN,
+        )
+        manifest = reviewed_manifest(adapter, [
+            {"kind": "scope", "key": "root", "value": scope()},
+            {"kind": "source", "key": "root", "value": {
+                "sha256": PLAN, "identity": "https://example.test/plan",
+            }},
+            {"kind": "provenance", "key": "session", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "session",
+            }},
+        ])
         with self.assertRaisesRegex(LinearProjectionError, "source_bytes_mismatch"):
             reconcile_required_projection(
                 adapter, {"root": {"identifier": "GEN-37"}}, manifest,
@@ -658,7 +866,7 @@ class ProjectionTests(unittest.TestCase):
         )
         projected_scope = scope()
         projected_scope["linear"]["root_issue_id"] = "wrong"
-        manifest = {"projection": [
+        manifest = reviewed_manifest(adapter, [
             {"kind": "scope", "key": "root", "value": projected_scope},
             {"kind": "source", "key": "root", "value": {
                 "sha256": PLAN, "identity": "https://example.test/plan",
@@ -666,7 +874,7 @@ class ProjectionTests(unittest.TestCase):
             {"kind": "provenance", "key": "session", "value": {
                 "agent": "codex", "machine": "M5", "session_id": "session",
             }},
-        ]}
+        ])
         with self.assertRaisesRegex(LinearProjectionError, "root_issue_id"):
             reconcile_required_projection(
                 adapter, {"root": {"identifier": "GEN-37"}}, manifest,
@@ -690,7 +898,11 @@ class ProjectionTests(unittest.TestCase):
         identity = "https://example.test/commit/plan.md"
         client = FakeProjectionClient()
         scoped = scope()
-        manifest = {"projection": [
+        manifest = {
+            "expected_projection_revision": 0,
+            "expected_active_heads": [],
+            "retirements": [],
+            "projection": [
             {"kind": "scope", "key": "root", "value": scoped},
             {"kind": "source", "key": "root", "value": {
                 "sha256": digest, "identity": identity,
@@ -725,6 +937,7 @@ class ProjectionTests(unittest.TestCase):
                 "--plan-identity", identity,
             ]
             for expected_writes in (4, 4):
+                manifest_path.write_text(json.dumps(manifest))
                 output = io.StringIO()
                 with mock.patch.object(workstream_projection.sys, "argv", argv), \
                      mock.patch.object(workstream_projection.sys, "stdout", output), \
@@ -738,6 +951,7 @@ class ProjectionTests(unittest.TestCase):
                 payload = json.loads(output.getvalue())
                 self.assertTrue(payload["readback_verified"])
                 self.assertEqual(len(client.comments), expected_writes)
+                manifest.update(payload["projection_contract"])
         self.assertEqual(len(json.loads(output.getvalue())["writes"]), 0)
 
     def test_final_live_readback_refuses_concurrent_graph_or_checkpoint_change(self):

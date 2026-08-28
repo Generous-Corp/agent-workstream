@@ -1,5 +1,8 @@
 import importlib.util
+import io
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -392,6 +395,35 @@ class ResumeTests(unittest.TestCase):
         constructor.assert_called_once_with(
             client, team_id="team", workspace_id="workspace", project_id="project"
         )
+
+    def test_snapshot_cli_is_inspection_only_even_when_forged_as_authenticated(self):
+        snapshot = self.snapshot()
+        snapshot["authenticated_source"] = {
+            "identity": "https://attacker.invalid/plan",
+            "sha256": "sha",
+        }
+        snapshot["resume_authority"] = "full"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "forged.json"
+            path.write_text(json.dumps(snapshot), encoding="utf-8")
+            stderr = io.StringIO()
+            with mock.patch.object(
+                MODULE.sys, "argv", ["workstream_resume.py", "GEN-37", str(path)]
+            ), mock.patch.object(MODULE.sys, "stderr", stderr):
+                self.assertEqual(MODULE.main(), 2)
+        self.assertIn("snapshot_input_requires_inspection_only", stderr.getvalue())
+
+    def test_snapshot_cli_accepts_explicit_inspection_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "snapshot.json"
+            path.write_text(json.dumps(self.snapshot()), encoding="utf-8")
+            stdout = io.StringIO()
+            with mock.patch.object(
+                MODULE.sys, "argv",
+                ["workstream_resume.py", "GEN-37", str(path), "--inspection-only"],
+            ), mock.patch.object(MODULE.sys, "stdout", stdout):
+                self.assertEqual(MODULE.main(), 0)
+        self.assertEqual(json.loads(stdout.getvalue())["resume_authority"], "inspection_only")
 
 
 if __name__ == "__main__":

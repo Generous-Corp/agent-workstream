@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import re
 import sys
 from typing import Any
@@ -561,6 +562,8 @@ def main() -> int:
     try:
         token = extract_token(args.token)
         authenticated_source = None
+        if args.snapshot is not None and not args.inspection_only:
+            raise ResumeError("snapshot_input_requires_inspection_only")
         if args.snapshot is None:
             route, _config_path = resolve_linear_route(
                 config_path=args.config,
@@ -596,7 +599,10 @@ def main() -> int:
                 snapshot, comments, token, authenticated_route=route,
             )
         else:
-            raw = sys.stdin.read() if args.snapshot == "-" else open(args.snapshot, encoding="utf-8").read()
+            raw = (
+                sys.stdin.read() if args.snapshot == "-"
+                else Path(args.snapshot).read_text(encoding="utf-8")
+            )
             snapshot = json.loads(raw)
         if not args.inspection_only:
             projected_source = snapshot.get("source") or {}

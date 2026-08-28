@@ -110,7 +110,13 @@ Full-authority output requires the append-only scope, source, provenance, and
 attach/successor disposition projection. A reviewed projection manifest can be
 applied idempotently with `workstreamctl projection GEN-123 manifest.json
 --remote-head <40-or-64-hex-head> --plan-source ./PLAN.md --plan-identity <URL>`;
-the command writes only changed keys and verifies a complete live readback.
+the manifest fences the exact current projection revision and active
+key/event/value-digest set. Retirement is explicit and names the reviewed head;
+omission never deletes live state. A stale review refuses before writing. A
+positional JSON snapshot to `workstreamctl resume` is always inspection-only
+and therefore requires `--inspection-only`; only a live authenticated Linear
+read can produce full-authority output. The command writes only reviewed
+changes and verifies a complete live readback.
 
 Unavailable live surfaces remain explicit rather than being inferred from a
 checkout or transcript. See [BOUNDARIES.md](BOUNDARIES.md) for why the plugin

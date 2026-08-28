@@ -236,11 +236,16 @@ the root's exact workspace/team/project route before the fenced read.
 source identity. `--plan-source` overrides the fetch location for an
 authenticated checkout; `--plan-identity` preserves its durable identity. It
 refuses success unless those exact bytes match the root and projection.
-`--inspection-only` is an explicit legacy diagnostic mode
-and labels its output `inspection_only`; it is not authority to continue work.
-`workstreamctl projection` idempotently appends a reviewed projection manifest,
+Any positional JSON snapshot requires `--inspection-only`, labels its output
+`inspection_only`, and is not authority to continue work; JSON fields that
+claim authentication do not change that boundary. Full authority comes only
+from the command's live authenticated Linear read. `workstreamctl projection`
+requires a reviewed manifest containing the exact current projection revision,
+the exact active key/event/value-digest set, and explicit retirements naming
+their reviewed event and value digest. It never retires an omitted key. A late
+key or changed head requires reload and review before any append. The command
 computes the concrete attach/successor disposition against a verified remote
-head, and rereads the complete comment stream before reporting success.
+head and rereads the complete comment stream before reporting success.
 
 This remains a validated bounded snapshot, not complete physical cross-machine
 recovery proof. Resume does not itself fetch owner, live source-control truth,

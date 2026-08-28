@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -27,6 +28,101 @@ from workstream_successor import choose_disposition, SuccessorError
 
 
 REQUIRED_KINDS = {"scope", "source", "provenance"}
+
+
+def _value_digest(value: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _active_heads(state: Any) -> dict[tuple[str, str], dict[str, Any]]:
+    active: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in state.events:
+        identity = (event["kind"], event["key"])
+        if event["value"] == TOMBSTONE:
+            active.pop(identity, None)
+        else:
+            active[identity] = event
+    return active
+
+
+def projection_review_contract(state: Any) -> dict[str, Any]:
+    """Return the exact remote projection surface a manifest must review."""
+    return _contract_from_heads(state.revision, _active_heads(state))
+
+
+def _contract_from_heads(
+    revision: int, active: dict[tuple[str, str], dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "expected_projection_revision": revision,
+        "expected_active_heads": [
+            {
+                "kind": kind,
+                "key": key,
+                "event_id": event["event_id"],
+                "value_sha256": _value_digest(event["value"]),
+            }
+            for (kind, key), event in sorted(active.items())
+        ],
+    }
+
+
+def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    required = {
+        "projection", "retirements", "expected_projection_revision",
+        "expected_active_heads",
+    }
+    if not isinstance(manifest, dict) or set(manifest) != required:
+        raise LinearProjectionError("manifest_review_contract_required")
+    revision = manifest["expected_projection_revision"]
+    if not isinstance(revision, int) or revision < 0:
+        raise LinearProjectionError("invalid_manifest_projection_revision")
+    heads = manifest["expected_active_heads"]
+    if not isinstance(heads, list):
+        raise LinearProjectionError("manifest_active_heads_must_be_list")
+    identities: set[tuple[str, str]] = set()
+    for index, head in enumerate(heads):
+        if not isinstance(head, dict) or set(head) != {
+            "kind", "key", "event_id", "value_sha256",
+        }:
+            raise LinearProjectionError(f"invalid_manifest_active_head:{index}")
+        identity = (head.get("kind"), head.get("key"))
+        if not all(isinstance(value, str) and value for value in identity):
+            raise LinearProjectionError(f"invalid_manifest_active_head_identity:{index}")
+        if identity in identities:
+            raise LinearProjectionError(
+                f"duplicate_manifest_active_head:{identity[0]}:{identity[1]}"
+            )
+        if not isinstance(head.get("event_id"), str) or not head["event_id"]:
+            raise LinearProjectionError(f"invalid_manifest_active_head_event:{index}")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(head.get("value_sha256", ""))):
+            raise LinearProjectionError(f"invalid_manifest_active_head_digest:{index}")
+        identities.add(identity)
+    retirements = manifest["retirements"]
+    if not isinstance(retirements, list):
+        raise LinearProjectionError("manifest_retirements_must_be_list")
+    retired: set[tuple[str, str]] = set()
+    for index, retirement in enumerate(retirements):
+        if not isinstance(retirement, dict) or set(retirement) != {
+            "kind", "key", "expected_event_id", "expected_value_sha256",
+        }:
+            raise LinearProjectionError(f"invalid_manifest_retirement:{index}")
+        identity = (retirement.get("kind"), retirement.get("key"))
+        if not all(isinstance(value, str) and value for value in identity):
+            raise LinearProjectionError(f"invalid_manifest_retirement_identity:{index}")
+        if identity in retired:
+            raise LinearProjectionError(
+                f"duplicate_manifest_retirement:{identity[0]}:{identity[1]}"
+            )
+        if not isinstance(retirement.get("expected_event_id"), str) or not retirement["expected_event_id"]:
+            raise LinearProjectionError(f"invalid_manifest_retirement_event:{index}")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(retirement.get("expected_value_sha256", ""))):
+            raise LinearProjectionError(f"invalid_manifest_retirement_digest:{index}")
+        retired.add(identity)
+    return _desired_items(manifest), retirements
 
 
 def stable_live_readback(
@@ -89,7 +185,7 @@ def reconcile_required_projection(
     """Append only missing/changed values and verify the complete current view."""
     if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", remote_head):
         raise LinearProjectionError("verified_full_remote_head_required")
-    desired = _desired_items(manifest)
+    desired, reviewed_retirements = _reviewed_manifest(manifest)
     scope_item = next(item for item in desired if item["kind"] == "scope")
     source_item = next(item for item in desired if item["kind"] == "source")
     source_identity = source_item["value"].get("identity") or source_item["value"].get("url")
@@ -128,18 +224,38 @@ def reconcile_required_projection(
 
     # Validate every event envelope before the first irreversible append.
     initial = adapter.state()
-    active_heads: dict[tuple[str, str], dict[str, Any]] = {}
-    for event in initial.events:
-        identity = (event["kind"], event["key"])
-        if event["value"] == TOMBSTONE:
-            active_heads.pop(identity, None)
-        else:
-            active_heads[identity] = event
-    retirements = [
-        {"kind": kind, "key": key, "value": TOMBSTONE}
-        for (kind, key) in sorted(active_heads)
-        if (kind, key) not in desired_by_identity
-    ]
+    observed_contract = projection_review_contract(initial)
+    reviewed_contract = {
+        "expected_projection_revision": manifest["expected_projection_revision"],
+        "expected_active_heads": sorted(
+            manifest["expected_active_heads"], key=lambda item: (item["kind"], item["key"])
+        ),
+    }
+    if observed_contract != reviewed_contract:
+        raise LinearProjectionError("projection_review_stale_reload_required")
+    active_heads = _active_heads(initial)
+    retirements: list[dict[str, Any]] = []
+    for retirement in reviewed_retirements:
+        identity = (retirement["kind"], retirement["key"])
+        if identity in desired_by_identity:
+            raise LinearProjectionError(
+                f"projection_retirement_still_desired:{identity[0]}:{identity[1]}"
+            )
+        current = active_heads.get(identity)
+        if current is None:
+            raise LinearProjectionError(
+                f"projection_retirement_missing:{identity[0]}:{identity[1]}"
+            )
+        if (
+            current["event_id"] != retirement["expected_event_id"]
+            or _value_digest(current["value"]) != retirement["expected_value_sha256"]
+        ):
+            raise LinearProjectionError(
+                f"projection_retirement_stale:{identity[0]}:{identity[1]}"
+            )
+        retirements.append({
+            "kind": identity[0], "key": identity[1], "value": TOMBSTONE,
+        })
 
     for item in [*desired, *retirements]:
         build_projection_event(
@@ -149,23 +265,42 @@ def reconcile_required_projection(
             created_at=created_at,
         )
 
+    # Re-read the exact reviewed surface immediately before the first append.
+    # A late unrelated key is as material as a changed reviewed head: neither
+    # may be silently retained or tombstoned by this reconciliation.
+    if projection_review_contract(adapter.state()) != observed_contract:
+        raise LinearProjectionError("projection_review_stale_reload_required")
+
     receipts: list[dict[str, Any]] = []
+    expected_revision = initial.revision
+    expected_heads = dict(active_heads)
     for item in [*desired, *retirements]:
         state = adapter.state()
-        current = next((
-            event for event in reversed(state.events)
-            if event["kind"] == item["kind"] and event["key"] == item["key"]
-        ), None)
+        if projection_review_contract(state) != _contract_from_heads(
+            expected_revision, expected_heads,
+        ):
+            raise LinearProjectionError("projection_changed_during_reconcile")
+        identity = (item["kind"], item["key"])
+        current = expected_heads.get(identity)
         if current is not None and current["value"] == item["value"]:
             continue
         event = build_projection_event(
             workstream_id=adapter.workstream_id,
             kind=item["kind"], key=item["key"], value=item["value"],
             plan_revision=adapter.plan_revision,
-            expected_revision=state.revision, created_at=created_at,
+            expected_revision=expected_revision, created_at=created_at,
             supersedes_event_id=current["event_id"] if current else None,
         )
         receipts.append(adapter.append(event))
+        expected_revision += 1
+        if item["value"] == TOMBSTONE:
+            expected_heads.pop(identity, None)
+        else:
+            expected_heads[identity] = event
+        if projection_review_contract(adapter.state()) != _contract_from_heads(
+            expected_revision, expected_heads,
+        ):
+            raise LinearProjectionError("projection_changed_during_reconcile")
 
     final = adapter.state()
     active: dict[tuple[str, str], dict[str, Any]] = {}
@@ -175,7 +310,14 @@ def reconcile_required_projection(
             active.pop(identity, None)
         else:
             active[identity] = event["value"]
-    if active != desired_by_identity:
+    expected_active = {
+        identity: deepcopy(event["value"])
+        for identity, event in active_heads.items()
+    }
+    expected_active.update(deepcopy(desired_by_identity))
+    for retirement in retirements:
+        expected_active.pop((retirement["kind"], retirement["key"]), None)
+    if active != expected_active:
         raise LinearProjectionError("projection_readback_not_exact")
     return {
         "workstream_id": adapter.workstream_id,
@@ -184,6 +326,7 @@ def reconcile_required_projection(
         "writes": receipts,
         "disposition": disposition,
         "readback_verified": True,
+        "projection_contract": projection_review_contract(final),
     }
 
 
