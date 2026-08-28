@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import io
 import json
 import sys
@@ -11,6 +12,9 @@ from workstream_checkpoint import build_checkpoint
 from workstream_delta import Delta
 from workstream_linear_checkpoints import encode_checkpoint_comment
 from workstream_linear_events import encode_event_comment
+from workstream_linear_projection import (
+    build_projection_event, encode_projection_comment, projection_slot_id,
+)
 
 
 SCRIPT = Path(__file__).with_name("workstream_resume.py")
@@ -581,6 +585,110 @@ class ResumeTests(unittest.TestCase):
         constructor.assert_called_once_with(
             client, team_id="team", workspace_id="workspace", project_id="project"
         )
+
+    def test_live_full_resume_authenticates_source_before_strict_lifecycle_check(self):
+        graph = self.snapshot()
+        graph["root"]["plan_revision"] = "a" * 64
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project",
+            "root_issue_id": "33333333-3333-4333-8333-333333333333",
+        }
+        authenticated_source = {
+            "identity": "https://example.test/immutable-plan",
+            "sha256": "a" * 64, "bytes": 123,
+        }
+        before = MODULE.add_material_history(
+            graph, [], "GEN-37", authenticated_route=route,
+            authenticated_source=authenticated_source,
+        )
+        github = {
+            "repository": "generous-corp/agent-workstream",
+            "provider_repository_id": "R_agent_workstream", "pr_number": 41,
+            "pr_head": "c" * 40, "merged": True, "merge_sha": "d" * 40,
+        }
+        shipyard_body = {
+            "schema_version": 1,
+            "repository": github["repository"],
+            "repository_key": "github.com:id:R_agent_workstream",
+            "pr_number": github["pr_number"], "head": github["pr_head"],
+            "disposition": "merged", "receipt_id": "receipt-41",
+        }
+        shipyard = {
+            **shipyard_body,
+            "receipt_sha256": hashlib.sha256(json.dumps(
+                shipyard_body, sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest(),
+        }
+        lifecycle = build_projection_event(
+            workstream_id="GEN-37", kind="lifecycle", key="root",
+            value={
+                "status": "Landed — acceptance review required",
+                "github": github, "shipyard_receipt": shipyard,
+                "closure_input_sha256": "b" * 64,
+                "snapshot_sha256": MODULE.closure_snapshot_digest(before),
+                "independent_review": None, "closure_receipt_sha256": None,
+            },
+            plan_revision="a" * 64, expected_revision=0,
+            created_at="2026-08-28T12:00:00Z", authority=route,
+        )
+        comments_payload = [{
+            "id": projection_slot_id(
+                "GEN-37", "a" * 64, 0, route,
+            ),
+            "body": encode_projection_comment(lifecycle),
+        }]
+        preauthentication = MODULE.add_material_history(
+            graph, comments_payload, "GEN-37", authenticated_route=route,
+            permit_stale_lifecycle_for_reconcile=True,
+        )
+        self.assertEqual(
+            preauthentication["lifecycle_recovery"]["state"], "stale_snapshot",
+        )
+        transport = mock.Mock()
+        transport.snapshot_for_root.return_value = graph
+        comments = mock.Mock()
+        comments.comments.return_value = comments_payload
+        stdout = io.StringIO()
+
+        def verified_context(snapshot, *_args, **_kwargs):
+            self.assertEqual(
+                snapshot["root"]["status"],
+                "Landed — acceptance review required",
+            )
+            self.assertNotIn("lifecycle_recovery", snapshot)
+            return {"status": snapshot["root"]["status"]}
+
+        with mock.patch.object(MODULE, "resolve_linear_route", return_value=(None, None)), \
+             mock.patch.object(MODULE, "resolve_authenticated_issue_route", return_value=route), \
+             mock.patch.object(MODULE, "HttpGraphQLClient", return_value=mock.Mock()), \
+             mock.patch.object(MODULE, "LinearGraphQLTransport", return_value=transport), \
+             mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
+             mock.patch.object(MODULE, "load_linear_api_key", return_value="secret"), \
+             mock.patch.object(
+                 MODULE, "plan_payload", return_value={"source": authenticated_source},
+             ), \
+             mock.patch.object(MODULE, "compact_context", side_effect=verified_context), \
+             mock.patch.object(
+                 MODULE.sys, "argv", [
+                     "workstream_resume.py", "GEN-37",
+                     "--plan-source", authenticated_source["identity"],
+                 ],
+             ), \
+             mock.patch.object(MODULE.sys, "stdout", stdout):
+            self.assertEqual(MODULE.main(), 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue())["status"],
+            "Landed — acceptance review required",
+        )
+        graph["root"]["next_action"] = "new material state after reconciliation"
+        with self.assertRaisesRegex(
+            MODULE.ResumeError, "lifecycle_snapshot_stale_reconcile_required",
+        ):
+            MODULE.add_material_history(
+                graph, comments_payload, "GEN-37", authenticated_route=route,
+                authenticated_source=authenticated_source,
+            )
 
     def test_snapshot_cli_is_inspection_only_even_when_forged_as_authenticated(self):
         snapshot = self.snapshot()

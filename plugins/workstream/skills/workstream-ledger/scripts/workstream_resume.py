@@ -910,7 +910,7 @@ def main() -> int:
                 workspace_id=route.get("workspace_id"),
                 project_id=route.get("project_id"),
             )
-            snapshot = transport.snapshot_for_root(token)
+            live_graph_snapshot = transport.snapshot_for_root(token)
             complete_route = route if all(
                 route.get(field) for field in ("workspace_id", "team_id", "project_id")
             ) else {}
@@ -920,8 +920,13 @@ def main() -> int:
                 workspace_id=complete_route.get("workspace_id"),
                 project_id=complete_route.get("project_id"),
             ).comments()
+            # This first join discovers the projected plan source before its
+            # bytes can be authenticated. Lifecycle validation is necessarily
+            # provisional here; the full-authority join below repeats the same
+            # live inputs with authenticated_source and enforces it strictly.
             snapshot = add_material_history(
-                snapshot, comments, token, authenticated_route=route,
+                live_graph_snapshot, comments, token, authenticated_route=route,
+                permit_stale_lifecycle_for_reconcile=not args.inspection_only,
             )
         else:
             raw = (
@@ -940,7 +945,7 @@ def main() -> int:
             )["source"]
             if args.snapshot is None:
                 snapshot = add_material_history(
-                    snapshot, comments, token, authenticated_route=route,
+                    live_graph_snapshot, comments, token, authenticated_route=route,
                     authenticated_source=authenticated_source,
                 )
             else:
