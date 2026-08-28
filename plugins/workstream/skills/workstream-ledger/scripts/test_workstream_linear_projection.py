@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -8,6 +9,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+import zlib
 
 from workstream_checkpoint import build_checkpoint
 from workstream_choices import record_choice
@@ -33,6 +35,13 @@ from workstream_successor import choose_disposition
 PLAN = "f38baae4441485b14e5b16ea0255e3a07e42aa94a4fb0e6e04e7aa513693719d"
 HEAD = "a" * 40
 ROOT_UUID = "33333333-3333-4333-8333-333333333333"
+
+# Literal read-only capture of GEN-37's 0.4.0 activation comment. The compressed
+# predecessor JSON is the exact ordered event array named by that marker; it is
+# deliberately not constructed with the current activation writer.
+GEN37_040_ACTIVATION_COMMENT_BODY = "<!-- workstream-projection:v1:eyJldmVudCI6eyJhdXRob3JpdHkiOnsicHJvamVjdF9pZCI6ImVlYTI1MjJiLTE4N2QtNGY1Yi1hZjI3LWZjODMzZDRmZDFjYiIsInJvb3RfaXNzdWVfaWQiOiI0MDljMTQyMy1mOTQ5LTQ2NTUtOWY1Zi1kMzIxM2Q3YjQzNGYiLCJ0ZWFtX2lkIjoiZDU5YzU1MDktOGQ5Ni00MDkzLWI3ZDUtMDQzN2NlZDVjNjc5Iiwid29ya3NwYWNlX2lkIjoiZDgzMGI1YWUtNTYxNi00OTJkLWE3MWQtMzMxMzM4N2U4YjZmIn0sImNyZWF0ZWRfYXQiOiIyMDI2LTA4LTI4VDE4OjEzOjI1LjA0MjAyNFoiLCJldmVudF9pZCI6IndzcF80MDFmODQ0ODUyNGNmODkwNTU3YzlhMmE4NGJiNjc0YSIsImV4cGVjdGVkX3JldmlzaW9uIjoxNSwia2V5Ijoicm9vdCIsImtpbmQiOiJjYXNfYWN0aXZhdGlvbiIsInBsYW5fcmV2aXNpb24iOiJmMzhiYWFlNDQ0MTQ4NWIxNGU1YjE2ZWEwMjU1ZTNhMDdlNDJhYTk0YTRmYjBlNmUwNGU3YWE1MTM2OTM3MTlkIiwic2NoZW1hX3ZlcnNpb24iOjIsInN1cGVyc2VkZXNfZXZlbnRfaWQiOm51bGwsInZhbHVlIjp7ImxlZ2FjeV9ldmVudF9pZHMiOlsid3NwX2JhMGU5ZDk3NTZmYjU2ZTQ0ODM4YThhNDc3YjM2NjUxIiwid3NwXzRjMWNlNjNjODZkOTk5MzJiYjg5NDI5MjQ4OTU2YjUyIiwid3NwXzM2MDE1MjFjOGE1MGFkOGRhMzNlYjU2YWUxZmEzMzllIiwid3NwXzhjZDgyODRhZTViMmU5MTVkZmRlMjYxMTAwNmJiMDIzIiwid3NwXzNkMjQ3NDM5OTE1MDI3YjJjNGNkNmI0NzVlZDY5YWUxIiwid3NwXzhhOWFiZWViYmYzMTg5ZGQ5Yzg3OWZmYTYwZDRhYzZiIiwid3NwX2ZiMWNlYmFiNjZjNTQ0NjBlYTdjZGUxODAyNjkxZTA3Iiwid3NwX2JlYzI2ZDM1MDhjZDUxYWExOTIzNWRhZTAwZjhhMDc5Iiwid3NwXzdiMTc5OWYwZGJiODA5NTk2ZGE1OTkyNTMyZmJlNzQ1Iiwid3NwX2M2ZGVjYzk5YWYzZDRjYmNkZmUwYWFjMGUwM2ZhMDIxIiwid3NwXzA3N2NmNzhlZTk1MzMxZDk3NzRjOGRjOWNkMWE0OWY0Iiwid3NwXzI4YzUzNmMxZDdlMzA0NDE0MGVlMzUxZmY1ODA2YWJkIiwid3NwX2ZmMWEzZTU4OThlNmM5Mzg3YzI3ZjI3MDUzNTk2OTVhIiwid3NwX2I2YTRkYzBlMjFhZTY1ZTJjMDMwYTU4ZDlkYTRmZTE2Iiwid3NwXzhhMWViMjY0YzU4NTVhYTVkMDRjYjdkY2NjOWVhNzA3Il0sImxlZ2FjeV9ldmVudHNfc2hhMjU2IjoiYmVlYTZhYmFmZTAwOTM5NmEwYzhmYzgzMWU4Mzk4MTY1N2IxYTBhZTJkYmU1OTgwNTBiNDdmYmI0NmZjMjUwZSJ9LCJ3b3Jrc3RyZWFtX2lkIjoiR0VOLTM3In0sInNoYTI1NiI6IjFiYTcyOTgxMGE5NTAwZTJkYjdlNjE4NzgwNTRlN2JkYzkyMDQyODA4ZTM0MDUzNjc0MDQ0NTMwMmU4NWExMDkifQ -->"
+GEN37_040_PREDECESSORS_ZLIB_B64 = "eNrtmktvGzkSx7+LzmbM90PnXeS0u8BgLjuDQCgWi1avJbXQ3bJjBPnuWy3Fj3ikRHacQN71RZBa7CJZv3+RVd3889MEO4KBygyGyXSipfZCRqHj7zJMTZxq/05Kp736Y3I2oStaDbOmcMPrfj3LICmVFJyv2XmyNpoIEWwI2Xjv1HjHxzXhaL2jq6Zv2tVkKs8ml3TDJrq2HbjJZbMaDfbYrol/rhewetB6Uk3MAGzcKhtdVpb4wxNI7RwZkIGsBkgWbM2SPElLAcAp45MJKhU22eOcljC7om5nU/GlzZp/UaF+dj+p1WaxOJtcwWJDkyk7Zt4syqy9XnHLebMeL73/+z+FiTyqi2aYb/I7bJfTpkx/m11e/O1fv8/CjC64v22rdEwrK49qpY5qpQ+0+i3Nu/fXt63Mt1t9PpssmhVBN0533bX/YXw74kSgndZZqBiKsNVlAVUHUTEaU2wtCjN3MlKdNX2/od1tViZUVhtRk03CeudEqq6KYrQyJWRrbN3ethloRNTUBmHYcvrEgmsKrZBx/PlpApthzqjGv4ktD92G7tTz1X+z3QxYRVAy4OWoql83k4FgubuhuITOySRiSZ5ZJyNyKE5IawJScehD4huu2+6yXwN+6aZEI7MDEs4rvivpIiCoIoxRxsRAMfs6+fzhbNLmnrqrA5Frp1r+8b848V/XzwqWtL1t1NcFq0tsDQ0sq6XAltW22jTDzdbJzRK6Gxbcuu2boe1uvhewdy0b6nfiXjTQb79/OHso+/HXR2CAcxbzOHjwykHwYCL5XBVok7Q2UmOuqUQvqaZANC57o42BB8jD6tvF5gdjioU03vg4qm6v3U585+K/zJYHMCq1X2wuvnLNOfuVOPZ7dmi3Pn/s5ifp/GcP5YFHN+vCTvlC69iun9Hj8bqgxPJ3NUqQ3libXCxQqsJCADmpYEqWzuVwCrq425C+AaPAqqFFB7XS4nzcfm+gKy8mhx8YwTNVcNfj8R0dD1+XlIzWsWKOSucEKaVaGbcLKheXIy/UaDlxOQX44d/vh+unROJ6s1i/HPlndv9c7LfdHTnJz192q+0CsDO0zSbDVg/PT9UtKiRvMHqWCmsl55isTtrG5Hx2en+qrg6k6u2mw9PK1W/h8CDmw7Dup+fnhyJs9LQYR75qVhfnedHmc/RKB580Su+ksk5WCBRskPzLYFABvC8l4fmdz+X+XGD8yrJqRoGUbSfvlttZzTnx8i/hoZ8lEOOlcrxKRHASCm8exhAXdUCq8tdE+wWibwUiFUhVrBcGLIhQohRRKhQqG16TtI+I5V5AY9DQClYnJqLtBswjwLbQRzazBC4BV2P69w83WqV+NLfz2ZETHlkxqq35p2dw/cA0x4CDSpPPPwt9xBJ1tMB+1pSUK7UQt1RS+pylNvvRm7u1gRZjx9NxLMreQ95eH5ueEuIBugsa7leM2lD3xY/bsT+semJgSlxXJJczV9dFiZjJCUWO6yCZq7T+B4qYmzXdO+/nhXXRNliTGKvUIWu0WHy2wVHxiYN7P1u7j60Or5ftduwP2HpSPpORojArrmgzs7UQGLXS3vIYo6WTZxshQSbKuRoV07g/xcBpH3hZLKDP+9m6vXH7itmqR2xlImcqWCFt1EwpGMHckrDGx2qyVBzEJ8+2Zs7XMmTv0VnLewIELuVUZBtJkQz72fq9bPUrZqu/ZgsmJ1LSCyRAYSEGkQkYMDI9bbFmU06ebSbUvhgneeN1CkAlbVwBkrJG9nPazzbsY/uKw/ZR1FrvE2oVRGVWzKg4kZ01nE9JdBE8aDInTzZkFbjyloXLK5lc8gVcStoZXTPXE24/2bg3auUrjlr5NVtONTQgSCGrt8Jy9iuAMgqusGw1EEC5evJs0RdCTAmqKRYzlkoSACVJ3mykPpBJpX1szStekc2jFdkzJq1DEOA1r8jkx3w5RYZmonc+uuLVybOVIWANkSg5HkFJIViMBRMWBTZVe+DpiNwH177iEsg+KoGyHyvBXEQ2geFarXm7TUm4wvkIxRpMOf1USkd0xqMqgRP+0d2SyDhVq4vSQy4H4B549lWafvuc79SoPhwX50nDADjfPuXElk3x1GrXLmdsGy/XbTM+5tgZ6GjZDvTkt0vPhmX1VEuGZVx0+/Je7tOQi4n7x8RqQR2qDtIZ3k2TgwOw9MmeKTj2oMTbqYO3Uwdvpw7eTh2c5qkD7ZO3piqMvEAXVGhSBsfbp7Qy5sx5PGmjUng7dfB26uDt1MHbqYO3Uwf/H6cOvpPNZw+2oCStgLwjjdJI4DUiFc6sSfkD2bx53W+Vj32f/ovfOz9hD3+h987fUUcERVl7i/y3Y18XaZETKURMBOHQOw5lT7wwP/ahwwuX7kfj/QbOD/8Fek0stw=="
+GEN37_040_PREDECESSORS_SHA256 = "a15eb5261aa9da3a1afd81cf88e053453ca29758c616485aa7174eebe1165da2"
 AUTHORITY = {
     "workspace_id": "workspace", "team_id": "team", "project_id": "project",
     "root_issue_id": ROOT_UUID,
@@ -63,6 +72,26 @@ def legacy_event(kind, key, value, revision, created_at):
 
 def legacy_comment(event, remote_id):
     return {"id": remote_id, "body": encode_projection_comment(event)}
+
+
+def gen37_040_activation_fixture():
+    predecessor_bytes = zlib.decompress(base64.b64decode(
+        GEN37_040_PREDECESSORS_ZLIB_B64
+    ))
+    assert hashlib.sha256(predecessor_bytes).hexdigest() == (
+        GEN37_040_PREDECESSORS_SHA256
+    )
+    predecessors = json.loads(predecessor_bytes)
+    return [
+        *[
+            legacy_comment(event, f"captured-gen37-predecessor-{index}")
+            for index, event in enumerate(predecessors)
+        ],
+        {
+            "id": "91886409-e4dd-4777-a462-20f9ebb20513",
+            "body": GEN37_040_ACTIVATION_COMMENT_BODY,
+        },
+    ]
 
 
 def reviewed_manifest(adapter, projection, retirements=None):
@@ -267,6 +296,121 @@ def evidence_contract() -> dict:
 
 
 class ProjectionTests(unittest.TestCase):
+    def _single_legacy_activation_comments(self, value):
+        legacy = legacy_event(
+            "scope", "root", scope(), 0, "2026-08-27T17:00:00Z",
+        )
+        activation = build_projection_event(
+            workstream_id="GEN-37", kind="cas_activation", key="root",
+            value=value, plan_revision=PLAN, expected_revision=1,
+            created_at="2026-08-27T18:00:00Z", authority=AUTHORITY,
+        )
+        return legacy, [
+            legacy_comment(legacy, "legacy-0"), projection_comment(activation),
+        ]
+
+    def test_literal_gen37_040_activation_and_predecessors_remain_readable(self):
+        state = reduce_projection_comments(
+            gen37_040_activation_fixture(), workstream_id="GEN-37",
+            expected_plan_revision=PLAN,
+            authenticated_route={
+                "workspace_id": "d830b5ae-5616-492d-a71d-3313387e8b6f",
+                "team_id": "d59c5509-8d96-4093-b7d5-0437ced5c679",
+                "project_id": "eea2522b-187d-4f5b-af27-fc833d4fd1cb",
+                "root_issue_id": "409c1423-f949-4655-9f5f-d3213d7b434f",
+            },
+        )
+        self.assertEqual(state.revision, 16)
+        activation = state.events[-1]
+        self.assertEqual(activation["event_id"], "wsp_401f8448524cf890557c9a2a84bb674a")
+        self.assertEqual(
+            set(activation["value"]),
+            {"legacy_event_ids", "legacy_events_sha256"},
+        )
+        self.assertEqual(state.snapshot["scope"]["namespace"], "agent-workstream-continuity")
+
+    def test_unversioned_d457_full_event_digest_remains_readable(self):
+        legacy = legacy_event(
+            "scope", "root", scope(), 0, "2026-08-27T17:00:00Z",
+        )
+        value = {
+            "legacy_event_ids": [legacy["event_id"]],
+            "legacy_events_sha256": hashlib.sha256(
+                projection_module._canonical([legacy])
+            ).hexdigest(),
+        }
+        _legacy, comments = self._single_legacy_activation_comments(value)
+        state = reduce_projection_comments(
+            comments, workstream_id="GEN-37", expected_plan_revision=PLAN,
+            authenticated_route=AUTHORITY,
+        )
+        self.assertEqual(state.revision, 2)
+
+    def test_tagged_activation_rejects_ids_digest_without_fallback(self):
+        legacy = legacy_event(
+            "scope", "root", scope(), 0, "2026-08-27T17:00:00Z",
+        )
+        value = {
+            "legacy_digest_kind": projection_module.LEGACY_DIGEST_KIND_FULL_EVENTS,
+            "legacy_event_ids": [legacy["event_id"]],
+            "legacy_events_sha256": hashlib.sha256(
+                projection_module._canonical([legacy["event_id"]])
+            ).hexdigest(),
+        }
+        _legacy, comments = self._single_legacy_activation_comments(value)
+        with self.assertRaisesRegex(
+            LinearProjectionError, "activation_legacy_digest_mismatch",
+        ):
+            reduce_projection_comments(
+                comments, workstream_id="GEN-37", expected_plan_revision=PLAN,
+                authenticated_route=AUTHORITY,
+            )
+
+    def test_untagged_activation_rejects_neither_and_ambiguous_both(self):
+        legacy = legacy_event(
+            "scope", "root", scope(), 0, "2026-08-27T17:00:00Z",
+        )
+        neither = {
+            "legacy_event_ids": [legacy["event_id"]],
+            "legacy_events_sha256": "0" * 64,
+        }
+        _legacy, comments = self._single_legacy_activation_comments(neither)
+        with self.assertRaisesRegex(
+            LinearProjectionError, "activation_legacy_digest_mismatch",
+        ):
+            reduce_projection_comments(
+                comments, workstream_id="GEN-37", expected_plan_revision=PLAN,
+                authenticated_route=AUTHORITY,
+            )
+        ambiguous = {**neither, "legacy_events_sha256": "a" * 64}
+        with mock.patch.object(
+            projection_module, "_activation_digest_candidates",
+            return_value=("a" * 64, "a" * 64),
+        ):
+            self.assertFalse(projection_module._activation_legacy_digest_is_valid(
+                ambiguous, [legacy],
+            ))
+
+    def test_activation_rejects_unknown_tag_and_extra_fields(self):
+        base = {
+            "legacy_digest_kind": projection_module.LEGACY_DIGEST_KIND_FULL_EVENTS,
+            "legacy_event_ids": ["wsp_legacy"],
+            "legacy_events_sha256": "a" * 64,
+        }
+        for value in (
+            {**base, "legacy_digest_kind": "unknown"},
+            {**base, "extra": "mixed"},
+            {key: item for key, item in base.items() if key != "legacy_event_ids"},
+        ):
+            with self.assertRaisesRegex(
+                LinearProjectionError, "invalid_projection_cas_activation",
+            ):
+                build_projection_event(
+                    workstream_id="GEN-37", kind="cas_activation", key="root",
+                    value=value, plan_revision=PLAN, expected_revision=1,
+                    created_at="2026-08-27T18:00:00Z", authority=AUTHORITY,
+                )
+
     def event(self, kind, key, value, revision, supersedes=None):
         return build_projection_event(
             workstream_id="GEN-37", kind=kind, key=key, value=value,
@@ -826,7 +970,16 @@ class ProjectionTests(unittest.TestCase):
             created_at="2026-08-27T18:00:00Z", authenticated_source=source,
         )
         self.assertEqual(len(first["writes"]), 1)
-        self.assertEqual(adapter.state().events[-1]["kind"], "cas_activation")
+        activation = adapter.state().events[-1]
+        self.assertEqual(activation["kind"], "cas_activation")
+        self.assertEqual(
+            set(activation["value"]),
+            {"legacy_digest_kind", "legacy_event_ids", "legacy_events_sha256"},
+        )
+        self.assertEqual(
+            activation["value"]["legacy_digest_kind"],
+            projection_module.LEGACY_DIGEST_KIND_FULL_EVENTS,
+        )
         self.assertEqual(len(client.comments), 5)
 
         replay_manifest = reviewed_manifest(adapter, projection)
