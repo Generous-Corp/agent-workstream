@@ -25,6 +25,11 @@ class PlanIntakeTests(unittest.TestCase):
         self.addCleanup(error.close)
         return error
 
+    def test_git_fetch_timeout_is_bounded_at_measured_thirty_second_budget(self):
+        self.assertEqual(MODULE.GIT_FETCH_TIMEOUT_SECONDS, 30)
+        self.assertEqual(MODULE.GIT_SHOW_TIMEOUT_SECONDS, 5)
+        self.assertEqual(MODULE.PROCESS_REAP_TIMEOUT_SECONDS, 2)
+
     def test_remote_plan_fetch_uses_verified_tls_context(self):
         context = object()
         response = mock.MagicMock()

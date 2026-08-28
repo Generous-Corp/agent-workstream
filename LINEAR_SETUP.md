@@ -69,8 +69,10 @@ lives somewhere else.
 ## 3. Required access
 
 The key must be able to read teams, projects, issues, and comments and to create
-or update the issues and comments used by the workstream. Do not grant
-administrative access for this workflow.
+or update the issues and comments used by the workstream. Initial `intake`
+specifically requires issue-read and issue-create access; it supplies
+deterministic issue IDs and verifies the complete route after creation. Do not
+grant administrative access for this workflow.
 
 Treat `.workstream.json` as non-secret configuration and every Linear token as
 a secret. If `linear inspect` cannot see the intended route, fix the key's

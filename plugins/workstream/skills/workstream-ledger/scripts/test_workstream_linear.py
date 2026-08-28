@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 import os
 import ssl
+import threading
 import unittest
 from unittest import mock
 
 from workstream_http import default_ssl_context
+from workstream_graph import GraphReviewRequired
 from workstream_linear import (
     bootstrap_linear_route,
     HttpGraphQLClient,
     LinearGraphQLTransport,
     LinearTransportError,
     MARKER,
+    deterministic_issue_id,
     parse_next_action,
     parse_plan_revision,
     parse_root_revision,
@@ -37,7 +40,10 @@ class FakeClient:
             return {"team": {"issues": {"nodes": self.issues[:]}}}
         if "issueCreate" in query:
             data = variables["input"]
-            issue = {"id": f"id-{self.next_id}", "identifier": f"GEN-{self.next_id}", "title": data["title"], "description": data["description"], "url": f"https://linear.test/{self.next_id}", "updatedAt": "now", "state": {"name": "Todo", "type": "unstarted"}, "parent": {"id": data.get("parentId")} if data.get("parentId") else None, "project": {"id": data["projectId"]} if data.get("projectId") else None}
+            issue_id = data.get("id", f"id-{self.next_id}")
+            if any(issue["id"] == issue_id for issue in self.issues):
+                raise LinearTransportError("duplicate issue id")
+            issue = {"id": issue_id, "identifier": f"GEN-{self.next_id}", "title": data["title"], "description": data["description"], "url": f"https://linear.test/{self.next_id}", "updatedAt": "now", "state": {"name": "Todo", "type": "unstarted"}, "parent": {"id": data.get("parentId")} if data.get("parentId") else None, "project": {"id": data["projectId"]} if data.get("projectId") else None, "team": {"id": data["teamId"], "organization": {"id": "workspace"}}}
             self.next_id += 1
             self.issues.append(issue)
             return {"issueCreate": {"success": True, "issue": issue}}
@@ -112,6 +118,11 @@ class LinearTransportTests(unittest.TestCase):
     def plan(self):
         return {"graph_review_required": True, "root": {"stable_key": "source-demo", "title": "Demo", "plan_revision": "sha-demo"}, "children": [{"key": "a", "stable_key": "a", "title": "Build"}]}
 
+    def routed_transport(self, fake):
+        return LinearGraphQLTransport(
+            fake, team_id="team", workspace_id="workspace", project_id="project"
+        )
+
     def test_reviewed_plan_creates_one_root_and_child(self):
         fake = FakeClient()
         result = LinearGraphQLTransport(fake, team_id="team").apply_reviewed_plan(self.plan(), accepted_keys={"a"})
@@ -130,6 +141,189 @@ class LinearTransportTests(unittest.TestCase):
         self.assertEqual(route_calls, [{"teamId": "team", "projectId": "project"}])
         self.assertEqual(len(create_inputs), 2)
         self.assertTrue(all(item["projectId"] == "project" for item in create_inputs))
+        self.assertTrue(all(item.get("id") for item in create_inputs))
+
+    def test_deterministic_issue_ids_are_scoped_by_route_root_and_child(self):
+        root = deterministic_issue_id(
+            workspace_id="workspace", team_id="team", project_id="project",
+            root_stable_key="source-demo",
+        )
+        self.assertEqual(root, "eac384c6-5f7c-5afc-bbd9-618cedf902a2")
+        self.assertEqual(
+            root,
+            deterministic_issue_id(
+                workspace_id="workspace", team_id="team", project_id="project",
+                root_stable_key="source-demo",
+            ),
+        )
+        child = deterministic_issue_id(
+            workspace_id="workspace", team_id="team", project_id="project",
+            root_stable_key="source-demo", child_stable_key="a",
+        )
+        self.assertEqual(child, "e94bc97d-505d-55ba-a8e7-4b6002c785b0")
+        self.assertNotEqual(root, child)
+        self.assertNotEqual(
+            child,
+            deterministic_issue_id(
+                workspace_id="workspace", team_id="team", project_id="project",
+                root_stable_key="source-other", child_stable_key="a",
+            ),
+        )
+        self.assertNotEqual(
+            child,
+            deterministic_issue_id(
+                workspace_id="workspace", team_id="team", project_id="project",
+                root_stable_key="source-demo", child_stable_key="b",
+            ),
+        )
+        self.assertNotEqual(
+            root,
+            deterministic_issue_id(
+                workspace_id="workspace", team_id="team", project_id="other",
+                root_stable_key="source-demo",
+            ),
+        )
+
+    def test_routed_intake_is_idempotent_and_returns_exact_receipts(self):
+        fake = FakeClient()
+        transport = self.routed_transport(fake)
+        first = transport.intake_reviewed_plan(self.plan(), accepted_keys={"a"})
+        second = transport.intake_reviewed_plan(self.plan(), accepted_keys={"a"})
+
+        self.assertEqual(len(fake.issues), 2)
+        self.assertEqual(first["receipts"]["root"]["id"], second["receipts"]["root"]["id"])
+        self.assertEqual(first["receipts"]["children"][0]["id"], second["receipts"]["children"][0]["id"])
+        self.assertEqual(second["receipts"]["root"]["disposition"], "existing")
+        self.assertEqual(second["receipts"]["children"][0]["disposition"], "existing")
+        self.assertEqual(sum("issueCreate" in query for query, _ in fake.calls), 2)
+
+    def test_concurrent_first_intake_converges_without_duplicate_or_delete(self):
+        class ConcurrentFake(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.lock = threading.Lock()
+                self.first_reads = set()
+                self.barrier = threading.Barrier(2)
+
+            def execute(self, query, variables):
+                if "query WorkstreamIssues" in query:
+                    thread = threading.get_ident()
+                    with self.lock:
+                        first = thread not in self.first_reads
+                        self.first_reads.add(thread)
+                    if first:
+                        self.barrier.wait(timeout=2)
+                with self.lock:
+                    return super().execute(query, variables)
+
+        fake = ConcurrentFake()
+        results = []
+        failures = []
+
+        def intake():
+            try:
+                results.append(
+                    self.routed_transport(fake).intake_reviewed_plan(
+                        self.plan(), accepted_keys={"a"}
+                    )
+                )
+            except Exception as error:  # pragma: no cover - asserted below
+                failures.append(error)
+
+        threads = [threading.Thread(target=intake) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(failures, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(len(fake.issues), 2)
+        self.assertEqual(
+            {result["receipts"]["root"]["id"] for result in results},
+            {fake.issues[0]["id"]},
+        )
+        self.assertFalse(any("issueUpdate" in query or "issueDelete" in query for query, _ in fake.calls))
+
+    def test_committed_create_with_lost_response_converges_by_readback(self):
+        class LostResponseFake(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.lose_next_create = True
+
+            def execute(self, query, variables):
+                result = super().execute(query, variables)
+                if "issueCreate" in query and self.lose_next_create:
+                    self.lose_next_create = False
+                    raise TimeoutError("response lost after commit")
+                return result
+
+        fake = LostResponseFake()
+        result = self.routed_transport(fake).intake_reviewed_plan(
+            self.plan(), accepted_keys={"a"}
+        )
+
+        self.assertEqual(len(fake.issues), 2)
+        self.assertEqual(result["receipts"]["root"]["disposition"], "converged")
+        self.assertEqual(result["receipts"]["children"][0]["disposition"], "created")
+
+    def test_same_plan_can_add_a_newly_reviewed_missing_child(self):
+        fake = FakeClient()
+        transport = self.routed_transport(fake)
+        plan = self.plan()
+        plan["children"].append({"key": "b", "stable_key": "b", "title": "Verify"})
+
+        transport.intake_reviewed_plan(plan, accepted_keys={"a"})
+        result = transport.intake_reviewed_plan(plan, accepted_keys={"a", "b"})
+
+        self.assertEqual(len(fake.issues), 3)
+        dispositions = {
+            receipt["stable_key"]: receipt["disposition"]
+            for receipt in result["receipts"]["children"]
+        }
+        self.assertEqual(dispositions, {"a": "existing", "b": "created"})
+
+    def test_changed_plan_still_refuses_without_remote_cas(self):
+        fake = FakeClient()
+        transport = self.routed_transport(fake)
+        transport.intake_reviewed_plan(self.plan(), accepted_keys={"a"})
+        changed = self.plan()
+        changed["root"]["plan_revision"] = "sha-changed"
+        fake.calls.clear()
+
+        with self.assertRaisesRegex(LinearTransportError, "remote_cas_unavailable"):
+            transport.intake_reviewed_plan(changed, accepted_keys={"a"})
+
+        self.assertFalse(any("issueCreate" in query or "issueUpdate" in query for query, _ in fake.calls))
+
+    def test_deterministic_id_collision_fails_closed(self):
+        fake = FakeClient()
+        root_id = deterministic_issue_id(
+            workspace_id="workspace", team_id="team", project_id="project",
+            root_stable_key="source-demo",
+        )
+        fake.issues.append({
+            "id": root_id, "identifier": "GEN-99", "title": "Unrelated",
+            "description": "<!-- workstream-key:other -->\nPlan revision: sha-demo",
+            "url": "https://linear.test/99", "updatedAt": "now", "parent": None,
+            "project": {"id": "project"},
+            "team": {"id": "team", "organization": {"id": "workspace"}},
+        })
+
+        with self.assertRaisesRegex(LinearTransportError, "intake_identity_collision"):
+            self.routed_transport(fake).intake_reviewed_plan(
+                self.plan(), accepted_keys={"a"}
+            )
+        self.assertEqual(len(fake.issues), 1)
+
+    def test_routed_missed_review_fails_before_network(self):
+        fake = FakeClient()
+        with self.assertRaises(GraphReviewRequired):
+            self.routed_transport(fake).intake_reviewed_plan(
+                self.plan(), accepted_keys=None
+            )
+        self.assertEqual(fake.calls, [])
 
     def test_from_config_requires_and_consumes_complete_route(self):
         fake = FakeClient()

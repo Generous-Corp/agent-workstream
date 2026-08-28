@@ -36,6 +36,10 @@ class GraphTests(unittest.TestCase):
         with self.assertRaises(MODULE.GraphReviewRequired):
             MODULE.build_operations(self.plan(), accepted_keys={"missing"})
 
+    def test_explicit_empty_review_creates_only_the_root(self):
+        operations = MODULE.build_operations(self.plan(), accepted_keys=set())
+        self.assertEqual([operation["action"] for operation in operations], ["create_root"])
+
 
 if __name__ == "__main__":
     unittest.main()

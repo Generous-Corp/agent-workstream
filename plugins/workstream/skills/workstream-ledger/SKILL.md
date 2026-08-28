@@ -89,22 +89,32 @@ with `-`; supply `--identity` as soon as a durable reference exists. An omitted
 identity makes stdin content-addressed and is only a provisional snapshot.
 
 The output's `source.sha256`/`root.plan_revision` is the plan revision to record
-on the single Linear root. This helper is intentionally side-effect free and
+on the single Linear root. `workstreamctl plan` is intentionally side-effect free and
 sets `graph_review_required=true`: Markdown structure can produce deterministic
 candidates, but cannot prove which sections are independently actionable. The
 active agent must review completeness before creating the root and accepted
-children. When the repository root contains `.workstream.json`, load its
+children. Apply that explicit review with:
+
+```sh
+workstreamctl intake ./PLAN.md --identity <canonical-url> \
+  --plan-revision <source-sha256-from-preview> \
+  --root-stable-key <root-stable-key-from-preview> \
+  --accept-key <stable-key-from-preview>
+```
+
+Use `--accept-none` only after explicitly reviewing a root-only graph. When the
+repository root contains `.workstream.json`, load its
 validated Linear workspace/team/project route automatically; an explicit
 `--config` or `WORKSTREAM_CONFIG` may select a deliberate external declaration.
-Use `LinearGraphQLTransport.from_config` for initial graph operations. Explicit
-route arguments must match the declaration, and authenticated route validation
-must pass before any issue read or write. The current GraphQL transport can
-create an initial graph and treats
-an exact same-revision repeat with all accepted children present as a zero-write
-no-op. It cannot serialize concurrent first creation or safely rewrite an
-existing graph: those paths fail `remote_cas_unavailable` until a remote
-serialization/CAS authority exists. Never infer a repository, worktree, or
-Linear project from the Markdown's current directory.
+Explicit route arguments must match the declaration, and authenticated route
+validation must pass before any issue read or write. Initial root and child IDs
+are deterministic UUIDs scoped by immutable workspace/team/project plus stable
+plan keys. Concurrent duplicate creates reload and validate every owned field,
+converging only on an exact match; they never lock by time, update, or delete.
+An exact repeat is a zero-write no-op, and the same plan revision may add a
+newly reviewed missing child. Changed-plan and other existing-graph mutations
+still fail `remote_cas_unavailable` until a remote CAS authority exists. Never
+infer a repository, worktree, or Linear project from the Markdown's cwd.
 
 ### Material-delta journal
 
@@ -263,10 +273,12 @@ blocker.
 `scripts/workstream_graph.py` converts an intake payload plus a reviewed set of
 candidate keys into deterministic root/child operations and refuses child
 creation before explicit review. Stable keys make sequential comparison and
-same-revision no-op detection deterministic; they are not a server-side unique
-constraint. The current authenticated transport rejects duplicate observed
-keys and all existing-graph mutations that would require remote CAS. Concurrent
-first creation remains unproven and must not be described as idempotent.
+same-revision no-op detection deterministic. The authenticated intake transport
+maps those keys to client-supplied, route-scoped UUIDs and resolves a duplicate
+create only by complete reload and exact-field validation. Focused fake-client
+tests cover concurrent first creation and collision refusal; they are not live
+Linear or cross-machine proof. Existing-graph mutations that require remote CAS
+remain refused.
 
 ### Material-boundary checkpoint schema
 

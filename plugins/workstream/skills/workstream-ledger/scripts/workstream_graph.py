@@ -26,7 +26,7 @@ def build_operations(
     if plan.get("graph_review_required") and accepted_keys is None:
         raise GraphReviewRequired("review candidate graph before creating children")
     candidates = {str(child["key"]): child for child in plan.get("children", [])}
-    accepted = set(accepted_keys or candidates)
+    accepted = set(candidates if accepted_keys is None else accepted_keys)
     unknown = accepted - candidates.keys()
     if unknown:
         raise GraphReviewRequired("accepted key is not present in plan: " + ",".join(sorted(unknown)))

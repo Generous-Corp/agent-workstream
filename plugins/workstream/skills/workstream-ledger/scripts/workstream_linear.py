@@ -5,8 +5,8 @@ The transport is intentionally dependency-free and accepts an injectable
 GraphQL client for deterministic tests.  It never creates children before the
 candidate review gate and deduplicates by stable marker, not title or cwd.
 Linear's API has no conditional-update primitive, so revision-fenced overwrites
-fail closed. A future serialized or append-only adapter must provide the remote
-CAS/replay boundary before concurrent mutations can be enabled.
+fail closed. Initial reviewed intake is concurrency-safe because its immutable
+issue identities are deterministic; mutable updates still require remote CAS.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import json
 import re
 import ssl
 import urllib.request
+import uuid
 from typing import Any, Protocol
 
 from workstream_http import default_ssl_context
@@ -83,6 +84,7 @@ query WorkstreamIssues($teamId: String!, $after: String) {
         id identifier title description url updatedAt
         parent { id identifier }
         project { id }
+        team { id organization { id } }
         state { name type }
       }
       pageInfo { hasNextPage endCursor }
@@ -110,9 +112,39 @@ query WorkstreamTokenRoute($issueId: String!) {
 
 CREATE_MUTATION = """
 mutation WorkstreamIssueCreate($input: IssueCreateInput!) {
-  issueCreate(input: $input) { success issue { id identifier title description url updatedAt } }
+  issueCreate(input: $input) {
+    success
+    issue {
+      id identifier title description url updatedAt
+      parent { id identifier }
+      project { id }
+      team { id organization { id } }
+    }
+  }
 }
 """
+
+ISSUE_ID_NAMESPACE = uuid.UUID("3ce600c8-3d41-4b3c-b399-cc9d54629335")
+
+
+def deterministic_issue_id(
+    *, workspace_id: str, team_id: str, project_id: str,
+    root_stable_key: str, child_stable_key: str | None = None,
+) -> str:
+    """Return the client-supplied UUID for one immutable intake identity."""
+    fields = (workspace_id, team_id, project_id, root_stable_key)
+    if any(not isinstance(value, str) or not value.strip() for value in fields):
+        raise ValueError("deterministic Linear issue identity needs a complete route and root key")
+    if child_stable_key is not None and (
+        not isinstance(child_stable_key, str) or not child_stable_key.strip()
+    ):
+        raise ValueError("deterministic Linear child identity needs a stable key")
+    material = json.dumps(
+        ["workstream-issue-v1", *fields, child_stable_key],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return str(uuid.uuid5(ISSUE_ID_NAMESPACE, material))
 
 def marker(key: str) -> str:
     return f"<!-- workstream-key:{key} -->"
@@ -342,10 +374,308 @@ class LinearGraphQLTransport:
             "decisions": [], "provenance": [],
         }
 
+    def _intake_route(self) -> dict[str, str]:
+        if not self.workspace_id or not self.project_id:
+            raise LinearTransportError(
+                "concurrent intake requires explicit workspace, team, and project IDs"
+            )
+        return {
+            "workspace_id": self.workspace_id,
+            "team_id": self.team_id,
+            "project_id": self.project_id,
+        }
+
+    def _validate_intake_issue(
+        self,
+        issue: dict[str, Any],
+        *,
+        issue_id: str,
+        stable_key: str,
+        title: str,
+        plan_revision: str,
+        parent_id: str | None,
+    ) -> None:
+        """Validate every intake-owned immutable field after create or reload."""
+        route = self._intake_route()
+        description = issue.get("description") or ""
+        markers = MARKER.findall(description)
+        revisions = [
+            value
+            for match in PLAN_REVISION.findall(description)
+            for value in match
+            if value
+        ]
+        if markers != [stable_key]:
+            raise LinearTransportError(
+                f"intake_identity_collision:{stable_key}:stable_key"
+            )
+        if revisions != [plan_revision]:
+            raise LinearTransportError(
+                f"intake_identity_collision:{stable_key}:plan_revision"
+            )
+        observed = {
+            "id": issue.get("id"),
+            "title": issue.get("title"),
+            "parent_id": (issue.get("parent") or {}).get("id"),
+            "project_id": (issue.get("project") or {}).get("id"),
+            "team_id": (issue.get("team") or {}).get("id"),
+            "workspace_id": ((issue.get("team") or {}).get("organization") or {}).get("id"),
+        }
+        expected = {
+            "id": issue_id,
+            "title": title,
+            "parent_id": parent_id,
+            "project_id": route["project_id"],
+            "team_id": route["team_id"],
+            "workspace_id": route["workspace_id"],
+        }
+        for field, value in expected.items():
+            if observed[field] != value:
+                raise LinearTransportError(
+                    f"intake_identity_collision:{stable_key}:{field}"
+                )
+
+    def _create_or_converge(
+        self,
+        *,
+        issue_id: str,
+        stable_key: str,
+        title: str,
+        description: str,
+        plan_revision: str,
+        parent_id: str | None,
+    ) -> tuple[dict[str, Any], str]:
+        values: dict[str, Any] = {
+            "id": issue_id,
+            "title": title,
+            "description": description,
+        }
+        if parent_id is not None:
+            values["parentId"] = parent_id
+        issue: dict[str, Any] | None = None
+        failure: Exception | None = None
+        try:
+            response = self.client.execute(
+                CREATE_MUTATION, {"input": self._create_input(**values)}
+            )
+            candidate = response.get("issueCreate", {}).get("issue")
+            if isinstance(candidate, dict):
+                issue = candidate
+        except (LinearTransportError, OSError, TimeoutError, ValueError) as error:
+            # The server may have committed before the response failed. The
+            # deterministic UUID makes a complete reload the only safe oracle.
+            failure = error
+        if issue is not None:
+            self._validate_intake_issue(
+                issue,
+                issue_id=issue_id,
+                stable_key=stable_key,
+                title=title,
+                plan_revision=plan_revision,
+                parent_id=parent_id,
+            )
+            return issue, "created"
+
+        try:
+            reloaded = self.snapshot()["issues"]
+        except Exception as reload_error:
+            raise LinearTransportError(
+                f"intake_create_unconfirmed:{stable_key}"
+            ) from reload_error
+        issue = next((item for item in reloaded if item.get("id") == issue_id), None)
+        if not isinstance(issue, dict):
+            raise LinearTransportError(
+                f"intake_create_unconfirmed:{stable_key}"
+            ) from failure
+        self._validate_intake_issue(
+            issue,
+            issue_id=issue_id,
+            stable_key=stable_key,
+            title=title,
+            plan_revision=plan_revision,
+            parent_id=parent_id,
+        )
+        return issue, "converged"
+
+    @staticmethod
+    def _intake_receipt(
+        issue: dict[str, Any], *, stable_key: str, disposition: str,
+    ) -> dict[str, Any]:
+        return {
+            "stable_key": stable_key,
+            "id": issue["id"],
+            "identifier": issue.get("identifier"),
+            "url": issue.get("url"),
+            "title": issue.get("title"),
+            "parent_id": (issue.get("parent") or {}).get("id"),
+            "updated_at": issue.get("updatedAt"),
+            "disposition": disposition,
+        }
+
+    def intake_reviewed_plan(
+        self, plan: dict[str, Any], *, accepted_keys: set[str] | None,
+    ) -> dict[str, Any]:
+        """Create or converge one reviewed same-plan graph without remote updates."""
+        # Review is an authorization boundary. Validate it before auth, route
+        # discovery, or any other network call.
+        operations = build_operations(plan, accepted_keys=accepted_keys)
+        route = self._intake_route()
+        self._ensure_route()
+        root_operation = operations[0]
+        root_key = root_operation["stable_key"]
+        plan_revision = root_operation["plan_revision"]
+        root_id = deterministic_issue_id(
+            **route, root_stable_key=root_key
+        )
+        existing = self.snapshot()["issues"]
+        matching_roots = [item for item in existing if issue_key(item) == root_key]
+        if len(matching_roots) > 1:
+            raise LinearTransportError("duplicate_workstream_root")
+        root = matching_roots[0] if matching_roots else None
+        root_disposition = "existing"
+        if root is not None:
+            if parse_plan_revision(root.get("description")) != plan_revision:
+                raise LinearTransportError("remote_cas_unavailable")
+            self._validate_intake_issue(
+                root,
+                issue_id=root_id,
+                stable_key=root_key,
+                title=root_operation["title"],
+                plan_revision=plan_revision,
+                parent_id=None,
+            )
+        else:
+            occupied = next((item for item in existing if item.get("id") == root_id), None)
+            if occupied is not None:
+                self._validate_intake_issue(
+                    occupied,
+                    issue_id=root_id,
+                    stable_key=root_key,
+                    title=root_operation["title"],
+                    plan_revision=plan_revision,
+                    parent_id=None,
+                )
+                root, root_disposition = occupied, "converged"
+            else:
+                root, root_disposition = self._create_or_converge(
+                    issue_id=root_id,
+                    stable_key=root_key,
+                    title=root_operation["title"],
+                    description=durable_description(
+                        root_key,
+                        plan_revision,
+                        next_action=root_operation.get("next_action"),
+                        ledger_revision=0,
+                    ),
+                    plan_revision=plan_revision,
+                    parent_id=None,
+                )
+
+        child_receipts: list[dict[str, Any]] = []
+        applied: list[dict[str, Any]] = (
+            [root] if root_disposition != "existing" else []
+        )
+        for operation in operations[1:]:
+            key = operation["stable_key"]
+            child_id = deterministic_issue_id(
+                **route, root_stable_key=root_key, child_stable_key=key
+            )
+            current = self.snapshot()["issues"]
+            root_children = [
+                item for item in current
+                if (item.get("parent") or {}).get("id") == root_id
+            ]
+            matching = [item for item in root_children if issue_key(item) == key]
+            if len(matching) > 1:
+                raise LinearTransportError("duplicate_workstream_child")
+            child = matching[0] if matching else None
+            disposition = "existing"
+            if child is not None:
+                self._validate_intake_issue(
+                    child,
+                    issue_id=child_id,
+                    stable_key=key,
+                    title=operation["title"],
+                    plan_revision=plan_revision,
+                    parent_id=root_id,
+                )
+            else:
+                occupied = next((item for item in current if item.get("id") == child_id), None)
+                if occupied is not None:
+                    self._validate_intake_issue(
+                        occupied,
+                        issue_id=child_id,
+                        stable_key=key,
+                        title=operation["title"],
+                        plan_revision=plan_revision,
+                        parent_id=root_id,
+                    )
+                    child, disposition = occupied, "converged"
+                else:
+                    child, disposition = self._create_or_converge(
+                        issue_id=child_id,
+                        stable_key=key,
+                        title=operation["title"],
+                        description=durable_description(
+                            key,
+                            plan_revision,
+                            next_action=operation.get("next_action"),
+                        ),
+                        plan_revision=plan_revision,
+                        parent_id=root_id,
+                    )
+            if disposition != "existing":
+                applied.append(child)
+            child_receipts.append(
+                self._intake_receipt(child, stable_key=key, disposition=disposition)
+            )
+
+        # A full final readback is the receipt authority; mutation responses are
+        # never enough to claim that the graph converged.
+        final = self.snapshot()["issues"]
+        final_root = next((item for item in final if item.get("id") == root_id), None)
+        if not isinstance(final_root, dict):
+            raise LinearTransportError("intake_readback_missing_root")
+        self._validate_intake_issue(
+            final_root,
+            issue_id=root_id,
+            stable_key=root_key,
+            title=root_operation["title"],
+            plan_revision=plan_revision,
+            parent_id=None,
+        )
+        for receipt, operation in zip(child_receipts, operations[1:]):
+            child = next((item for item in final if item.get("id") == receipt["id"]), None)
+            if not isinstance(child, dict):
+                raise LinearTransportError(
+                    f"intake_readback_missing_child:{receipt['stable_key']}"
+                )
+            self._validate_intake_issue(
+                child,
+                issue_id=receipt["id"],
+                stable_key=receipt["stable_key"],
+                title=operation["title"],
+                plan_revision=plan_revision,
+                parent_id=root_id,
+            )
+        root_receipt = self._intake_receipt(
+            final_root, stable_key=root_key, disposition=root_disposition
+        )
+        return {
+            "schema_version": 1,
+            "plan_revision": plan_revision,
+            "route": route,
+            "root": final_root,
+            "issues": applied,
+            "receipts": {"root": root_receipt, "children": child_receipts},
+        }
+
     def apply_reviewed_plan(
         self, plan: dict[str, Any], *, accepted_keys: set[str],
         expected_revision: int | None = None,
     ) -> dict[str, Any]:
+        if self.workspace_id and self.project_id and expected_revision is None:
+            return self.intake_reviewed_plan(plan, accepted_keys=accepted_keys)
         existing = self.snapshot()["issues"]
         root_key = str(plan.get("root", {}).get("stable_key", ""))
         matching_roots = [i for i in existing if issue_key(i) == root_key]

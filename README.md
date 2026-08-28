@@ -16,6 +16,8 @@ Its goals are to:
 
 Linear is the pilot durable ledger. Deterministic Python reducers validate plan
 intake, scope, deltas, checkpoints, evidence, resume snapshots, and closure.
+Reviewed first intake uses route-scoped deterministic Linear issue IDs, so
+concurrent creators converge on one exact root/child graph or fail closed.
 An optional repository-root `.workstream.json` is the fail-closed routing
 authority for its Linear workspace, team, and project; explicit overrides must
 match it.
