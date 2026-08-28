@@ -79,7 +79,7 @@ machine:
 
 ```sh
 python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_plan.py" \
-  ./PLAN.md --identity https://github.com/org/private-plans/blob/main/PLAN.md
+  ./PLAN.md --identity https://github.com/org/private-plans/blob/<40-hex-commit>/PLAN.md
 ```
 
 Pasted Markdown works too. First commit the exact text to its durable planning
@@ -236,6 +236,10 @@ the root's exact workspace/team/project route before the fenced read.
 source identity. `--plan-source` overrides the fetch location for an
 authenticated checkout; `--plan-identity` preserves its durable identity. It
 refuses success unless those exact bytes match the root and projection.
+For an immutable `github.com/.../blob/<40-hex-commit>/<path>` source, HTTPS is
+tried first; a 404 may fall back to existing noninteractive GitHub SSH access
+in a temporary isolated repository. Mutable refs, malformed paths, prompts,
+timeouts, and Git failures refuse resume rather than weakening source proof.
 Any positional JSON snapshot requires `--inspection-only`, labels its output
 `inspection_only`, and is not authority to continue work; JSON fields that
 claim authentication do not change that boundary. Full authority comes only

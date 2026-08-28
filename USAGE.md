@@ -88,7 +88,7 @@ From a checkout of this repository:
 ```sh
 # Snapshot a plan without writing to Linear.
 plugins/workstream/bin/workstreamctl plan ./PLAN.md \
-  --identity https://github.com/example/plans/blob/main/PLAN.md
+  --identity https://github.com/example/plans/blob/<40-hex-commit>/PLAN.md
 
 # Resolve one live root with full authority, fetching its projected plan bytes.
 plugins/workstream/bin/workstreamctl resume GEN-123
@@ -100,6 +100,12 @@ plugins/workstream/bin/workstreamctl resume GEN-123 \
 # Inspect an older root without claiming authority to continue it.
 plugins/workstream/bin/workstreamctl resume GEN-123 --inspection-only
 ```
+
+Token-only resume tries HTTPS first. If an immutable GitHub blob URL at an
+exact 40-hex commit returns 404, it can use existing noninteractive GitHub SSH
+access in a temporary isolated repository. Mutable refs and failed or timed-out
+SSH retrieval refuse authority; no API token is forwarded to the Git process.
+The fallback requires POSIX process-group cleanup; HTTPS remains portable.
 
 Live resume also reduces the root's complete append-only material-event and
 checkpoint history. It uses the latest durable event next action and, when one

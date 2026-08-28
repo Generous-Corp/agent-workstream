@@ -1,6 +1,6 @@
 {
   "name": "workstream",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Durable project workstreams that survive agent sessions, machines, and changing scope.",
   "author": {
     "name": "Generous Corp",

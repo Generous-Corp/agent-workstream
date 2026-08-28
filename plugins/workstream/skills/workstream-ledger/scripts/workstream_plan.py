@@ -14,8 +14,12 @@ import hashlib
 import json
 import os
 import re
+import signal
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -25,6 +29,155 @@ SCHEMA_VERSION = 1
 HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 NUMBERED = re.compile(r"^\s*(\d+)[.)]\s+(.+?)\s*$")
 FENCE = re.compile(r"^\s*(```|~~~)")
+GITHUB_OWNER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
+GITHUB_REPOSITORY = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?"
+)
+GITHUB_PATH_SEGMENT = re.compile(r"[A-Za-z0-9._+@,-]+")
+EXACT_GIT_COMMIT = re.compile(r"[0-9a-f]{40}")
+GIT_FETCH_TIMEOUT_SECONDS = 20
+GIT_SHOW_TIMEOUT_SECONDS = 5
+PROCESS_REAP_TIMEOUT_SECONDS = 2
+SSH_WRAPPER = """#!/usr/bin/env python3
+import os
+import sys
+
+os.execvp("ssh", ["ssh", "-oBatchMode=yes", *sys.argv[1:]])
+"""
+
+
+def _immutable_github_blob(source: str) -> tuple[str, str, str, str] | None:
+    """Parse a strict immutable github.com blob identity for SSH fallback."""
+    parsed = urlparse(source)
+    if parsed.scheme != "https" or parsed.netloc.lower() != "github.com":
+        return None
+    if parsed.params or parsed.query or parsed.fragment:
+        return None
+    match = re.fullmatch(
+        r"/([^/]+)/([^/]+)/blob/([^/]+)/(.+)", parsed.path,
+    )
+    if not match:
+        return None
+    owner, repository, commit, path = match.groups()
+    segments = path.split("/")
+    if (
+        not GITHUB_OWNER.fullmatch(owner)
+        or not GITHUB_REPOSITORY.fullmatch(repository)
+        or not EXACT_GIT_COMMIT.fullmatch(commit)
+        or len(path) > 4096
+        or any(
+            not segment
+            or segment in {".", ".."}
+            or not GITHUB_PATH_SEGMENT.fullmatch(segment)
+            for segment in segments
+        )
+    ):
+        return None
+    return owner, repository, commit, path
+
+
+def _git_ssh_environment() -> dict[str, str]:
+    """Keep only environment needed for Git/SSH; never forward API tokens."""
+    allowed = (
+        "PATH", "HOME", "SSH_AUTH_SOCK", "LANG", "LC_ALL", "USER",
+        "LOGNAME", "TMPDIR",
+    )
+    environment = {
+        key: os.environ[key] for key in allowed if os.environ.get(key)
+    }
+    environment.update({
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    })
+    return environment
+
+
+def _run_bounded(
+    arguments: list[str], *, environment: dict[str, str], timeout: float,
+) -> bytes:
+    """Run one command in an owned process group and reap its whole tree."""
+    if not hasattr(os, "killpg") or not hasattr(signal, "SIGKILL"):
+        raise OSError("immutable GitHub SSH plan fetch requires process-group support")
+    try:
+        process = subprocess.Popen(
+            arguments,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            start_new_session=True,
+        )
+    except OSError as error:
+        raise OSError("immutable GitHub SSH plan fetch failed") from error
+    try:
+        stdout, _stderr = process.communicate(timeout=timeout)
+    except BaseException as error:
+        _kill_and_reap(process)
+        if isinstance(error, subprocess.TimeoutExpired):
+            raise TimeoutError("immutable GitHub SSH plan fetch timed out") from error
+        raise
+    if process.returncode != 0:
+        _kill_and_reap(process)
+        raise OSError("immutable GitHub SSH plan fetch failed")
+    return stdout
+
+
+def _kill_and_reap(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.communicate(timeout=PROCESS_REAP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.communicate(timeout=PROCESS_REAP_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as error:
+            raise OSError(
+                "immutable GitHub SSH plan process tree could not be reaped"
+            ) from error
+
+
+def _write_ssh_wrapper(directory: str) -> str:
+    """Create a fixed no-shell SSH launcher that forbids interactive auth."""
+    wrapper = Path(directory) / "workstream-ssh"
+    wrapper.write_text(SSH_WRAPPER, encoding="utf-8")
+    wrapper.chmod(0o700)
+    return str(wrapper)
+
+
+def _github_ssh_blob_bytes(
+    owner: str, repository: str, commit: str, path: str,
+) -> bytes:
+    """Fetch one exact GitHub object over SSH in a disposable bare repo."""
+    remote = f"git@github.com:{owner}/{repository}.git"
+    with tempfile.TemporaryDirectory(prefix="workstream-plan-") as directory:
+        repository_path = str(Path(directory) / "repository.git")
+        environment = _git_ssh_environment()
+        environment.update({
+            "GIT_SSH": _write_ssh_wrapper(directory),
+            "GIT_SSH_VARIANT": "ssh",
+        })
+        _run_bounded(
+            ["git", "init", "--bare", "--quiet", repository_path],
+            environment=environment, timeout=GIT_SHOW_TIMEOUT_SECONDS,
+        )
+        _run_bounded(
+            [
+                "git", "-C", repository_path, "fetch", "--quiet", "--no-tags",
+                "--depth=1", remote, commit,
+            ],
+            environment=environment, timeout=GIT_FETCH_TIMEOUT_SECONDS,
+        )
+        return _run_bounded(
+            [
+                "git", "-C", repository_path, "show", "--no-ext-diff",
+                "--no-textconv", f"{commit}:{path}",
+            ],
+            environment=environment, timeout=GIT_SHOW_TIMEOUT_SECONDS,
+        )
 
 
 def source_bytes(source: str, identity: str | None = None) -> tuple[bytes, str]:
@@ -49,10 +202,16 @@ def source_bytes(source: str, identity: str | None = None) -> tuple[bytes, str]:
         }:
             headers["Authorization"] = f"Bearer {github_token}"
         request = Request(fetch_url, headers=headers)
-        with urlopen(  # noqa: S310 - explicit user source
-            request, timeout=15, context=default_ssl_context()
-        ) as response:
-            return response.read(), identity or source
+        try:
+            with urlopen(  # noqa: S310 - explicit user source
+                request, timeout=15, context=default_ssl_context()
+            ) as response:
+                return response.read(), identity or source
+        except HTTPError as error:
+            immutable = _immutable_github_blob(source)
+            if error.code != 404 or immutable is None:
+                raise
+            return _github_ssh_blob_bytes(*immutable), identity or source
     path = Path(source).expanduser().resolve()
     return path.read_bytes(), identity or str(path)
 
