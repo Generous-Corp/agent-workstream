@@ -272,6 +272,7 @@ def reconcile_required_projection(
             kind=item["kind"], key=item["key"], value=item["value"],
             plan_revision=adapter.plan_revision, expected_revision=0,
             created_at=created_at,
+            authority=adapter.authority,
         )
 
     # Re-read the exact reviewed surface immediately before the first append.
@@ -303,6 +304,7 @@ def reconcile_required_projection(
             supersedes_event_id=(
                 latest_current["event_id"] if latest_current else None
             ),
+            authority=adapter.authority,
         )
         receipts.append(adapter.append(event))
         expected_revision += 1

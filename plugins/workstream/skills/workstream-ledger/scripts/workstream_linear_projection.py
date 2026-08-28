@@ -18,6 +18,7 @@ import hmac
 import json
 import os
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,18 +29,52 @@ from workstream_linear import (
 from workstream_linear_events import COMMENT_CREATE_MUTATION, COMMENTS_QUERY
 
 
+COMMENT_CREATE_CAPABILITY_QUERY = """
+query WorkstreamProjectionCommentCreateCapability {
+  __type(name: "CommentCreateInput") { inputFields { name } }
+}
+"""
+
+
 PROJECTION_PREFIX = "<!-- workstream-projection:v1:"
 PROJECTION_RE = re.compile(r"<!-- workstream-projection:v1:([A-Za-z0-9_-]+) -->")
 KINDS = {
     "scope", "relation", "choice", "evidence_contract", "source",
-    "provenance", "disposition",
+    "provenance", "disposition", "closure_review", "lifecycle", "cas_activation",
+    "quarantine_disposition",
 }
-SINGLETON_KINDS = {"scope", "source", "disposition"}
+SINGLETON_KINDS = {
+    "scope", "source", "disposition", "lifecycle", "cas_activation",
+    "quarantine_disposition",
+}
 TOMBSTONE = {"_projection_tombstone": True}
+AUTHORITY_FIELDS = {"workspace_id", "team_id", "project_id", "root_issue_id"}
 
 
 class LinearProjectionError(LinearTransportError):
     """The remote projection cannot be persisted or reduced without guessing."""
+
+
+def projection_slot_id(
+    workstream_id: str, plan_revision: str, revision: int,
+    authority: dict[str, str],
+) -> str:
+    """Return one UUIDv4-shaped remote create slot for a projection revision."""
+    if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", workstream_id.upper()):
+        raise LinearProjectionError("invalid_projection_workstream")
+    if not isinstance(plan_revision, str) or not plan_revision:
+        raise LinearProjectionError("projection_missing:plan_revision")
+    if not isinstance(revision, int) or revision < 0:
+        raise LinearProjectionError("invalid_projection_revision")
+    validate_projection_authority(authority)
+    material = _canonical([
+        "workstream-projection-slot-v2", authority, workstream_id.upper(),
+        plan_revision, revision,
+    ])
+    raw = bytearray(hashlib.sha256(material).digest()[:16])
+    raw[6] = (raw[6] & 0x0F) | 0x40
+    raw[8] = (raw[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(raw)))
 
 
 def _canonical(value: Any) -> bytes:
@@ -56,13 +91,20 @@ def _event_id(event: dict[str, Any]) -> str:
     return "wsp_" + hashlib.sha256(_canonical(_immutable(event))).hexdigest()[:32]
 
 
+def validate_projection_authority(authority: dict[str, Any]) -> None:
+    if not isinstance(authority, dict) or set(authority) != AUTHORITY_FIELDS:
+        raise LinearProjectionError("invalid_projection_authority")
+    if not all(isinstance(authority[field], str) and authority[field] for field in AUTHORITY_FIELDS):
+        raise LinearProjectionError("invalid_projection_authority")
+
+
 def build_projection_event(
     *, workstream_id: str, kind: str, key: str, value: dict[str, Any],
     plan_revision: str, expected_revision: int, created_at: str,
-    supersedes_event_id: str | None = None,
+    supersedes_event_id: str | None = None, authority: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     event = {
-        "schema_version": 1,
+        "schema_version": 2,
         "workstream_id": workstream_id.upper(),
         "kind": kind,
         "key": key,
@@ -71,6 +113,7 @@ def build_projection_event(
         "expected_revision": expected_revision,
         "created_at": created_at,
         "supersedes_event_id": supersedes_event_id,
+        "authority": deepcopy(authority),
     }
     event["event_id"] = _event_id(event)
     validate_projection_event(event)
@@ -83,8 +126,13 @@ def validate_projection_event(event: dict[str, Any]) -> None:
         "value", "plan_revision", "expected_revision", "created_at",
         "supersedes_event_id",
     }
-    if set(event) != required or event.get("schema_version") != 1:
+    schema_version = event.get("schema_version")
+    if schema_version == 2:
+        required.add("authority")
+    if set(event) != required or schema_version not in {1, 2}:
         raise LinearProjectionError("invalid_projection_event_fields")
+    if schema_version == 2:
+        validate_projection_authority(event["authority"])
     if event.get("kind") not in KINDS:
         raise LinearProjectionError("invalid_projection_kind")
     for field in ("event_id", "workstream_id", "key", "plan_revision", "created_at"):
@@ -96,6 +144,44 @@ def validate_projection_event(event: dict[str, Any]) -> None:
         raise LinearProjectionError("invalid_projection_value")
     value = event["value"]
     tombstone = value == TOMBSTONE
+    if event["kind"] == "cas_activation":
+        if tombstone or set(value) != {"legacy_event_ids", "legacy_events_sha256"}:
+            raise LinearProjectionError("invalid_projection_cas_activation")
+        legacy_ids = value["legacy_event_ids"]
+        if (
+            event["key"] != "root"
+            or not isinstance(legacy_ids, list)
+            or len(legacy_ids) != len(set(legacy_ids))
+            or not all(isinstance(item, str) and item for item in legacy_ids)
+            or value["legacy_events_sha256"] != hashlib.sha256(
+                _canonical(sorted(legacy_ids))
+            ).hexdigest()
+        ):
+            raise LinearProjectionError("invalid_projection_cas_activation")
+    if event["kind"] == "quarantine_disposition":
+        required_disposition = {
+            "event_ids", "events_sha256", "review_artifact_identity",
+            "review_artifact_sha256", "reviewed_at",
+        }
+        event_ids = value.get("event_ids") if isinstance(value, dict) else None
+        if (
+            tombstone
+            or set(value) != required_disposition
+            or event["key"] != "root"
+            or not isinstance(event_ids, list)
+            or not event_ids
+            or event_ids != sorted(set(event_ids))
+            or not all(isinstance(item, str) and item for item in event_ids)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("events_sha256", "")))
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(value.get("review_artifact_sha256", ""))
+            )
+            or not all(
+                isinstance(value.get(field), str) and value[field]
+                for field in ("review_artifact_identity", "reviewed_at")
+            )
+        ):
+            raise LinearProjectionError("invalid_projection_quarantine_disposition")
     if event["kind"] == "source" and not tombstone:
         if not re.fullmatch(r"[0-9a-f]{64}", str(value.get("sha256", ""))):
             raise LinearProjectionError("invalid_projection_source_digest")
@@ -106,6 +192,35 @@ def validate_projection_event(event: dict[str, Any]) -> None:
         for field in ("agent", "machine", "session_id"):
             if not isinstance(value.get(field), str) or not value[field].strip():
                 raise LinearProjectionError(f"invalid_projection_provenance:{field}")
+    if event["kind"] == "closure_review" and not tombstone:
+        review_fields = {
+            "schema_version", "workstream_id", "snapshot_sha256",
+            "closure_input_sha256", "repository_key", "exact_head", "verdict",
+            "reviewer_agent", "reviewer_session_id", "implementer_session_id",
+            "reviewed_at", "review_artifact_identity", "review_artifact_sha256",
+            "trust_boundary", "procedural_independence",
+        }
+        if set(value) != review_fields or value.get("schema_version") != 1:
+            raise LinearProjectionError("invalid_projection_closure_review")
+        if (
+            event["key"] != value.get("snapshot_sha256")
+            or value.get("workstream_id") != event["workstream_id"]
+            or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("snapshot_sha256", "")))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("closure_input_sha256", "")))
+            or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", str(value.get("exact_head", "")))
+            or value.get("verdict") != "pass"
+            or value.get("trust_boundary") != "shared_linear_credential"
+            or value.get("procedural_independence") is not True
+            or value.get("reviewer_session_id") == value.get("implementer_session_id")
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(value.get("review_artifact_sha256", ""))
+            )
+            or not all(isinstance(value.get(field), str) and value[field]
+                       for field in ("repository_key", "reviewer_agent",
+                                     "reviewer_session_id", "implementer_session_id",
+                                     "reviewed_at", "review_artifact_identity"))
+        ):
+            raise LinearProjectionError("invalid_projection_closure_review")
     if event["kind"] == "disposition" and not tombstone:
         if value.get("disposition") not in {"attach", "create_successor"}:
             raise LinearProjectionError("invalid_projection_disposition")
@@ -118,6 +233,92 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             and not isinstance(value["recovered_from_checkpoint"], str)
         ):
             raise LinearProjectionError("invalid_projection_disposition_checkpoint")
+    if event["kind"] == "lifecycle" and not tombstone:
+        required = {
+            "status", "github", "shipyard_receipt", "closure_input_sha256",
+            "snapshot_sha256", "independent_review", "closure_receipt_sha256",
+        }
+        if set(value) != required:
+            raise LinearProjectionError("invalid_projection_lifecycle_fields")
+        if value["status"] not in {"In Progress", "Landed — acceptance review required", "Done"}:
+            raise LinearProjectionError("invalid_projection_lifecycle_status")
+        for field in ("github", "shipyard_receipt"):
+            if not isinstance(value[field], dict):
+                raise LinearProjectionError(f"invalid_projection_lifecycle:{field}")
+        github = value["github"]
+        if set(github) != {
+            "repository", "provider_repository_id", "pr_number", "pr_head",
+            "merged", "merge_sha",
+        }:
+            raise LinearProjectionError("invalid_projection_lifecycle:github")
+        if (
+            not re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", str(github["repository"]))
+            or not isinstance(github["provider_repository_id"], str)
+            or not github["provider_repository_id"]
+            or not isinstance(github["pr_number"], int) or github["pr_number"] <= 0
+            or not re.fullmatch(r"[0-9a-f]{40}", str(github["pr_head"]))
+            or github["merged"] is not True
+            or not re.fullmatch(r"[0-9a-f]{40}", str(github["merge_sha"]))
+        ):
+            raise LinearProjectionError("invalid_projection_lifecycle:github")
+        shipyard = value["shipyard_receipt"]
+        if set(shipyard) != {
+            "schema_version", "repository", "repository_key", "pr_number", "head",
+            "disposition", "receipt_id", "receipt_sha256",
+        } or shipyard.get("schema_version") != 1:
+            raise LinearProjectionError("invalid_projection_lifecycle:shipyard_receipt")
+        shipyard_digest = hashlib.sha256(_canonical({
+            key: item for key, item in shipyard.items() if key != "receipt_sha256"
+        })).hexdigest()
+        if (
+            shipyard.get("repository") != github["repository"]
+            or shipyard.get("pr_number") != github["pr_number"]
+            or shipyard.get("head") != github["pr_head"]
+            or shipyard.get("disposition") not in {"merged", "already_merged", "landed"}
+            or not isinstance(shipyard.get("receipt_id"), str) or not shipyard["receipt_id"]
+            or shipyard.get("receipt_sha256") != shipyard_digest
+        ):
+            raise LinearProjectionError("invalid_projection_lifecycle:shipyard_receipt")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(value["closure_input_sha256"])):
+            raise LinearProjectionError("invalid_projection_lifecycle:closure_input_sha256")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(value["snapshot_sha256"])):
+            raise LinearProjectionError("invalid_projection_lifecycle:snapshot_sha256")
+        if value["status"] == "Done":
+            if not isinstance(value["independent_review"], dict):
+                raise LinearProjectionError("done_requires_independent_review")
+            review = value["independent_review"]
+            if set(review) != {
+                "schema_version", "workstream_id", "snapshot_sha256",
+                "closure_input_sha256", "repository_key", "exact_head", "verdict",
+                "reviewer_agent", "reviewer_session_id", "implementer_session_id",
+                "reviewed_at", "review_artifact_identity", "review_artifact_sha256",
+                "trust_boundary", "procedural_independence",
+            } or review.get("schema_version") != 1:
+                raise LinearProjectionError("invalid_projection_lifecycle:independent_review")
+            if (
+                review.get("workstream_id") != event["workstream_id"]
+                or review.get("snapshot_sha256") != value["snapshot_sha256"]
+                or review.get("closure_input_sha256") != value["closure_input_sha256"]
+                or review.get("repository_key") != shipyard["repository_key"]
+                or review.get("exact_head") != github["pr_head"]
+                or review.get("verdict") != "pass"
+                or review.get("trust_boundary") != "shared_linear_credential"
+                or review.get("procedural_independence") is not True
+                or review.get("reviewer_session_id") == review.get("implementer_session_id")
+                or not re.fullmatch(r"[0-9a-f]{64}", str(review.get("snapshot_sha256", "")))
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}", str(review.get("review_artifact_sha256", ""))
+                )
+                or not all(isinstance(review.get(field), str) and review[field]
+                           for field in ("reviewer_agent", "reviewer_session_id",
+                                         "implementer_session_id", "reviewed_at",
+                                         "review_artifact_identity"))
+            ):
+                raise LinearProjectionError("invalid_projection_lifecycle:independent_review")
+            if not re.fullmatch(r"[0-9a-f]{64}", str(value["closure_receipt_sha256"])):
+                raise LinearProjectionError("done_requires_closure_receipt")
+        elif value["independent_review"] is not None or value["closure_receipt_sha256"] is not None:
+            raise LinearProjectionError("non_done_lifecycle_has_closure_receipt")
     if event["kind"] == "choice" and not tombstone and value.get("event_id") != event["key"]:
         raise LinearProjectionError("projection_choice_key_mismatch")
     if event["kind"] == "evidence_contract" and not tombstone:
@@ -211,20 +412,68 @@ def reduce_projection_comments(
             item["created_at"], item["event_id"],
         ),
     )
-    events = sorted(
-        (event for event in history if event["plan_revision"] == expected_plan_revision),
-        key=lambda item: (item["expected_revision"], item["created_at"], item["event_id"]),
-    )
+    generation = [
+        event for event in history if event["plan_revision"] == expected_plan_revision
+    ]
     stale_events = [
         event for event in history if event["plan_revision"] != expected_plan_revision
     ]
+    legacy = sorted(
+        (event for event in generation if event["schema_version"] == 1),
+        key=lambda item: (item["expected_revision"], item["created_at"], item["event_id"]),
+    )
+    modern = sorted(
+        (event for event in generation if event["schema_version"] == 2),
+        key=lambda item: (item["expected_revision"], item["created_at"], item["event_id"]),
+    )
+    quarantined: list[dict[str, Any]] = []
+    accepted_legacy = legacy
+    if modern:
+        activation = modern[0]
+        if activation["expected_revision"] == 0:
+            accepted_legacy = []
+            quarantined = legacy
+        else:
+            if activation["kind"] != "cas_activation":
+                raise LinearProjectionError("projection_v2_activation_required")
+            reviewed_ids = activation["value"]["legacy_event_ids"]
+            by_id = {event["event_id"]: event for event in legacy}
+            if len(reviewed_ids) != activation["expected_revision"] or any(
+                event_id not in by_id for event_id in reviewed_ids
+            ):
+                raise LinearProjectionError("projection_v2_activation_legacy_mismatch")
+            accepted_legacy = sorted(
+                (by_id[event_id] for event_id in reviewed_ids),
+                key=lambda item: (
+                    item["expected_revision"], item["created_at"], item["event_id"],
+                ),
+            )
+            reviewed = set(reviewed_ids)
+            quarantined = [event for event in legacy if event["event_id"] not in reviewed]
+    for index, event in enumerate(accepted_legacy):
+        if event["expected_revision"] > index:
+            raise LinearProjectionError(
+                f"projection_revision_ahead:{event['event_id']}:{event['expected_revision']}:{index}"
+            )
+    for offset, event in enumerate(modern):
+        index = len(accepted_legacy) + offset
+        if event["expected_revision"] != index:
+            raise LinearProjectionError(
+                f"projection_revision_mismatch:{event['event_id']}:{event['expected_revision']}:{index}"
+            )
+        authority = event["authority"]
+        if authenticated_route is not None:
+            for field in AUTHORITY_FIELDS:
+                if authority[field] != authenticated_route.get(field):
+                    raise LinearProjectionError(f"projection_route_mismatch:{field}")
+        if observed[event["event_id"]][1] != projection_slot_id(
+            workstream_id, event["plan_revision"], index, authority,
+        ):
+            raise LinearProjectionError(f"projection_slot_identity_mismatch:{event['event_id']}")
+    events = [*accepted_legacy, *modern]
     active: dict[tuple[str, str], dict[str, Any]] = {}
     heads: dict[tuple[str, str], dict[str, Any]] = {}
     for index, event in enumerate(events):
-        if event["expected_revision"] > index:
-            raise LinearProjectionError(
-                f"projection_revision_gap:{event['event_id']}:{event['expected_revision']}:{index}"
-            )
         identity = (event["kind"], event["key"])
         current = heads.get(identity)
         supersedes = event["supersedes_event_id"]
@@ -262,6 +511,29 @@ def reduce_projection_comments(
             if linear.get(field) != authenticated_route.get(field):
                 raise LinearProjectionError(f"projection_route_mismatch:{field}")
 
+    quarantine_disposition = (
+        by_kind["quarantine_disposition"][0]
+        if by_kind["quarantine_disposition"] else None
+    )
+    retired_quarantine_ids: set[str] = set()
+    if quarantine_disposition is not None:
+        retired_quarantine_ids = set(quarantine_disposition["event_ids"])
+        quarantined_by_id = {event["event_id"]: event for event in quarantined}
+        if not retired_quarantine_ids.issubset(quarantined_by_id):
+            raise LinearProjectionError("quarantine_disposition_unknown_event")
+        reviewed_events = [
+            quarantined_by_id[event_id]
+            for event_id in sorted(retired_quarantine_ids)
+        ]
+        if quarantine_disposition["events_sha256"] != hashlib.sha256(
+            _canonical(reviewed_events)
+        ).hexdigest():
+            raise LinearProjectionError("quarantine_disposition_digest_mismatch")
+    unresolved_quarantine = [
+        event for event in quarantined
+        if event["event_id"] not in retired_quarantine_ids
+    ]
+
     snapshot = {
         "scope": scope,
         "relations": by_kind["relation"],
@@ -269,9 +541,16 @@ def reduce_projection_comments(
         "evidence_contracts": by_kind["evidence_contract"],
         "source": source,
         "provenance": by_kind["provenance"],
+        "closure_reviews": by_kind["closure_review"],
         "disposition": by_kind["disposition"][0] if by_kind["disposition"] else None,
+        "lifecycle": by_kind["lifecycle"][0] if by_kind["lifecycle"] else None,
+        "quarantine_disposition": quarantine_disposition,
         "projection_events": [deepcopy(event) for event in events],
         "projection_history": [deepcopy(event) for event in stale_events],
+        "projection_quarantined": [deepcopy(event) for event in quarantined],
+        "projection_unresolved_quarantine": [
+            deepcopy(event) for event in unresolved_quarantine
+        ],
         "projection_revision": len(events),
         "projection_recovery": {
             "state": (
@@ -307,10 +586,52 @@ class LinearProjectionAdapter:
         self.team_id = team_id
         self.project_id = project_id
         self.root_issue_id = root_issue_id
+        self._comment_id_capability_verified = False
         if any((workspace_id, team_id, project_id, root_issue_id)) and not all(
             (workspace_id, team_id, project_id, root_issue_id)
         ):
             raise ValueError("Linear workspace, team, project, and root issue IDs must be supplied together")
+
+    @property
+    def authority(self) -> dict[str, str]:
+        authority = {
+            "workspace_id": self.workspace_id,
+            "team_id": self.team_id,
+            "project_id": self.project_id,
+            "root_issue_id": self.root_issue_id,
+        }
+        validate_projection_authority(authority)
+        return authority  # type: ignore[return-value]
+
+    def _assert_comment_id_capability(self) -> None:
+        if self._comment_id_capability_verified:
+            return
+        result = self.client.execute(COMMENT_CREATE_CAPABILITY_QUERY, {})
+        fields = ((result.get("__type") or {}).get("inputFields") or [])
+        if not isinstance(fields, list) or "id" not in {
+            field.get("name") for field in fields if isinstance(field, dict)
+        }:
+            raise LinearProjectionError("linear_comment_create_id_capability_unavailable")
+        self._comment_id_capability_verified = True
+
+    def activate_v2(self, *, created_at: str) -> dict[str, Any] | None:
+        """Fence reviewed v1 history before accepting any v2 CAS writes."""
+        before = self.state()
+        if any(event["schema_version"] == 2 for event in before.events) or not before.events:
+            return None
+        legacy_ids = [event["event_id"] for event in before.events]
+        event = build_projection_event(
+            workstream_id=self.workstream_id, kind="cas_activation", key="root",
+            value={
+                "legacy_event_ids": legacy_ids,
+                "legacy_events_sha256": hashlib.sha256(
+                    _canonical(sorted(legacy_ids))
+                ).hexdigest(),
+            },
+            plan_revision=self.plan_revision, expected_revision=before.revision,
+            created_at=created_at, authority=self.authority,
+        )
+        return self.append(event)
 
     @classmethod
     def from_env(
@@ -385,8 +706,16 @@ class LinearProjectionAdapter:
             if existing != event:
                 raise LinearProjectionError(f"conflicting_projection_event_id:{event['event_id']}")
             return {"event_id": event["event_id"], "remote_id": existing_id, "revision": before.revision}
-        if event["expected_revision"] > before.revision:
-            raise LinearProjectionError("projection_revision_ahead")
+        if event["expected_revision"] != before.revision:
+            raise LinearProjectionError("projection_slot_stale_reload_required")
+        if event["schema_version"] != 2 or event.get("authority") != self.authority:
+            raise LinearProjectionError("projection_append_authority_mismatch")
+        if (
+            any(item["schema_version"] == 1 for item in before.events)
+            and not any(item["schema_version"] == 2 for item in before.events)
+            and event["kind"] != "cas_activation"
+        ):
+            raise LinearProjectionError("projection_v2_activation_required")
         current = next(
             (
                 item for item in reversed(before.events)
@@ -400,13 +729,42 @@ class LinearProjectionAdapter:
             raise LinearProjectionError(
                 f"projection_concurrent_conflict:{event['kind']}:{event['key']}"
             )
-        response = self.client.execute(
-            COMMENT_CREATE_MUTATION,
-            {"input": {"issueId": self.issue_id, "body": encode_projection_comment(event)}},
+        slot_id = projection_slot_id(
+            self.workstream_id, self.plan_revision, event["expected_revision"],
+            self.authority,
         )
+        self._assert_comment_id_capability()
+        try:
+            response = self.client.execute(
+                COMMENT_CREATE_MUTATION,
+                {"input": {
+                    "id": slot_id, "issueId": self.issue_id,
+                    "body": encode_projection_comment(event),
+                }},
+            )
+        except LinearTransportError:
+            # A deterministic create-ID collision is the remote CAS loser path.
+            # Reload before deciding whether this is identical replay or a
+            # conflicting winner; an unavailable reload preserves the original
+            # transport failure and never attempts another write.
+            after_error = self.state()
+            winner = next(
+                (item for item in after_error.events
+                 if after_error.remote_ids.get(item["event_id"]) == slot_id),
+                None,
+            )
+            if winner == event:
+                return {
+                    "event_id": event["event_id"], "remote_id": slot_id,
+                    "revision": after_error.revision,
+                }
+            if winner is not None:
+                raise LinearProjectionError("projection_slot_lost_reload_required")
+            raise
         created = response.get("commentCreate") or {}
         comment = created.get("comment")
-        if created.get("success") is not True or not comment or not comment.get("id"):
+        if (created.get("success") is not True or not comment
+                or comment.get("id") != slot_id):
             raise LinearProjectionError("Linear comment creation returned no durable receipt")
         after = self.state()
         if after.remote_ids.get(event["event_id"]) != comment["id"]:

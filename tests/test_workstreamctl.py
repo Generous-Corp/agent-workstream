@@ -110,6 +110,15 @@ class WorkstreamCtlTests(unittest.TestCase):
             [MODULE.sys.executable, str(script), "GEN-37", "manifest.json"],
         )
 
+    def test_reconcile_dispatches_live_closure_command(self):
+        with mock.patch.object(MODULE.os, "execv") as execute:
+            MODULE.main(["reconcile", "GEN-37", "--help"])
+        script = MODULE.SCRIPTS / "workstream_reconcile.py"
+        execute.assert_called_once_with(
+            MODULE.sys.executable,
+            [MODULE.sys.executable, str(script), "GEN-37", "--help"],
+        )
+
     def test_intake_dispatches_reviewed_linear_intake_command(self):
         with mock.patch.object(MODULE.os, "execv") as execute:
             MODULE.main(["intake", "plan.md", "--identity", "plan:demo", "--plan-revision", "abc", "--root-stable-key", "source-abc", "--accept-none"])

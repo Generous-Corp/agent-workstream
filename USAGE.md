@@ -167,6 +167,27 @@ and therefore requires `--inspection-only`; only a live authenticated Linear
 read can produce full-authority output. The command writes only reviewed
 changes and verifies a complete live readback.
 
+After a PR lands, `workstreamctl reconcile --help` exposes the explicit GitHub,
+Shipyard fixed-argv, plan, and closure-input arguments. The command records
+`Landed — acceptance review required` from exact live truth. Supplying a
+durably projected fresh-session review receipt bound to that exact snapshot is
+the only path to a durable `Done`; a stale writer or unchanged replay writes
+nothing. Use `--github-token-command` with a noninteractive file/keychain/App
+helper, or explicitly opt into `--github-token-env GITHUB_TOKEN`; helper output
+is bounded and never logged.
+
+Review receipts name and digest the reviewer’s durable artifact and declare the
+`shared_linear_credential` trust boundary. This enforces a separate procedural
+pass, not cryptographic agent identity. Linear CAS slots include the immutable
+workspace/project/root route. A 2026-08-28 live canary verified that
+`CommentCreateInput.id` is accepted, exact-ID replay collides, IDs are global
+across issues, and cleanup succeeded; runtime schema introspection still fails
+closed if that input disappears. See
+[the bounded proof receipt](docs/reconcile-linear-cas-proof.md).
+Late v1 writes remain visible as a bounded quarantine summary (and exact events
+with `--include-history`) and block lifecycle updates until a reviewed durable
+disposition names their exact IDs and digest.
+
 Unavailable live surfaces remain explicit rather than being inferred from a
 checkout or transcript. See [BOUNDARIES.md](BOUNDARIES.md) for why the plugin
 does not silently install always-on orchestration and what optional companion

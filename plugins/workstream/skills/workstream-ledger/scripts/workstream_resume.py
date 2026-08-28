@@ -10,6 +10,7 @@ before an agent edits anything.
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
@@ -54,6 +55,34 @@ MATERIAL_OBLIGATION_KEYS = {
 
 class ResumeError(ValueError):
     pass
+
+
+def closure_snapshot_digest(snapshot: dict[str, Any]) -> str:
+    """Digest semantic closure input, excluding review/lifecycle self-writes."""
+    material = deepcopy(snapshot)
+    material.pop("lifecycle", None)
+    material.pop("closure_reviews", None)
+    material.pop("lifecycle_recovery", None)
+    root = material.get("root")
+    if isinstance(root, dict):
+        issue_status = root.pop("issue_status", root.get("status"))
+        root["status"] = issue_status
+        root.pop("closure_receipt", None)
+    events = material.get("projection_events")
+    if isinstance(events, list):
+        material["projection_events"] = [
+            event for event in events
+            if event.get("kind") not in {"closure_review", "lifecycle"}
+        ]
+        material["projection_revision"] = len(material["projection_events"])
+        recovery = material.get("projection_recovery")
+        if isinstance(recovery, dict) and not material["projection_events"]:
+            recovery["state"] = (
+                "stale_plan" if material.get("projection_history") else "not_found"
+            )
+    return hashlib.sha256(json.dumps(
+        material, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
 
 
 def _event_record(event: Any) -> dict[str, Any]:
@@ -217,6 +246,7 @@ def add_material_history(
     snapshot: dict[str, Any], comments: list[dict[str, Any]], token: str,
     *, authenticated_route: dict[str, str] | None = None,
     authenticated_source: dict[str, Any] | None = None,
+    permit_stale_lifecycle_for_reconcile: bool = False,
 ) -> dict[str, Any]:
     """Join one complete Linear comment read to the issue-graph snapshot."""
     result = dict(snapshot)
@@ -264,6 +294,29 @@ def add_material_history(
     result["root"]["next_action"] = _resolved_next_action(
         events, result["root"].get("next_action"), result["latest_checkpoint"],
     )
+    lifecycle = projection_log.snapshot.get("lifecycle")
+    if lifecycle is not None:
+        observed_snapshot_sha256 = closure_snapshot_digest(result)
+        if lifecycle.get("snapshot_sha256") != observed_snapshot_sha256:
+            unresolved_quarantine = result.get("projection_unresolved_quarantine") or []
+            if not permit_stale_lifecycle_for_reconcile and not unresolved_quarantine:
+                raise ResumeError("lifecycle_snapshot_stale_reconcile_required")
+            result["lifecycle_recovery"] = {
+                "state": (
+                    "blocked_unresolved_quarantine"
+                    if unresolved_quarantine else "stale_snapshot"
+                ),
+                "lifecycle_snapshot_sha256": lifecycle.get("snapshot_sha256"),
+                "observed_snapshot_sha256": observed_snapshot_sha256,
+            }
+            if unresolved_quarantine:
+                result["root"]["next_action"] = (
+                    "Review and disposition quarantined v1 projection events"
+                )
+        else:
+            result["root"]["issue_status"] = result["root"].get("status")
+            result["root"]["status"] = lifecycle["status"]
+            result["root"]["closure_receipt"] = lifecycle.get("closure_receipt_sha256")
     return result
 
 
@@ -418,11 +471,19 @@ def validate_snapshot(
         raise ResumeError("choice_events must be a list")
     projection_events = snapshot.get("projection_events", [])
     projection_history = snapshot.get("projection_history", [])
+    projection_quarantined = snapshot.get("projection_quarantined", [])
+    projection_unresolved_quarantine = snapshot.get(
+        "projection_unresolved_quarantine", projection_quarantined,
+    )
     projection_revision = snapshot.get("projection_revision")
     if not isinstance(projection_events, list):
         raise ResumeError("projection_events must be a list")
     if not isinstance(projection_history, list):
         raise ResumeError("projection_history must be a list")
+    if not isinstance(projection_quarantined, list):
+        raise ResumeError("projection_quarantined must be a list")
+    if not isinstance(projection_unresolved_quarantine, list):
+        raise ResumeError("projection_unresolved_quarantine must be a list")
     if projection_revision is not None and projection_revision != len(projection_events):
         raise ResumeError("projection_revision_mismatch")
     for index, event in enumerate(projection_history):
@@ -434,11 +495,53 @@ def validate_snapshot(
             raise ResumeError(f"projection_workstream_mismatch:{index}")
     if any(event["plan_revision"] == root["plan_revision"] for event in projection_history):
         raise ResumeError("projection_stale_history_contains_current_generation")
+    for index, event in enumerate(projection_quarantined):
+        try:
+            validate_projection_event(event)
+        except LinearProjectionError as error:
+            raise ResumeError(f"invalid_quarantined_projection_event:{index}:{error}") from error
+        if (
+            event["workstream_id"] != identifier.upper()
+            or event["plan_revision"] != root["plan_revision"]
+            or event["schema_version"] != 1
+        ):
+            raise ResumeError(f"invalid_quarantined_projection_event:{index}")
+    quarantined_by_id = {
+        event["event_id"]: event for event in projection_quarantined
+    }
+    unresolved_ids = {
+        event.get("event_id") for event in projection_unresolved_quarantine
+        if isinstance(event, dict)
+    }
+    if (
+        len(unresolved_ids) != len(projection_unresolved_quarantine)
+        or not unresolved_ids.issubset(quarantined_by_id)
+    ):
+        raise ResumeError("invalid_projection_unresolved_quarantine")
+    quarantine_disposition = snapshot.get("quarantine_disposition")
+    retired_ids = set()
+    if quarantine_disposition is not None:
+        retired_ids = set(quarantine_disposition.get("event_ids") or [])
+        if not retired_ids.issubset(quarantined_by_id):
+            raise ResumeError("invalid_quarantine_disposition")
+        reviewed_events = [quarantined_by_id[event_id] for event_id in sorted(retired_ids)]
+        if quarantine_disposition.get("events_sha256") != hashlib.sha256(json.dumps(
+            reviewed_events, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest():
+            raise ResumeError("invalid_quarantine_disposition")
+    if unresolved_ids != set(quarantined_by_id) - retired_ids:
+        raise ResumeError("invalid_projection_unresolved_quarantine")
+    modern_seen = False
     for index, event in enumerate(projection_events):
         if event["plan_revision"] != root["plan_revision"]:
             raise ResumeError(f"projection_plan_drift:{index}")
-        if event["expected_revision"] > index:
-            raise ResumeError(f"projection_revision_gap:{index}")
+        if event["schema_version"] == 2:
+            modern_seen = True
+        if (
+            (modern_seen and event["expected_revision"] != index)
+            or (not modern_seen and event["expected_revision"] > index)
+        ):
+            raise ResumeError(f"projection_revision_mismatch:{index}")
     projection_recovery = snapshot.get("projection_recovery")
     if projection_recovery is not None and (
         not isinstance(projection_recovery, dict)
@@ -448,11 +551,27 @@ def validate_snapshot(
         or projection_recovery["stale_plan_count"] < 0
     ):
         raise ResumeError("invalid_projection_recovery")
+    lifecycle_recovery = snapshot.get("lifecycle_recovery")
+    if lifecycle_recovery is not None and (
+        not isinstance(lifecycle_recovery, dict)
+        or set(lifecycle_recovery) != {
+            "state", "lifecycle_snapshot_sha256", "observed_snapshot_sha256",
+        }
+        or lifecycle_recovery.get("state") not in {
+            "stale_snapshot", "blocked_unresolved_quarantine",
+        }
+        or not all(
+            isinstance(lifecycle_recovery.get(field), str)
+            and re.fullmatch(r"[0-9a-f]{64}", lifecycle_recovery[field])
+            for field in ("lifecycle_snapshot_sha256", "observed_snapshot_sha256")
+        )
+    ):
+        raise ResumeError("invalid_lifecycle_recovery")
     authenticated_route = snapshot.get("authenticated_route")
     if projection_events:
         if not isinstance(authenticated_route, dict) or not all(
             isinstance(authenticated_route.get(field), str) and authenticated_route[field]
-            for field in ("workspace_id", "team_id", "project_id")
+            for field in ("workspace_id", "team_id", "project_id", "root_issue_id")
         ):
             raise ResumeError("projection_authenticated_route_missing")
         if projection_recovery.get("state") != "current":
@@ -480,14 +599,28 @@ def validate_snapshot(
             else:
                 active[identity] = event
         for kind, field in (("scope", "scope"), ("source", "source"),
-                            ("disposition", "disposition")):
+                            ("disposition", "disposition"), ("lifecycle", "lifecycle"),
+                            ("quarantine_disposition", "quarantine_disposition")):
             values = [event["value"] for (event_kind, _), event in active.items()
                       if event_kind == kind]
+            if kind in {"lifecycle", "quarantine_disposition"} and not values and snapshot.get(field) is None:
+                continue
             if len(values) != 1 or values[0] != snapshot.get(field):
                 raise ResumeError(f"projection_current_view_mismatch:{field}")
+        lifecycle = snapshot.get("lifecycle")
+        if lifecycle is not None and (
+            root.get("status") != lifecycle["status"]
+            or root.get("closure_receipt") != lifecycle.get("closure_receipt_sha256")
+        ) and not (
+            isinstance(lifecycle_recovery, dict)
+            and lifecycle_recovery.get("state") == "blocked_unresolved_quarantine"
+            and projection_unresolved_quarantine
+        ):
+            raise ResumeError("projection_current_view_mismatch:lifecycle_root")
         for kind, field in (("relation", "relations"), ("choice", "choice_events"),
                             ("evidence_contract", "evidence_contracts"),
-                            ("provenance", "provenance")):
+                            ("provenance", "provenance"),
+                            ("closure_review", "closure_reviews")):
             values = [event["value"] for (event_kind, _), event in active.items()
                       if event_kind == kind]
             values.sort(key=lambda value: json.dumps(
@@ -592,8 +725,12 @@ def validate_snapshot(
             "disposition": snapshot.get("disposition"),
             "projection_events": projection_events,
             "projection_history": projection_history,
+            "projection_quarantined": projection_quarantined,
+            "projection_unresolved_quarantine": projection_unresolved_quarantine,
+            "quarantine_disposition": quarantine_disposition,
             "projection_revision": projection_revision,
             "projection_recovery": projection_recovery,
+            "lifecycle_recovery": lifecycle_recovery,
             "authenticated_route": authenticated_route,
             "authenticated_source": snapshot.get("authenticated_source")}
 
@@ -638,6 +775,10 @@ def compact_context(
         "material_events": history_summary(clean["material_events"]),
         "projection_events": history_summary(clean["projection_events"]),
         "projection_history": history_summary(clean["projection_history"]),
+        "projection_quarantined": history_summary(clean["projection_quarantined"]),
+        "projection_unresolved_quarantine": history_summary(
+            clean["projection_unresolved_quarantine"]
+        ),
     }
     checkpoint_revision = (
         clean["latest_checkpoint"]["root_revision"]
@@ -673,6 +814,11 @@ def compact_context(
         "disposition": clean.get("disposition"),
         "projection_revision": clean["projection_revision"],
         "projection_recovery": clean["projection_recovery"],
+        "lifecycle_recovery": clean["lifecycle_recovery"],
+        "projection_quarantine": history_summary(
+            clean["projection_unresolved_quarantine"]
+        ),
+        "quarantine_disposition": clean["quarantine_disposition"],
         "authenticated_route": clean["authenticated_route"],
         "authenticated_source": clean["authenticated_source"],
         "history": history,
@@ -684,6 +830,10 @@ def compact_context(
         context["material_events"] = clean["material_events"]
         context["projection_events"] = clean["projection_events"]
         context["projection_history"] = clean["projection_history"]
+        context["projection_quarantined"] = clean["projection_quarantined"]
+        context["projection_unresolved_quarantine"] = clean[
+            "projection_unresolved_quarantine"
+        ]
     item_count = sum(
         len(value) for value in (
             context["children"], context["decisions"], context["choice_events"],
@@ -693,6 +843,8 @@ def compact_context(
             context.get("material_events", []),
             context.get("projection_events", []),
             context.get("projection_history", []),
+            context.get("projection_quarantined", []),
+            context.get("projection_unresolved_quarantine", []),
             (context["latest_checkpoint"] or {}).get("provenance_chain", []),
         )
     )
