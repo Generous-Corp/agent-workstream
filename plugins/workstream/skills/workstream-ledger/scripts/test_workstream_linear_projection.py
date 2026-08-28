@@ -1058,7 +1058,9 @@ class ProjectionTests(unittest.TestCase):
                 "workstream_projection.py", "GEN-37", str(manifest_path),
                 "--remote-head", HEAD, "--plan-source", str(plan_path),
                 "--plan-identity", identity,
+                "--max-bytes", "65536", "--max-items", "500",
             ]
+            compact = workstream_projection.compact_context
             for expected_writes in (4, 4):
                 manifest_path.write_text(json.dumps(manifest))
                 output = io.StringIO()
@@ -1070,7 +1072,12 @@ class ProjectionTests(unittest.TestCase):
                      mock.patch.object(workstream_projection, "resolve_authenticated_issue_route", return_value=route), \
                      mock.patch.object(workstream_projection, "LinearGraphQLTransport", return_value=transport), \
                      mock.patch.object(workstream_projection, "LinearCommentEventAdapter", return_value=comments):
-                    self.assertEqual(workstream_projection.main(), 0)
+                    with mock.patch.object(
+                        workstream_projection, "compact_context", wraps=compact,
+                    ) as compact_mock:
+                        self.assertEqual(workstream_projection.main(), 0)
+                        self.assertEqual(compact_mock.call_args.kwargs["max_bytes"], 65536)
+                        self.assertEqual(compact_mock.call_args.kwargs["max_items"], 500)
                 payload = json.loads(output.getvalue())
                 self.assertTrue(payload["readback_verified"])
                 self.assertEqual(len(client.comments), expected_writes)

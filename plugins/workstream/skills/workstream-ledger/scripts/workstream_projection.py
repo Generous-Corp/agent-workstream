@@ -351,6 +351,14 @@ def main() -> int:
     parser.add_argument("--remote-head", required=True)
     parser.add_argument("--plan-source", required=True)
     parser.add_argument("--plan-identity")
+    parser.add_argument(
+        "--max-bytes", type=int, default=16 * 1024,
+        help="maximum encoded full-resume context accepted after projection",
+    )
+    parser.add_argument(
+        "--max-items", type=int, default=100,
+        help="maximum full-resume item count accepted after projection",
+    )
     parser.add_argument("--config")
     parser.add_argument("--linear-endpoint", default="https://api.linear.app/graphql")
     args = parser.parse_args()
@@ -405,7 +413,8 @@ def main() -> int:
             authenticated_source=authenticated_source,
         )
         context = compact_context(
-            verified, token, require_projection_authority=True,
+            verified, token, max_bytes=args.max_bytes, max_items=args.max_items,
+            require_projection_authority=True,
         )
         choose_disposition(context, remote_head=args.remote_head)
         json.dump(result, sys.stdout, sort_keys=True, indent=2)
