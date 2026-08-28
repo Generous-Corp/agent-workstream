@@ -19,10 +19,11 @@ from workstream_linear_events import (
 )
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
-    LinearProjectionError, reduce_projection_comments, TOMBSTONE,
+    LinearProjectionError, projection_slot_id, reduce_projection_comments, TOMBSTONE,
 )
 from workstream_resume import add_material_history, compact_context, ResumeError
 import workstream_projection
+import workstream_linear_projection as projection_module
 from workstream_projection import (
     projection_review_contract, reconcile_required_projection, stable_live_readback,
 )
@@ -32,6 +33,36 @@ from workstream_successor import choose_disposition
 PLAN = "f38baae4441485b14e5b16ea0255e3a07e42aa94a4fb0e6e04e7aa513693719d"
 HEAD = "a" * 40
 ROOT_UUID = "33333333-3333-4333-8333-333333333333"
+AUTHORITY = {
+    "workspace_id": "workspace", "team_id": "team", "project_id": "project",
+    "root_issue_id": ROOT_UUID,
+}
+
+
+def projection_comment(event):
+    return {
+        "id": projection_slot_id(
+            event["workstream_id"], event["plan_revision"], event["expected_revision"],
+            event["authority"],
+        ),
+        "body": encode_projection_comment(event),
+    }
+
+
+def legacy_event(kind, key, value, revision, created_at):
+    event = build_projection_event(
+        workstream_id="GEN-37", kind=kind, key=key, value=value,
+        plan_revision=PLAN, expected_revision=revision, created_at=created_at,
+        authority=AUTHORITY,
+    )
+    event["schema_version"] = 1
+    event.pop("authority")
+    event["event_id"] = projection_module._event_id(event)
+    return event
+
+
+def legacy_comment(event, remote_id):
+    return {"id": remote_id, "body": encode_projection_comment(event)}
 
 
 def reviewed_manifest(adapter, projection, retirements=None):
@@ -64,6 +95,8 @@ class FakeProjectionClient:
 
     def execute(self, query, variables):
         self.calls.append((query, variables))
+        if "WorkstreamProjectionCommentCreateCapability" in query:
+            return {"__type": {"inputFields": [{"name": "id"}, {"name": "body"}]}}
         if "query WorkstreamDeltaComments" in query:
             return {"issue": {
                 "id": ROOT_UUID, "identifier": "GEN-37",
@@ -73,12 +106,35 @@ class FakeProjectionClient:
                              "pageInfo": {"hasNextPage": False, "endCursor": None}},
             }}
         if "commentCreate" in query:
-            comment = {"id": f"comment-{len(self.comments) + 1}",
+            comment_id = variables["input"].get("id", f"comment-{len(self.comments) + 1}")
+            if any(item["id"] == comment_id for item in self.comments):
+                from workstream_linear import LinearTransportError
+                raise LinearTransportError("duplicate comment id")
+            comment = {"id": comment_id,
                        "body": variables["input"]["body"],
                        "createdAt": "now", "updatedAt": "now"}
             self.comments.append(comment)
             return {"commentCreate": {"success": True, "comment": dict(comment)}}
         raise AssertionError("unexpected GraphQL operation")
+
+
+class RacingProjectionClient(FakeProjectionClient):
+    def __init__(self, winner):
+        super().__init__()
+        self.winner = winner
+        self.injected = False
+
+    def execute(self, query, variables):
+        if "commentCreate" in query and not self.injected:
+            self.injected = True
+            self.comments.append({
+                "id": variables["input"]["id"],
+                "body": encode_projection_comment(self.winner),
+                "createdAt": "now", "updatedAt": "now",
+            })
+            from workstream_linear import LinearTransportError
+            raise LinearTransportError("duplicate comment id")
+        return super().execute(query, variables)
 
 
 class PaginatedLiveLikeClient:
@@ -217,7 +273,152 @@ class ProjectionTests(unittest.TestCase):
             plan_revision=PLAN, expected_revision=revision,
             created_at=f"2026-08-27T12:{revision:02d}:00Z",
             supersedes_event_id=supersedes,
+            authority=AUTHORITY,
         )
+
+    def test_deterministic_remote_slot_collision_refuses_loser_without_poisoning(self):
+        winner = self.event("provenance", "winner", {
+            "agent": "claude", "machine": "M3", "session_id": "winner",
+        }, 0)
+        loser = self.event("provenance", "loser", {
+            "agent": "codex", "machine": "M5", "session_id": "loser",
+        }, 0)
+        client = RacingProjectionClient(winner)
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37", plan_revision=PLAN,
+            workspace_id="workspace", team_id="team", project_id="project",
+            root_issue_id=ROOT_UUID,
+        )
+        with self.assertRaisesRegex(LinearProjectionError, "projection_slot_lost_reload_required"):
+            adapter.append(loser)
+        state = adapter.state()
+        self.assertEqual(state.revision, 1)
+        self.assertEqual([item["event_id"] for item in state.events], [winner["event_id"]])
+        self.assertEqual(
+            client.comments[0]["id"], projection_slot_id("GEN-37", PLAN, 0, AUTHORITY),
+        )
+
+    def test_identical_remote_slot_collision_is_crash_safe_replay(self):
+        event = self.event("provenance", "same", {
+            "agent": "codex", "machine": "M5", "session_id": "same",
+        }, 0)
+        client = RacingProjectionClient(event)
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37", plan_revision=PLAN,
+            workspace_id="workspace", team_id="team", project_id="project",
+            root_issue_id=ROOT_UUID,
+        )
+        receipt = adapter.append(event)
+        self.assertEqual(
+            receipt["remote_id"], projection_slot_id("GEN-37", PLAN, 0, AUTHORITY),
+        )
+        self.assertEqual(len(client.comments), 1)
+        self.assertEqual(adapter.append(event)["remote_id"], receipt["remote_id"])
+        self.assertEqual(len(client.comments), 1)
+
+    def test_reducer_rejects_duplicate_revision_and_wrong_v2_remote_slot(self):
+        first = self.event("provenance", "one", {
+            "agent": "codex", "machine": "M5", "session_id": "one",
+        }, 0)
+        second = self.event("provenance", "two", {
+            "agent": "claude", "machine": "M3", "session_id": "two",
+        }, 0)
+        with self.assertRaisesRegex(LinearProjectionError, "projection_revision_mismatch"):
+            reduce_projection_comments(
+                [projection_comment(first), projection_comment(second)],
+                workstream_id="GEN-37", expected_plan_revision=PLAN,
+            )
+        with self.assertRaisesRegex(LinearProjectionError, "projection_slot_identity_mismatch"):
+            reduce_projection_comments(
+                [{"id": "arbitrary", "body": encode_projection_comment(first)}],
+                workstream_id="GEN-37", expected_plan_revision=PLAN,
+            )
+
+    def test_v1_history_activation_quarantines_late_v1_writer(self):
+        client = FakeProjectionClient()
+        first = legacy_event(
+            "provenance", "legacy-one",
+            {"agent": "codex", "machine": "M5", "session_id": "legacy-one"},
+            0, "2026-08-27T11:00:00Z",
+        )
+        second = legacy_event(
+            "provenance", "legacy-two",
+            {"agent": "claude", "machine": "M3", "session_id": "legacy-two"},
+            0, "2026-08-27T11:01:00Z",
+        )
+        client.comments.extend([
+            legacy_comment(first, "legacy-comment-1"),
+            legacy_comment(second, "legacy-comment-2"),
+        ])
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37", plan_revision=PLAN,
+            **AUTHORITY,
+        )
+        self.assertEqual(adapter.state().revision, 2)
+        premature = self.event("provenance", "modern", {
+            "agent": "codex", "machine": "M5", "session_id": "modern",
+        }, 2)
+        with self.assertRaisesRegex(LinearProjectionError, "v2_activation_required"):
+            adapter.append(premature)
+        activation = adapter.activate_v2(created_at="2026-08-27T11:02:00Z")
+        self.assertEqual(activation["revision"], 3)
+
+        late = legacy_event(
+            "provenance", "late-v1",
+            {"agent": "codex", "machine": "M1", "session_id": "late-v1"},
+            2, "2026-08-27T11:03:00Z",
+        )
+        client.comments.append(legacy_comment(late, "late-arbitrary-comment"))
+        modern = self.event("provenance", "modern", {
+            "agent": "codex", "machine": "M5", "session_id": "modern",
+        }, 3)
+        adapter.append(modern)
+        state = adapter.state()
+        self.assertEqual(state.revision, 4)
+        self.assertEqual(
+            [item["session_id"] for item in state.snapshot["provenance"]],
+            ["legacy-two", "legacy-one", "modern"],
+        )
+        self.assertEqual(
+            [event["event_id"] for event in state.snapshot["projection_quarantined"]],
+            [late["event_id"]],
+        )
+        disposition = self.event("quarantine_disposition", "root", {
+            "event_ids": [late["event_id"]],
+            "events_sha256": hashlib.sha256(json.dumps(
+                [late], ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest(),
+            "review_artifact_identity": "https://example.test/reviews/late-v1.md",
+            "review_artifact_sha256": "d" * 64,
+            "reviewed_at": "2026-08-27T11:04:00Z",
+        }, 4)
+        adapter.append(disposition)
+        self.assertEqual(adapter.state().snapshot["projection_unresolved_quarantine"], [])
+
+    def test_slots_are_isolated_by_immutable_linear_route(self):
+        other = {**AUTHORITY, "workspace_id": "other-workspace", "root_issue_id": "other-root"}
+        self.assertNotEqual(
+            projection_slot_id("GEN-37", PLAN, 0, AUTHORITY),
+            projection_slot_id("GEN-37", PLAN, 0, other),
+        )
+
+    def test_append_refuses_when_linear_schema_lacks_client_comment_id(self):
+        class NoIdClient(FakeProjectionClient):
+            def execute(self, query, variables):
+                if "WorkstreamProjectionCommentCreateCapability" in query:
+                    return {"__type": {"inputFields": [{"name": "body"}]}}
+                return super().execute(query, variables)
+
+        client = NoIdClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37", plan_revision=PLAN,
+            **AUTHORITY,
+        )
+        with self.assertRaisesRegex(LinearProjectionError, "id_capability_unavailable"):
+            adapter.append(self.event("provenance", "one", {
+                "agent": "codex", "machine": "M5", "session_id": "one",
+            }, 0))
+        self.assertEqual(client.comments, [])
 
     def test_live_like_gen37_projection_round_trips_into_token_resume(self):
         client = FakeProjectionClient()
@@ -316,7 +517,7 @@ class ProjectionTests(unittest.TestCase):
             }, 3),
         ]
         client = PaginatedLiveLikeClient([
-            {"id": f"projection-{index}", "body": encode_projection_comment(event),
+            {**projection_comment(event),
              "createdAt": "now", "updatedAt": "now"}
             for index, event in enumerate(projection_events)
         ])
@@ -343,6 +544,7 @@ class ProjectionTests(unittest.TestCase):
             value={"agent": "codex", "machine": "M3", "session_id": "stale"},
             plan_revision="b" * 64, expected_revision=enriched["projection_revision"],
             created_at="2026-08-27T15:00:00Z",
+            authority=AUTHORITY,
         )
         enriched["projection_events"].append(stale)
         enriched["projection_revision"] += 1
@@ -352,7 +554,9 @@ class ProjectionTests(unittest.TestCase):
     def test_replay_is_zero_write_and_unfenced_replacement_fails_closed(self):
         client = FakeProjectionClient()
         adapter = LinearProjectionAdapter(
-            client, issue_id="GEN-37", workstream_id="GEN-37", plan_revision=PLAN
+            client, issue_id="GEN-37", workstream_id="GEN-37", plan_revision=PLAN,
+            workspace_id="workspace", team_id="team", project_id="project",
+            root_issue_id=ROOT_UUID,
         )
         first = self.event("source", "root", {"sha256": PLAN, "identity": "https://example.test/plan"}, 0)
         adapter.append(first)
@@ -367,7 +571,9 @@ class ProjectionTests(unittest.TestCase):
     def test_explicit_supersession_preserves_history_and_derives_current_source(self):
         client = FakeProjectionClient()
         adapter = LinearProjectionAdapter(
-            client, issue_id="GEN-37", workstream_id="GEN-37", plan_revision=PLAN
+            client, issue_id="GEN-37", workstream_id="GEN-37", plan_revision=PLAN,
+            workspace_id="workspace", team_id="team", project_id="project",
+            root_issue_id=ROOT_UUID,
         )
         first = self.event("source", "root", {"sha256": PLAN,
                                                "identity": "https://example.test/old"}, 0)
@@ -387,7 +593,7 @@ class ProjectionTests(unittest.TestCase):
                                                "identity": "https://example.test/plan"}, 0)
         from workstream_linear_projection import encode_projection_comment
         reduced = reduce_projection_comments(
-            [{"id": "one", "body": encode_projection_comment(event)}],
+            [projection_comment(event)],
             workstream_id="GEN-37", expected_plan_revision="b" * 64,
         )
         self.assertEqual(reduced.revision, 0)
@@ -406,11 +612,9 @@ class ProjectionTests(unittest.TestCase):
             plan_revision="b" * 64, expected_revision=0,
             created_at="2026-08-27T13:00:00Z",
             supersedes_event_id=current["event_id"],
+            authority=AUTHORITY,
         )
-        comments = [
-            {"id": "current", "body": encode_projection_comment(current)},
-            {"id": "stale", "body": encode_projection_comment(stale)},
-        ]
+        comments = [projection_comment(current), projection_comment(stale)]
         reduced = reduce_projection_comments(
             comments, workstream_id="GEN-37", expected_plan_revision=PLAN,
         )
@@ -426,14 +630,12 @@ class ProjectionTests(unittest.TestCase):
             value={"sha256": old_plan, "identity": "https://example.test/old"},
             plan_revision=old_plan, expected_revision=0,
             created_at="2026-08-27T10:00:00Z",
+            authority=AUTHORITY,
         )
         current = self.event(
             "source", "root", {"sha256": PLAN, "identity": "https://example.test/current"}, 0,
         )
-        comments = [
-            {"id": "old", "body": encode_projection_comment(old)},
-            {"id": "current", "body": encode_projection_comment(current)},
-        ]
+        comments = [projection_comment(old), projection_comment(current)]
         reduced = reduce_projection_comments(
             comments, workstream_id="GEN-37", expected_plan_revision=PLAN,
         )
@@ -442,8 +644,8 @@ class ProjectionTests(unittest.TestCase):
         conflict = self.event(
             "source", "root", {"sha256": PLAN, "identity": "https://example.test/other"}, 0,
         )
-        comments.append({"id": "conflict", "body": encode_projection_comment(conflict)})
-        with self.assertRaisesRegex(LinearProjectionError, "projection_concurrent_conflict"):
+        comments.append(projection_comment(conflict))
+        with self.assertRaisesRegex(LinearProjectionError, "projection_revision_mismatch"):
             reduce_projection_comments(
                 comments, workstream_id="GEN-37", expected_plan_revision=PLAN,
             )
@@ -458,8 +660,7 @@ class ProjectionTests(unittest.TestCase):
         ]
         from workstream_linear_projection import encode_projection_comment
         reduced = reduce_projection_comments(
-            [{"id": str(index), "body": encode_projection_comment(event)}
-             for index, event in enumerate(events)],
+            [projection_comment(event) for event in events],
             workstream_id="GEN-37", expected_plan_revision=PLAN,
         )
         self.assertEqual(
@@ -474,16 +675,17 @@ class ProjectionTests(unittest.TestCase):
             value={"sha256": "b" * 64, "identity": "https://example.test/plan"},
             plan_revision=PLAN, expected_revision=0,
             created_at="2026-08-27T14:00:00Z",
+            authority=AUTHORITY,
         )
         with self.assertRaisesRegex(LinearProjectionError, "source_plan_mismatch"):
             reduce_projection_comments(
-                [{"id": "source", "body": encode_projection_comment(wrong_source)}],
+                [projection_comment(wrong_source)],
                 workstream_id="GEN-37", expected_plan_revision=PLAN,
             )
         scoped = self.event("scope", "root", scope(), 0)
         with self.assertRaisesRegex(LinearProjectionError, "route_mismatch:project_id"):
             reduce_projection_comments(
-                [{"id": "scope", "body": encode_projection_comment(scoped)}],
+                [projection_comment(scoped)],
                 workstream_id="GEN-37", expected_plan_revision=PLAN,
                 authenticated_route={"workspace_id": "workspace", "team_id": "team",
                                      "project_id": "wrong", "root_issue_id": ROOT_UUID},
@@ -496,8 +698,7 @@ class ProjectionTests(unittest.TestCase):
                 "sha256": PLAN, "identity": "https://example.test/plan",
             }, 1),
         ]
-        comments = [{"id": str(i), "body": encode_projection_comment(event)}
-                    for i, event in enumerate(events)]
+        comments = [projection_comment(event) for event in events]
         route = {"workspace_id": "workspace", "team_id": "team",
                  "project_id": "project", "root_issue_id": ROOT_UUID}
         with self.assertRaisesRegex(LinearProjectionError, "root_issue_id"):
@@ -682,9 +883,10 @@ class ProjectionTests(unittest.TestCase):
             }},
             plan_revision=PLAN, expected_revision=0,
             created_at="2026-08-27T18:00:01Z",
+            authority=AUTHORITY,
         )
         client.comments.append({
-            "id": "late-comment", "body": encode_projection_comment(late),
+            **projection_comment(late),
             "createdAt": "now", "updatedAt": "now",
         })
         writes_before = len(client.comments)
@@ -782,6 +984,7 @@ class ProjectionTests(unittest.TestCase):
             plan_revision=PLAN, expected_revision=adapter.state().revision,
             created_at="2026-08-27T18:00:30Z",
             supersedes_event_id=current["event_id"],
+            authority=AUTHORITY,
         )
         adapter.append(changed)
         writes_before = len(client.comments)
@@ -946,6 +1149,7 @@ class ProjectionTests(unittest.TestCase):
             expected_revision=adapter.state().revision,
             created_at="2026-08-27T19:30:00Z",
             supersedes_event_id=tombstone["event_id"],
+            authority=AUTHORITY,
         )
         adapter.append(competitor)
         writes_before = len(client.comments)
@@ -961,6 +1165,8 @@ class ProjectionTests(unittest.TestCase):
         adapter = LinearProjectionAdapter(
             client, issue_id="GEN-37", workstream_id="GEN-37",
             plan_revision=PLAN,
+            workspace_id="workspace", team_id="team", project_id="project",
+            root_issue_id=ROOT_UUID,
         )
         manifest = reviewed_manifest(adapter, [
             {"kind": "scope", "key": "root", "value": scope()},

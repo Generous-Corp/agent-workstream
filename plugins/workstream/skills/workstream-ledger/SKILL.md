@@ -217,6 +217,27 @@ these errors away. Deterministic closure evidence without an explicitly passed
 semantic review remains `Landed — acceptance review required`; invocation alone
 cannot emit `Done`.
 
+`workstreamctl reconcile` is the bounded live landing/closure path. It reads an
+authenticated GitHub repository identity, PR head, and merge SHA; invokes one
+explicit fixed-argv Shipyard receipt adapter without a shell; and persists the
+result as the singleton lifecycle projection. Projection revisions use
+route-scoped deterministic client-supplied Linear comment IDs as exclusive
+remote slots. Runtime schema introspection must confirm that Linear still
+supports `CommentCreateInput.id`; an identical collision is replay, while a
+different winner requires reload and review before another write. Reviewed v1
+history is fenced by one v2 activation event; later v1 writes are quarantined
+and surfaced by count/digest (or exact events in history mode) rather than
+silently admitted. Lifecycle reconciliation refuses while any quarantine is
+unresolved; retiring one requires a reviewed projection disposition naming the
+exact event IDs and event digest. A merged exact head can emit only `Landed —
+acceptance review required`. `Done` additionally requires a durably projected
+fresh-session review receipt bound to the exact snapshot, closure input,
+repository key, and head. The receipt names and digests the durable review
+artifact and declares procedural independence under a shared Linear credential;
+it does not claim cryptographic agent identity.
+Resume derives lifecycle status and the closure receipt digest from that durable
+projection rather than mutable issue prose.
+
 ### Fresh-session resume
 
 If `workstream-resume` already returned the bounded authoritative snapshot in

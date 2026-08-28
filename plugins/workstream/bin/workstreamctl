@@ -24,7 +24,7 @@ def fail(message: str) -> int:
 
 def usage() -> int:
     print(
-        "usage: workstreamctl {plan|intake|resume|projection|ingress} [args...]\n"
+        "usage: workstreamctl {plan|intake|resume|projection|reconcile|ingress} [args...]\n"
         "       workstreamctl linear inspect [--config PATH] [--team-id ID --project-id ID]\n"
         "       workstreamctl config validate [path]\n\n"
         "These commands expose existing deterministic helpers. They do not claim a hosted live-status service."
@@ -41,6 +41,7 @@ def main(argv: list[str]) -> int:
         "intake": "workstream_intake.py",
         "resume": "workstream_resume.py",
         "projection": "workstream_projection.py",
+        "reconcile": "workstream_reconcile.py",
         "ingress": "workstream_ingress.py",
     }
     if command in scripts:
