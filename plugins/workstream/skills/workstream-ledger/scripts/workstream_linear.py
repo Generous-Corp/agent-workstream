@@ -131,7 +131,13 @@ def deterministic_issue_id(
     *, workspace_id: str, team_id: str, project_id: str,
     root_stable_key: str, child_stable_key: str | None = None,
 ) -> str:
-    """Return the client-supplied UUID for one immutable intake identity."""
+    """Return a deterministic UUIDv4-shaped Linear intake identity.
+
+    Linear accepts client-supplied issue IDs but its live validator requires
+    UUID version 4. Derive all random payload bits from the immutable route and
+    plan keys, then set only the RFC 4122 version and variant bits. This keeps
+    concurrent creators on one stable ID without depending on UUIDv5 support.
+    """
     fields = (workspace_id, team_id, project_id, root_stable_key)
     if any(not isinstance(value, str) or not value.strip() for value in fields):
         raise ValueError("deterministic Linear issue identity needs a complete route and root key")
@@ -144,7 +150,8 @@ def deterministic_issue_id(
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    return str(uuid.uuid5(ISSUE_ID_NAMESPACE, material))
+    deterministic = uuid.uuid5(ISSUE_ID_NAMESPACE, material)
+    return str(uuid.UUID(bytes=deterministic.bytes, version=4))
 
 def marker(key: str) -> str:
     return f"<!-- workstream-key:{key} -->"
