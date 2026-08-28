@@ -86,6 +86,15 @@ class ResumeTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ResumeError, "root missing next_action"):
             MODULE.validate_snapshot(snapshot, "GEN-37")
 
+    def test_root_next_action_must_be_nonblank_text(self):
+        for value in ({}, [], "   ", None):
+            with self.subTest(value=value):
+                snapshot = self.snapshot()
+                snapshot["root"]["status"] = "Done"
+                snapshot["root"]["next_action"] = value
+                with self.assertRaisesRegex(MODULE.ResumeError, "invalid_root_next_action"):
+                    MODULE.validate_snapshot(snapshot, "GEN-37")
+
     def test_context_budget_fails_loudly(self):
         with self.assertRaisesRegex(MODULE.ResumeError, "over_budget"):
             MODULE.compact_context(self.snapshot(), "GEN-37", max_bytes=10)
@@ -163,11 +172,77 @@ class ResumeTests(unittest.TestCase):
         ])
         self.assertRegex(context["latest_checkpoint"]["provenance"]["sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(context["surface_availability"]["latest_checkpoint"], "available")
+        self.assertEqual(context["next_action"], "validate live resume")
         full = MODULE.compact_context(
             MODULE.add_material_history(snapshot, comments, "GEN-37"), "GEN-37",
             include_history=True,
         )
         self.assertEqual(full["latest_checkpoint"]["provenance_chain"][0]["machine"], "M5")
+
+    def test_material_event_after_checkpoint_supersedes_checkpoint_next_action(self):
+        snapshot = self.snapshot()
+        checkpoint = build_checkpoint(
+            workstream_id="GEN-37", boundary_id="checkpointed", root_revision=1,
+            plan_revision="sha", before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai", "session_id": "session-1",
+                "machine": "M5", "worktree": {
+                    "state": "safe", "path": "/repo/worktree", "branch": "feature/resume",
+                    "head": "abc123",
+                },
+            },
+            exact_head="abc123", evidence=[], blocker=None,
+            next_action="checkpoint action",
+        )
+        comments = [
+            {"id": "event-1", "body": encode_event_comment(Delta(
+                "event-a", "GEN-37", "progress", "agent",
+                {"next_action": "acknowledged action"}, 0,
+                "2026-08-21T00:00:00Z",
+            ))},
+            {"id": "checkpoint-1", "body": encode_checkpoint_comment(checkpoint)},
+            {"id": "event-2", "body": encode_event_comment(Delta(
+                "event-b", "GEN-37", "progress", "agent",
+                {"next_action": "new action"}, 1,
+                "2026-08-21T00:01:00Z",
+            ))},
+        ]
+        context = MODULE.compact_context(
+            MODULE.add_material_history(snapshot, comments, "GEN-37"), "GEN-37"
+        )
+        self.assertEqual(context["next_action"], "new action")
+
+    def test_later_canonical_event_beats_checkpoint_despite_stale_writer_revision(self):
+        snapshot = self.snapshot()
+        checkpoint = build_checkpoint(
+            workstream_id="GEN-37", boundary_id="checkpointed", root_revision=1,
+            plan_revision="sha", before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai", "session_id": "session-1",
+                "machine": "M5", "worktree": {
+                    "state": "safe", "path": "/repo/worktree", "branch": "feature/resume",
+                    "head": "abc123",
+                },
+            },
+            exact_head="abc123", evidence=[], blocker=None,
+            next_action="checkpoint action",
+        )
+        comments = [
+            {"id": "event-1", "body": encode_event_comment(Delta(
+                "event-a", "GEN-37", "progress", "agent", {}, 0,
+                "2026-08-21T00:00:00Z",
+            ))},
+            {"id": "checkpoint-1", "body": encode_checkpoint_comment(checkpoint)},
+            {"id": "event-2", "body": encode_event_comment(Delta(
+                "event-b", "GEN-37", "progress", "agent",
+                {"next_action": "later action"}, 0,
+                "2026-08-21T00:01:00Z",
+            ))},
+        ]
+        context = MODULE.compact_context(
+            MODULE.add_material_history(snapshot, comments, "GEN-37"), "GEN-37"
+        )
+        self.assertEqual(context["next_action"], "later action")
 
     def test_material_history_exposes_absent_checkpoint_without_fabrication(self):
         context = MODULE.compact_context(
@@ -229,6 +304,28 @@ class ResumeTests(unittest.TestCase):
         snapshot["material_event_revision"] = 2
         with self.assertRaisesRegex(MODULE.ResumeError, "duplicate_material_event"):
             MODULE.compact_context(snapshot, "GEN-37")
+
+    def test_event_next_action_must_be_nonblank_text(self):
+        payloads = (
+            {"next_action": {}},
+            {"next_action": "   "},
+            {"boundary_id": "turn-1", "changes": [
+                {"kind": "next_action", "payload": {"next_action": []}},
+            ]},
+        )
+        for index, payload in enumerate(payloads):
+            with self.subTest(payload=payload):
+                snapshot = self.snapshot()
+                snapshot["root"]["revision"] = 1
+                snapshot["material_events"] = [{
+                    "event_id": f"event-{index}", "workstream_id": "GEN-37",
+                    "kind": "material_boundary" if "changes" in payload else "progress",
+                    "source": "agent", "payload": payload, "expected_revision": 0,
+                    "created_at": "2026-08-21T00:00:00Z",
+                }]
+                snapshot["material_event_revision"] = 1
+                with self.assertRaisesRegex(MODULE.ResumeError, "invalid_event_next_action"):
+                    MODULE.compact_context(snapshot, "GEN-37")
 
     def test_offline_material_revision_must_match_root(self):
         snapshot = self.snapshot()

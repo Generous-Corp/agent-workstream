@@ -83,15 +83,42 @@ def _event_next_actions(event: dict[str, Any]) -> set[str]:
             ):
                 raise ResumeError(f"malformed_material_boundary:{event['event_id']}")
             payloads.append(change["payload"])
-    actions = {
-        value.strip()
-        for payload in payloads
-        for value in [payload.get("next_action")]
-        if isinstance(value, str) and value.strip()
-    }
+    actions: set[str] = set()
+    for payload in payloads:
+        if "next_action" not in payload:
+            continue
+        value = payload["next_action"]
+        if not isinstance(value, str) or not value.strip():
+            raise ResumeError(f"invalid_event_next_action:{event['event_id']}")
+        actions.add(value.strip())
     if len(actions) > 1:
         raise ResumeError(f"conflicting_event_next_action:{event['event_id']}")
     return actions
+
+
+def _resolved_next_action(
+    events: list[dict[str, Any]], current: str | None,
+    checkpoint: dict[str, Any] | None,
+) -> str | None:
+    """Let an acknowledged checkpoint fence older material instructions."""
+    if current is not None and (not isinstance(current, str) or not current.strip()):
+        raise ResumeError("invalid_root_next_action")
+    checkpoint_revision = 0
+    resolved = current.strip() if current is not None else None
+    if checkpoint is not None:
+        checkpoint_revision = checkpoint["root_revision"]
+        resolved = checkpoint["next_action"]
+    next_actions_by_revision: dict[int, set[str]] = {}
+    for index, event in enumerate(events):
+        for value in _event_next_actions(event):
+            expected = event["expected_revision"]
+            actions = next_actions_by_revision.setdefault(expected, set())
+            actions.add(value)
+            if len(actions) > 1:
+                raise ResumeError(f"conflicting_concurrent_next_action:{expected}")
+            if index >= checkpoint_revision:
+                resolved = value
+    return resolved
 
 
 def _uncheckpointed_material_obligations(
@@ -213,19 +240,6 @@ def add_material_history(
     )
     result["root"]["issue_revision"] = result["root"].get("revision", 0)
     result["root"]["revision"] = event_log.revision
-    next_actions_by_revision: dict[int, set[str]] = {}
-    for event in events:
-        for value in _event_next_actions(event):
-            actions = next_actions_by_revision.setdefault(
-                event["expected_revision"], set()
-            )
-            actions.add(value)
-            if len(actions) > 1:
-                raise ResumeError(
-                    f"conflicting_concurrent_next_action:{event['expected_revision']}"
-                )
-            result["root"]["next_action"] = value
-
     result["latest_checkpoint"] = None
     current_checkpoints = [
         checkpoint for checkpoint in checkpoint_log.checkpoints
@@ -247,6 +261,9 @@ def add_material_history(
         )
         if result["latest_checkpoint"]["root_revision"] > event_log.revision:
             raise ResumeError("checkpoint_ahead_of_material_event_log")
+    result["root"]["next_action"] = _resolved_next_action(
+        events, result["root"].get("next_action"), result["latest_checkpoint"],
+    )
     return result
 
 
@@ -282,7 +299,12 @@ def validate_snapshot(
         not isinstance(root["issue_revision"], int) or root["issue_revision"] < 0
     ):
         raise ResumeError("issue revision must be a non-negative integer")
-    if str(root.get("status", "")).lower() not in TERMINAL and not root.get("next_action"):
+    root_next_action = root.get("next_action")
+    if "next_action" in root and (
+        not isinstance(root_next_action, str) or not root_next_action.strip()
+    ):
+        raise ResumeError("invalid_root_next_action")
+    if str(root.get("status", "")).lower() not in TERMINAL and not root_next_action:
         raise ResumeError("nonterminal root missing next_action")
     events_present = "material_events" in snapshot
     revision_present = "material_event_revision" in snapshot
@@ -292,7 +314,6 @@ def validate_snapshot(
     if not isinstance(material_events, list):
         raise ResumeError("material_events must be a list")
     event_ids: set[str] = set()
-    next_actions_by_revision: dict[int, set[str]] = {}
     for index, event in enumerate(material_events):
         if not isinstance(event, dict):
             raise ResumeError(f"invalid_material_event:{index}")
@@ -315,12 +336,7 @@ def validate_snapshot(
         expected = event["expected_revision"]
         if not isinstance(expected, int) or expected < 0 or expected > index:
             raise ResumeError(f"invalid_material_event_revision:{event['event_id']}")
-        for value in _event_next_actions(event):
-            actions = next_actions_by_revision.setdefault(expected, set())
-            actions.add(value)
-            if len(actions) > 1:
-                raise ResumeError(f"conflicting_concurrent_next_action:{expected}")
-            root["next_action"] = value
+        _event_next_actions(event)
     material_revision = snapshot.get("material_event_revision")
     if events_present and (
         material_revision != len(material_events) or root["revision"] != material_revision
@@ -379,6 +395,11 @@ def validate_snapshot(
             or provenance_chain[-1].get("worktree") != latest_checkpoint["worktree"]
         ):
             raise ResumeError("invalid_latest_checkpoint")
+    root["next_action"] = _resolved_next_action(
+        material_events, root.get("next_action"), latest_checkpoint,
+    )
+    if str(root.get("status", "")).lower() not in TERMINAL and not root.get("next_action"):
+        raise ResumeError("nonterminal root missing next_action")
     children = snapshot.get("children")
     if not isinstance(children, list):
         raise ResumeError("children must be a list")
