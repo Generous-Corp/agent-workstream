@@ -17,7 +17,10 @@ from typing import Any
 
 from workstream_config import load_linear_api_key, resolve_linear_route
 from workstream_checkpoint import CheckpointError, recover_latest
-from workstream_linear import HttpGraphQLClient, LinearGraphQLTransport, LinearTransportError
+from workstream_linear import (
+    bootstrap_linear_route, HttpGraphQLClient, LinearGraphQLTransport,
+    LinearTransportError,
+)
 from workstream_linear_checkpoints import (
     LinearCheckpointError,
     reduce_checkpoint_comments,
@@ -26,6 +29,9 @@ from workstream_linear_events import (
     LinearCommentEventAdapter,
     LinearEventError,
     reduce_event_comments,
+)
+from workstream_linear_projection import (
+    LinearProjectionError, reduce_projection_comments, validate_projection_event,
 )
 from workstream_choices import ChoiceError, reduce_choices
 from workstream_evidence import evidence_errors
@@ -79,17 +85,26 @@ def _event_next_actions(event: dict[str, Any]) -> set[str]:
 
 
 def add_material_history(
-    snapshot: dict[str, Any], comments: list[dict[str, Any]], token: str
+    snapshot: dict[str, Any], comments: list[dict[str, Any]], token: str,
+    *, authenticated_route: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Join one complete Linear comment read to the issue-graph snapshot."""
     result = dict(snapshot)
     result["root"] = dict(snapshot.get("root") or {})
     event_log = reduce_event_comments(comments, workstream_id=token)
     checkpoint_log = reduce_checkpoint_comments(comments, workstream_id=token)
+    plan_revision = result["root"].get("plan_revision")
+    projection_log = reduce_projection_comments(
+        comments, workstream_id=token, expected_plan_revision=plan_revision,
+        authenticated_route=authenticated_route,
+    )
     events = [_event_record(event) for event in event_log.events]
 
     result["material_events"] = events
     result["material_event_revision"] = event_log.revision
+    if projection_log.revision:
+        result.update(projection_log.snapshot)
+        result["authenticated_route"] = dict(authenticated_route) if authenticated_route else None
     result["root"]["issue_revision"] = result["root"].get("revision", 0)
     result["root"]["revision"] = event_log.revision
     next_actions_by_revision: dict[int, set[str]] = {}
@@ -263,11 +278,85 @@ def validate_snapshot(snapshot: dict[str, Any], token: str | None = None) -> dic
     choice_events = snapshot.get("choice_events", [])
     if not isinstance(choice_events, list):
         raise ResumeError("choice_events must be a list")
+    projection_events = snapshot.get("projection_events", [])
+    projection_revision = snapshot.get("projection_revision")
+    if not isinstance(projection_events, list):
+        raise ResumeError("projection_events must be a list")
+    if projection_revision is not None and projection_revision != len(projection_events):
+        raise ResumeError("projection_revision_mismatch")
+    for index, event in enumerate(projection_events):
+        try:
+            validate_projection_event(event)
+        except LinearProjectionError as error:
+            raise ResumeError(f"invalid_projection_event:{index}:{error}") from error
+        if event["workstream_id"] != identifier.upper():
+            raise ResumeError(f"projection_workstream_mismatch:{index}")
+        if event["plan_revision"] != root["plan_revision"]:
+            raise ResumeError(f"projection_plan_drift:{index}")
+        if event["expected_revision"] > index:
+            raise ResumeError(f"projection_revision_gap:{index}")
+    projection_recovery = snapshot.get("projection_recovery")
+    if projection_recovery is not None and (
+        not isinstance(projection_recovery, dict)
+        or set(projection_recovery) != {"state", "stale_plan_count"}
+        or projection_recovery.get("state") not in {"current", "stale_plan", "not_found"}
+        or not isinstance(projection_recovery.get("stale_plan_count"), int)
+        or projection_recovery["stale_plan_count"] < 0
+    ):
+        raise ResumeError("invalid_projection_recovery")
+    authenticated_route = snapshot.get("authenticated_route")
+    if projection_events:
+        if not isinstance(authenticated_route, dict) or not all(
+            isinstance(authenticated_route.get(field), str) and authenticated_route[field]
+            for field in ("workspace_id", "team_id", "project_id")
+        ):
+            raise ResumeError("projection_authenticated_route_missing")
+        if projection_recovery != {"state": "current", "stale_plan_count": 0}:
+            raise ResumeError("projection_not_current")
+        if snapshot.get("scope") is None or snapshot.get("source") is None:
+            raise ResumeError("projection_authority_missing")
+        if not snapshot.get("provenance"):
+            raise ResumeError("projection_provenance_missing")
+        if snapshot.get("disposition") is None:
+            raise ResumeError("projection_disposition_missing")
+        active: dict[tuple[str, str], dict[str, Any]] = {}
+        for event in projection_events:
+            identity = (event["kind"], event["key"])
+            current = active.get(identity)
+            if current is None and event["supersedes_event_id"] is not None:
+                raise ResumeError(f"projection_supersedes_missing:{event['event_id']}")
+            if current is not None and event["supersedes_event_id"] != current["event_id"]:
+                raise ResumeError(f"projection_concurrent_conflict:{event['kind']}:{event['key']}")
+            active[identity] = event
+        for kind, field in (("scope", "scope"), ("source", "source"),
+                            ("disposition", "disposition")):
+            values = [event["value"] for (event_kind, _), event in active.items()
+                      if event_kind == kind]
+            if len(values) != 1 or values[0] != snapshot.get(field):
+                raise ResumeError(f"projection_current_view_mismatch:{field}")
+        for kind, field in (("relation", "relations"), ("choice", "choice_events"),
+                            ("evidence_contract", "evidence_contracts"),
+                            ("provenance", "provenance")):
+            values = [event["value"] for (event_kind, _), event in active.items()
+                      if event_kind == kind]
+            values.sort(key=lambda value: json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ))
+            if values != snapshot.get(field):
+                raise ResumeError(f"projection_current_view_mismatch:{field}")
     try:
         choice_view = reduce_choices(choice_events)
         scope = snapshot.get("scope")
         if scope is not None:
             validate_scope(scope, root_id=identifier.upper(), child_ids=keys)
+            if authenticated_route:
+                for field in ("workspace_id", "team_id", "project_id"):
+                    if scope["linear"].get(field) != authenticated_route.get(field):
+                        raise ResumeError(f"projection_route_mismatch:{field}")
+        source = snapshot.get("source")
+        if source is not None:
+            if not isinstance(source, dict) or source.get("sha256") != root["plan_revision"]:
+                raise ResumeError("projection_source_plan_mismatch")
         relations = snapshot.get("relations", [])
         validate_relations(
             relations, root_id=identifier.upper(),
@@ -336,7 +425,12 @@ def validate_snapshot(snapshot: dict[str, Any], token: str | None = None) -> dic
             "material_event_revision": material_revision,
             "latest_checkpoint": latest_checkpoint,
             "checkpoint_recovery": checkpoint_recovery,
-            "source": snapshot.get("source")}
+            "source": snapshot.get("source"),
+            "disposition": snapshot.get("disposition"),
+            "projection_events": projection_events,
+            "projection_revision": projection_revision,
+            "projection_recovery": projection_recovery,
+            "authenticated_route": authenticated_route}
 
 
 def compact_context(
@@ -371,12 +465,18 @@ def compact_context(
         "latest_checkpoint": clean["latest_checkpoint"],
         "checkpoint_recovery": clean["checkpoint_recovery"],
         "source": clean.get("source"),
+        "disposition": clean.get("disposition"),
+        "projection_events": clean["projection_events"],
+        "projection_revision": clean["projection_revision"],
+        "projection_recovery": clean["projection_recovery"],
+        "authenticated_route": clean["authenticated_route"],
     }
     item_count = sum(
         len(value) for value in (
             context["children"], context["decisions"], context["choice_events"],
             context["relations"], context["provenance"],
             context["evidence_contracts"], context["material_events"],
+            context["projection_events"],
             (context["latest_checkpoint"] or {}).get("provenance_chain", []),
         )
     )
@@ -409,10 +509,6 @@ def main() -> int:
                 team_id=args.linear_team_id,
                 project_id=args.linear_project_id,
             )
-            if not route:
-                raise ResumeError(
-                    "snapshot, repository-root .workstream.json, or explicit Linear route is required"
-                )
             api_key = load_linear_api_key()
             if not api_key:
                 raise ResumeError(
@@ -420,6 +516,8 @@ def main() -> int:
                     "or install ~/.config/agent-workstream/linear.token"
                 )
             client = HttpGraphQLClient(api_key, args.linear_endpoint)
+            if not route:
+                route = bootstrap_linear_route(client, token)
             transport = LinearGraphQLTransport(
                 client,
                 team_id=route["team_id"],
@@ -436,14 +534,17 @@ def main() -> int:
                 workspace_id=complete_route.get("workspace_id"),
                 project_id=complete_route.get("project_id"),
             ).comments()
-            snapshot = add_material_history(snapshot, comments, token)
+            snapshot = add_material_history(
+                snapshot, comments, token, authenticated_route=route,
+            )
         else:
             raw = sys.stdin.read() if args.snapshot == "-" else open(args.snapshot, encoding="utf-8").read()
             snapshot = json.loads(raw)
         output = compact_context(snapshot, token, args.max_bytes, args.max_items)
     except (
         OSError, json.JSONDecodeError, ResumeError, LinearTransportError,
-        LinearEventError, LinearCheckpointError, CheckpointError, ValueError,
+        LinearEventError, LinearCheckpointError, LinearProjectionError,
+        CheckpointError, ValueError,
     ) as error:
         print(f"workstream resume refused: {error}", file=sys.stderr)
         return 2

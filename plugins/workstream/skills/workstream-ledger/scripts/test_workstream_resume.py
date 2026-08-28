@@ -366,6 +366,29 @@ class ResumeTests(unittest.TestCase):
         transport.snapshot_for_root.assert_called_once_with("GEN-37")
         comments.comments.assert_called_once_with()
 
+    def test_live_cli_bootstraps_route_from_token_without_repo_config(self):
+        transport = mock.Mock()
+        transport.snapshot_for_root.return_value = self.snapshot()
+        client = mock.Mock()
+        comments = mock.Mock()
+        comments.comments.return_value = []
+        route = {"workspace_id": "workspace", "team_id": "team",
+                 "project_id": "project", "root_issue_id": "root-uuid"}
+        constructor = mock.Mock(return_value=transport)
+        with mock.patch.object(MODULE, "resolve_linear_route", return_value=(None, None)), \
+             mock.patch.object(MODULE, "bootstrap_linear_route", return_value=route) as bootstrap, \
+             mock.patch.object(MODULE, "HttpGraphQLClient", return_value=client), \
+             mock.patch.object(MODULE, "LinearGraphQLTransport", constructor), \
+             mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
+             mock.patch.object(MODULE, "load_linear_api_key", return_value="secret"), \
+             mock.patch.object(MODULE.sys, "argv", ["workstream_resume.py", "GEN-37"]), \
+             mock.patch.object(MODULE.sys, "stdout"):
+            self.assertEqual(MODULE.main(), 0)
+        bootstrap.assert_called_once_with(client, "GEN-37")
+        constructor.assert_called_once_with(
+            client, team_id="team", workspace_id="workspace", project_id="project"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

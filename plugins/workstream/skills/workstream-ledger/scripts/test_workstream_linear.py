@@ -6,6 +6,7 @@ from unittest import mock
 
 from workstream_http import default_ssl_context
 from workstream_linear import (
+    bootstrap_linear_route,
     HttpGraphQLClient,
     LinearGraphQLTransport,
     LinearTransportError,
@@ -49,6 +50,30 @@ class FakeClient:
 
 
 class LinearTransportTests(unittest.TestCase):
+    def test_token_only_bootstrap_reads_exact_issue_route(self):
+        client = mock.Mock()
+        client.execute.return_value = {"issue": {
+            "id": "root-uuid", "identifier": "GEN-37",
+            "team": {"id": "team", "organization": {"id": "workspace"}},
+            "project": {"id": "project", "teams": {"nodes": [{"id": "team"}]}},
+        }}
+        self.assertEqual(
+            bootstrap_linear_route(client, "gen-37"),
+            {"workspace_id": "workspace", "team_id": "team",
+             "project_id": "project", "root_issue_id": "root-uuid"},
+        )
+        client.execute.assert_called_once()
+
+    def test_token_only_bootstrap_refuses_project_team_mismatch(self):
+        client = mock.Mock()
+        client.execute.return_value = {"issue": {
+            "id": "root-uuid", "identifier": "GEN-37",
+            "team": {"id": "team", "organization": {"id": "workspace"}},
+            "project": {"id": "project", "teams": {"nodes": [{"id": "other"}]}},
+        }}
+        with self.assertRaisesRegex(LinearTransportError, "not associated"):
+            bootstrap_linear_route(client, "GEN-37")
+
     def test_http_client_passes_an_explicit_ssl_context(self):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         response = mock.MagicMock()

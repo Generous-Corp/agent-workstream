@@ -46,12 +46,17 @@ duplicates, and unknown relation types.
 
 The live Linear graph transport verifies the declared workspace/team/project
 relationship, fences reads to that project, and assigns the project on creates.
-It does not yet read or write typed cross-workstream relations. Treat relations
-as a transport gap: validate and preserve the logical scope, but do not claim
-live relation proof until a paginated, authenticated read-back-verified adapter
-exists. Until then it emits `transport_unimplemented`. The deterministic
-validator rejects missing or mismatched receipts; the transport remains
-responsible for their authenticity.
+The append-only projection transport persists scope and typed cross-workstream
+relations as immutable Linear comments and derives their current view from a
+complete paginated readback. Replacing a keyed projection must name the exact
+event it supersedes; ambiguous concurrent replacements fail closed. The
+source digest must equal the root plan revision, and the projected
+workspace/team/project route must equal the authenticated token readback.
+Mixed or stale plan revisions fail closed instead of silently changing or
+omitting current state. Evidence contracts are keyed by stable slice ID, so
+one child may own several independently verifiable slices. The
+deterministic validator rejects missing or mismatched receipts; the transport
+remains responsible for their authenticity.
 
 ### Markdown plan intake
 
@@ -158,10 +163,11 @@ requires an explicit audit verdict before closure. Any active `must_fix` choice
 blocks landing; reversible low-risk choices may receive a provisional verdict
 with a review trigger.
 
-This is currently a deterministic logical contract only. Material deltas and
-checkpoints use fully paginated Linear comments and resume readback, but choice
-events do not yet have that adapter. A future adapter must connect choice events
-before complete cross-machine recovery can be claimed.
+Choice events use the same fully paginated append-only projection boundary as
+scope, relations, evidence contracts, source, provenance, and continuation
+disposition. Their immutable event identity remains intact inside the projection
+event. This is authenticated transport proof, not evidence that an authorized
+person cannot edit or delete a Linear comment.
 
 ### Slice evidence contract
 
@@ -208,20 +214,26 @@ while excluding terminal children. A tab title is only a token carrier; no
 agent may resume from a cwd, stale transcript, or title metadata alone.
 
 The current paginated Linear transport obtains the issue graph and reads the
-root comment connection once to reduce both append-only material events and
-remote checkpoints. A newer material-event `next_action` supersedes stale root
-description prose. An acknowledged checkpoint restores its bounded provenance,
-machine, worktree, exact head, evidence, blocker, and next action; an empty
-checkpoint log is reported as empty rather than fabricated. The transport still
-returns empty decisions and provenance and does not fetch typed choices, scope,
-relations, evidence contracts, owner, live source-control truth, or every other
-Linear history surface. Therefore its output is a validated bounded snapshot,
-not yet complete physical cross-machine recovery proof. Resume must recover and
-reduce every durable choice event, then reconcile its plan revision, repository
-scope, and exact head before implementation. Resume emits
-`transport_unimplemented` for each unfetched surface; closure treats every such
-marker as a blocker. Absence is a named pilot gate, not evidence that no choices
-exist and never closure-ready.
+root comment connection once to reduce append-only material events, remote
+checkpoints, and the complete projection history. A newer material-event
+`next_action` supersedes stale root description prose. The projection restores
+scope, relations, choices, evidence contracts, source, provenance, and the
+recorded attach/successor disposition. An acknowledged checkpoint restores its
+bounded machine, worktree, exact head, evidence, blocker, and next action and is
+the authority used to choose attach versus successor after live remote-head
+verification. The recorded disposition is always the explicit `attach` or
+`create_successor` result and must reconcile with that checkpoint and live head;
+an ambiguous placeholder is not executable. An empty surface is reported as
+empty rather than fabricated.
+When no local config is available, authenticated token-only bootstrap resolves
+the root's exact workspace/team/project route before the fenced read.
+
+This remains a validated bounded snapshot, not complete physical cross-machine
+recovery proof. Resume does not itself fetch owner, live source-control truth,
+landing-controller truth, or deletion resistance. Reconcile plan revision,
+repository scope, and exact heads before implementation. An unfetched surface
+still emits `transport_unimplemented`, and closure treats that marker as a
+blocker.
 
 ### Linear graph operations
 
