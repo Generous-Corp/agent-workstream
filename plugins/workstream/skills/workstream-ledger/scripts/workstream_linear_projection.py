@@ -49,6 +49,7 @@ SINGLETON_KINDS = {
 }
 TOMBSTONE = {"_projection_tombstone": True}
 AUTHORITY_FIELDS = {"workspace_id", "team_id", "project_id", "root_issue_id"}
+LEGACY_DIGEST_KIND_FULL_EVENTS = "canonical-full-events-v1"
 
 
 class LinearProjectionError(LinearTransportError):
@@ -89,6 +90,30 @@ def _immutable(event: dict[str, Any]) -> dict[str, Any]:
 
 def _event_id(event: dict[str, Any]) -> str:
     return "wsp_" + hashlib.sha256(_canonical(_immutable(event))).hexdigest()[:32]
+
+
+def _activation_digest_candidates(
+    legacy_event_ids: list[str], accepted_legacy: list[dict[str, Any]],
+) -> tuple[str, str]:
+    return (
+        hashlib.sha256(_canonical(sorted(legacy_event_ids))).hexdigest(),
+        hashlib.sha256(_canonical(accepted_legacy)).hexdigest(),
+    )
+
+
+def _activation_legacy_digest_is_valid(
+    value: dict[str, Any], accepted_legacy: list[dict[str, Any]],
+) -> bool:
+    historical_ids_digest, full_events_digest = _activation_digest_candidates(
+        value["legacy_event_ids"], accepted_legacy,
+    )
+    observed_digest = value["legacy_events_sha256"]
+    if "legacy_digest_kind" in value:
+        return observed_digest == full_events_digest
+    return sum((
+        observed_digest == historical_ids_digest,
+        observed_digest == full_events_digest,
+    )) == 1
 
 
 def validate_projection_authority(authority: dict[str, Any]) -> None:
@@ -145,7 +170,10 @@ def validate_projection_event(event: dict[str, Any]) -> None:
     value = event["value"]
     tombstone = value == TOMBSTONE
     if event["kind"] == "cas_activation":
-        if tombstone or set(value) != {"legacy_event_ids", "legacy_events_sha256"}:
+        historical_fields = {"legacy_event_ids", "legacy_events_sha256"}
+        tagged_fields = {*historical_fields, "legacy_digest_kind"}
+        fields = set(value)
+        if tombstone or (fields != historical_fields and fields != tagged_fields):
             raise LinearProjectionError("invalid_projection_cas_activation")
         legacy_ids = value["legacy_event_ids"]
         if (
@@ -156,6 +184,10 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             or not re.fullmatch(
                 r"[0-9a-f]{64}", str(value["legacy_events_sha256"])
             )
+        ):
+            raise LinearProjectionError("invalid_projection_cas_activation")
+        if fields == tagged_fields and (
+            value["legacy_digest_kind"] != LEGACY_DIGEST_KIND_FULL_EVENTS
         ):
             raise LinearProjectionError("invalid_projection_cas_activation")
     if event["kind"] == "quarantine_disposition":
@@ -431,6 +463,10 @@ def reduce_projection_comments(
     if modern:
         activation = modern[0]
         if activation["expected_revision"] == 0:
+            if activation["kind"] == "cas_activation":
+                raise LinearProjectionError(
+                    "projection_v2_activation_without_legacy"
+                )
             accepted_legacy = []
             quarantined = legacy
         else:
@@ -448,11 +484,19 @@ def reduce_projection_comments(
                     item["expected_revision"], item["created_at"], item["event_id"],
                 ),
             )
+            if (
+                "legacy_digest_kind" in activation["value"]
+                and reviewed_ids
+                != [event["event_id"] for event in accepted_legacy]
+            ):
+                raise LinearProjectionError(
+                    "projection_v2_activation_legacy_order_mismatch"
+                )
             reviewed = set(reviewed_ids)
             quarantined = [event for event in legacy if event["event_id"] not in reviewed]
-            if activation["value"]["legacy_events_sha256"] != hashlib.sha256(
-                _canonical(accepted_legacy)
-            ).hexdigest():
+            if not _activation_legacy_digest_is_valid(
+                activation["value"], accepted_legacy,
+            ):
                 raise LinearProjectionError("projection_v2_activation_legacy_digest_mismatch")
     for index, event in enumerate(accepted_legacy):
         if event["expected_revision"] > index:
@@ -644,6 +688,7 @@ class LinearProjectionAdapter:
         event = build_projection_event(
             workstream_id=self.workstream_id, kind="cas_activation", key="root",
             value={
+                "legacy_digest_kind": LEGACY_DIGEST_KIND_FULL_EVENTS,
                 "legacy_event_ids": legacy_ids,
                 "legacy_events_sha256": legacy_events_sha256,
             },
