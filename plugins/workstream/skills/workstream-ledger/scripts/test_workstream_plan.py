@@ -1,6 +1,8 @@
 import importlib.util
 import io
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +17,11 @@ SPEC.loader.exec_module(MODULE)
 
 
 class PlanIntakeTests(unittest.TestCase):
+    def http_error(self, source, code, message):
+        error = MODULE.HTTPError(source, code, message, None, io.BytesIO())
+        self.addCleanup(error.close)
+        return error
+
     def test_remote_plan_fetch_uses_verified_tls_context(self):
         context = object()
         response = mock.MagicMock()
@@ -44,6 +51,118 @@ class PlanIntakeTests(unittest.TestCase):
         self.assertEqual(request.get_header("Authorization"), "Bearer secret")
         self.assertEqual(raw, b"# Private plan\n")
         self.assertEqual(identity, source)
+
+    def test_exact_github_blob_404_falls_back_to_bounded_isolated_ssh(self):
+        commit = "a" * 40
+        source = (
+            "https://github.com/Generous-Corp/pulp-planning/blob/"
+            f"{commit}/plans/continuity.md"
+        )
+        missing = self.http_error(source, 404, "Not Found")
+        completed = [
+            subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess([], 0, stdout=b"# Private exact plan\n", stderr=b""),
+        ]
+        with mock.patch.dict(
+            MODULE.os.environ,
+            {
+                "PATH": "/usr/bin:/bin", "HOME": "/Users/test",
+                "SSH_AUTH_SOCK": "/tmp/agent.sock", "GITHUB_TOKEN": "secret",
+                "GH_TOKEN": "also-secret", "GIT_SSH_COMMAND": "unsafe",
+            },
+            clear=True,
+        ), mock.patch.object(MODULE, "urlopen", side_effect=missing), \
+             mock.patch.object(MODULE.subprocess, "run", side_effect=completed) as run:
+            raw, identity = MODULE.source_bytes(source)
+
+        self.assertEqual(raw, b"# Private exact plan\n")
+        self.assertEqual(identity, source)
+        self.assertEqual(run.call_count, 3)
+        init, fetch, show = run.call_args_list
+        isolated = init.args[0][-1]
+        self.assertEqual(init.args[0][0:4], ["git", "init", "--bare", "--quiet"])
+        self.assertEqual(fetch.args[0], [
+            "git", "-C", isolated, "fetch", "--quiet", "--no-tags",
+            "--depth=1", "git@github.com:Generous-Corp/pulp-planning.git", commit,
+        ])
+        self.assertEqual(show.args[0], [
+            "git", "-C", isolated, "show", "--no-ext-diff", "--no-textconv",
+            f"{commit}:plans/continuity.md",
+        ])
+        self.assertFalse(Path(isolated).exists())
+        for call in run.call_args_list:
+            self.assertIsInstance(call.args[0], list)
+            self.assertNotIn("shell", call.kwargs)
+            self.assertTrue(call.kwargs["check"])
+            self.assertTrue(call.kwargs["capture_output"])
+            self.assertIs(call.kwargs["stdin"], subprocess.DEVNULL)
+            self.assertEqual(call.kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+            self.assertEqual(call.kwargs["env"]["GIT_CONFIG_NOSYSTEM"], "1")
+            self.assertEqual(call.kwargs["env"]["GIT_CONFIG_GLOBAL"], os.devnull)
+            self.assertNotIn("GITHUB_TOKEN", call.kwargs["env"])
+            self.assertNotIn("GH_TOKEN", call.kwargs["env"])
+            self.assertNotIn("GIT_SSH_COMMAND", call.kwargs["env"])
+        self.assertEqual(init.kwargs["timeout"], MODULE.GIT_SHOW_TIMEOUT_SECONDS)
+        self.assertEqual(fetch.kwargs["timeout"], MODULE.GIT_FETCH_TIMEOUT_SECONDS)
+        self.assertEqual(show.kwargs["timeout"], MODULE.GIT_SHOW_TIMEOUT_SECONDS)
+
+    def test_github_ssh_fallback_refuses_mutable_or_malformed_blob_urls(self):
+        invalid = [
+            "https://github.com/acme/plans/blob/main/PLAN.md",
+            f"https://github.com/acme/plans/blob/{'a' * 39}/PLAN.md",
+            f"https://github.com/bad_owner/plans/blob/{'a' * 40}/PLAN.md",
+            f"https://github.com/acme/plans/blob/{'a' * 40}/../PLAN.md",
+            f"https://github.com/acme/plans/blob/{'a' * 40}/PLAN%2Emd",
+            f"https://github.com/acme/plans/blob/{'a' * 40}/PLAN.md?raw=1",
+            f"http://github.com/acme/plans/blob/{'a' * 40}/PLAN.md",
+        ]
+        for source in invalid:
+            with self.subTest(source=source), \
+                 mock.patch.object(
+                     MODULE, "urlopen",
+                     side_effect=self.http_error(source, 404, "Not Found"),
+                 ), mock.patch.object(MODULE.subprocess, "run") as run:
+                with self.assertRaises(MODULE.HTTPError):
+                    MODULE.source_bytes(source)
+                run.assert_not_called()
+
+    def test_github_ssh_fallback_only_handles_https_404(self):
+        source = (
+            "https://github.com/acme/plans/blob/"
+            f"{'a' * 40}/PLAN.md"
+        )
+        with mock.patch.object(
+            MODULE, "urlopen",
+            side_effect=self.http_error(source, 403, "Forbidden"),
+        ), mock.patch.object(MODULE.subprocess, "run") as run:
+            with self.assertRaises(MODULE.HTTPError):
+                MODULE.source_bytes(source)
+        run.assert_not_called()
+
+    def test_github_ssh_fallback_timeout_fails_closed(self):
+        commit = "a" * 40
+        source = f"https://github.com/acme/plans/blob/{commit}/PLAN.md"
+        missing = self.http_error(source, 404, "Not Found")
+        with mock.patch.object(MODULE, "urlopen", side_effect=missing), \
+             mock.patch.object(MODULE.subprocess, "run", side_effect=[
+                 subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
+                 subprocess.TimeoutExpired(["git", "fetch"], 20),
+             ]):
+            with self.assertRaisesRegex(TimeoutError, "timed out"):
+                MODULE.source_bytes(source)
+
+    def test_github_ssh_fallback_command_failure_fails_closed(self):
+        commit = "a" * 40
+        source = f"https://github.com/acme/plans/blob/{commit}/PLAN.md"
+        missing = self.http_error(source, 404, "Not Found")
+        with mock.patch.object(MODULE, "urlopen", side_effect=missing), \
+             mock.patch.object(
+                 MODULE.subprocess, "run",
+                 side_effect=subprocess.CalledProcessError(128, ["git", "init"]),
+             ):
+            with self.assertRaisesRegex(OSError, "fetch failed"):
+                MODULE.source_bytes(source)
 
     def test_exact_revision_and_stable_graph(self):
         with tempfile.TemporaryDirectory() as directory:
