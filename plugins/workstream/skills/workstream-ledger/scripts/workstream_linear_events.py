@@ -3,8 +3,8 @@
 
 Linear issue updates are not conditional. This adapter therefore never
 rewrites issue state: each delta is one issue comment and the live revision is
-the number of unique, valid event comments. Concurrent appends from the same
-revision commute and are retained by the reducer.
+the number of unique, valid event comments. A route-scoped deterministic
+comment ID is the exclusive remote slot for each revision.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import hmac
 import json
 import os
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,6 +54,12 @@ mutation WorkstreamDeltaCommentCreate($input: CommentCreateInput!) {
 }
 """
 
+COMMENT_CREATE_CAPABILITY_QUERY = """
+query WorkstreamEventCommentCreateCapability {
+  __type(name: "CommentCreateInput") { inputFields { name } }
+}
+"""
+
 
 class LinearEventError(LinearTransportError):
     """The remote event journal cannot be reduced without guessing."""
@@ -64,6 +71,52 @@ class ReducedEventLog:
     revision: int
     events: tuple[Delta, ...]
     remote_ids: dict[str, str]
+
+
+def ledger_boundary_slot_id(
+    workstream_id: str,
+    material_revision: int,
+    checkpoint_event_ids: list[str],
+    authority: dict[str, str],
+) -> str:
+    """Return the shared remote slot for one combined ledger frontier."""
+    if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", workstream_id.upper()):
+        raise LinearEventError("invalid_comment_slot_workstream")
+    if not isinstance(material_revision, int) or material_revision < 0:
+        raise LinearEventError("invalid_comment_slot_material_revision")
+    if (
+        not isinstance(checkpoint_event_ids, list)
+        or not all(isinstance(item, str) and item for item in checkpoint_event_ids)
+        or checkpoint_event_ids != sorted(set(checkpoint_event_ids))
+    ):
+        raise LinearEventError("invalid_comment_slot_checkpoint_frontier")
+    required = {"workspace_id", "team_id", "project_id", "root_issue_id"}
+    if set(authority) != required or not all(
+        isinstance(authority[field], str) and authority[field] for field in required
+    ):
+        raise LinearEventError("comment_slot_authority_incomplete")
+    stable_authority = {
+        "workspace_id": authority["workspace_id"],
+        "root_issue_id": authority["root_issue_id"],
+    }
+    material = json.dumps(
+        [
+            "workstream-ledger-boundary-slot-v1", stable_authority,
+            material_revision,
+            hashlib.sha256(
+                json.dumps(
+                    checkpoint_event_ids, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest(),
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    raw = bytearray(hashlib.sha256(material).digest()[:16])
+    raw[6] = (raw[6] & 0x0F) | 0x40
+    raw[8] = (raw[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(raw)))
 
 
 def _canonical_event(delta: Delta) -> dict[str, Any]:
@@ -83,6 +136,20 @@ def _canonical_event(delta: Delta) -> dict[str, Any]:
         **immutable,
         "sha256": hashlib.sha256(material).hexdigest(),
     }
+
+
+def _rebase_compatible_replay(existing: Delta, requested: Delta) -> bool:
+    """Accept only the same event durably rebased to a later revision."""
+    if existing.expected_revision < requested.expected_revision:
+        return False
+    return (
+        existing.event_id == requested.event_id
+        and existing.workstream_id == requested.workstream_id
+        and existing.kind == requested.kind
+        and existing.source == requested.source
+        and existing.payload == requested.payload
+        and existing.created_at == requested.created_at
+    )
 
 
 def encode_event_comment(delta: Delta) -> str:
@@ -181,6 +248,14 @@ def reduce_event_comments(
     )
 
 
+def _event_applied_revision(state: ReducedEventLog, event_id: str) -> int:
+    """Return the stable canonical position of one event, never the log tip."""
+    for index, event in enumerate(state.events, start=1):
+        if event.event_id == event_id:
+            return index
+    raise LinearEventError(f"event_not_observed:{event_id}")
+
+
 class LinearCommentEventAdapter:
     """Lossless material-delta adapter backed by Linear issue comments."""
 
@@ -203,6 +278,8 @@ class LinearCommentEventAdapter:
         self.workspace_id = workspace_id
         self.team_id = team_id
         self.project_id = project_id
+        self._observed_authority: dict[str, str] | None = None
+        self._comment_id_capability_verified = False
         if any((workspace_id, team_id, project_id)) and not all((workspace_id, team_id, project_id)):
             raise ValueError("Linear workspace, team, and project IDs must be supplied together")
 
@@ -249,6 +326,19 @@ class LinearCommentEventAdapter:
                 )
             except LinearTransportError as error:
                 raise LinearEventError(str(error)) from error
+            team = issue.get("team") or {}
+            project = issue.get("project") or {}
+            authority = {
+                "workspace_id": (team.get("organization") or {}).get("id"),
+                "team_id": team.get("id"),
+                "project_id": project.get("id"),
+                "root_issue_id": issue.get("id"),
+            }
+            if not all(isinstance(value, str) and value for value in authority.values()):
+                raise LinearEventError("comment_slot_authority_incomplete")
+            if self._observed_authority is not None and self._observed_authority != authority:
+                raise LinearEventError("comment_slot_authority_changed")
+            self._observed_authority = authority  # type: ignore[assignment]
             connection = issue.get("comments") or {}
             comments.extend(connection.get("nodes") or [])
             page_info = connection.get("pageInfo") or {}
@@ -266,37 +356,153 @@ class LinearCommentEventAdapter:
     def _state(self, workstream_id: str) -> ReducedEventLog:
         return reduce_event_comments(self._comments(), workstream_id=workstream_id)
 
+    def _combined_state(self) -> tuple[ReducedEventLog, Any, list[dict[str, Any]]]:
+        comments = self._comments()
+        events = reduce_event_comments(comments, workstream_id=self.issue_id)
+        # Local import avoids a module cycle: checkpoint transport shares this
+        # event transport's query, capability, and boundary-slot helpers.
+        from workstream_linear_checkpoints import reduce_checkpoint_comments
+
+        checkpoints = reduce_checkpoint_comments(
+            comments, workstream_id=self.issue_id
+        )
+        return events, checkpoints, comments
+
+    @staticmethod
+    def _checkpoint_frontier(checkpoints: Any) -> list[str]:
+        return sorted(item["event_id"] for item in checkpoints.checkpoints)
+
+    @staticmethod
+    def _validate_checkpoint_prefix(events: ReducedEventLog, checkpoints: Any) -> None:
+        records = list(checkpoints.checkpoints)
+        if any(item["root_revision"] > events.revision for item in records):
+            raise LinearEventError("checkpoint_material_history_incomplete")
+        if not records:
+            return
+        if records[0].get("predecessor_event_id") is not None:
+            raise LinearEventError("checkpoint_chain_truncated")
+        previous = records[0]
+        for item in records[1:]:
+            if item["root_revision"] <= previous["root_revision"]:
+                raise LinearEventError("checkpoint_revision_not_monotonic")
+            if item.get("predecessor_event_id") != previous["event_id"]:
+                raise LinearEventError("checkpoint_chain_broken")
+            previous = item
+
     def current_revision(self, workstream_id: str) -> int:
         if workstream_id != self.issue_id:
             raise LinearEventError("workstream_id_mismatch")
         return self._state(workstream_id).revision
 
+    def _assert_comment_id_capability(self) -> None:
+        if self._comment_id_capability_verified:
+            return
+        result = self.client.execute(COMMENT_CREATE_CAPABILITY_QUERY, {})
+        fields = ((result.get("__type") or {}).get("inputFields") or [])
+        if not isinstance(fields, list) or "id" not in {
+            field.get("name") for field in fields if isinstance(field, dict)
+        }:
+            raise LinearEventError("linear_comment_create_id_capability_unavailable")
+        self._comment_id_capability_verified = True
+
     def apply(self, delta: Delta) -> MutationReceipt:
         if delta.workstream_id != self.issue_id:
             raise LinearEventError("workstream_id_mismatch")
-        before = self._state(delta.workstream_id)
-        existing_id = before.remote_ids.get(delta.event_id)
-        if existing_id:
-            existing = next(event for event in before.events if event.event_id == delta.event_id)
-            if _canonical_event(existing) != _canonical_event(delta):
-                raise LinearEventError(f"conflicting_event_id:{delta.event_id}")
-            return MutationReceipt(delta.event_id, before.revision, existing_id)
-        if delta.expected_revision > before.revision:
-            raise RevisionConflict(
-                f"expected revision {delta.expected_revision}, live revision {before.revision}"
+        for _attempt in range(8):
+            before, checkpoints, _comments = self._combined_state()
+            existing_id = before.remote_ids.get(delta.event_id)
+            if existing_id:
+                existing = next(
+                    event for event in before.events
+                    if event.event_id == delta.event_id
+                )
+                if not _rebase_compatible_replay(existing, delta):
+                    raise LinearEventError(f"conflicting_event_id:{delta.event_id}")
+                return MutationReceipt(
+                    delta.event_id,
+                    _event_applied_revision(before, delta.event_id),
+                    existing_id,
+                )
+            self._validate_checkpoint_prefix(before, checkpoints)
+            if delta.expected_revision != before.revision:
+                raise RevisionConflict(
+                    f"expected revision {delta.expected_revision}, "
+                    f"live revision {before.revision}"
+                )
+            if self._observed_authority is None:
+                raise LinearEventError("comment_slot_authority_incomplete")
+            frontier = self._checkpoint_frontier(checkpoints)
+            slot_id = ledger_boundary_slot_id(
+                delta.workstream_id, before.revision, frontier,
+                self._observed_authority,
             )
-
-        response = self.client.execute(
-            COMMENT_CREATE_MUTATION,
-            {"input": {"issueId": self.issue_id, "body": encode_event_comment(delta)}},
-        )
-        created = response.get("commentCreate") or {}
-        comment = created.get("comment")
-        if created.get("success") is not True or not comment or not comment.get("id"):
-            raise LinearEventError("Linear comment creation returned no durable receipt")
-
-        after = self._state(delta.workstream_id)
-        remote_id = after.remote_ids.get(delta.event_id)
-        if remote_id != comment["id"]:
-            raise LinearEventError("event_append_not_observed")
-        return MutationReceipt(delta.event_id, after.revision, remote_id)
+            self._assert_comment_id_capability()
+            try:
+                response = self.client.execute(
+                    COMMENT_CREATE_MUTATION,
+                    {"input": {
+                        "id": slot_id,
+                        "issueId": self.issue_id,
+                        "body": encode_event_comment(delta),
+                    }},
+                )
+            except LinearTransportError:
+                after_events, after_checkpoints, _ = self._combined_state()
+                winner = next(
+                    (
+                        event for event in after_events.events
+                        if after_events.remote_ids.get(event.event_id) == slot_id
+                    ),
+                    None,
+                )
+                if winner is not None and _canonical_event(winner) == _canonical_event(delta):
+                    return MutationReceipt(
+                        delta.event_id,
+                        _event_applied_revision(after_events, delta.event_id),
+                        slot_id,
+                    )
+                if winner is not None:
+                    raise RevisionConflict(
+                        f"expected revision {delta.expected_revision}, "
+                        f"live revision {after_events.revision}"
+                    )
+                checkpoint_winner = next(
+                    (
+                        item for item in after_checkpoints.checkpoints
+                        if after_checkpoints.remote_ids.get(item["event_id"])
+                        == slot_id
+                    ),
+                    None,
+                )
+                if checkpoint_winner is not None:
+                    self._validate_checkpoint_prefix(
+                        after_events, after_checkpoints
+                    )
+                    if after_events.revision != delta.expected_revision:
+                        raise RevisionConflict(
+                            f"expected revision {delta.expected_revision}, "
+                            f"live revision {after_events.revision}"
+                        )
+                    continue
+                raise
+            created = response.get("commentCreate") or {}
+            comment = created.get("comment")
+            if (
+                created.get("success") is not True
+                or not comment
+                or comment.get("id") != slot_id
+            ):
+                raise LinearEventError(
+                    "Linear comment creation returned no durable receipt"
+                )
+            after, after_checkpoints, _ = self._combined_state()
+            self._validate_checkpoint_prefix(after, after_checkpoints)
+            remote_id = after.remote_ids.get(delta.event_id)
+            if remote_id != comment["id"]:
+                raise LinearEventError("event_append_not_observed")
+            return MutationReceipt(
+                delta.event_id,
+                _event_applied_revision(after, delta.event_id),
+                remote_id,
+            )
+        raise LinearEventError("ledger_boundary_coordination_retry_exhausted")

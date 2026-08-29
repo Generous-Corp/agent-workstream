@@ -29,7 +29,13 @@ from workstream_checkpoint import (
 from workstream_linear import (
     GraphQLClient, HttpGraphQLClient, LinearTransportError, validate_issue_route,
 )
-from workstream_linear_events import COMMENT_CREATE_MUTATION, COMMENTS_QUERY
+from workstream_linear_events import (
+    COMMENT_CREATE_CAPABILITY_QUERY,
+    COMMENT_CREATE_MUTATION,
+    COMMENTS_QUERY,
+    ledger_boundary_slot_id,
+    reduce_event_comments,
+)
 
 
 CHECKPOINT_PREFIX = "<!-- workstream-checkpoint:v1:"
@@ -191,6 +197,8 @@ class LinearCheckpointAdapter:
         self.workspace_id = workspace_id
         self.team_id = team_id
         self.project_id = project_id
+        self._observed_authority: dict[str, str] | None = None
+        self._comment_id_capability_verified = False
         if any((workspace_id, team_id, project_id)) and not all((workspace_id, team_id, project_id)):
             raise ValueError("Linear workspace, team, and project IDs must be supplied together")
 
@@ -241,6 +249,19 @@ class LinearCheckpointAdapter:
                 )
             except LinearTransportError as error:
                 raise LinearCheckpointError(str(error)) from error
+            team = issue.get("team") or {}
+            project = issue.get("project") or {}
+            authority = {
+                "workspace_id": (team.get("organization") or {}).get("id"),
+                "team_id": team.get("id"),
+                "project_id": project.get("id"),
+                "root_issue_id": issue.get("id"),
+            }
+            if not all(isinstance(value, str) and value for value in authority.values()):
+                raise LinearCheckpointError("comment_slot_authority_incomplete")
+            if self._observed_authority is not None and self._observed_authority != authority:
+                raise LinearCheckpointError("comment_slot_authority_changed")
+            self._observed_authority = authority  # type: ignore[assignment]
             connection = issue.get("comments")
             if not isinstance(connection, dict):
                 raise LinearCheckpointError("invalid Linear comment connection")
@@ -261,12 +282,64 @@ class LinearCheckpointAdapter:
             self._comments(), workstream_id=self.workstream_id
         )
 
+    def _assert_comment_id_capability(self) -> None:
+        if self._comment_id_capability_verified:
+            return
+        result = self.client.execute(COMMENT_CREATE_CAPABILITY_QUERY, {})
+        fields = ((result.get("__type") or {}).get("inputFields") or [])
+        if not isinstance(fields, list) or "id" not in {
+            field.get("name") for field in fields if isinstance(field, dict)
+        }:
+            raise LinearCheckpointError(
+                "linear_comment_create_id_capability_unavailable"
+            )
+        self._comment_id_capability_verified = True
+
+    @staticmethod
+    def _validate_material_history(
+        checkpoints: ReducedCheckpointLog, material_revision: int
+    ) -> None:
+        if any(
+            item["root_revision"] > material_revision
+            for item in checkpoints.checkpoints
+        ):
+            raise LinearCheckpointError("checkpoint_material_history_incomplete")
+
+    def _confirmed_readback(
+        self, checkpoint: dict[str, Any], *, expected_remote_id: str
+    ) -> dict[str, Any]:
+        """Confirm one durable checkpoint and that it still covers the log tip."""
+        comments = self._comments()
+        checkpoints = reduce_checkpoint_comments(
+            comments, workstream_id=self.workstream_id
+        )
+        observed = next(
+            (
+                item for item in checkpoints.checkpoints
+                if item["event_id"] == checkpoint["event_id"]
+            ),
+            None,
+        )
+        if (
+            observed is None
+            or checkpoints.remote_ids.get(checkpoint["event_id"])
+            != expected_remote_id
+            or _canonical_record(observed) != _canonical_record(checkpoint)
+        ):
+            raise LinearCheckpointError("checkpoint_append_not_observed")
+        material = reduce_event_comments(comments, workstream_id=self.workstream_id)
+        self._validate_material_history(checkpoints, material.revision)
+        return deepcopy(observed)
+
     def persist(self, checkpoint: dict[str, Any]) -> dict[str, Any]:
         """Persist once and return only a read-after-write remote acknowledgement."""
         validate_checkpoint(checkpoint)
         if checkpoint["workstream_id"] != self.workstream_id:
             raise LinearCheckpointError("workstream_id_mismatch")
-        before = self._state()
+        comments = self._comments()
+        before = reduce_checkpoint_comments(
+            comments, workstream_id=self.workstream_id
+        )
         existing_id = before.remote_ids.get(checkpoint["event_id"])
         if existing_id:
             existing = next(
@@ -285,32 +358,111 @@ class LinearCheckpointAdapter:
                 raise LinearCheckpointError("checkpoint_acknowledgement_conflict")
             return deepcopy(existing)
 
-        response = self.client.execute(
-            COMMENT_CREATE_MUTATION,
-            {
-                "input": {
-                    "issueId": self.issue_id,
-                    "body": encode_checkpoint_comment(checkpoint),
-                }
-            },
+        material = reduce_event_comments(comments, workstream_id=self.workstream_id)
+        self._validate_material_history(before, material.revision)
+
+        try:
+            current = recover_latest(
+                list(before.checkpoints), self.workstream_id,
+                expected_plan_revision=checkpoint["plan_revision"],
+            )
+        except CheckpointError as error:
+            if str(error) != "checkpoint_not_found":
+                raise LinearCheckpointError(str(error)) from error
+            current = None
+        expected_predecessor = (
+            current["checkpoint_event_id"] if current is not None else None
         )
+        if checkpoint.get("predecessor_event_id") != expected_predecessor:
+            raise LinearCheckpointError(
+                "checkpoint_predecessor_stale_reload_required"
+            )
+        if (
+            current is not None
+            and checkpoint["root_revision"] <= current["root_revision"]
+        ):
+            raise LinearCheckpointError(
+                "checkpoint_successor_revision_not_monotonic"
+            )
+        if checkpoint["root_revision"] > material.revision:
+            raise LinearCheckpointError("checkpoint_material_history_incomplete")
+        if checkpoint["root_revision"] < material.revision:
+            raise LinearCheckpointError(
+                "checkpoint_material_revision_advanced_reload_and_rebuild_required"
+            )
+        if self._observed_authority is None:
+            raise LinearCheckpointError("comment_slot_authority_incomplete")
+        frontier = sorted(item["event_id"] for item in before.checkpoints)
+        slot_id = ledger_boundary_slot_id(
+            self.workstream_id, material.revision, frontier,
+            self._observed_authority,
+        )
+        self._assert_comment_id_capability()
+
+        try:
+            response = self.client.execute(
+                COMMENT_CREATE_MUTATION,
+                {
+                    "input": {
+                        "id": slot_id,
+                        "issueId": self.issue_id,
+                        "body": encode_checkpoint_comment(checkpoint),
+                    }
+                },
+            )
+        except LinearTransportError:
+            comments_after = self._comments()
+            checkpoints_after = reduce_checkpoint_comments(
+                comments_after, workstream_id=self.workstream_id
+            )
+            events_after = reduce_event_comments(
+                comments_after, workstream_id=self.workstream_id
+            )
+            checkpoint_winner = next(
+                (
+                    item for item in checkpoints_after.checkpoints
+                    if checkpoints_after.remote_ids.get(item["event_id"])
+                    == slot_id
+                ),
+                None,
+            )
+            if (
+                checkpoint_winner is not None
+                and _canonical_record(checkpoint_winner)
+                == _canonical_record(checkpoint)
+            ):
+                return self._confirmed_readback(
+                    checkpoint, expected_remote_id=slot_id
+                )
+            if checkpoint_winner is not None:
+                raise LinearCheckpointError(
+                    "checkpoint_slot_lost_reload_required"
+                )
+            event_winner = next(
+                (
+                    event for event in events_after.events
+                    if events_after.remote_ids.get(event.event_id) == slot_id
+                ),
+                None,
+            )
+            if event_winner is not None:
+                raise LinearCheckpointError(
+                    "checkpoint_material_revision_advanced_reload_and_rebuild_required"
+                )
+            raise
         created = response.get("commentCreate") or {}
         comment = created.get("comment")
-        if created.get("success") is not True or not comment or not comment.get("id"):
+        if (
+            created.get("success") is not True
+            or not comment
+            or comment.get("id") != slot_id
+        ):
             raise LinearCheckpointError(
                 "Linear comment creation returned no durable receipt"
             )
 
-        after = self._state()
-        remote_id = after.remote_ids.get(checkpoint["event_id"])
-        if remote_id != comment["id"]:
-            raise LinearCheckpointError("checkpoint_append_not_observed")
-        return deepcopy(
-            next(
-                item
-                for item in after.checkpoints
-                if item["event_id"] == checkpoint["event_id"]
-            )
+        return self._confirmed_readback(
+            checkpoint, expected_remote_id=comment["id"]
         )
 
     def recover(self, *, expected_plan_revision: str) -> dict[str, Any]:

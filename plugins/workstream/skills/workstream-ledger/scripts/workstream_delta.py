@@ -3,10 +3,9 @@
 
 The journal is deliberately independent of a particular Linear transport. An
 adapter implements ``apply(delta)`` and must make the remote mutation
-idempotent by ``event_id``. Mutable-state transports must enforce
-``expected_revision`` with atomic CAS; append-only transports may accept
-concurrent events based on the same revision because neither replaces the
-other. The local transaction is the durable hand-off: a process may die after
+idempotent by ``event_id``. Remote transports enforce ``expected_revision``
+with an atomic CAS slot even when the durable representation is append-only.
+The local transaction is the durable hand-off: a process may die after
 the adapter accepts a mutation but before the journal records it as applied,
 so replay is expected and safe.
 """
@@ -66,9 +65,9 @@ class MutationAdapter(Protocol):
 def _supports_lossless_remote_mutation(adapter: MutationAdapter) -> bool:
     """Accept either fenced state replacement or an atomic append-only log.
 
-    An append-only event transport does not need compare-and-swap because two
-    writers never replace the same state. Its reducer must derive revision
-    from the complete durable event set and reject duplicate event IDs.
+    An append-only event transport still needs a deterministic remote slot so
+    two writers cannot both claim the same root revision. Its reducer derives
+    revision from the complete durable event set and rejects duplicate IDs.
     """
     return (
         getattr(adapter, "supports_atomic_cas", False) is True
@@ -270,8 +269,8 @@ class DeltaJournal:
         The event ID remains stable when its expected revision is rebased. A
         best-effort read/write adapter is refused before mutation: read-after-
         write verification cannot turn Linear's non-conditional update into a
-        compare-and-swap. An append-only adapter does not rebase ordinary
-        concurrent events because a shared expected revision is valid there.
+        compare-and-swap. A deterministic append slot may expose a conflict;
+        the caller reloads and retries at the newer revision.
         """
         if not _supports_lossless_remote_mutation(adapter):
             raise RemoteCASUnavailable("remote_cas_unavailable")

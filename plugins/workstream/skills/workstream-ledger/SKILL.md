@@ -154,9 +154,18 @@ and retries a stable event ID after `RevisionConflict`.
 Linear `MutationAdapter`. It stores one immutable material delta per issue
 comment using Linear's documented `commentCreate` API, paginates the complete
 comment set, and derives the ledger revision from the valid event set. It does
-not use or claim conditional `issueUpdate`. Concurrent writers observed at the
-same revision append independent comments, so neither replaces the other.
-Replay returns the existing receipt; duplicate or conflicting event IDs,
+not use or claim conditional `issueUpdate`. Material events and checkpoints
+share one deterministic client-supplied boundary slot derived from the stable
+workspace/root identity, current material revision, and checkpoint frontier.
+Team or project moves therefore cannot create a second slot. A checkpoint
+winner moves a concurrent event to the next frontier; an event winner forces a
+pending checkpoint to reload and rebuild. Replay returns the existing receipt;
+bounded rebase replay also accepts the same stable event ID when workstream,
+kind, source, payload, and creation time are identical and the remote expected
+revision moved only forward. Reverse revisions or any other material mismatch
+remain conflicts. This closes the crash window where remote acceptance occurs
+after rebase but before the local outbox acknowledgement. Duplicate or
+conflicting event IDs,
 malformed markers, causal revision gaps, incomplete pagination, missing auth,
 and unobserved writes fail closed. Configure it with `LINEAR_API_KEY` and the
 exact root issue identifier. `from_env` also consumes the validated
@@ -439,7 +448,18 @@ and complete predecessor-chain recovery. `scripts/workstream_linear_checkpoints.
 persists that schema as a distinct immutable marker over the same authenticated,
 fully paginated Linear comment boundary as material-delta events. It derives an
 acknowledgement only after readback, replays an already observed event without a
-second write, and fails closed on ambiguous or malformed remote state. This is
+second write, and fences the exact live material revision and checkpoint
+predecessor through the shared ledger-boundary slot before appending. A
+checkpoint is linearized when it wins that slot. An event admitted after the
+checkpoint's final combined read is later, uncheckpointed work and resume
+surfaces it as such. It fails closed on ambiguous or malformed remote state.
+Legacy comments may have arbitrary remote IDs and remain readable; new writes
+use deterministic slots. A legacy checkpoint whose root revision is ahead of
+the material-event history is not guessed or silently repaired: new event and
+checkpoint mutation fails with `checkpoint_material_history_incomplete` until
+a reviewed quarantine/remediation operation accounts for the missing history.
+Exact replay of the existing checkpoint remains a no-write acknowledgement.
+This is
 logical transport proof. Its `from_env` constructor consumes the same validated
 repository-root route and refuses a root outside it. Do not call the
 deterministic fake-client tests a live Linear, second-machine, process-death, or
