@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import io
 import json
+from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 from workstream_linear import LinearTransportError
 from workstream_linear_projection import (
@@ -11,8 +15,8 @@ from workstream_linear_projection import (
     projection_slot_id,
 )
 from workstream_repository_identity import (
-    _value_digest, GitHubRepositoryResolver, reconcile_repository_identity,
-    RepositoryIdentityError,
+    _MutationTrackingClient, _value_digest, GitHubRepositoryResolver,
+    main, reconcile_repository_identity, RepositoryIdentityError,
 )
 
 
@@ -136,6 +140,44 @@ class RacingProjectionClient(FakeProjectionClient):
         return super().execute(query, variables)
 
 
+class MaterialRacingProjectionClient(FakeProjectionClient):
+    def __init__(self):
+        super().__init__()
+        self.comment_reads = 0
+
+    def execute(self, query, variables):
+        if "query WorkstreamDeltaComments" in query:
+            self.comment_reads += 1
+            if self.comment_reads == 3:
+                from workstream_delta import Delta
+                from workstream_linear_events import encode_event_comment
+
+                delta = Delta(
+                    "wsd_race", "GEN-37", "requirement", "agent",
+                    {"text": "concurrent material"}, 0, "2026-08-29T12:00:00Z",
+                )
+                self.comments.append({
+                    "id": "material-race", "body": encode_event_comment(delta),
+                    "createdAt": "2026-08-29T12:00:00Z",
+                    "updatedAt": "2026-08-29T12:00:00Z",
+                })
+        return super().execute(query, variables)
+
+
+class LostPostWriteReadbackClient(FakeProjectionClient):
+    def __init__(self):
+        super().__init__()
+        self.fail_readback = True
+
+    def execute(self, query, variables):
+        if (
+            "query WorkstreamDeltaComments" in query
+            and self.write_count == 1 and self.fail_readback
+        ):
+            raise LinearTransportError("lost post-write readback")
+        return super().execute(query, variables)
+
+
 def adapter_with_scope(value=None):
     client = FakeProjectionClient()
     adapter = LinearProjectionAdapter(
@@ -161,6 +203,17 @@ def racing_adapter_with_scope():
     client.comments = deepcopy(initial.comments)
     adapter = LinearProjectionAdapter(
         client, issue_id="GEN-37", workstream_id="GEN-37", plan_revision=PLAN,
+        **AUTHORITY,
+    )
+    return adapter, client, event
+
+
+def special_adapter_with_scope(client):
+    _adapter, initial, event = adapter_with_scope()
+    client.comments = deepcopy(initial.comments)
+    tracked = _MutationTrackingClient(client)
+    adapter = LinearProjectionAdapter(
+        tracked, issue_id="GEN-37", workstream_id="GEN-37", plan_revision=PLAN,
         **AUTHORITY,
     )
     return adapter, client, event
@@ -232,6 +285,58 @@ class RepositoryIdentityWriterTests(unittest.TestCase):
         self.assertEqual(client.write_count, 0)
         self.assertEqual(len(client.comments), 2)  # initial scope plus planted competitor
 
+    def test_material_race_inside_append_final_read_refuses_before_writer_mutation(self):
+        adapter, client, event = special_adapter_with_scope(
+            MaterialRacingProjectionClient(),
+        )
+        with self.assertRaisesRegex(LinearTransportError, "material_frontier_stale"):
+            apply(adapter, event)
+        self.assertEqual(client.write_count, 0)
+        self.assertEqual(len(client.comments), 2)  # initial scope plus planted material
+
+    def test_lost_post_write_readback_is_unconfirmed_then_replay_converges(self):
+        adapter, client, event = special_adapter_with_scope(
+            LostPostWriteReadbackClient(),
+        )
+        uncertain = apply(adapter, event)
+        self.assertEqual(uncertain["disposition"], "landed_unconfirmed")
+        self.assertTrue(uncertain["reconcile_required"])
+        self.assertEqual(client.write_count, 1)
+
+        client.fail_readback = False
+        replay = apply(adapter, event)
+        self.assertEqual(replay["disposition"], "existing")
+        self.assertEqual(client.write_count, 1)
+
+    def test_later_scope_replacement_cannot_erase_or_alter_identity_history(self):
+        adapter, client, event = adapter_with_scope()
+        apply(adapter, event)
+        state = adapter.state()
+        current = next(item for item in reversed(state.events)
+                       if (item["kind"], item["key"]) == ("scope", "root"))
+        for mutate in ("erase", "alter", "remove_repository"):
+            with self.subTest(mutate=mutate):
+                changed = deepcopy(current["value"])
+                repo = changed["repositories"][0]
+                if mutate == "remove_repository":
+                    changed["repositories"] = []
+                    changed["primary_repository"] = None
+                    changed["child_ownership"] = {}
+                elif mutate == "erase":
+                    repo["aliases"] = []
+                    repo["identity_updates"] = []
+                else:
+                    repo["identity_updates"][0]["effective_at"] = "2026-08-30T00:00:00Z"
+                replacement = build_projection_event(
+                    workstream_id="GEN-37", kind="scope", key="root", value=changed,
+                    plan_revision=PLAN, expected_revision=state.revision,
+                    created_at="2026-08-30T00:00:00Z",
+                    supersedes_event_id=current["event_id"], authority=AUTHORITY,
+                )
+                with self.assertRaisesRegex(LinearTransportError, "identity_history_regressed"):
+                    adapter.append(replacement)
+                self.assertEqual(client.write_count, 1)
+
     def test_recycled_alias_with_different_provider_id_refuses_without_write(self):
         adapter, client, event = adapter_with_scope()
         with self.assertRaisesRegex(RepositoryIdentityError, "selection_ambiguous"):
@@ -239,6 +344,34 @@ class RepositoryIdentityWriterTests(unittest.TestCase):
                 provider_repository_id="R_recycled",
                 repository_key="github.com:id:R_recycled",
             ))
+        self.assertEqual(client.write_count, 0)
+
+    def test_forged_legacy_replay_without_full_deterministic_proof_refuses(self):
+        value = scope()
+        repo = value["repositories"][0]
+        repo["slug"] = NEW
+        repo["aliases"] = [OLD]
+        repo["identity_updates"] = [{
+            "from": OLD, "to": NEW, "repository_key": KEY,
+            "provider_repository_id": "R_pulp",
+            "observed_at": "2026-08-29T12:00:00Z",
+            "evidence": [{
+                "kind": "authenticated_provider_readback", "authenticated": True,
+                "repository_key": KEY, "provider_repository_id": "R_pulp",
+                "requested_slug": OLD, "resolved_slug": NEW,
+            }],
+        }]
+        repo["identity_resolution"] = {
+            "provider_repository_id": "R_pulp", "resolved_slug": NEW,
+            "observed_at": "2026-08-29T12:00:00Z",
+            "evidence": [{
+                "kind": "authenticated_provider_readback", "authenticated": True,
+                "provider_repository_id": "R_pulp", "resolved_slug": NEW,
+            }],
+        }
+        adapter, client, event = adapter_with_scope(value)
+        with self.assertRaisesRegex(RepositoryIdentityError, "replay_mismatch"):
+            apply(adapter, event)
         self.assertEqual(client.write_count, 0)
 
 
@@ -297,6 +430,93 @@ class GitHubResolverTests(unittest.TestCase):
             self.resolver(second_id="456").resolve(
                 requested_slug=OLD, provider_repository_id="R_pulp",
             )
+
+
+class RepositoryIdentityCliTests(unittest.TestCase):
+    def request(self):
+        _adapter, _client, event = adapter_with_scope()
+        return {
+            "schema_version": 1, "workstream_id": "GEN-37", "authority": AUTHORITY,
+            "plan_revision": PLAN,
+            "repository": {
+                "requested_slug": OLD, "provider_repository_id": "R_pulp",
+            },
+            "expected_frontier": {
+                "material_revision": 0, "projection_revision": 1,
+                "scope_event_id": event["event_id"],
+                "scope_sha256": _value_digest(event["value"]),
+            },
+        }
+
+    def write_request(self, raw):
+        temp = tempfile.TemporaryDirectory()
+        path = Path(temp.name) / "request.json"
+        path.write_text(raw if isinstance(raw, str) else json.dumps(raw))
+        self.addCleanup(temp.cleanup)
+        return path
+
+    def test_duplicate_json_key_refuses_before_credentials_or_provider(self):
+        raw = json.dumps(self.request()).replace(
+            '"schema_version": 1,', '"schema_version": 1, "schema_version": 1,', 1,
+        )
+        path = self.write_request(raw)
+        with mock.patch("workstream_repository_identity.load_linear_api_key") as token, \
+             mock.patch("workstream_repository_identity.GitHubRepositoryResolver") as provider, \
+             mock.patch("workstream_repository_identity.sys.stderr", io.StringIO()):
+            self.assertEqual(main(["--request", str(path), "--apply"]), 2)
+        token.assert_not_called()
+        provider.assert_not_called()
+
+    def test_invalid_static_frontiers_refuse_before_credentials_or_provider(self):
+        for field, value in (("material_revision", False), ("projection_revision", -1)):
+            with self.subTest(field=field, value=value):
+                request = self.request()
+                request["expected_frontier"][field] = value
+                path = self.write_request(request)
+                with mock.patch("workstream_repository_identity.load_linear_api_key") as token, \
+                     mock.patch("workstream_repository_identity.GitHubRepositoryResolver") as provider, \
+                     mock.patch("workstream_repository_identity.sys.stderr", io.StringIO()):
+                    self.assertEqual(main(["--request", str(path), "--apply"]), 2)
+                token.assert_not_called()
+                provider.assert_not_called()
+
+    def test_public_malicious_linear_endpoint_option_is_rejected_without_token_access(self):
+        path = self.write_request(self.request())
+        with mock.patch("workstream_repository_identity.load_linear_api_key") as token, \
+             mock.patch("workstream_repository_identity.sys.stderr", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                main([
+                    "--request", str(path), "--apply", "--linear-endpoint",
+                    "https://attacker.example/graphql",
+                ])
+        token.assert_not_called()
+
+    def test_oversized_request_refuses_before_credentials_or_provider(self):
+        path = self.write_request("{" + (" " * (64 * 1024)) + "}")
+        with mock.patch("workstream_repository_identity.load_linear_api_key") as token, \
+             mock.patch("workstream_repository_identity.GitHubRepositoryResolver") as provider, \
+             mock.patch("workstream_repository_identity.sys.stderr", io.StringIO()):
+            self.assertEqual(main(["--request", str(path), "--apply"]), 2)
+        token.assert_not_called()
+        provider.assert_not_called()
+
+    def test_linear_mutation_uses_immutable_root_issue_id_and_official_authority(self):
+        path = self.write_request(self.request())
+        fake_http = mock.Mock()
+        fake_resolver = mock.Mock()
+        fake_resolver.resolve.return_value = resolution()
+        with mock.patch("workstream_repository_identity.load_linear_api_key", return_value="secret"), \
+             mock.patch("workstream_repository_identity.os.environ.get", return_value="github"), \
+             mock.patch("workstream_repository_identity.HttpGraphQLClient", return_value=fake_http) as http, \
+             mock.patch("workstream_repository_identity.GitHubRepositoryResolver", return_value=fake_resolver), \
+             mock.patch("workstream_repository_identity.reconcile_repository_identity") as reconcile, \
+             mock.patch("workstream_repository_identity.sys.stdout", io.StringIO()):
+            reconcile.return_value = {"disposition": "existing", "write_count": 0}
+            self.assertEqual(main(["--request", str(path), "--apply"]), 0)
+        http.assert_called_once_with("secret", "https://api.linear.app/graphql")
+        adapter = reconcile.call_args.args[0]
+        self.assertEqual(adapter.issue_id, ROOT_UUID)
+        self.assertEqual(adapter.workstream_id, "GEN-37")
 
 
 if __name__ == "__main__":

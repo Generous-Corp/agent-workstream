@@ -36,6 +36,8 @@ projection revision, active scope event ID, and scope value digest. It appends
 one scope replacement containing the immutable identity-update event; exact
 replay is a zero-write no-op. A stale frontier, recycled alias, multi-hop
 redirect, or coordinate owned by another repository refuses before mutation.
+Chained coordinate history such as A to B to C is intentionally not supported;
+it requires reviewed manual consolidation before this single-hop writer runs.
 
 Neither a provider ID nor a Linear destination is trusted merely because it is
 nonempty. Repository identity includes a timestamped authenticated-provider

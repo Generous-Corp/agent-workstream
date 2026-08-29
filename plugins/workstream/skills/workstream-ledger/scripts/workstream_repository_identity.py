@@ -23,7 +23,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from workstream_config import load_linear_api_key
+from workstream_config import load_linear_api_key, unique_object
 from workstream_http import default_ssl_context
 from workstream_linear import HttpGraphQLClient, LinearTransportError
 from workstream_linear_events import reduce_event_comments
@@ -37,15 +37,50 @@ from workstream_scope import (
 
 
 MAX_PROVIDER_BYTES = 1024 * 1024
+MAX_REQUEST_BYTES = 64 * 1024
 REQUEST_FIELDS = {
     "schema_version", "workstream_id", "authority", "plan_revision",
     "repository", "expected_frontier",
 }
 AUTHORITY_FIELDS = {"workspace_id", "team_id", "project_id", "root_issue_id"}
+LINEAR_OFFICIAL_ENDPOINT = "https://api.linear.app/graphql"
 
 
 class RepositoryIdentityError(RuntimeError):
     """A repository identity update cannot be proven or fenced."""
+
+
+class _MutationTrackingClient:
+    """Record only whether the exact projection mutation may have committed."""
+
+    def __init__(self, client: Any):
+        self.client = client
+        self.mutation_attempted = False
+        self.mutation_transport_unknown = False
+        self.mutation_acknowledged = False
+
+    def execute(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        is_create = "mutation WorkstreamDeltaCommentCreate" in query
+        if is_create:
+            self.mutation_attempted = True
+            self.mutation_transport_unknown = False
+            self.mutation_acknowledged = False
+        try:
+            result = self.client.execute(query, variables)
+        except (OSError, TimeoutError, LinearTransportError):
+            if is_create:
+                self.mutation_transport_unknown = True
+            raise
+        if is_create:
+            created = result.get("commentCreate") or {}
+            self.mutation_acknowledged = (
+                created.get("success") is True
+                and isinstance(created.get("comment"), dict)
+                and bool(created["comment"].get("id"))
+            )
+            if created.get("success") is True and not self.mutation_acknowledged:
+                self.mutation_transport_unknown = True
+        return result
 
 
 def _canonical(value: Any) -> bytes:
@@ -194,13 +229,74 @@ def _scope_head(state: Any) -> dict[str, Any]:
 def _matching_update(
     repository: dict[str, Any], resolution: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    updates = repository.get("identity_updates", [])
+    if not isinstance(updates, list):
+        raise RepositoryIdentityError("invalid_repository_identity_update_history")
     return [
-        update for update in repository.get("identity_updates", [])
-        if update.get("from") == resolution["requested_slug"]
+        update for update in updates
+        if isinstance(update, dict)
+        and update.get("from") == resolution["requested_slug"]
         and update.get("to") == resolution["resolved_slug"]
         and update.get("repository_key") == resolution["repository_key"]
         and update.get("provider_repository_id") == resolution["provider_repository_id"]
     ]
+
+
+def _identity_event_id(repository_key_value: str, requested: str, resolved: str) -> str:
+    return "wsri_" + hashlib.sha256(_canonical([
+        "repository-identity-update-v1", repository_key_value, requested, resolved,
+    ])).hexdigest()[:32]
+
+
+def _provider_evidence(resolution: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "kind": "authenticated_provider_readback",
+        "authenticated": True,
+        "repository_key": resolution["repository_key"],
+        "provider_repository_id": resolution["provider_repository_id"],
+        "requested_slug": resolution["requested_slug"],
+        "resolved_slug": resolution["resolved_slug"],
+        "redirect_count": resolution["redirect_count"],
+        "requested_response_url": resolution["requested_response_url"],
+        "canonical_response_url": resolution["canonical_response_url"],
+    }
+
+
+def _validate_replay_update(
+    repository: dict[str, Any], update: dict[str, Any], resolution: dict[str, Any],
+) -> None:
+    """Require a prior update to carry the complete deterministic proof schema."""
+    expected_fields = {
+        "event_id", "from", "to", "repository_key", "provider_repository_id",
+        "observed_at", "effective_at", "evidence",
+    }
+    if set(update) != expected_fields:
+        raise RepositoryIdentityError("repository_identity_update_replay_mismatch")
+    expected_event_id = _identity_event_id(
+        resolution["repository_key"], resolution["requested_slug"],
+        resolution["resolved_slug"],
+    )
+    if update["event_id"] != expected_event_id:
+        raise RepositoryIdentityError("repository_identity_update_replay_mismatch")
+    if (
+        not isinstance(update["observed_at"], str)
+        or update["effective_at"] != update["observed_at"]
+        or update["evidence"] != [_provider_evidence(resolution)]
+    ):
+        raise RepositoryIdentityError("repository_identity_update_replay_mismatch")
+    expected_resolution = {
+        "provider_repository_id": resolution["provider_repository_id"],
+        "resolved_slug": resolution["resolved_slug"],
+        "observed_at": update["observed_at"],
+        "evidence": [{
+            "kind": "authenticated_provider_readback",
+            "authenticated": True,
+            "provider_repository_id": resolution["provider_repository_id"],
+            "resolved_slug": resolution["resolved_slug"],
+        }],
+    }
+    if repository.get("identity_resolution") != expected_resolution:
+        raise RepositoryIdentityError("repository_identity_update_replay_mismatch")
 
 
 def _updated_scope(
@@ -228,6 +324,7 @@ def _updated_scope(
     if existing:
         if repository["slug"] != resolved or requested not in repository.get("aliases", []):
             raise RepositoryIdentityError("repository_identity_update_incomplete")
+        _validate_replay_update(repository, existing[0], resolution)
         validate_scope(
             desired, root_id=root_id,
             child_ids=set(desired.get("child_ownership", {})),
@@ -243,28 +340,15 @@ def _updated_scope(
     aliases = list(repository.get("aliases", []))
     if requested != resolved and requested not in aliases:
         aliases.append(requested)
-    identity_event_id = "wsri_" + hashlib.sha256(_canonical([
-        "repository-identity-update-v1", key, requested, resolved,
-    ])).hexdigest()[:32]
     update = {
-        "event_id": identity_event_id,
+        "event_id": _identity_event_id(key, requested, resolved),
         "from": requested,
         "to": resolved,
         "repository_key": key,
         "provider_repository_id": resolution["provider_repository_id"],
         "observed_at": resolution["observed_at"],
         "effective_at": resolution["observed_at"],
-        "evidence": [{
-            "kind": "authenticated_provider_readback",
-            "authenticated": True,
-            "repository_key": key,
-            "provider_repository_id": resolution["provider_repository_id"],
-            "requested_slug": requested,
-            "resolved_slug": resolved,
-            "redirect_count": resolution["redirect_count"],
-            "requested_response_url": resolution["requested_response_url"],
-            "canonical_response_url": resolution["canonical_response_url"],
-        }],
+        "evidence": [_provider_evidence(resolution)],
     }
     repository["slug"] = resolved
     repository["aliases"] = aliases
@@ -369,8 +453,40 @@ def reconcile_repository_identity(
         created_at=resolution["observed_at"],
         supersedes_event_id=expected_scope_event_id, authority=adapter.authority,
     )
-    receipt = adapter.append(event)
-    after = adapter.state()
+    try:
+        receipt = adapter.append(
+            event, expected_material_revision=expected_material_revision,
+        )
+    except (OSError, TimeoutError, LinearTransportError) as error:
+        client = adapter.client
+        known_loser = str(error).startswith((
+            "projection_slot_lost_reload_required",
+            "projection_concurrent_conflict",
+        ))
+        if not known_loser and (
+            getattr(client, "mutation_transport_unknown", False)
+            or getattr(client, "mutation_acknowledged", False)
+        ):
+            return {
+                "disposition": "landed_unconfirmed",
+                "reconcile_required": True,
+                "write_count": "unknown",
+                "expected_projection_revision": expected_projection_revision + 1,
+                "scope_event_id": event["event_id"],
+                "identity_update": update,
+            }
+        raise
+    try:
+        after = adapter.state()
+    except (OSError, TimeoutError, LinearTransportError):
+        return {
+            "disposition": "landed_unconfirmed",
+            "reconcile_required": True,
+            "write_count": "unknown",
+            "expected_projection_revision": expected_projection_revision + 1,
+            "scope_event_id": event["event_id"],
+            "identity_update": update,
+        }
     after_head = _scope_head(after)
     matching = _matching_update(
         next(repo for repo in after_head["value"]["repositories"]
@@ -423,16 +539,31 @@ def validate_request(request: dict[str, Any]) -> None:
     }
     if not isinstance(frontier, dict) or set(frontier) != required_frontier:
         raise RepositoryIdentityError("invalid_repository_identity_frontier")
+    for field in ("material_revision", "projection_revision"):
+        value = frontier[field]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise RepositoryIdentityError(
+                f"invalid_repository_{field.removesuffix('_revision')}_frontier"
+            )
+    if not isinstance(frontier["scope_event_id"], str) or not frontier["scope_event_id"]:
+        raise RepositoryIdentityError("invalid_repository_scope_event_frontier")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(frontier["scope_sha256"])):
+        raise RepositoryIdentityError("invalid_repository_scope_digest_frontier")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--request", required=True)
     parser.add_argument("--apply", action="store_true")
-    parser.add_argument("--linear-endpoint", default="https://api.linear.app/graphql")
     args = parser.parse_args(argv)
     try:
-        request = json.loads(Path(args.request).read_text(encoding="utf-8"))
+        raw = Path(args.request).read_bytes()
+        if len(raw) > MAX_REQUEST_BYTES:
+            raise RepositoryIdentityError("repository_identity_request_too_large")
+        request = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=unique_object,
+        )
         validate_request(request)
         if not args.apply:
             raise RepositoryIdentityError("repository_identity_apply_required")
@@ -444,9 +575,12 @@ def main(argv: list[str] | None = None) -> int:
             **request["repository"],
         )
         authority = request["authority"]
+        client = _MutationTrackingClient(HttpGraphQLClient(
+            linear_token, LINEAR_OFFICIAL_ENDPOINT,
+        ))
         adapter = LinearProjectionAdapter(
-            HttpGraphQLClient(linear_token, args.linear_endpoint),
-            issue_id=request["workstream_id"],
+            client,
+            issue_id=authority["root_issue_id"],
             workstream_id=request["workstream_id"],
             plan_revision=request["plan_revision"],
             workspace_id=authority["workspace_id"], team_id=authority["team_id"],
@@ -461,7 +595,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         json.dump(result, sys.stdout, sort_keys=True, indent=2)
         sys.stdout.write("\n")
-        return 0
+        return 3 if result.get("reconcile_required") is True else 0
     except (
         OSError, json.JSONDecodeError, LinearProjectionError, LinearTransportError,
         RepositoryIdentityError, ScopeError, ValueError,

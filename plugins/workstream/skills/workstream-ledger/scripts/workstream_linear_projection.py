@@ -750,6 +750,13 @@ def reduce_projection_comments(
             raise LinearProjectionError(f"projection_supersedes_missing:{event['event_id']}")
         if current is not None and supersedes != current["event_id"]:
             raise LinearProjectionError(f"projection_concurrent_conflict:{event['kind']}:{event['key']}")
+        if identity == ("scope", "root") and current is not None and event["value"] != TOMBSTONE:
+            from workstream_scope import ScopeError, validate_repository_identity_transition
+
+            try:
+                validate_repository_identity_transition(current["value"], event["value"])
+            except ScopeError as error:
+                raise LinearProjectionError(str(error)) from error
         heads[identity] = event
         if event["value"] == TOMBSTONE:
             active.pop(identity, None)
@@ -985,6 +992,7 @@ class LinearProjectionAdapter:
         self, event: dict[str, Any], *,
         expected_quarantine_count: int | None = None,
         expected_quarantine_sha256: str | None = None,
+        expected_material_revision: int | None = None,
     ) -> dict[str, Any]:
         validate_projection_event(event)
         if (expected_quarantine_count is None) != (
@@ -993,7 +1001,33 @@ class LinearProjectionAdapter:
             raise LinearProjectionError("projection_quarantine_fence_incomplete")
         if event["workstream_id"] != self.workstream_id or event["plan_revision"] != self.plan_revision:
             raise LinearProjectionError("projection_route_or_plan_mismatch")
-        before = self.state()
+        if expected_material_revision is not None and (
+            not isinstance(expected_material_revision, int)
+            or isinstance(expected_material_revision, bool)
+            or expected_material_revision < 0
+        ):
+            raise LinearProjectionError("invalid_projection_material_frontier")
+        if expected_material_revision is not None:
+            from workstream_linear_events import reduce_event_comments
+
+            before_comments = self._comments()
+            before = reduce_projection_comments(
+                before_comments, workstream_id=self.workstream_id,
+                expected_plan_revision=self.plan_revision,
+                authenticated_route=self.authority if all((
+                    self.workspace_id, self.team_id, self.project_id,
+                    self.root_issue_id,
+                )) else None,
+            )
+            material = reduce_event_comments(
+                before_comments, workstream_id=self.workstream_id,
+            )
+            if material.revision != expected_material_revision:
+                raise LinearProjectionError(
+                    "projection_material_frontier_stale_reload_required"
+                )
+        else:
+            before = self.state()
         if expected_quarantine_count is not None or expected_quarantine_sha256 is not None:
             quarantine = before.snapshot.get("projection_quarantined") or []
             if (
@@ -1033,6 +1067,16 @@ class LinearProjectionAdapter:
             raise LinearProjectionError(
                 f"projection_concurrent_conflict:{event['kind']}:{event['key']}"
             )
+        if (
+            event["kind"] == "scope" and event["key"] == "root"
+            and current is not None and event["value"] != TOMBSTONE
+        ):
+            from workstream_scope import ScopeError, validate_repository_identity_transition
+
+            try:
+                validate_repository_identity_transition(current["value"], event["value"])
+            except ScopeError as error:
+                raise LinearProjectionError(str(error)) from error
         slot_id = projection_slot_id(
             self.workstream_id, self.plan_revision, event["expected_revision"],
             self.authority,

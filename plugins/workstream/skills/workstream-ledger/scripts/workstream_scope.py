@@ -167,6 +167,50 @@ def _validate_identity_history(repository: dict[str, Any], key: str) -> list[str
     return canonical_aliases
 
 
+def validate_repository_identity_transition(
+    previous_scope: dict[str, Any], next_scope: dict[str, Any],
+) -> None:
+    """Prevent an ordinary scope replacement from rewriting identity history."""
+    previous_repositories = previous_scope.get("repositories")
+    next_repositories = next_scope.get("repositories")
+    if not isinstance(previous_repositories, list) or not isinstance(next_repositories, list):
+        raise ScopeError("repository_identity_transition_scope_invalid")
+    next_by_key: dict[str, dict[str, Any]] = {}
+    for repository in next_repositories:
+        if not isinstance(repository, dict):
+            raise ScopeError("repository_identity_transition_scope_invalid")
+        key = repository_key(repository)
+        if key in next_by_key:
+            raise ScopeError(f"repository_identity_transition_ambiguous:{key}")
+        next_by_key[key] = repository
+    for previous in previous_repositories:
+        if not isinstance(previous, dict):
+            raise ScopeError("repository_identity_transition_scope_invalid")
+        key = repository_key(previous)
+        current = next_by_key.get(key)
+        if current is None:
+            if previous.get("aliases") or previous.get("identity_updates"):
+                raise ScopeError(
+                    f"repository_identity_history_regressed:{key}:repository_removed"
+                )
+            continue
+        previous_aliases = previous.get("aliases", [])
+        current_aliases = current.get("aliases", [])
+        previous_updates = previous.get("identity_updates", [])
+        current_updates = current.get("identity_updates", [])
+        if (
+            not isinstance(previous_aliases, list)
+            or not isinstance(current_aliases, list)
+            or not all(isinstance(alias, str) for alias in previous_aliases)
+            or not all(isinstance(alias, str) for alias in current_aliases)
+            or not set(previous_aliases).issubset(set(current_aliases))
+            or not isinstance(previous_updates, list)
+            or not isinstance(current_updates, list)
+            or current_updates[:len(previous_updates)] != previous_updates
+        ):
+            raise ScopeError(f"repository_identity_history_regressed:{key}")
+
+
 def validate_scope(scope: dict[str, Any], *, root_id: str,
                    child_ids: set[str] | None = None) -> None:
     if not is_issue_token(root_id):
