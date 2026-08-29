@@ -27,6 +27,16 @@ creates a second repository identity. Coordinate-only fallback requires
 explicit redirect-resolution evidence and fails closed when equivalence is
 unproven.
 
+For a GitHub rename or transfer already represented by one projected scope,
+use the no-model `workstreamctl repository-identity --request REQUEST.json
+--apply` path. It authenticates both the exact old coordinate and GitHub's
+returned canonical coordinate, requires the same immutable repository ID, and
+accepts only one redirect hop. The request fences the material revision,
+projection revision, active scope event ID, and scope value digest. It appends
+one scope replacement containing the immutable identity-update event; exact
+replay is a zero-write no-op. A stale frontier, recycled alias, multi-hop
+redirect, or coordinate owned by another repository refuses before mutation.
+
 Neither a provider ID nor a Linear destination is trusted merely because it is
 nonempty. Repository identity includes a timestamped authenticated-provider
 readback binding the immutable ID to the resolved current coordinate; every
