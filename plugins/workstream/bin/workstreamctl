@@ -24,7 +24,7 @@ def fail(message: str) -> int:
 
 def usage() -> int:
     print(
-        "usage: workstreamctl {plan|intake|resume|projection|reconcile|ingress|tab-title} [args...]\n"
+        "usage: workstreamctl {plan|intake|resume|projection|reconcile|shipyard-profile|ingress|tab-title} [args...]\n"
         "       workstreamctl linear inspect [--config PATH] [--team-id ID --project-id ID]\n"
         "       workstreamctl config validate [path]\n\n"
         "These commands expose existing deterministic helpers. They do not claim a hosted live-status service."
@@ -42,15 +42,18 @@ def main(argv: list[str]) -> int:
         "resume": "workstream_resume.py",
         "projection": "workstream_projection.py",
         "reconcile": "workstream_reconcile.py",
+        "shipyard-profile": "workstream_shipyard_profile.py",
         "ingress": "workstream_ingress.py",
         "tab-title": "workstream_tab.py",
     }
     if command in scripts:
         script = SCRIPTS / scripts[command]
         os.execv(sys.executable, [sys.executable, str(script), *rest])
+        return 0
     if command == "linear" and rest[:1] == ["inspect"]:
         script = SCRIPTS / "workstream_linear_setup.py"
         os.execv(sys.executable, [sys.executable, str(script), *rest[1:]])
+        return 0
     if command == "config" and rest[:1] == ["validate"]:
         if len(rest) > 2:
             return fail("config validate accepts at most one path")

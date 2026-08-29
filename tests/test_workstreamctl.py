@@ -119,6 +119,23 @@ class WorkstreamCtlTests(unittest.TestCase):
             [MODULE.sys.executable, str(script), "GEN-37", "--help"],
         )
 
+    def test_shipyard_profile_dispatches_private_profile_generator(self):
+        with mock.patch.object(MODULE.os, "execv") as execute:
+            result = MODULE.main([
+                "shipyard-profile", "GEN-37", "--model", "gpt-5.6-sol",
+                "--reasoning-effort", "medium", "--output", "/private/profile.json",
+            ])
+        self.assertEqual(result, 0)
+        script = MODULE.SCRIPTS / "workstream_shipyard_profile.py"
+        execute.assert_called_once_with(
+            MODULE.sys.executable,
+            [
+                MODULE.sys.executable, str(script), "GEN-37", "--model",
+                "gpt-5.6-sol", "--reasoning-effort", "medium", "--output",
+                "/private/profile.json",
+            ],
+        )
+
     def test_intake_dispatches_reviewed_linear_intake_command(self):
         with mock.patch.object(MODULE.os, "execv") as execute:
             MODULE.main(["intake", "plan.md", "--identity", "plan:demo", "--plan-revision", "abc", "--root-stable-key", "source-abc", "--accept-none"])

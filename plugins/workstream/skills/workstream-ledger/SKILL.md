@@ -472,6 +472,22 @@ Before continuing in another agent session:
    acknowledge the restored objective, decisions, open items, head, and next
    action. Do not close the source beforehand.
 
+When a configured Shipyard handoff needs a native launch profile, create it
+only after step 4 with the bundled product helper resolved from this skill:
+
+```sh
+python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_shipyard_profile.py" ABC-123 \
+  --repo-path /absolute/worktree \
+  --model <canonical-model> --reasoning-effort <effort> \
+  --output /owner-only/private-directory/ABC-123.json
+```
+
+The command itself reruns authenticated full-authority resume, derives the
+provider/session from the current remote checkpoint, and refuses any stale,
+uncheckpointed, dirty, mismatched, or unlineaged authority. It emits no prompt
+or secret. Owner-only profile publication currently requires macOS. See [the
+exact bridge and digest contract](references/shipyard-launch-profile.md).
+
 ## Abrupt termination
 
 Native transcript resume is useful but not cross-machine task authority. The

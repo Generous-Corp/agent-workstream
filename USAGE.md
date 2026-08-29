@@ -128,10 +128,24 @@ plugins/workstream/bin/workstreamctl resume GEN-123 \
 
 # Inspect an older root without claiming authority to continue it.
 plugins/workstream/bin/workstreamctl resume GEN-123 --inspection-only
+
+# After a current remote checkpoint, create one private Shipyard launch profile.
+install -d -m 700 ~/.local/share/agent-workstream/launch-profiles
+plugins/workstream/bin/workstreamctl shipyard-profile GEN-123 \
+  --repo-path /absolute/path/to/worktree \
+  --model gpt-5.6-sol --reasoning-effort medium \
+  --output ~/.local/share/agent-workstream/launch-profiles/GEN-123.json
 ```
 
 Those are secondary repository-local CLI examples; installation does not add
 `workstreamctl` to global `PATH`.
+
+`shipyard-profile` derives provider and session from the latest acknowledged
+checkpoint, performs a fresh authenticated full-authority resume, validates the
+exact clean GitHub worktree and active Shipyard lineage, and writes a new
+owner-only file atomically on macOS. It refuses other platforms, stale or
+uncheckpointed state, and never puts Linear credentials in the profile. See the
+[launch-profile bridge contract](plugins/workstream/skills/workstream-ledger/references/shipyard-launch-profile.md).
 
 Token-only resume tries HTTPS first. If an immutable GitHub blob URL at an
 exact 40-hex commit returns 404, it can use existing noninteractive GitHub SSH

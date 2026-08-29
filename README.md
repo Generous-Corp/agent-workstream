@@ -41,6 +41,8 @@ tracked workstream. From then on, the stable Linear token can be used to:
 - ask for current status or what changed since the last checkpoint;
 - checkpoint the exact machine, repository, worktree, branch, head, evidence,
   and next action needed for continuation;
+- generate a private exact-checkpoint Shipyard launch profile on macOS for an
+  explicitly configured landing handoff;
 - resume in another session, agent, or machine after reconciling Linear with
   live repository and landing state; and
 - challenge completion adversarially so missing work or proof stays visible.
@@ -80,6 +82,8 @@ See [INSTALL.md](INSTALL.md) for installation and configuration.
 See [LINEAR_SETUP.md](LINEAR_SETUP.md) for the one-time Linear route and
 authentication setup.
 See [USAGE.md](USAGE.md) for the start, resume, status, and closure workflow.
+See the [Shipyard profile bridge](plugins/workstream/skills/workstream-ledger/references/shipyard-launch-profile.md)
+for the optional exact-checkpoint handoff contract.
 See [BOUNDARIES.md](BOUNDARIES.md) for the local-first architecture boundary.
 See [FUTURE.md](FUTURE.md) for the roadmap of deferred optional integrations.
 
