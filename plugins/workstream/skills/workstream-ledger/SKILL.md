@@ -623,13 +623,11 @@ python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" \
   unbind --workstream ABC-123 --session <exact-provider-session-id>
 ```
 
-After triage, use `promote` for a material event. Use `process` only for
-`superseded` or `no-material-delta`. Never mark a material event processed
-before the promotion path verifies the corresponding Linear mutation. A
-non-material classification is authoritative only when GitHub API metadata
-identifies the exact actor recorded by `configure` and the marker binds the
-capture digest plus physical repo/issue route; another actor's well-formed
-comment must leave recovery refused.
+After triage, use `promote` for a material event. Never mark a material event
+processed before the promotion path verifies the corresponding immutable
+Linear event and exact receipt. GitHub comments for `superseded` or
+`no-material-delta` are mutable hints only and never suppress an open capture;
+`process` therefore refuses to publish them as durable classifications.
 
 Issue titles must be understandable outside the project view and use a
 plan/workstream-derived prefix. Every issue independently includes the stable

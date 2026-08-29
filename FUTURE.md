@@ -61,6 +61,14 @@ The portable plugin already provides the reviewed raw-capture-to-Linear
 promotion protocol and crash replay. This roadmap item is the managed hook and
 deployment layer that feeds it, not a second promotion or ledger authority.
 
+A later design may add an immutable or signed receipt for reviewed
+`no-material-delta` and `superseded` classifications. Do not treat an editable
+GitHub comment, current login, user ID, or unchanged timestamp as that receipt,
+and do not introduce signing keys or key management until the authority,
+rotation, revocation, and recovery contract is specified and reviewed. Until
+then only an exact immutable Linear material event plus verified receipt may
+close a captured turn.
+
 ## Hosted control plane
 
 Agent Workstream may eventually gain an optional hosted or self-hosted control

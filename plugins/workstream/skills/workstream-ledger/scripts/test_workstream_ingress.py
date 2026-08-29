@@ -107,23 +107,24 @@ class WorkstreamIngressTests(unittest.TestCase):
         self.assertEqual(row[0], 44)
         self.assertIsNotNone(row[1])
 
-    def test_remote_recovery_deduplicates_and_hides_processed(self):
+    def test_remote_recovery_deduplicates_but_keeps_mutable_classification_open(self):
         capture = {"event_id": "e1", "captured_at": "2026-08-14T01:00:00Z", "workstream_id": "ABC-12"}
-        route = MODULE.canonical_ingress_route("o/r", 7)
-        processed = MODULE.build_classification_payload(
-            capture=capture, disposition="no-material-delta", route=route, actor="trusted-bot",
-        )
+        processed = {
+            "schema_version": 2, "event_id": "e1", "processed_at": "2026-08-14T02:00:00Z",
+            "disposition": "no-material-delta", "promoted_issue": None,
+        }
         comments = [
             {"id": 1, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture), "html_url": "u1"},
             {"id": 2, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture), "html_url": "u2"},
             {"id": 3, "body": MODULE.comment_body(MODULE.PROCESSED_MARKER, processed),
              "html_url": "u3", "user": {"login": "trusted-bot"}},
         ]
-        MODULE.save_config({"repo": "o/r", "issue": 7, "classification_actor": "trusted-bot"})
         with mock.patch.object(MODULE, "gh", side_effect=[
             [{"number": 7, "url": "i", "title": "ingress"}], [comments]
         ]):
-            self.assertEqual(MODULE.remote_events("o/r", "ABC-12"), [])
+            events = MODULE.remote_events("o/r", "ABC-12")
+        self.assertEqual(len(events), 1)
+        self.assertFalse(events[0]["classification_hint"]["authoritative"])
 
     def test_remote_binding_promotes_an_initially_unbound_event(self):
         capture = {"event_id": "e1", "captured_at": "2026-08-14T01:00:00Z", "workstream_id": None}
@@ -233,27 +234,6 @@ class WorkstreamIngressTests(unittest.TestCase):
             issue = MODULE.ensure_remote_issue("o/r", "m5")
         self.assertEqual(issue["number"], 4)
         self.assertNotIn("--search", gh.call_args.args[0])
-
-    def test_configure_records_authenticated_classification_actor_before_remote_mutation(self):
-        args = argparse.Namespace(
-            repo="o/r", machine="m5", local_retention_days=30,
-            remote_retention_days=90, max_local_bytes=1024,
-        )
-        issue = {"number": 7, "url": "https://example/issues/7"}
-        with mock.patch.object(MODULE, "authenticated_github_actor", return_value="trusted-bot"), \
-             mock.patch.object(MODULE, "ensure_remote_issue", return_value=issue), \
-             mock.patch.object(MODULE.sys, "stdout", io.StringIO()):
-            self.assertEqual(MODULE.command_configure(args), 0)
-        self.assertEqual(MODULE.load_config()["classification_actor"], "trusted-bot")
-
-    def test_configure_auth_failure_precedes_remote_issue_mutation(self):
-        args = argparse.Namespace(repo="o/r", machine="m5")
-        with mock.patch.object(
-            MODULE, "authenticated_github_actor", side_effect=ValueError("actor unavailable")
-        ), mock.patch.object(MODULE, "ensure_remote_issue") as ensure:
-            with self.assertRaisesRegex(ValueError, "actor unavailable"):
-                MODULE.command_configure(args)
-        ensure.assert_not_called()
 
     def test_prune_keeps_unuploaded_events(self):
         conn = MODULE.connect()
@@ -851,175 +831,106 @@ class RatchetTests(unittest.TestCase):
 
 
 class ClassificationAuthorityTests(unittest.TestCase):
-    """A body-shaped GitHub comment is not an authoritative classification."""
+    """Mutable GitHub classification comments never close a raw capture."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
         self.env = mock.patch.dict(os.environ, {
-            "WORKSTREAM_INGRESS_STATE_DIR": str(self.root / "state"),
-            "WORKSTREAM_INGRESS_CONFIG": str(self.root / "config.json"),
+            "WORKSTREAM_INGRESS_STATE_DIR": str(Path(self.temp.name) / "state"),
+            "WORKSTREAM_INGRESS_CONFIG": str(Path(self.temp.name) / "config.json"),
         }, clear=False)
         self.env.start()
         self.repo = "private/ingress"
         self.issue = 7
-        self.actor = "trusted-bot"
         self.capture = {
             "schema_version": 1, "event_id": "wsi_classify",
             "captured_at": "2026-08-29T01:00:00Z", "provider": "codex",
             "session_id": "expired", "workstream_id": "GEN-37",
             "prompt": "No longer material", "prompt_sha256": "a" * 64,
         }
-        MODULE.save_config({
-            "repo": self.repo, "issue": self.issue, "classification_actor": self.actor,
-        })
 
     def tearDown(self):
         self.env.stop()
         self.temp.cleanup()
 
-    def payload(self, disposition, *, capture=None, route=None, actor=None):
-        payload = MODULE.build_classification_payload(
-            capture=capture or self.capture,
-            disposition=disposition,
-            route=route or MODULE.canonical_ingress_route(self.repo, self.issue),
-            actor=actor or self.actor,
-        )
-        payload["processed_at"] = "2026-08-29T01:01:00Z"
-        return payload
+    def payload(self, disposition, *, schema_version=2):
+        return {
+            "schema_version": schema_version, "event_id": "wsi_classify",
+            "processed_at": "2026-08-29T01:01:00Z", "disposition": disposition,
+            "promoted_issue": None,
+            "ingress_route": {"provider": "github", "repository": self.repo, "issue": self.issue},
+            "capture_sha256": "b" * 64,
+            "classification_actor": {"provider": "github", "login": "trusted-bot", "id": 100},
+            "classification_source": "reviewed_agent_classification",
+            "classification_id": "wsc_" + "c" * 32,
+        }
 
-    def recover(self, payload, *, comment_actor=None, capture=None, repo=None, issue=None):
-        capture = capture or self.capture
-        repo = repo or self.repo
-        issue = issue or self.issue
+    def recover(self, payload, *, comment_metadata=None):
         comments = [
-            {"id": 1, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture)},
-            {"id": 2, "body": MODULE.comment_body(MODULE.PROCESSED_MARKER, payload),
-             "user": {"login": comment_actor or self.actor}},
+            {"id": 1, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, self.capture)},
+            {
+                "id": 2, "body": MODULE.comment_body(MODULE.PROCESSED_MARKER, payload),
+                **(comment_metadata or {
+                    "created_at": "2026-08-29T01:01:00Z",
+                    "updated_at": "2026-08-29T01:01:00Z",
+                    "user": {"login": "trusted-bot", "id": 100},
+                }),
+            },
         ]
         with mock.patch.object(MODULE, "gh", side_effect=[
-            [{"number": issue, "url": "i", "title": "ingress"}], [comments],
+            [{"number": self.issue, "url": "i", "title": "ingress"}], [comments],
         ]):
-            return MODULE.remote_events(repo, "GEN-37")
+            return MODULE.remote_events(self.repo, "GEN-37")
 
-    def test_valid_authenticated_classification_hides_capture_for_both_dispositions(self):
-        for disposition in ("no-material-delta", "superseded"):
-            with self.subTest(disposition=disposition):
-                self.assertEqual(self.recover(self.payload(disposition)), [])
+    def assert_visible_hint(self, payload, *, metadata=None):
+        events = self.recover(payload, comment_metadata=metadata)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_id"], "wsi_classify")
+        self.assertEqual(events[0]["classification_hint"], {
+            "disposition": payload["disposition"],
+            "authoritative": False,
+            "reason": "mutable_github_comment",
+        })
 
-    def test_process_uses_authenticated_actor_and_verifies_remote_readback(self):
-        comments = [{
-            "id": 1, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, self.capture),
-        }]
-
-        def gh(args, *, stdin=None, timeout=4):
-            if args == ["api", "user"]:
-                return {"login": self.actor}
-            if "--paginate" in args:
-                return [list(comments)]
-            if args[-2:] == ["--input", "-"]:
-                item = {
-                    "id": 2, "html_url": "https://example/comment/2",
-                    "body": json.loads(stdin)["body"], "user": {"login": self.actor},
-                }
-                comments.append(item)
-                return item
-            raise AssertionError(args)
-
-        args = argparse.Namespace(
-            disposition="no-material-delta", event="wsi_classify", issue=None,
-            repo=self.repo, remote_issue=self.issue,
-        )
-        output = io.StringIO()
-        with mock.patch.object(MODULE, "gh", side_effect=gh), \
-             mock.patch.object(MODULE.sys, "stdout", output):
-            self.assertEqual(MODULE.command_process(args), 0)
-        self.assertEqual(json.loads(output.getvalue())["event_id"], "wsi_classify")
-        payload = MODULE.parse_comment(comments[-1]["body"], MODULE.PROCESSED_MARKER)
-        self.assertEqual(payload["classification_actor"]["login"], self.actor)
-        replay = io.StringIO()
-        with mock.patch.object(MODULE, "gh", side_effect=gh), \
-             mock.patch.object(MODULE.sys, "stdout", replay):
-            self.assertEqual(MODULE.command_process(args), 0)
-        self.assertTrue(json.loads(replay.getvalue())["replay"])
-        self.assertEqual(len(comments), 2, "classification replay appended a duplicate comment")
-
-    def test_legacy_schema_is_rejected_for_both_dispositions(self):
-        for disposition in ("no-material-delta", "superseded"):
-            with self.subTest(disposition=disposition):
-                payload = self.payload(disposition)
-                payload["schema_version"] = 999
-                with self.assertRaisesRegex(ValueError, "classification_schema_invalid"):
-                    self.recover(payload)
-
-    def test_false_timestamp_is_rejected_for_both_dispositions(self):
-        for disposition in ("no-material-delta", "superseded"):
-            with self.subTest(disposition=disposition):
-                payload = self.payload(disposition)
-                payload["processed_at"] = False
-                with self.assertRaisesRegex(ValueError, "classification_timestamp_invalid"):
-                    self.recover(payload)
-
-    def test_object_promoted_issue_is_rejected_for_both_dispositions(self):
-        for disposition in ("no-material-delta", "superseded"):
-            with self.subTest(disposition=disposition):
-                payload = self.payload(disposition)
-                payload["promoted_issue"] = {"identifier": "GEN-37"}
-                with self.assertRaisesRegex(ValueError, "classification_promoted_issue_invalid"):
-                    self.recover(payload)
-
-    def test_wrong_declared_actor_is_rejected_for_both_dispositions(self):
-        for disposition in ("no-material-delta", "superseded"):
-            with self.subTest(disposition=disposition):
-                payload = self.payload(disposition, actor="attacker")
-                with self.assertRaisesRegex(ValueError, "classification_actor_mismatch"):
-                    self.recover(payload, comment_actor="attacker")
-
-    def test_wrong_route_is_rejected_for_both_dispositions(self):
-        wrong = MODULE.canonical_ingress_route("public/other", 999)
-        for disposition in ("no-material-delta", "superseded"):
-            with self.subTest(disposition=disposition):
-                payload = self.payload(disposition, route=wrong)
-                with self.assertRaisesRegex(ValueError, "classification_route_mismatch"):
-                    self.recover(payload)
-
-    def test_well_formed_marker_by_wrong_github_actor_is_rejected_for_both_dispositions(self):
-        for disposition in ("no-material-delta", "superseded"):
-            with self.subTest(disposition=disposition):
-                with self.assertRaisesRegex(ValueError, "classification_actor_mismatch"):
-                    self.recover(self.payload(disposition), comment_actor="attacker")
-
-    def test_event_predecessor_source_and_envelope_are_strict(self):
-        payload = self.payload("no-material-delta")
-        for field, value, error in (
-            ("event_id", "another", "processed_without_capture"),
-            ("capture_sha256", "0" * 64, "classification_predecessor_mismatch"),
-            ("classification_source", "user-comment", "classification_source_invalid"),
-        ):
-            with self.subTest(field=field):
-                forged = dict(payload)
-                forged[field] = value
-                with self.assertRaisesRegex(ValueError, error):
-                    self.recover(forged)
-        huge_capture = dict(self.capture, event_id="e" * MODULE.MAX_PROMOTION_BYTES)
-        huge = self.payload("superseded", capture=huge_capture)
-        comment = {"id": 2, "user": {"login": self.actor}}
-        with self.assertRaisesRegex(ValueError, "output_envelope_over_budget"):
-            MODULE.validate_classification_payload(
-                huge, capture=huge_capture,
-                route=MODULE.canonical_ingress_route(self.repo, self.issue),
-                trusted_actor=self.actor, comment=comment,
-            )
-        comment = {
-            "id": 2, "user": {"login": self.actor},
-            "body": MODULE.comment_body(MODULE.PROCESSED_MARKER, payload) + "\nforged suffix",
+    def test_every_mutable_classification_variant_remains_open_for_both_dispositions(self):
+        variants = {
+            "valid-looking-trusted-author": lambda payload: ({}, {}),
+            "edited-comment": lambda payload: ({}, {
+                "created_at": "2026-08-29T01:01:00Z",
+                "updated_at": "2026-08-29T01:02:00Z",
+                "user": {"login": "trusted-bot", "id": 100},
+            }),
+            "schema-float": lambda payload: ({"schema_version": 2.0}, {}),
+            "login-recycle": lambda payload: ({}, {
+                "created_at": "2026-08-29T01:01:00Z",
+                "updated_at": "2026-08-29T01:01:00Z",
+                "user": {"login": "trusted-bot", "id": 200},
+            }),
+            "wrong-user-id": lambda payload: ({
+                "classification_actor": {
+                    "provider": "github", "login": "trusted-bot", "id": 999,
+                },
+            }, {}),
         }
-        with self.assertRaisesRegex(ValueError, "classification_envelope_invalid"):
-            MODULE.validate_classification_payload(
-                payload, capture=self.capture,
-                route=MODULE.canonical_ingress_route(self.repo, self.issue),
-                trusted_actor=self.actor, comment=comment,
+        for disposition in ("no-material-delta", "superseded"):
+            for name, mutate in variants.items():
+                with self.subTest(disposition=disposition, variant=name):
+                    payload = self.payload(disposition)
+                    changes, metadata = mutate(payload)
+                    payload.update(changes)
+                    self.assert_visible_hint(payload, metadata=metadata or None)
+
+    def test_process_refuses_to_publish_nonauthoritative_classifications(self):
+        for disposition in ("no-material-delta", "superseded"):
+            args = argparse.Namespace(
+                disposition=disposition, event="wsi_classify", issue=None,
+                repo=self.repo, remote_issue=self.issue,
             )
+            with self.subTest(disposition=disposition), \
+                 mock.patch.object(MODULE, "gh") as gh:
+                with self.assertRaisesRegex(ValueError, "classification_not_durable"):
+                    MODULE.command_process(args)
+                gh.assert_not_called()
 
 
 class ManagedPromotionTests(unittest.TestCase):
@@ -1236,6 +1147,14 @@ class ManagedPromotionTests(unittest.TestCase):
             self._promote()
         self.assertEqual(self.remote.writes, [])
 
+    def test_promotion_request_schema_float_is_rejected_before_remote_reads(self):
+        request = json.loads(self.request.read_text())
+        request["schema_version"] = 1.0
+        self.request.write_text(json.dumps(request))
+        with self.assertRaisesRegex(ValueError, "promotion_request_schema_unsupported"):
+            self._promote()
+        self.assertEqual(self.remote.writes, [])
+
     def test_legacy_process_cannot_bypass_material_receipt_verification(self):
         args = argparse.Namespace(
             disposition="promoted", event="wsi_raw", issue="GEN-37",
@@ -1280,6 +1199,55 @@ class ManagedPromotionTests(unittest.TestCase):
         })
         with self.assertRaisesRegex(ValueError, "promotion_marker_schema_unsupported"):
             MODULE.validate_promotion_payload(legacy)
+        schema_float = dict(current, schema_version=2.0)
+        schema_float["promotion_id"] = MODULE.promotion_id_for({
+            key: value for key, value in schema_float.items() if key != "promotion_id"
+        })
+        with self.assertRaisesRegex(ValueError, "promotion_marker_schema_unsupported"):
+            MODULE.validate_promotion_payload(schema_float)
+
+    def test_only_linear_receipted_promotion_suppresses_remote_capture(self):
+        request = json.loads(self.request.read_text())
+        promotion = MODULE.promotion_payload(request, self.capture)
+        delta = MODULE.promotion_delta(promotion)
+        receipt = self.linear.apply(delta)
+        processed = {
+            "schema_version": 1, "event_id": "wsi_raw",
+            "processed_at": "2026-08-29T01:01:00Z", "disposition": "promoted",
+            "promoted_issue": "GEN-37", "promotion_id": promotion["promotion_id"],
+            "material_event_id": delta.event_id, "material_revision": receipt.revision,
+            "material_remote_id": receipt.remote_id,
+        }
+        comments = [
+            {"id": 1, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, self.capture)},
+            {"id": 2, "body": MODULE.comment_body(MODULE.PROMOTION_MARKER, promotion)},
+            {"id": 3, "body": MODULE.comment_body(MODULE.PROCESSED_MARKER, processed)},
+        ]
+        with mock.patch.object(MODULE, "gh", side_effect=[
+            [{"number": 7, "url": "i", "title": "ingress"}], [comments],
+        ]):
+            self.assertEqual(MODULE.remote_events("private/ingress", "GEN-37"), [])
+
+    def test_processed_promotion_schema_float_is_rejected(self):
+        request = json.loads(self.request.read_text())
+        promotion = MODULE.promotion_payload(request, self.capture)
+        delta = MODULE.promotion_delta(promotion)
+        processed = {
+            "schema_version": 1.0, "event_id": "wsi_raw",
+            "processed_at": "2026-08-29T01:01:00Z", "disposition": "promoted",
+            "promoted_issue": "GEN-37", "promotion_id": promotion["promotion_id"],
+            "material_event_id": delta.event_id, "material_revision": 1,
+            "material_remote_id": "linear-1",
+        }
+        comments = [
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, self.capture)},
+            {"body": MODULE.comment_body(MODULE.PROMOTION_MARKER, promotion)},
+            {"body": MODULE.comment_body(MODULE.PROCESSED_MARKER, processed)},
+        ]
+        with self.assertRaisesRegex(ValueError, "processed_promotion_value_invalid"):
+            MODULE.reduce_ingress_comments(
+                comments, event_id="wsi_raw", repo="private/ingress", issue=7,
+            )
 
     def test_staged_intent_cannot_be_replayed_from_a_different_repo_issue(self):
         request = json.loads(self.request.read_text())

@@ -36,9 +36,10 @@ python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" status
 
 `configure` is a remote mutation: it creates or reuses a private, monthly
 GitHub issue and writes its coordinates to the local mode-0600 config. `capture`
-writes the local outbox and may append a remote comment. `bind`, `unbind`, and
-`process` may append remote comments. `flush` retries pending uploads. None of
-these commands runs during ordinary plugin installation.
+writes the local outbox and may append a remote comment. `bind` and `unbind`
+may append remote comments; `process` refuses mutable classifications. `flush`
+retries pending uploads. None of these commands runs during ordinary plugin
+installation.
 
 ## Identity and recovery
 
@@ -116,16 +117,15 @@ comment envelopes are capped at 16 KiB; expansion during encoding is checked
 before any write. Recovery does not hide a promoted capture until read-only
 Linear validation proves the marker's exact event and receipt.
 
-Use the older `process` command only for reviewed `no-material-delta` or
-`superseded` dispositions. Material promotion must use `promote`, which proves
-the Linear receipt before acknowledging the raw event. `configure` records the
-currently authenticated GitHub actor as the non-material classification trust
-boundary. Recovery accepts a classification only when the authenticated API
-metadata says that exact actor posted it and its schema-2 payload binds the
-physical repo/issue route, raw capture digest, event, source, disposition, and
-deterministic classification receipt. A well-formed marker posted by any other
-actor remains open and causes recovery to refuse; body shape alone is never
-authority. Changing the trusted actor requires rerunning `configure` deliberately.
+Material promotion must use `promote`, which proves the immutable Linear event
+and exact receipt before acknowledging the raw event. GitHub issue comments are
+editable and deletable, so `no-material-delta` and `superseded` comments are
+never durable processed authority—even when their body, author login, numeric
+user ID, and timestamps currently look valid. Recovery may expose such a
+comment as a nonauthoritative hint but keeps the capture open. The legacy
+`process` command refuses to publish these classifications until an immutable
+or signed receipt design exists; no signing keys or key-management surface are
+part of the current implementation.
 
 ## Privacy and retention
 
