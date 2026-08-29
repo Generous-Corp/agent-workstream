@@ -23,6 +23,8 @@ class SuccessorTests(unittest.TestCase):
                 "representation": "compact_validated",
             },
             "provenance": {
+                "worktree_authority_count": 1,
+                "worktree_authority_ambiguous": False,
                 "latest": {"worktree": {"state": "safe", "head": head}},
                 "latest_projection_head": {
                     "key": "session", "event_id": "event",
@@ -33,11 +35,54 @@ class SuccessorTests(unittest.TestCase):
         self.assertEqual(
             choose_disposition(snapshot, remote_head=head)["disposition"], "attach",
         )
-        snapshot["provenance"]["latest_projection_head"] = None
+        full = {
+            "root": {"identifier": "GEN-37"},
+            "provenance": [{"worktree": {"state": "safe", "head": head}}],
+        }
+        self.assertEqual(
+            choose_disposition(full, remote_head=head)["disposition"], "attach",
+        )
+        snapshot["provenance"].update({
+            "worktree_authority_count": 0,
+            "latest": None,
+            "latest_projection_head": None,
+        })
         self.assertEqual(
             choose_disposition(snapshot, remote_head=head)["disposition"],
             "create_successor",
         )
+        full["provenance"] = []
+        self.assertEqual(
+            choose_disposition(full, remote_head=head)["disposition"],
+            "create_successor",
+        )
+
+    def test_compact_and_full_multiple_worktrees_refuse_identically(self):
+        head = "a" * 40
+        compact = {
+            "root": {"identifier": "GEN-37"},
+            "context_schema": {
+                "name": "agent-workstream.resume-context", "version": 2,
+                "representation": "compact_validated",
+            },
+            "provenance": {
+                "worktree_authority_count": 2,
+                "worktree_authority_ambiguous": True,
+                "latest": None, "latest_projection_head": None,
+            },
+        }
+        full = {
+            "root": {"identifier": "GEN-37"},
+            "provenance": [
+                {"worktree": {"state": "safe", "head": head}},
+                {"worktree": {"state": "safe", "head": head}},
+            ],
+        }
+        for snapshot in (compact, full):
+            with self.assertRaisesRegex(
+                SuccessorError, "multiple projected worktree authorities",
+            ):
+                choose_disposition(snapshot, remote_head=head)
 
     def test_recovered_checkpoint_is_the_worktree_authority(self):
         snapshot = {

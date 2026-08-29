@@ -780,6 +780,8 @@ class ProjectionTests(unittest.TestCase):
             "name": "agent-workstream.resume-context", "version": 2,
             "representation": "compact_validated",
         })
+        self.assertEqual(context["provenance"]["worktree_authority_count"], 1)
+        self.assertFalse(context["provenance"]["worktree_authority_ambiguous"])
         self.assertEqual(
             [child["identifier"] for child in context["children"]],
             ["GEN-43", "GEN-85"],
@@ -916,7 +918,7 @@ class ProjectionTests(unittest.TestCase):
                 require_projection_authority=True,
             )
 
-    def test_compact_provenance_uses_projection_order_not_canonical_value_order(self):
+    def test_compact_provenance_does_not_invent_ordered_supersession(self):
         older = {
             "agent": "zeta", "machine": "M5", "session_id": "older",
             "worktree": {"state": "safe", "head": HEAD},
@@ -939,11 +941,10 @@ class ProjectionTests(unittest.TestCase):
         compact = resume_module._compact_provenance(
             items, projection_events, scope(),
         )
-        self.assertEqual(compact["latest"]["session_id"], "later")
-        self.assertEqual(compact["latest_projection_head"], {
-            "key": "later", "event_id": "event-new",
-            "value_sha256": canonical_digest(later),
-        })
+        self.assertEqual(compact["worktree_authority_count"], 2)
+        self.assertTrue(compact["worktree_authority_ambiguous"])
+        self.assertIsNone(compact["latest"])
+        self.assertIsNone(compact["latest_projection_head"])
 
     def test_multi_terminal_repair_is_ordered_full_and_idempotent(self):
         client, adapter, source, graph, _children, stale_manifest = (

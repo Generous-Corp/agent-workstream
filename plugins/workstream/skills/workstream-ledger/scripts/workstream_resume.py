@@ -645,16 +645,19 @@ def _compact_provenance(
         worktree = value.get("worktree") if isinstance(value, dict) else None
         if (
             isinstance(worktree, dict)
+            and str(worktree.get("state") or "").lower() == "safe"
             and is_full_oid(str(worktree.get("head") or ""))
             and worktree.get("head") in valid_heads
             and canonical_digest(value) in item_digests
         ):
             bound.append(candidate)
-    latest_event = max(bound, default=None, key=lambda item: item[0])
+    latest_event = bound[0] if len(bound) == 1 else None
     latest = latest_event[1]["value"] if latest_event is not None else None
     return {
         "count": len(items),
         "sha256": hashlib.sha256(encoded).hexdigest(),
+        "worktree_authority_count": len(bound),
+        "worktree_authority_ambiguous": len(bound) > 1,
         "latest": ({
             key: latest[key]
             for key in ("agent", "machine", "session_id", "worktree")
