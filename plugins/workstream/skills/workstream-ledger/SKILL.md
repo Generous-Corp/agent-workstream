@@ -326,6 +326,11 @@ their reviewed event and value digest. It never retires an omitted key. A late
 key or changed head requires reload and review before any append. The command
 computes the concrete attach/successor disposition against a verified remote
 head and rereads the complete comment stream before reporting success.
+If a historical relation points to a peer created before the relation-readback
+contract, only this reconcile command may load that incomplete head, and only
+when the reviewed manifest exactly retires or replaces every incomplete
+relation. Those relation migrations are appended before unrelated changes;
+normal resume and final readback remain strict.
 
 This remains a validated bounded snapshot, not complete physical cross-machine
 recovery proof. Resume does not itself fetch owner, live source-control truth,
