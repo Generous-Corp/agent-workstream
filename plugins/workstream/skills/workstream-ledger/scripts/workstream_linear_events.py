@@ -281,36 +281,37 @@ def reduce_ledger_reservations(
 def ledger_serialization_frontier(
     checkpoint_event_ids: list[str], comments: list[dict[str, Any]], *,
     workstream_id: str, authenticated_route: dict[str, str],
-    current_plan_revision: str | None = None,
+    current_plan_revision: str | None = None, material_revision: int,
 ) -> list[str]:
     reservations = _proven_ledger_reservations(
         comments, workstream_id=workstream_id,
         authenticated_route=authenticated_route,
         current_plan_revision=current_plan_revision,
     )
-    proven_remote_ids = {remote_id for _item, remote_id in reservations}
-    quarantine_hashes = sorted(
-        hashlib.sha256(json.dumps(
-            [comment.get("id"), comment.get("body")], ensure_ascii=False,
-            sort_keys=True, separators=(",", ":"),
-        ).encode("utf-8")).hexdigest()
-        for comment in comments
-        if isinstance(comment.get("body"), str)
-        and SERIALIZATION_PREFIX in comment["body"]
-        and comment.get("id") not in proven_remote_ids
-    )
-    quarantine = (
-        ["quarantine:" + hashlib.sha256(
-            "".join(quarantine_hashes).encode("ascii")
-        ).hexdigest()]
-        if quarantine_hashes else []
-    )
-    return sorted([
+    frontier = sorted([
         *checkpoint_event_ids,
         *(f"reservation:{item['intent_event']['event_id']}:{item['intent_sha256']}"
           for item, _remote_id in reservations),
-        *quarantine,
     ])
+    by_id = {
+        comment.get("id"): comment for comment in comments
+        if isinstance(comment.get("id"), str)
+    }
+    for _attempt in range(32):
+        slot_id = ledger_boundary_slot_id(
+            workstream_id, material_revision, frontier, authenticated_route,
+        )
+        occupant = by_id.get(slot_id)
+        if occupant is None:
+            return frontier
+        collision = "collision:" + hashlib.sha256(json.dumps(
+            [occupant.get("id"), occupant.get("body")], ensure_ascii=False,
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        if collision in frontier:
+            raise LinearEventError("ledger_boundary_collision_cycle")
+        frontier = sorted([*frontier, collision])
+    raise LinearEventError("ledger_boundary_collision_limit")
 
 
 def _proven_ledger_reservations(
@@ -321,10 +322,22 @@ def _proven_ledger_reservations(
 
     if current_plan_revision is None:
         return []
-    proven: list[tuple[dict[str, Any], str]] = []
-    for item, remote_id in reduce_ledger_reservations(
+    from workstream_linear_checkpoints import reduce_checkpoint_comments
+    reduced = reduce_ledger_reservations(
         comments, workstream_id=workstream_id,
-    ):
+    )
+    checkpoint_ids = {
+        event["event_id"] for event in reduce_checkpoint_comments(
+            comments, workstream_id=workstream_id,
+        ).checkpoints
+    }
+    reservation_tokens = {
+        f"reservation:{item['intent_event']['event_id']}:{item['intent_sha256']}"
+        for item, _remote_id in reduced
+    }
+    by_id = {comment.get("id"): comment for comment in comments}
+    proven: list[tuple[dict[str, Any], str]] = []
+    for item, remote_id in reduced:
         if item["authority"] != authenticated_route:
             continue
         try:
@@ -339,11 +352,46 @@ def _proven_ledger_reservations(
             state.remote_ids[event["event_id"]]
             for event in state.events[:item["projection_revision"]]
         ]
+        base = [value for value in item["frontier_ids"]
+                if not value.startswith("collision:")]
+        collisions = {value for value in item["frontier_ids"]
+                      if value.startswith("collision:")}
+        stored_checkpoints = {value for value in base if value in checkpoint_ids}
+        completed = any(event == item["intent_event"] for event in state.events)
         if (
             len(state.events) < item["projection_revision"]
             or prefix_ids != item["projection_frontier_ids"]
             or item["plan_revision"] != current_plan_revision
+            or (not completed and stored_checkpoints != checkpoint_ids)
+            or (completed and not stored_checkpoints.issubset(checkpoint_ids))
+            or any(value not in checkpoint_ids and value not in reservation_tokens
+                   for value in base)
         ):
+            continue
+        frontier = sorted(base)
+        valid_chain = True
+        while collisions:
+            slot_id = ledger_boundary_slot_id(
+                workstream_id, item["material_revision"], frontier,
+                authenticated_route,
+            )
+            occupant = by_id.get(slot_id)
+            if not isinstance(occupant, dict):
+                valid_chain = False
+                break
+            token = "collision:" + hashlib.sha256(json.dumps(
+                [occupant.get("id"), occupant.get("body")], ensure_ascii=False,
+                sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            if token not in collisions:
+                valid_chain = False
+                break
+            collisions.remove(token)
+            frontier = sorted([*frontier, token])
+        if not valid_chain or ledger_boundary_slot_id(
+            workstream_id, item["material_revision"], frontier,
+            authenticated_route,
+        ) != remote_id:
             continue
         proven.append((item, remote_id))
     return proven
@@ -369,38 +417,10 @@ def pending_ledger_reservations(
     )
     if not reservations:
         return []
-    # Runtime import avoids the event/projection module cycle. A reservation is
-    # released only by its exact event or an authenticated CAS successor.
+    # A reservation is released only by its exact event or an authenticated
+    # CAS successor. Its collision proof is independent of comment chronology.
     pending: list[dict[str, Any]] = []
-    from workstream_linear_checkpoints import reduce_checkpoint_comments
-    for item, remote_id in reservations:
-        reservation_comment = next(
-            (comment for comment in comments if comment.get("id") == remote_id),
-            None,
-        )
-        if not isinstance(reservation_comment, dict):
-            continue
-        reservation_created_at = reservation_comment.get("createdAt")
-        if not isinstance(reservation_created_at, str) or not reservation_created_at:
-            continue
-        reservation_order = (reservation_created_at, remote_id)
-        prior_comments = [
-            comment for comment in comments
-            if isinstance(comment.get("createdAt"), str)
-            and isinstance(comment.get("id"), str)
-            and (comment["createdAt"], comment["id"]) < reservation_order
-        ]
-        prior_checkpoints = reduce_checkpoint_comments(
-            prior_comments, workstream_id=workstream_id,
-        )
-        historical_frontier = ledger_serialization_frontier(
-            sorted(event["event_id"] for event in prior_checkpoints.checkpoints),
-            prior_comments, workstream_id=workstream_id,
-            authenticated_route=authenticated_route,
-            current_plan_revision=item["plan_revision"],
-        )
-        if item["frontier_ids"] != historical_frontier:
-            continue
+    for item, _remote_id in reservations:
         state = reduce_projection_comments(
             comments, workstream_id=workstream_id,
             expected_plan_revision=item["plan_revision"],
@@ -760,6 +780,7 @@ class LinearCommentEventAdapter:
                 workstream_id=self.issue_id,
                 authenticated_route=self._observed_authority,
                 current_plan_revision=self.plan_revision,
+                material_revision=before.revision,
             )
             slot_id = ledger_boundary_slot_id(
                 delta.workstream_id, before.revision, frontier,

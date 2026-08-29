@@ -412,6 +412,7 @@ class LinearCheckpointAdapter:
             workstream_id=self.workstream_id,
             authenticated_route=self._observed_authority,
             current_plan_revision=checkpoint["plan_revision"],
+            material_revision=material.revision,
         )
         slot_id = ledger_boundary_slot_id(
             self.workstream_id, material.revision, frontier,

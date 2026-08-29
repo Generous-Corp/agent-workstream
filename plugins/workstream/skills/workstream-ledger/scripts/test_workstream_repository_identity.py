@@ -428,8 +428,10 @@ class RepositoryIdentityWriterTests(unittest.TestCase):
             client.comments.append({
                 "id": f"malformed-after-{index}",
                 "body": "<!-- workstream-ledger-reservation:v1:not-valid -->",
-                "createdAt": f"2026-08-29T12:00:1{index}Z",
-                "updatedAt": f"2026-08-29T12:00:1{index}Z",
+                # Equal server timestamps and lexically later IDs must not be
+                # interpreted as chronology or revoke the existing lock.
+                "createdAt": "2026-08-29T12:00:00Z",
+                "updatedAt": "2026-08-29T12:00:00Z",
             })
         material_adapter = LinearCommentEventAdapter(
             client, issue_id="GEN-37", plan_revision=PLAN,
@@ -571,6 +573,52 @@ class RepositoryIdentityWriterTests(unittest.TestCase):
             provider.assert_not_called()
         self.assertEqual(client.reservation_count, 1)
         self.assertEqual(client.write_count, 1)
+
+    def test_distinct_chained_pending_intents_refuse_as_ambiguous(self):
+        adapter, client, initial = adapter_with_scope()
+        request = {
+            "schema_version": 1, "workstream_id": "GEN-37",
+            "authority": deepcopy(AUTHORITY), "plan_revision": PLAN,
+            "repository": {
+                "requested_slug": OLD, "provider_repository_id": "R_pulp",
+            },
+            "expected_frontier": {
+                "material_revision": 0, "projection_revision": 1,
+                "scope_event_id": initial["event_id"],
+                "scope_sha256": _value_digest(initial["value"]),
+            },
+        }
+        desired, _update, _replay = __import__(
+            "workstream_repository_identity"
+        )._updated_scope(scope(), resolution(), root_id="GEN-37")
+        first = build_projection_event(
+            workstream_id="GEN-37", kind="scope", key="root", value=desired,
+            plan_revision=PLAN, expected_revision=1,
+            created_at=resolution()["observed_at"],
+            supersedes_event_id=initial["event_id"], authority=AUTHORITY,
+        )
+        _reserve_material_frontier(
+            adapter, comments=client.comments, material_revision=0,
+            intent_event=first,
+        )
+        contradictory_scope = scope()
+        contradictory_scope["repositories"][0]["exact_head"] = "b" * 40
+        second = build_projection_event(
+            workstream_id="GEN-37", kind="scope", key="root",
+            value=contradictory_scope, plan_revision=PLAN,
+            expected_revision=1, created_at="2026-08-29T12:00:01Z",
+            supersedes_event_id=initial["event_id"], authority=AUTHORITY,
+        )
+        _reserve_material_frontier(
+            adapter, comments=adapter._comments(), material_revision=0,
+            intent_event=second,
+        )
+        with self.assertRaisesRegex(
+            RepositoryIdentityError, "pending_identity_intent_ambiguous",
+        ):
+            _recover_pending_resolution(adapter, request)
+        self.assertEqual(client.reservation_count, 2)
+        self.assertEqual(client.write_count, 0)
 
     def test_unproven_arbitrary_high_revision_and_old_plan_reservations_do_not_block(self):
         def material_result(extra_comments):

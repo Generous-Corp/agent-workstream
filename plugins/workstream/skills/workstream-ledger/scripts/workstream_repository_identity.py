@@ -274,6 +274,7 @@ def _reserve_material_frontier(
         workstream_id=adapter.workstream_id,
         authenticated_route=adapter.authority,
         current_plan_revision=adapter.plan_revision,
+        material_revision=material_revision,
     )
     projection = reduce_projection_comments(
         comments, workstream_id=adapter.workstream_id,
@@ -375,6 +376,8 @@ def _recover_pending_resolution(
         authenticated_route=adapter.authority,
         current_plan_revision=adapter.plan_revision,
     )
+    if len(pending) > 1:
+        raise RepositoryIdentityError("repository_pending_identity_intent_ambiguous")
     recoverable = [
         item for item, _remote_id in _proven_ledger_reservations(
             comments, workstream_id=adapter.workstream_id,
