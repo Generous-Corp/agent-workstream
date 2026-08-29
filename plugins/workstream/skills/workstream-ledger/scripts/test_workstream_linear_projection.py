@@ -358,7 +358,9 @@ class ProjectionTests(unittest.TestCase):
         adapter = self.authorization_adapter(client)
 
         first = self.reserve_child(adapter)
-        replay = self.reserve_child(adapter)
+        replay = self.reserve_child(
+            adapter, expected_projection_revision=1,
+        )
 
         self.assertEqual(first["event"], replay["event"])
         self.assertEqual(first["remote_id"], replay["remote_id"])
@@ -368,6 +370,20 @@ class ProjectionTests(unittest.TestCase):
             first["event"]["value"]["initial_state"],
             "planned_pending_projection",
         )
+        self.assertEqual(first["disposition"], "created")
+        self.assertEqual(replay["disposition"], "existing")
+
+    def test_preexisting_child_requires_preexisting_authorization(self):
+        client = FakeProjectionClient()
+        adapter = self.authorization_adapter(client)
+
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "child_extension_preexisting_child_without_authorization",
+        ):
+            self.reserve_child(adapter, require_existing=True)
+
+        self.assertEqual(client.comments, [])
 
     def test_child_extension_authorization_lost_response_converges(self):
         class LostResponseClient(FakeProjectionClient):
@@ -402,7 +418,10 @@ class ProjectionTests(unittest.TestCase):
             "updatedAt": "2026-08-20T00:00:01Z",
         })
 
-        replay = self.reserve_child(adapter)
+        replay = self.reserve_child(
+            adapter, expected_material_revision=1,
+            expected_projection_revision=1,
+        )
 
         self.assertEqual(replay["event"], first["event"])
         self.assertEqual(len(client.comments), 2)

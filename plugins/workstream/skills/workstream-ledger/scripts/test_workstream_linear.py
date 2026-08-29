@@ -87,30 +87,48 @@ class FakeChildAuthorization:
         self.reserve_calls += 1
         if self.failure:
             raise self.failure
+        if values.get("require_existing") and self.event is None:
+            raise LinearTransportError(
+                "child_extension_preexisting_child_without_authorization"
+            )
         route = {
             "workspace_id": "workspace", "team_id": "team",
             "project_id": "project",
             "root_issue_id": "409c1423-f949-4655-9f5f-d3213d7b434f",
         }
-        value = {
+        static_value = {
             "root_issue_id": route["root_issue_id"],
             "route": route,
             "source": values["source"],
             "plan_revision": values["source"]["sha256"],
             "reviewed_candidate_key": values["reviewed_candidate_key"],
             "child_issue_id": values["child_issue_id"],
-            "expected_material_revision": values["expected_material_revision"],
-            "expected_projection_revision": values["expected_projection_revision"],
             "initial_state": "planned_pending_projection",
         }
-        self.event = build_projection_event(
-            workstream_id="GEN-37", kind="child_extension_authorization",
-            key=values["child_issue_id"], value=value,
-            plan_revision=values["source"]["sha256"],
-            expected_revision=values["expected_projection_revision"],
-            created_at="1970-01-01T00:00:00Z", authority=route,
-        )
-        return {"event": self.event, "remote_id": "comment-a", "revision": 8}
+        if self.event is None:
+            value = {
+                **static_value,
+                "expected_material_revision": values["expected_material_revision"],
+                "expected_projection_revision": values["expected_projection_revision"],
+            }
+            self.event = build_projection_event(
+                workstream_id="GEN-37", kind="child_extension_authorization",
+                key=values["child_issue_id"], value=value,
+                plan_revision=values["source"]["sha256"],
+                expected_revision=values["expected_projection_revision"],
+                created_at="1970-01-01T00:00:00Z", authority=route,
+            )
+            disposition = "created"
+        else:
+            if {
+                key: self.event["value"].get(key) for key in static_value
+            } != static_value:
+                raise LinearTransportError("authorization mismatch")
+            disposition = "existing"
+        return {
+            "event": self.event, "remote_id": "comment-a", "revision": 8,
+            "disposition": disposition,
+        }
 
     def assert_child_extension_authorized(self, event):
         self.assert_calls += 1
@@ -332,14 +350,41 @@ class LinearTransportTests(unittest.TestCase):
         fake = FakeClient()
         fake.issues.append(self.legacy_root())
         transport = self.routed_transport(fake)
-        first = self.extend_legacy(transport)
+        authorization = FakeChildAuthorization()
+        first = self.extend_legacy(
+            transport, authorization_adapter=authorization,
+        )
         fake.calls.clear()
 
-        second = self.extend_legacy(transport)
+        second = self.extend_legacy(
+            transport, authorization_adapter=authorization,
+            expected_frontier={
+                "material_revision": 3, "projection_revision": 8,
+            },
+        )
 
         self.assertEqual(first["receipt"]["id"], second["receipt"]["id"])
         self.assertEqual(second["receipt"]["disposition"], "existing")
         self.assertEqual(second["issues"], [])
+        self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
+
+    def test_preexisting_exact_child_without_prior_grant_refuses(self):
+        fake = FakeClient()
+        fake.issues.append(self.legacy_root())
+        transport = self.routed_transport(fake)
+        self.extend_legacy(
+            transport, authorization_adapter=FakeChildAuthorization(),
+        )
+        fake.calls.clear()
+
+        with self.assertRaisesRegex(
+            LinearTransportError,
+            "child_extension_preexisting_child_without_authorization",
+        ):
+            self.extend_legacy(
+                transport, authorization_adapter=FakeChildAuthorization(),
+            )
+
         self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
 
     def test_existing_root_extension_lost_response_converges(self):
@@ -382,6 +427,9 @@ class LinearTransportTests(unittest.TestCase):
 
         result = self.extend_legacy(
             self.routed_transport(fake), authorization_adapter=authorization,
+            expected_frontier={
+                "material_revision": 3, "projection_revision": 8,
+            },
         )
         self.assertEqual(result["receipt"]["disposition"], "created")
         self.assertEqual(authorization.reserve_calls, 2)

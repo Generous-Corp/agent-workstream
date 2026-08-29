@@ -997,12 +997,13 @@ class LinearGraphQLTransport:
             child_issue_id=child_id,
             expected_material_revision=expected_frontier["material_revision"],
             expected_projection_revision=expected_frontier["projection_revision"],
+            require_existing=child is not None,
         )
         authorization_event = authorization.get("event")
         if not isinstance(authorization_event, dict):
             raise LinearTransportError("child_extension_authorization_receipt_invalid")
         authorization_route = {**route, "root_issue_id": root_issue_id}
-        expected_authorization_value = {
+        expected_authorization_static = {
             "root_issue_id": root_issue_id,
             "route": authorization_route,
             "source": {
@@ -1011,10 +1012,10 @@ class LinearGraphQLTransport:
             "plan_revision": plan_revision,
             "reviewed_candidate_key": reviewed_candidate_key,
             "child_issue_id": child_id,
-            "expected_material_revision": expected_frontier["material_revision"],
-            "expected_projection_revision": expected_frontier["projection_revision"],
             "initial_state": "planned_pending_projection",
         }
+        authorization_value = authorization_event.get("value")
+        authorization_disposition = authorization.get("disposition")
         if (
             authorization_event.get("schema_version") != 2
             or authorization_event.get("workstream_id")
@@ -1023,10 +1024,41 @@ class LinearGraphQLTransport:
             != "child_extension_authorization"
             or authorization_event.get("key") != child_id
             or authorization_event.get("plan_revision") != plan_revision
-            or authorization_event.get("expected_revision")
-            != expected_frontier["projection_revision"]
             or authorization_event.get("authority") != authorization_route
-            or authorization_event.get("value") != expected_authorization_value
+            or not isinstance(authorization_value, dict)
+            or {
+                key: authorization_value.get(key)
+                for key in expected_authorization_static
+            } != expected_authorization_static
+            or not isinstance(
+                authorization_value.get("expected_material_revision"), int
+            )
+            or isinstance(
+                authorization_value.get("expected_material_revision"), bool
+            )
+            or not isinstance(
+                authorization_value.get("expected_projection_revision"), int
+            )
+            or isinstance(
+                authorization_value.get("expected_projection_revision"), bool
+            )
+            or authorization_value["expected_material_revision"]
+            > expected_frontier["material_revision"]
+            or authorization_value["expected_projection_revision"]
+            > expected_frontier["projection_revision"]
+            or authorization_event.get("expected_revision")
+            != authorization_value["expected_projection_revision"]
+            or authorization_disposition not in {"created", "existing"}
+            or (child is not None and authorization_disposition != "existing")
+            or (
+                authorization_disposition == "created"
+                and (
+                    authorization_value["expected_material_revision"]
+                    != expected_frontier["material_revision"]
+                    or authorization_value["expected_projection_revision"]
+                    != expected_frontier["projection_revision"]
+                )
+            )
         ):
             raise LinearTransportError("child_extension_authorization_receipt_mismatch")
         if child is None:
