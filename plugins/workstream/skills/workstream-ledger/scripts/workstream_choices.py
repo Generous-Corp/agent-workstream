@@ -77,24 +77,28 @@ def record_choice(*, choice_id: str, workstream_id: str, owning_child: str,
                   spec_gap: str, decision: str, alternatives: list[str],
                   reach: str, irreversible: bool, domains: list[str],
                   technical_confidence: str, intent_confidence: str,
+                  acceptance_criteria: list[str] | None = None,
                   evidence: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    payload = {
+        "spec_gap": spec_gap,
+        "decision": decision,
+        "alternatives": deepcopy(alternatives),
+        "reach": reach,
+        "irreversible": irreversible,
+        "domains": sorted(set(domains)),
+        "technical_confidence": technical_confidence,
+        "intent_confidence": intent_confidence,
+        "evidence": deepcopy(evidence or []),
+    }
+    if acceptance_criteria is not None:
+        payload["acceptance_criteria"] = deepcopy(acceptance_criteria)
     return _base(
         event_type="recorded", choice_id=choice_id,
         workstream_id=workstream_id, owning_child=owning_child,
         namespace=namespace, repository=repository,
         repository_key=repository_key,
         plan_revision=plan_revision, git_head=git_head, created_at=created_at,
-        payload={
-            "spec_gap": spec_gap,
-            "decision": decision,
-            "alternatives": deepcopy(alternatives),
-            "reach": reach,
-            "irreversible": irreversible,
-            "domains": sorted(set(domains)),
-            "technical_confidence": technical_confidence,
-            "intent_confidence": intent_confidence,
-            "evidence": deepcopy(evidence or []),
-        },
+        payload=payload,
     )
 
 
@@ -207,6 +211,13 @@ def validate_event(event: dict[str, Any]) -> None:
         for field in ("technical_confidence", "intent_confidence"):
             if payload.get(field) not in CONFIDENCE:
                 raise ChoiceError(f"invalid_{field}")
+        criteria = payload.get("acceptance_criteria")
+        if criteria is not None and (
+            not isinstance(criteria, list)
+            or not all(isinstance(item, str) and item.strip() for item in criteria)
+            or len(criteria) != len(set(criteria))
+        ):
+            raise ChoiceError("invalid_acceptance_criteria")
     elif event_type == "audited":
         _required_text(payload.get("recorded_event_id"), "missing_recorded_event_id")
         _required_text(payload.get("rationale"), "missing_audit_rationale")
@@ -270,6 +281,7 @@ def reduce_choices(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             if _parse_timestamp(audit["created_at"]) < _parse_timestamp(record["created_at"]):
                 raise ChoiceError(f"audit_precedes_record:{choice_id}")
         supersession = superseded.pop(choice_id, None)
+        successor = None
         if supersession:
             if supersession["payload"]["target_event_id"] != record["event_id"]:
                 raise ChoiceError(f"supersession_target_mismatch:{choice_id}")
@@ -290,6 +302,9 @@ def reduce_choices(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         verdict = latest_audit["payload"]["verdict"] if latest_audit else None
         if high_risk and verdict == "provisional":
             raise ChoiceError(f"high_risk_choice_cannot_be_provisional:{choice_id}")
+        successor_criteria = set(
+            successor["payload"].get("acceptance_criteria") or []
+        ) if successor is not None else set()
         result[choice_id] = {
             "record": record,
             "audits": related_audits,
@@ -297,6 +312,11 @@ def reduce_choices(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             "active": supersession is None,
             "high_risk": high_risk,
             "verdict": verdict,
+            "retired_acceptance_criteria": [
+                criterion
+                for criterion in record["payload"].get("acceptance_criteria") or []
+                if supersession is not None and criterion not in successor_criteria
+            ],
             "landing_blocked": supersession is None and (
                 latest_audit is None or verdict == "must_fix"
             ),
@@ -306,6 +326,17 @@ def reduce_choices(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     if superseded:
         raise ChoiceError("supersession_without_record:" + ",".join(sorted(superseded)))
     return result
+
+
+def retired_acceptance_criteria(events: list[dict[str, Any]]) -> dict[str, str]:
+    """Map criteria removed by a choice supersession to the predecessor."""
+    retired: dict[str, str] = {}
+    for choice_id, view in reduce_choices(events).items():
+        for criterion in view["retired_acceptance_criteria"]:
+            previous = retired.setdefault(criterion, choice_id)
+            if previous != choice_id:
+                raise ChoiceError(f"acceptance_criterion_retired_twice:{criterion}")
+    return retired
 
 
 def closure_blockers(events: list[dict[str, Any]], *, plan_revision: str,

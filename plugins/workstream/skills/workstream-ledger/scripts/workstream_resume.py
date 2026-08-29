@@ -53,10 +53,24 @@ MATERIAL_OBLIGATION_KEYS = {
     "requirement", "requirements", "blocker", "blockers",
     "followup", "followups", "decision", "decisions",
 }
+RAW_TRANSCRIPT_KEYS = {"raw_transcript", "transcript"}
 
 
 class ResumeError(ValueError):
     pass
+
+
+def _without_raw_transcripts(value: Any) -> Any:
+    """Exclude transcript bodies from every default and audit resume payload."""
+    if isinstance(value, dict):
+        return {
+            key: _without_raw_transcripts(item)
+            for key, item in value.items()
+            if str(key).lower().replace("-", "_") not in RAW_TRANSCRIPT_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_raw_transcripts(item) for item in value]
+    return value
 
 
 def closure_snapshot_digest(snapshot: dict[str, Any]) -> str:
@@ -842,6 +856,7 @@ def compact_context(
         context["projection_unresolved_quarantine"] = clean[
             "projection_unresolved_quarantine"
         ]
+    context = _without_raw_transcripts(context)
     item_count = sum(
         len(value) for value in (
             context["children"], context["decisions"], context["choice_events"],

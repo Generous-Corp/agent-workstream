@@ -85,6 +85,32 @@ class WorkstreamScopeTests(unittest.TestCase):
         with self.assertRaisesRegex(ScopeError, "local_path_is_not_repository_identity"):
             validate_scope(scope, root_id="GEN-37", child_ids={"GEN-38", "GEN-39"})
 
+    def test_same_owner_and_repo_on_distinct_hosts_have_distinct_identity(self):
+        scope = self.scope()
+        shared_provider_id = "R_same_path"
+        repositories = []
+        for host in ("forge.example", "gitlab.example"):
+            slug = f"{host}/generous-corp/pulp"
+            repositories.append({
+                "slug": slug, "exact_head": "c" * 40,
+                "provider_repository_id": shared_provider_id, "aliases": [],
+                "identity_resolution": {
+                    "provider_repository_id": shared_provider_id,
+                    "resolved_slug": slug, "observed_at": "2026-08-21T11:00:00Z",
+                    "evidence": [{
+                        "kind": "authenticated_provider_readback", "authenticated": True,
+                        "provider_repository_id": shared_provider_id,
+                        "resolved_slug": slug,
+                    }],
+                },
+                "identity_updates": [], "evidence": [{"kind": "host-isolation"}],
+            })
+        scope["repositories"].extend(repositories)
+        validate_scope(scope, root_id="GEN-37", child_ids={"GEN-38", "GEN-39"})
+        self.assertEqual(repository_key(repositories[0]), "forge.example:id:R_same_path")
+        self.assertEqual(repository_key(repositories[1]), "gitlab.example:id:R_same_path")
+        self.assertNotEqual(repository_key(repositories[0]), repository_key(repositories[1]))
+
     def test_git_remote_forms_normalize_and_github_case_cannot_duplicate(self):
         self.assertEqual(canonical_repository("git@github.com:Generous-Corp/vellum.git"),
                          "github.com/generous-corp/vellum")

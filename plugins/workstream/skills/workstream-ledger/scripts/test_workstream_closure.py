@@ -2,7 +2,7 @@
 import unittest
 
 from workstream_closure import review
-from workstream_choices import record_choice
+from workstream_choices import audit_choice, record_choice, supersede_choice
 
 
 class ClosureTests(unittest.TestCase):
@@ -193,6 +193,136 @@ class ClosureTests(unittest.TestCase):
         )
         self.assertFalse(result["ok"])
         self.assertIn("choice_landing_blocked:choice-authority", result["errors"])
+
+    def test_rejected_choice_criterion_cannot_survive_acceptance(self):
+        snapshot = self.factory_snapshot({
+            "root": {"identifier": "GEN-37", "url": "https://linear/GEN-37",
+                     "plan_revision": "sha", "revision": 2, "status": "In Progress"},
+            "children": [{"identifier": "GEN-38", "status": "Done", "owner": "agent"}],
+        })
+        record = record_choice(
+            choice_id="choice-legacy", workstream_id="GEN-37", owning_child="GEN-38",
+            namespace="pulp-playback", repository="github.com/generous-corp/pulp",
+            repository_key="github.com:id:R_pulp", plan_revision="sha",
+            git_head="a" * 40, created_at="2026-08-21T12:00:00Z",
+            spec_gap="Legacy mode unspecified", decision="Require legacy mode",
+            alternatives=["Remove legacy mode"], reach="local", irreversible=False,
+            domains=[], technical_confidence="high", intent_confidence="low",
+            acceptance_criteria=["legacy-mode-required"],
+        )
+        audit = audit_choice(
+            choice_id="choice-legacy", workstream_id="GEN-37", owning_child="GEN-38",
+            namespace="pulp-playback", repository="github.com/generous-corp/pulp",
+            repository_key="github.com:id:R_pulp", plan_revision="sha",
+            git_head="a" * 40, created_at="2026-08-21T13:00:00Z",
+            recorded_event_id=record["event_id"], verdict="accepted",
+            rationale="Accepted initially", auditor="fresh-agent",
+        )
+        rejected = supersede_choice(
+            choice_id="choice-legacy", workstream_id="GEN-37", owning_child="GEN-38",
+            namespace="pulp-playback", repository="github.com/generous-corp/pulp",
+            repository_key="github.com:id:R_pulp", plan_revision="sha",
+            git_head="a" * 40, created_at="2026-08-21T14:00:00Z",
+            target_event_id=record["event_id"], reason="Human rejected requirement",
+        )
+        snapshot["choice_events"] = [record, audit, rejected]
+        evidence = self.evidence()
+        evidence["legacy-mode-required"] = {"satisfied": True}
+        stale = review(
+            snapshot, expected_plan_revision="sha",
+            criteria=["a", "legacy-mode-required"], evidence=evidence,
+            exact_head="a" * 40,
+        )
+        self.assertFalse(stale["ok"])
+        self.assertIn(
+            "retired_choice_criterion:choice-legacy:legacy-mode-required",
+            stale["errors"],
+        )
+        current = review(
+            snapshot, expected_plan_revision="sha", criteria=["a"],
+            evidence=self.evidence(), exact_head="a" * 40,
+        )
+        self.assertTrue(current["ok"])
+
+    def test_successor_preserves_overlap_and_retires_only_predecessor_difference(self):
+        snapshot = self.factory_snapshot({
+            "root": {"identifier": "GEN-37", "url": "https://linear/GEN-37",
+                     "plan_revision": "sha", "revision": 2, "status": "In Progress"},
+            "children": [{"identifier": "GEN-38", "status": "Done", "owner": "agent"}],
+        })
+        predecessor = record_choice(
+            choice_id="choice-old", workstream_id="GEN-37", owning_child="GEN-38",
+            namespace="pulp-playback", repository="github.com/generous-corp/pulp",
+            repository_key="github.com:id:R_pulp", plan_revision="sha",
+            git_head="a" * 40, created_at="2026-08-21T12:00:00Z",
+            spec_gap="Behavior unspecified", decision="Use old behavior",
+            alternatives=["Use new behavior"], reach="local", irreversible=False,
+            domains=[], technical_confidence="high", intent_confidence="low",
+            acceptance_criteria=["shared-behavior", "old-only-behavior"],
+        )
+        predecessor_audit = audit_choice(
+            choice_id="choice-old", workstream_id="GEN-37", owning_child="GEN-38",
+            namespace="pulp-playback", repository="github.com/generous-corp/pulp",
+            repository_key="github.com:id:R_pulp", plan_revision="sha",
+            git_head="a" * 40, created_at="2026-08-21T13:00:00Z",
+            recorded_event_id=predecessor["event_id"], verdict="accepted",
+            rationale="Accepted old behavior", auditor="fresh-agent",
+        )
+        successor = record_choice(
+            choice_id="choice-new", workstream_id="GEN-37", owning_child="GEN-38",
+            namespace="pulp-playback", repository="github.com/generous-corp/pulp",
+            repository_key="github.com:id:R_pulp", plan_revision="sha",
+            git_head="a" * 40, created_at="2026-08-21T13:30:00Z",
+            spec_gap="Behavior revised", decision="Use new behavior",
+            alternatives=["Keep old behavior"], reach="local", irreversible=False,
+            domains=[], technical_confidence="high", intent_confidence="high",
+            acceptance_criteria=["shared-behavior", "new-only-behavior"],
+        )
+        supersession = supersede_choice(
+            choice_id="choice-old", workstream_id="GEN-37", owning_child="GEN-38",
+            namespace="pulp-playback", repository="github.com/generous-corp/pulp",
+            repository_key="github.com:id:R_pulp", plan_revision="sha",
+            git_head="a" * 40, created_at="2026-08-21T14:00:00Z",
+            target_event_id=predecessor["event_id"], reason="Adopt replacement",
+            successor_choice_id="choice-new",
+        )
+        successor_audit = audit_choice(
+            choice_id="choice-new", workstream_id="GEN-37", owning_child="GEN-38",
+            namespace="pulp-playback", repository="github.com/generous-corp/pulp",
+            repository_key="github.com:id:R_pulp", plan_revision="sha",
+            git_head="a" * 40, created_at="2026-08-21T15:00:00Z",
+            recorded_event_id=successor["event_id"], verdict="accepted",
+            rationale="Accepted replacement", auditor="fresh-agent",
+        )
+        snapshot["choice_events"] = [
+            predecessor, predecessor_audit, successor, supersession, successor_audit,
+        ]
+        evidence = self.evidence()
+        evidence.update({
+            "shared-behavior": {"satisfied": True},
+            "old-only-behavior": {"satisfied": True},
+            "new-only-behavior": {"satisfied": True},
+        })
+        stale = review(
+            snapshot, expected_plan_revision="sha",
+            criteria=["shared-behavior", "old-only-behavior", "new-only-behavior"],
+            evidence=evidence, exact_head="a" * 40,
+        )
+        self.assertFalse(stale["ok"])
+        self.assertIn(
+            "retired_choice_criterion:choice-old:old-only-behavior",
+            stale["errors"],
+        )
+        self.assertNotIn(
+            "retired_choice_criterion:choice-old:shared-behavior",
+            stale["errors"],
+        )
+        current = review(
+            snapshot, expected_plan_revision="sha",
+            criteria=["shared-behavior", "new-only-behavior"],
+            evidence=evidence, exact_head="a" * 40,
+        )
+        self.assertTrue(current["ok"])
 
     def test_untransported_factory_surface_cannot_close_done(self):
         snapshot = self.factory_snapshot({
