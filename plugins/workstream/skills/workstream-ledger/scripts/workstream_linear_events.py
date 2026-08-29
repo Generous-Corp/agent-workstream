@@ -29,6 +29,12 @@ from workstream_linear import (
 
 EVENT_PREFIX = "<!-- workstream-delta:v1:"
 EVENT_RE = re.compile(r"<!-- workstream-delta:v1:([A-Za-z0-9_-]+) -->")
+SERIALIZATION_PREFIX = "<!-- workstream-ledger-reservation:v1:"
+SERIALIZATION_RE = re.compile(
+    r"<!-- workstream-ledger-reservation:v1:([A-Za-z0-9_-]+) -->"
+)
+MAX_LEDGER_RESERVATION_BYTES = 64 * 1024
+MAX_WORKSTREAM_ID_BYTES = 64
 
 
 COMMENTS_QUERY = """
@@ -81,9 +87,17 @@ def ledger_boundary_slot_id(
     authority: dict[str, str],
 ) -> str:
     """Return the shared remote slot for one combined ledger frontier."""
-    if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", workstream_id.upper()):
+    if (
+        not isinstance(workstream_id, str)
+        or len(workstream_id.encode("utf-8")) > MAX_WORKSTREAM_ID_BYTES
+        or not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", workstream_id.upper())
+    ):
         raise LinearEventError("invalid_comment_slot_workstream")
-    if not isinstance(material_revision, int) or material_revision < 0:
+    if (
+        not isinstance(material_revision, int)
+        or isinstance(material_revision, bool)
+        or material_revision < 0
+    ):
         raise LinearEventError("invalid_comment_slot_material_revision")
     if (
         not isinstance(checkpoint_event_ids, list)
@@ -118,6 +132,323 @@ def ledger_boundary_slot_id(
     raw[6] = (raw[6] & 0x0F) | 0x40
     raw[8] = (raw[8] & 0x3F) | 0x80
     return str(uuid.UUID(bytes=bytes(raw)))
+
+
+def encode_ledger_reservation(reservation: dict[str, Any]) -> str:
+    required = {
+        "schema_version", "workstream_id", "material_revision", "intent_kind",
+        "plan_revision", "projection_revision", "projection_frontier_ids",
+        "frontier_ids", "authority", "intent_event", "intent_sha256",
+    }
+    if (
+        not isinstance(reservation, dict)
+        or set(reservation) != required
+        or not isinstance(reservation.get("schema_version"), int)
+        or isinstance(reservation.get("schema_version"), bool)
+        or reservation["schema_version"] != 1
+        or not isinstance(reservation.get("material_revision"), int)
+        or isinstance(reservation.get("material_revision"), bool)
+        or reservation["material_revision"] < 0
+        or not isinstance(reservation.get("projection_revision"), int)
+        or isinstance(reservation.get("projection_revision"), bool)
+        or reservation["projection_revision"] < 0
+        or not all(
+            isinstance(reservation.get(field), str) and reservation[field]
+            for field in ("workstream_id", "intent_kind", "plan_revision")
+        )
+        or len(reservation["workstream_id"].encode("utf-8")) > MAX_WORKSTREAM_ID_BYTES
+        or not re.fullmatch(
+            r"[A-Z][A-Z0-9]*-\d+", reservation["workstream_id"]
+        )
+        or reservation["intent_kind"] != "repository_identity_projection"
+        or not re.fullmatch(
+            r"wsp_[0-9a-f]{32}", str(
+                (reservation.get("intent_event") or {}).get("event_id", "")
+            )
+        )
+        or not re.fullmatch(r"[0-9a-f]{64}", reservation["plan_revision"])
+        or not re.fullmatch(r"[0-9a-f]{64}", str(reservation.get("intent_sha256", "")))
+        or not isinstance(reservation.get("intent_event"), dict)
+        or not isinstance(reservation.get("authority"), dict)
+        or not isinstance(reservation.get("frontier_ids"), list)
+        or reservation["frontier_ids"] != sorted(set(reservation["frontier_ids"]))
+        or not all(isinstance(item, str) and item for item in reservation["frontier_ids"])
+        or not isinstance(reservation.get("projection_frontier_ids"), list)
+        or len(reservation["projection_frontier_ids"])
+        != reservation["projection_revision"]
+        or not all(
+            isinstance(item, str) and item
+            for item in reservation["projection_frontier_ids"]
+        )
+    ):
+        raise LinearEventError("invalid_ledger_reservation")
+    from workstream_linear_projection import validate_projection_event
+
+    try:
+        validate_projection_event(reservation["intent_event"])
+    except LinearTransportError as error:
+        raise LinearEventError("invalid_ledger_reservation") from error
+    intent = reservation["intent_event"]
+    if (
+        intent["workstream_id"] != reservation["workstream_id"]
+        or intent["plan_revision"] != reservation["plan_revision"]
+        or intent["expected_revision"] != reservation["projection_revision"]
+        or intent["authority"] != reservation["authority"]
+        or intent["kind"] != "scope"
+        or intent["key"] != "root"
+        or hashlib.sha256(json.dumps(
+            intent, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest() != reservation["intent_sha256"]
+    ):
+        raise LinearEventError("invalid_ledger_reservation")
+    material = json.dumps(
+        reservation, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    envelope = {
+        "reservation": reservation,
+        "sha256": hashlib.sha256(material).hexdigest(),
+    }
+    encoded = base64.urlsafe_b64encode(json.dumps(
+        envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).decode("ascii").rstrip("=")
+    body = f"{SERIALIZATION_PREFIX}{encoded} -->"
+    if len(body.encode("utf-8")) > MAX_LEDGER_RESERVATION_BYTES:
+        raise LinearEventError("ledger_reservation_too_large")
+    return body
+
+
+def reduce_ledger_reservations(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+) -> list[tuple[dict[str, Any], str]]:
+    """Return proven-shaped reservations, quarantining malformed/duplicate intent."""
+    observed: dict[str, tuple[dict[str, Any], str]] = {}
+    conflicted: set[str] = set()
+    for comment in comments:
+        body = comment.get("body") or ""
+        if not isinstance(body, str):
+            continue
+        if SERIALIZATION_PREFIX not in body:
+            continue
+        matches = SERIALIZATION_RE.findall(body)
+        if len(matches) != 1 or body.count(SERIALIZATION_PREFIX) != 1:
+            continue
+        try:
+            encoded = matches[0]
+            envelope = json.loads(base64.urlsafe_b64decode(
+                encoded + "=" * (-len(encoded) % 4)
+            ))
+            reservation = envelope["reservation"]
+            digest = envelope["sha256"]
+            if set(envelope) != {"reservation", "sha256"}:
+                raise ValueError("unexpected reservation envelope")
+            canonical = json.dumps(
+                reservation, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            if not isinstance(digest, str) or not hmac.compare_digest(
+                digest, hashlib.sha256(canonical).hexdigest()
+            ):
+                raise ValueError("reservation digest mismatch")
+            if encode_ledger_reservation(reservation) != body:
+                raise ValueError("noncanonical reservation body")
+        except (
+            binascii.Error, KeyError, TypeError, ValueError, json.JSONDecodeError,
+            LinearEventError,
+        ):
+            # Reservation-shaped arbitrary comments are quarantined. They are
+            # never durable scheduling authority.
+            continue
+        if reservation["workstream_id"] != workstream_id:
+            continue
+        event_id = reservation["intent_event"]["event_id"]
+        remote_id = comment.get("id")
+        expected_remote_id = ledger_boundary_slot_id(
+            workstream_id, reservation["material_revision"],
+            reservation["frontier_ids"], reservation["authority"],
+        )
+        if not isinstance(remote_id, str) or remote_id != expected_remote_id:
+            continue
+        if event_id in observed or event_id in conflicted:
+            observed.pop(event_id, None)
+            conflicted.add(event_id)
+            continue
+        observed[event_id] = (reservation, remote_id)
+    return sorted(observed.values(), key=lambda item: (
+        item[0]["material_revision"], item[0]["intent_event"]["event_id"],
+    ))
+
+
+def ledger_serialization_frontier(
+    checkpoint_event_ids: list[str], comments: list[dict[str, Any]], *,
+    workstream_id: str, authenticated_route: dict[str, str],
+    current_plan_revision: str | None = None, material_revision: int,
+) -> list[str]:
+    reservations = _proven_ledger_reservations(
+        comments, workstream_id=workstream_id,
+        authenticated_route=authenticated_route,
+        current_plan_revision=current_plan_revision,
+    )
+    frontier = sorted([
+        *checkpoint_event_ids,
+        *(f"reservation:{item['intent_event']['event_id']}:{item['intent_sha256']}"
+          for item, _remote_id in reservations),
+    ])
+    by_id = {
+        comment.get("id"): comment for comment in comments
+        if isinstance(comment.get("id"), str)
+    }
+    for _attempt in range(32):
+        slot_id = ledger_boundary_slot_id(
+            workstream_id, material_revision, frontier, authenticated_route,
+        )
+        occupant = by_id.get(slot_id)
+        if occupant is None:
+            return frontier
+        collision = "collision:" + hashlib.sha256(json.dumps(
+            [occupant.get("id"), occupant.get("body")], ensure_ascii=False,
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        if collision in frontier:
+            raise LinearEventError("ledger_boundary_collision_cycle")
+        frontier = sorted([*frontier, collision])
+    raise LinearEventError("ledger_boundary_collision_limit")
+
+
+def _proven_ledger_reservations(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    authenticated_route: dict[str, str], current_plan_revision: str | None,
+) -> list[tuple[dict[str, Any], str]]:
+    from workstream_linear_projection import reduce_projection_comments
+
+    if current_plan_revision is None:
+        return []
+    from workstream_linear_checkpoints import reduce_checkpoint_comments
+    reduced = reduce_ledger_reservations(
+        comments, workstream_id=workstream_id,
+    )
+    checkpoint_ids = {
+        event["event_id"] for event in reduce_checkpoint_comments(
+            comments, workstream_id=workstream_id,
+        ).checkpoints
+    }
+    reservation_tokens = {
+        f"reservation:{item['intent_event']['event_id']}:{item['intent_sha256']}"
+        for item, _remote_id in reduced
+    }
+    by_id = {comment.get("id"): comment for comment in comments}
+    proven: list[tuple[dict[str, Any], str]] = []
+    for item, remote_id in reduced:
+        if item["authority"] != authenticated_route:
+            continue
+        try:
+            state = reduce_projection_comments(
+                comments, workstream_id=workstream_id,
+                expected_plan_revision=item["plan_revision"],
+                authenticated_route=authenticated_route,
+            )
+        except LinearTransportError:
+            continue
+        prefix_ids = [
+            state.remote_ids[event["event_id"]]
+            for event in state.events[:item["projection_revision"]]
+        ]
+        base = [value for value in item["frontier_ids"]
+                if not value.startswith("collision:")]
+        collisions = {value for value in item["frontier_ids"]
+                      if value.startswith("collision:")}
+        stored_checkpoints = {value for value in base if value in checkpoint_ids}
+        completed = any(event == item["intent_event"] for event in state.events)
+        if (
+            len(state.events) < item["projection_revision"]
+            or prefix_ids != item["projection_frontier_ids"]
+            or item["plan_revision"] != current_plan_revision
+            or (not completed and stored_checkpoints != checkpoint_ids)
+            or (completed and not stored_checkpoints.issubset(checkpoint_ids))
+            or any(value not in checkpoint_ids and value not in reservation_tokens
+                   for value in base)
+        ):
+            continue
+        frontier = sorted(base)
+        valid_chain = True
+        while collisions:
+            slot_id = ledger_boundary_slot_id(
+                workstream_id, item["material_revision"], frontier,
+                authenticated_route,
+            )
+            occupant = by_id.get(slot_id)
+            if not isinstance(occupant, dict):
+                valid_chain = False
+                break
+            token = "collision:" + hashlib.sha256(json.dumps(
+                [occupant.get("id"), occupant.get("body")], ensure_ascii=False,
+                sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            if token not in collisions:
+                valid_chain = False
+                break
+            collisions.remove(token)
+            frontier = sorted([*frontier, token])
+        if not valid_chain or ledger_boundary_slot_id(
+            workstream_id, item["material_revision"], frontier,
+            authenticated_route,
+        ) != remote_id:
+            continue
+        proven.append((item, remote_id))
+    return proven
+
+
+def pending_ledger_reservations(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    authenticated_route: dict[str, str], current_plan_revision: str | None = None,
+) -> list[dict[str, Any]]:
+    from workstream_linear_projection import reduce_projection_comments
+
+    raw_reservations = [
+        item for item, _remote_id in reduce_ledger_reservations(
+            comments, workstream_id=workstream_id,
+        ) if item["authority"] == authenticated_route
+    ]
+    if raw_reservations and current_plan_revision is None:
+        raise LinearEventError("ledger_reservation_plan_authority_required")
+    reservations = _proven_ledger_reservations(
+        comments, workstream_id=workstream_id,
+        authenticated_route=authenticated_route,
+        current_plan_revision=current_plan_revision,
+    )
+    if not reservations:
+        return []
+    # A reservation is released only by its exact event or an authenticated
+    # CAS successor. Its collision proof is independent of comment chronology.
+    pending: list[dict[str, Any]] = []
+    for item, _remote_id in reservations:
+        state = reduce_projection_comments(
+            comments, workstream_id=workstream_id,
+            expected_plan_revision=item["plan_revision"],
+            authenticated_route=authenticated_route,
+        )
+        if (
+            not any(
+                event == item["intent_event"] for event in state.events
+            )
+            and state.revision <= item["projection_revision"]
+        ):
+            pending.append(item)
+    return pending
+
+
+def assert_no_pending_ledger_reservation(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    authenticated_route: dict[str, str], current_plan_revision: str | None = None,
+) -> None:
+    pending = pending_ledger_reservations(
+        comments, workstream_id=workstream_id,
+        authenticated_route=authenticated_route,
+        current_plan_revision=current_plan_revision,
+    )
+    if pending:
+        raise LinearEventError(
+            f"ledger_boundary_reserved:{pending[0]['intent_event']['event_id']}"
+        )
 
 
 def _canonical_event(delta: Delta) -> dict[str, Any]:
@@ -271,6 +602,8 @@ class LinearCommentEventAdapter:
         workspace_id: str | None = None,
         team_id: str | None = None,
         project_id: str | None = None,
+        root_issue_id: str | None = None,
+        plan_revision: str | None = None,
     ):
         if not issue_id:
             raise ValueError("Linear issue ID is required")
@@ -279,10 +612,16 @@ class LinearCommentEventAdapter:
         self.workspace_id = workspace_id
         self.team_id = team_id
         self.project_id = project_id
+        self.root_issue_id = root_issue_id
+        if plan_revision is not None and re.fullmatch(r"[0-9a-f]{64}", plan_revision) is None:
+            raise ValueError("invalid plan revision")
+        self.plan_revision = plan_revision
         self._observed_authority: dict[str, str] | None = None
         self._comment_id_capability_verified = False
         if any((workspace_id, team_id, project_id)) and not all((workspace_id, team_id, project_id)):
             raise ValueError("Linear workspace, team, and project IDs must be supplied together")
+        if root_issue_id and not all((workspace_id, team_id, project_id)):
+            raise ValueError("Linear root issue ID requires workspace, team, and project IDs")
 
     @classmethod
     def from_env(
@@ -291,6 +630,7 @@ class LinearCommentEventAdapter:
         issue_id: str,
         env: dict[str, str] | None = None,
         config_path: str | None = None,
+        plan_revision: str | None = None,
     ) -> "LinearCommentEventAdapter":
         values = os.environ if env is None else env
         from workstream_config import load_linear_api_key, resolve_linear_route
@@ -305,6 +645,7 @@ class LinearCommentEventAdapter:
             HttpGraphQLClient(token), issue_id=issue_id,
             workspace_id=route.get("workspace_id"), team_id=route.get("team_id"),
             project_id=route.get("project_id"),
+            plan_revision=plan_revision,
         )
 
     def _comments(self) -> list[dict[str, Any]]:
@@ -337,6 +678,8 @@ class LinearCommentEventAdapter:
             }
             if not all(isinstance(value, str) and value for value in authority.values()):
                 raise LinearEventError("comment_slot_authority_incomplete")
+            if self.root_issue_id and authority["root_issue_id"] != self.root_issue_id:
+                raise LinearEventError("root_issue_id_mismatch")
             if self._observed_authority is not None and self._observed_authority != authority:
                 raise LinearEventError("comment_slot_authority_changed")
             self._observed_authority = authority  # type: ignore[assignment]
@@ -405,7 +748,7 @@ class LinearCommentEventAdapter:
         if delta.workstream_id != self.issue_id:
             raise LinearEventError("workstream_id_mismatch")
         for _attempt in range(8):
-            before, checkpoints, _comments = self._combined_state()
+            before, checkpoints, comments = self._combined_state()
             self._validate_checkpoint_prefix(before, checkpoints)
             existing_id = before.remote_ids.get(delta.event_id)
             if existing_id:
@@ -425,9 +768,20 @@ class LinearCommentEventAdapter:
                     f"expected revision {delta.expected_revision}, "
                     f"live revision {before.revision}"
                 )
+            assert_no_pending_ledger_reservation(
+                comments, workstream_id=self.issue_id,
+                authenticated_route=self._observed_authority,
+                current_plan_revision=self.plan_revision,
+            )
             if self._observed_authority is None:
                 raise LinearEventError("comment_slot_authority_incomplete")
-            frontier = self._checkpoint_frontier(checkpoints)
+            frontier = ledger_serialization_frontier(
+                self._checkpoint_frontier(checkpoints), comments,
+                workstream_id=self.issue_id,
+                authenticated_route=self._observed_authority,
+                current_plan_revision=self.plan_revision,
+                material_revision=before.revision,
+            )
             slot_id = ledger_boundary_slot_id(
                 delta.workstream_id, before.revision, frontier,
                 self._observed_authority,

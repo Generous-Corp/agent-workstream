@@ -13,10 +13,16 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+
+from workstream_delta import Delta, MutationReceipt, RevisionConflict
+from workstream_linear_events import (
+    LinearCommentEventAdapter, encode_event_comment, reduce_event_comments,
+)
 
 
 SCHEMA_VERSION = 1
@@ -37,6 +43,13 @@ OPPORTUNISTIC_DRAIN = 5
 CAPTURE_MARKER = "<!-- workstream-ingress:capture:v1 -->"
 PROCESSED_MARKER = "<!-- workstream-ingress:processed:v1 -->"
 BIND_MARKER = "<!-- workstream-ingress:bind:v1 -->"
+PROMOTION_MARKER = "<!-- workstream-ingress:promotion:v2 -->"
+PROMOTION_SCHEMA_VERSION = 2
+MAX_PROMOTION_CHANGES = 32
+MAX_PROMOTION_BYTES = 16 * 1024
+MAX_PROMOTION_CONFLICTS = 8
+MAX_CLASSIFICATION_HINT_GROUPS = 256
+MAX_CLASSIFICATION_HINTS_REPORTED = 8
 
 SECRET_PATTERNS = (
     re.compile(r"-----BEGIN [^-]*(?:PRIVATE KEY|CERTIFICATE)-----.*?-----END [^-]*-----", re.S),
@@ -425,6 +438,413 @@ def comment_body(marker: str, payload: dict[str, Any]) -> str:
     return marker + "\n```json\n" + json.dumps(payload, sort_keys=True) + "\n```"
 
 
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def canonical_ingress_route(repo: Any, issue: Any) -> dict[str, Any]:
+    if (
+        not isinstance(repo, str)
+        or not re.fullmatch(
+            r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}", repo
+        )
+        or repo.endswith(".git")
+    ):
+        raise ValueError("ingress_repository_route_invalid")
+    if not isinstance(issue, int) or isinstance(issue, bool) or issue <= 0:
+        raise ValueError("ingress_issue_route_invalid")
+    return {"provider": "github", "repository": repo.lower(), "issue": issue}
+
+
+def validate_output_envelope(marker: str, payload: dict[str, Any]) -> None:
+    size = len(comment_body(marker, payload).encode("utf-8"))
+    if size > MAX_PROMOTION_BYTES:
+        raise ValueError(f"ingress_output_envelope_over_budget:{size}>{MAX_PROMOTION_BYTES}")
+
+
+def promotion_id_for(value: dict[str, Any]) -> str:
+    material = canonical_json(value).encode("utf-8")
+    return "wsp_" + hashlib.sha256(material).hexdigest()[:32]
+
+
+def load_promotion_request(path: str) -> dict[str, Any]:
+    raw = sys.stdin.read() if path == "-" else Path(path).read_text()
+    if len(raw.encode("utf-8")) > MAX_PROMOTION_BYTES:
+        raise ValueError("promotion_request_over_budget")
+    try:
+        request = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError("promotion_request_invalid_json") from error
+    if not isinstance(request, dict) or set(request) != {
+        "schema_version", "ingress", "authority", "workstream_id",
+        "plan_revision", "expected_material_revision", "changes",
+    }:
+        raise ValueError("promotion_request_schema_invalid")
+    if type(request["schema_version"]) is not int or request["schema_version"] != 1:
+        raise ValueError("promotion_request_schema_unsupported")
+    ingress = request["ingress"]
+    if not isinstance(ingress, dict) or set(ingress) != {
+        "repo", "remote_issue", "event_id", "prompt_sha256",
+    }:
+        raise ValueError("promotion_request_ingress_invalid")
+    for field in ("repo", "event_id"):
+        if not isinstance(ingress[field], str) or not ingress[field]:
+            raise ValueError(f"promotion_request_{field}_invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", ingress["prompt_sha256"] or ""):
+        raise ValueError("promotion_request_prompt_sha256_invalid")
+    if (
+        not isinstance(ingress["remote_issue"], int)
+        or isinstance(ingress["remote_issue"], bool)
+        or ingress["remote_issue"] <= 0
+    ):
+        raise ValueError("promotion_request_remote_issue_invalid")
+    canonical_ingress_route(ingress["repo"], ingress["remote_issue"])
+    if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", request["workstream_id"] or ""):
+        raise ValueError("promotion_request_workstream_invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", request["plan_revision"] or ""):
+        raise ValueError("promotion_request_plan_revision_invalid")
+    authority = request["authority"]
+    required_authority = {"workspace_id", "team_id", "project_id", "root_issue_id"}
+    if not isinstance(authority, dict) or set(authority) != required_authority:
+        raise ValueError("promotion_request_authority_invalid")
+    for field in sorted(required_authority):
+        value = authority[field]
+        try:
+            valid = isinstance(value, str) and str(uuid.UUID(value)) == value.lower()
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError(f"promotion_request_{field}_invalid")
+    revision = request["expected_material_revision"]
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+        raise ValueError("promotion_request_expected_revision_invalid")
+    changes = request["changes"]
+    if not isinstance(changes, list) or not changes or len(changes) > MAX_PROMOTION_CHANGES:
+        raise ValueError("promotion_request_changes_invalid")
+    for change in changes:
+        if (
+            not isinstance(change, dict)
+            or set(change) != {"kind", "payload"}
+            or not isinstance(change["kind"], str)
+            or not change["kind"]
+            or not isinstance(change["payload"], dict)
+        ):
+            raise ValueError("promotion_request_change_invalid")
+    return request
+
+
+def promotion_payload(request: dict[str, Any], capture: dict[str, Any]) -> dict[str, Any]:
+    immutable = {
+        "schema_version": PROMOTION_SCHEMA_VERSION,
+        "event_id": request["ingress"]["event_id"],
+        "prompt_sha256": request["ingress"]["prompt_sha256"],
+        "workstream_id": request["workstream_id"],
+        "plan_revision": request["plan_revision"],
+        "authority": request["authority"],
+        "ingress_route": canonical_ingress_route(
+            request["ingress"]["repo"], request["ingress"]["remote_issue"]
+        ),
+        "expected_material_revision": request["expected_material_revision"],
+        "changes": request["changes"],
+        # A source timestamp is stable across machines and retries. It is the
+        # material boundary's causal time, not a claim about mutation time.
+        "source_captured_at": capture["captured_at"],
+    }
+    return {**immutable, "promotion_id": promotion_id_for(immutable)}
+
+
+def validate_promotion_payload(promotion: Any) -> dict[str, Any]:
+    if not isinstance(promotion, dict) or set(promotion) != {
+        "schema_version", "event_id", "prompt_sha256", "workstream_id",
+        "plan_revision", "authority", "ingress_route", "expected_material_revision", "changes",
+        "source_captured_at", "promotion_id",
+    }:
+        raise ValueError("promotion_marker_schema_invalid")
+    request = {
+        "schema_version": promotion["schema_version"],
+        "ingress": {
+            # These route fields are not repeated in the marker; fixed safe
+            # placeholders let the shared type/budget validator cover every
+            # material field without inventing route identity.
+            "repo": "validated/marker",
+            "remote_issue": 1,
+            "event_id": promotion["event_id"],
+            "prompt_sha256": promotion["prompt_sha256"],
+        },
+        "workstream_id": promotion["workstream_id"],
+        "plan_revision": promotion["plan_revision"],
+        "authority": promotion["authority"],
+        "expected_material_revision": promotion["expected_material_revision"],
+        "changes": promotion["changes"],
+    }
+    # Validate the same shapes as a first-attempt request without reading a
+    # file or trusting a successor's local state.
+    if (
+        type(request["schema_version"]) is not int
+        or request["schema_version"] != PROMOTION_SCHEMA_VERSION
+    ):
+        raise ValueError("promotion_marker_schema_unsupported")
+    if not isinstance(promotion["event_id"], str) or not promotion["event_id"]:
+        raise ValueError("promotion_marker_event_id_invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", promotion["prompt_sha256"] or ""):
+        raise ValueError("promotion_marker_prompt_sha256_invalid")
+    if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", promotion["workstream_id"] or ""):
+        raise ValueError("promotion_marker_workstream_invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", promotion["plan_revision"] or ""):
+        raise ValueError("promotion_marker_plan_revision_invalid")
+    authority = promotion["authority"]
+    required_authority = {"workspace_id", "team_id", "project_id", "root_issue_id"}
+    if not isinstance(authority, dict) or set(authority) != required_authority:
+        raise ValueError("promotion_marker_authority_invalid")
+    for field in sorted(required_authority):
+        value = authority[field]
+        try:
+            valid = isinstance(value, str) and str(uuid.UUID(value)) == value.lower()
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError(f"promotion_marker_{field}_invalid")
+    route = promotion["ingress_route"]
+    if not isinstance(route, dict) or set(route) != {"provider", "repository", "issue"}:
+        raise ValueError("promotion_marker_ingress_route_invalid")
+    canonical_route = canonical_ingress_route(route.get("repository"), route.get("issue"))
+    if route != canonical_route:
+        raise ValueError("promotion_marker_ingress_route_not_canonical")
+    revision = promotion["expected_material_revision"]
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+        raise ValueError("promotion_marker_expected_revision_invalid")
+    changes = promotion["changes"]
+    if not isinstance(changes, list) or not changes or len(changes) > MAX_PROMOTION_CHANGES:
+        raise ValueError("promotion_marker_changes_invalid")
+    for change in changes:
+        if (
+            not isinstance(change, dict) or set(change) != {"kind", "payload"}
+            or not isinstance(change["kind"], str) or not change["kind"]
+            or not isinstance(change["payload"], dict)
+        ):
+            raise ValueError("promotion_marker_change_invalid")
+    if not isinstance(promotion["source_captured_at"], str) or not promotion["source_captured_at"]:
+        raise ValueError("promotion_marker_source_time_invalid")
+    immutable = {key: value for key, value in promotion.items() if key != "promotion_id"}
+    if promotion.get("promotion_id") != promotion_id_for(immutable):
+        raise ValueError(f"promotion_digest_mismatch:{promotion['event_id']}")
+    validate_output_envelope(PROMOTION_MARKER, promotion)
+    return promotion
+
+
+def promotion_delta(promotion: dict[str, Any]) -> Delta:
+    return Delta(
+        event_id="wsd_" + hashlib.sha256(
+            ("workstream-ingress-promotion-v1\0" + promotion["promotion_id"]).encode("utf-8")
+        ).hexdigest()[:32],
+        workstream_id=promotion["workstream_id"],
+        kind="material_boundary",
+        source="user_turn",
+        payload={
+            "boundary_id": "ingress:" + promotion["event_id"],
+            "changes": promotion["changes"],
+            "ingress": {
+                "event_id": promotion["event_id"],
+                "prompt_sha256": promotion["prompt_sha256"],
+                "promotion_id": promotion["promotion_id"],
+                "plan_revision": promotion["plan_revision"],
+                "route": promotion["ingress_route"],
+            },
+        },
+        expected_revision=promotion["expected_material_revision"],
+        created_at=promotion["source_captured_at"],
+    )
+
+
+def apply_promotion_delta(
+    adapter: LinearCommentEventAdapter, delta: Delta, *, max_conflicts: int = MAX_PROMOTION_CONFLICTS
+) -> MutationReceipt:
+    current = delta
+    for conflict in range(max_conflicts + 1):
+        try:
+            return adapter.apply(current)
+        except RevisionConflict:
+            if conflict >= max_conflicts:
+                raise
+            live_revision = adapter.current_revision(current.workstream_id)
+            if live_revision <= current.expected_revision:
+                raise RevisionConflict("conflict did not expose a newer live revision")
+            current = Delta(
+                current.event_id, current.workstream_id, current.kind, current.source,
+                current.payload, live_revision, current.created_at,
+            )
+    raise AssertionError("unreachable")
+
+
+def verify_processed_promotion(
+    adapter: LinearCommentEventAdapter, delta: Delta, processed: dict[str, Any]
+) -> MutationReceipt:
+    """Read-only proof that a processed marker names the exact Linear event."""
+    state = reduce_event_comments(adapter.comments(), workstream_id=delta.workstream_id)
+    existing = next((item for item in state.events if item.event_id == delta.event_id), None)
+    if existing is None:
+        raise ValueError("processed_material_event_missing")
+    if not (
+        existing.workstream_id == delta.workstream_id
+        and existing.kind == delta.kind
+        and existing.source == delta.source
+        and existing.payload == delta.payload
+        and existing.created_at == delta.created_at
+        and existing.expected_revision >= delta.expected_revision
+    ):
+        raise ValueError("processed_material_event_mismatch")
+    revision = next(
+        index for index, item in enumerate(state.events, start=1)
+        if item.event_id == delta.event_id
+    )
+    remote_id = state.remote_ids[delta.event_id]
+    if (
+        processed.get("material_revision") != revision
+        or processed.get("material_remote_id") != remote_id
+    ):
+        raise ValueError("processed_material_receipt_mismatch")
+    return MutationReceipt(delta.event_id, revision, remote_id)
+
+
+def linear_adapter_for_promotion(
+    promotion: dict[str, Any], *, config_path: str | None = None,
+) -> LinearCommentEventAdapter:
+    from workstream_config import load_linear_api_key, resolve_linear_route
+    from workstream_linear import HttpGraphQLClient
+
+    token = load_linear_api_key()
+    if not token:
+        raise ValueError("linear_auth_unavailable")
+    configured, _resolved = resolve_linear_route(config_path=config_path)
+    configured = configured or {}
+    authority = promotion["authority"]
+    for field in ("workspace_id", "team_id", "project_id"):
+        if configured.get(field) and configured[field] != authority[field]:
+            raise ValueError(f"promotion_config_{field}_mismatch")
+    return LinearCommentEventAdapter(
+        HttpGraphQLClient(token), issue_id=promotion["workstream_id"],
+        workspace_id=authority["workspace_id"], team_id=authority["team_id"],
+        project_id=authority["project_id"], root_issue_id=authority["root_issue_id"],
+        plan_revision=promotion["plan_revision"],
+    )
+
+
+def promotion_failpoint(_stage: str) -> None:
+    """Injectable crash point. Production deliberately performs no action."""
+
+
+def _payload_without_time(payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in payload.items() if key != "processed_at"}
+
+
+def reduce_ingress_comments(
+    comments: list[dict[str, Any]], *, event_id: str,
+    repo: str | None = None, issue: int | None = None,
+) -> dict[str, Any]:
+    """Reduce one raw event and its durable successor chain without guessing."""
+    captures: list[dict[str, Any]] = []
+    promotions: list[dict[str, Any]] = []
+    processed: list[dict[str, Any]] = []
+    bindings: list[dict[str, Any]] = []
+    for comment in comments:
+        body = comment.get("body", "")
+        if not isinstance(body, str):
+            raise ValueError("ingress_comment_body_invalid")
+        for marker, target in (
+            (CAPTURE_MARKER, captures), (PROMOTION_MARKER, promotions),
+            (PROCESSED_MARKER, processed), (BIND_MARKER, bindings),
+        ):
+            item = parse_comment(body, marker)
+            if item and item.get("event_id") == event_id:
+                target.append(item)
+                break
+
+    def one_logical(items: list[dict[str, Any]], name: str, *, ignore_time: bool = False):
+        if not items:
+            return None
+        canonical = {
+            canonical_json(_payload_without_time(item) if ignore_time else item) for item in items
+        }
+        if len(canonical) != 1:
+            raise ValueError(f"conflicting_{name}:{event_id}")
+        return items[0]
+
+    capture = one_logical(captures, "capture")
+    promotion = one_logical(promotions, "promotion")
+    disposition = one_logical(processed, "processed", ignore_time=True)
+    binding = bindings[-1] if bindings else None
+    if capture and binding:
+        capture = {**capture, "workstream_id": binding.get("workstream_id"),
+                   "context_url": binding.get("context_url")}
+    if promotion:
+        validate_promotion_payload(promotion)
+        if repo is not None or issue is not None:
+            if promotion["ingress_route"] != canonical_ingress_route(repo, issue):
+                raise ValueError(f"promotion_ingress_route_mismatch:{event_id}")
+        if not capture:
+            raise ValueError(f"promotion_without_capture:{event_id}")
+        if (
+            promotion.get("prompt_sha256") != capture.get("prompt_sha256")
+            or promotion.get("workstream_id") != capture.get("workstream_id")
+            or promotion.get("source_captured_at") != capture.get("captured_at")
+        ):
+            raise ValueError(f"promotion_capture_mismatch:{event_id}")
+    if disposition:
+        if disposition.get("disposition") == "promoted":
+            if set(disposition) != {
+                "schema_version", "event_id", "processed_at", "disposition", "promoted_issue",
+                "promotion_id", "material_event_id", "material_revision", "material_remote_id",
+            }:
+                raise ValueError(f"processed_promotion_schema_invalid:{event_id}")
+            validate_output_envelope(PROCESSED_MARKER, disposition)
+            if (
+                type(disposition.get("schema_version")) is not int
+                or disposition.get("schema_version") != 1
+                or not isinstance(disposition.get("processed_at"), str)
+                or not disposition["processed_at"]
+                or not isinstance(disposition.get("material_revision"), int)
+                or isinstance(disposition.get("material_revision"), bool)
+                or disposition["material_revision"] <= 0
+                or not isinstance(disposition.get("material_remote_id"), str)
+                or not disposition["material_remote_id"]
+            ):
+                raise ValueError(f"processed_promotion_value_invalid:{event_id}")
+            if (
+                not promotion or disposition.get("promotion_id") != promotion.get("promotion_id")
+                or disposition.get("promoted_issue") != promotion.get("workstream_id")
+                or disposition.get("material_event_id") != promotion_delta(promotion).event_id
+            ):
+                raise ValueError(f"processed_without_promotion:{event_id}")
+        elif promotion:
+            raise ValueError(f"promotion_disposition_mismatch:{event_id}")
+    return {"capture": capture, "promotion": promotion, "processed": disposition}
+
+
+def remote_issue_comments(repo: str, issue: int) -> list[dict[str, Any]]:
+    pages = gh([
+        "api", "--paginate", "--slurp", f"repos/{repo}/issues/{issue}/comments?per_page=100",
+    ], timeout=20)
+    if not pages:
+        return []
+    return [comment for page in pages for comment in page] if isinstance(pages[0], list) else pages
+
+
+def remote_event_state(repo: str, issue: int, event_id: str) -> dict[str, Any]:
+    canonical_ingress_route(repo, issue)
+    return reduce_ingress_comments(
+        remote_issue_comments(repo, issue), event_id=event_id, repo=repo, issue=issue,
+    )
+
+
+def append_ingress_marker(repo: str, issue: int, marker: str, payload: dict[str, Any]) -> Any:
+    canonical_ingress_route(repo, issue)
+    validate_output_envelope(marker, payload)
+    return gh(
+        ["api", f"repos/{repo}/issues/{issue}/comments", "--input", "-"],
+        stdin=json.dumps({"body": comment_body(marker, payload)}), timeout=10,
+    )
+
+
 def upload_event(conn: sqlite3.Connection, event_id: str, config: dict[str, Any]) -> bool:
     row = conn.execute(
         "SELECT event_id,captured_at,provider,session_id,turn_id,surface_id,workspace_id,cwd,"
@@ -499,41 +919,176 @@ def parse_comment(body: str, marker: str) -> dict[str, Any] | None:
 
 
 def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, Any]]:
+    canonical_repo = canonical_ingress_route(repo, 1)["repository"]
     issues = gh([
         "issue", "list", "--repo", repo, "--state", "all", "--label", LABEL,
         "--limit", "100", "--json", "number,url,title",
     ], timeout=15)
     captures: dict[str, dict[str, Any]] = {}
-    processed: set[str] = set()
+    processed: dict[str, dict[str, Any]] = {}
+    mutable_hints: dict[tuple[int, str], dict[str, Any]] = {}
+    promotions: dict[str, dict[str, Any]] = {}
     bindings: dict[str, dict[str, Any]] = {}
+    event_routes: dict[str, dict[str, Any]] = {}
+    comments_by_issue: dict[int, list[dict[str, Any]]] = {}
+
+    def bind_route(event_id: str, issue_number: int) -> None:
+        route = canonical_ingress_route(canonical_repo, issue_number)
+        previous = event_routes.get(event_id)
+        if previous and previous != route:
+            raise ValueError(f"ingress_event_route_collision:{event_id}")
+        event_routes[event_id] = route
+
+    def record_mutable_hint(
+        item: Any, comment: dict[str, Any], issue_number: int,
+    ) -> None:
+        if not isinstance(item, dict):
+            return
+        disposition = item.get("disposition")
+        event_id = item.get("event_id")
+        if (
+            disposition not in {"no-material-delta", "superseded"}
+            or not isinstance(event_id, str)
+            or not event_id
+            or len(event_id.encode("utf-8")) > 256
+        ):
+            return
+        key = (issue_number, event_id)
+        if key not in mutable_hints:
+            if len(mutable_hints) >= MAX_CLASSIFICATION_HINT_GROUPS:
+                return
+            mutable_hints[key] = {
+                "count": 0, "dispositions": set(), "fingerprints": set(),
+                "ambiguous": False,
+            }
+        hint = mutable_hints[key]
+        hint["count"] += 1
+        hint["dispositions"].add(disposition)
+        user = comment.get("user")
+        user = user if isinstance(user, dict) else {}
+        fingerprint_material = canonical_json({
+            "body": comment.get("body") if isinstance(comment.get("body"), str) else "",
+            "user_login": user.get("login") if isinstance(user.get("login"), str) else None,
+            "user_id": user.get("id")
+            if isinstance(user.get("id"), (str, int)) and not isinstance(user.get("id"), bool)
+            else None,
+            "created_at": comment.get("created_at")
+            if isinstance(comment.get("created_at"), str) else None,
+            "updated_at": comment.get("updated_at")
+            if isinstance(comment.get("updated_at"), str) else None,
+        }).encode("utf-8")
+        fingerprint = hashlib.sha256(fingerprint_material).hexdigest()
+        if fingerprint not in hint["fingerprints"]:
+            if len(hint["fingerprints"]) < 2:
+                hint["fingerprints"].add(fingerprint)
+            else:
+                hint["ambiguous"] = True
+        if len(hint["fingerprints"]) > 1 or len(hint["dispositions"]) > 1:
+            hint["ambiguous"] = True
+
     for issue in issues:
+        issue_number = issue.get("number")
+        canonical_ingress_route(canonical_repo, issue_number)
         pages = gh([
             "api", "--paginate", "--slurp",
-            f"repos/{repo}/issues/{issue['number']}/comments?per_page=100",
+            f"repos/{repo}/issues/{issue_number}/comments?per_page=100",
         ], timeout=20)
         comments = [comment for page in pages for comment in page] if pages and isinstance(pages[0], list) else pages
+        comments_by_issue[issue_number] = comments
         for comment in comments:
             item = parse_comment(comment.get("body", ""), CAPTURE_MARKER)
             if item:
-                item["remote_issue"] = issue["number"]
+                bind_route(item["event_id"], issue_number)
+                item["remote_issue"] = issue_number
                 item["remote_repo"] = repo
                 item["remote_url"] = comment.get("html_url")
                 captures[item["event_id"]] = item
                 continue
             item = parse_comment(comment.get("body", ""), PROCESSED_MARKER)
             if item:
-                processed.add(item["event_id"])
+                record_mutable_hint(item, comment, issue_number)
+                if not isinstance(item, dict) or item.get("disposition") != "promoted":
+                    continue
+                event_id = item.get("event_id")
+                if not isinstance(event_id, str) or not event_id:
+                    raise ValueError("processed_promotion_schema_invalid:unknown")
+                bind_route(event_id, issue_number)
+                previous = processed.get(event_id)
+                if previous and _payload_without_time(previous) != _payload_without_time(item):
+                    raise ValueError(f"conflicting_processed:{event_id}")
+                processed[event_id] = item
+                continue
+            item = parse_comment(comment.get("body", ""), PROMOTION_MARKER)
+            if item:
+                bind_route(item["event_id"], issue_number)
+                validate_promotion_payload(item)
+                if item["ingress_route"] != canonical_ingress_route(canonical_repo, issue_number):
+                    raise ValueError(f"promotion_ingress_route_mismatch:{item['event_id']}")
+                previous = promotions.get(item["event_id"])
+                if previous and previous != item:
+                    raise ValueError(f"conflicting_promotion:{item['event_id']}")
+                promotions[item["event_id"]] = item
                 continue
             item = parse_comment(comment.get("body", ""), BIND_MARKER)
             if item:
+                bind_route(item["event_id"], issue_number)
                 bindings[item["event_id"]] = item
     for event_id, binding in bindings.items():
         if event_id in captures:
             captures[event_id]["workstream_id"] = binding.get("workstream_id")
             captures[event_id]["context_url"] = binding.get("context_url")
-    result = [event for event_id, event in captures.items() if event_id not in processed]
+    for event_id, event in captures.items():
+        route = event_routes[event_id]
+        hint = mutable_hints.get((route["issue"], event_id))
+        if hint:
+            count = hint["count"]
+            event["classification_hint"] = {
+                "authoritative": False,
+                "reason": "mutable_github_comment",
+                "observed_count": min(count, MAX_CLASSIFICATION_HINTS_REPORTED),
+                "additional_hints_omitted": max(
+                    0, count - MAX_CLASSIFICATION_HINTS_REPORTED,
+                ),
+                "dispositions": sorted(hint["dispositions"]),
+                "ambiguous": bool(hint["ambiguous"]),
+            }
+    for event_id in processed:
+        if event_id not in captures:
+            raise ValueError(f"processed_without_capture:{event_id}")
+    for event_id, promotion in promotions.items():
+        if event_id not in captures:
+            raise ValueError(f"promotion_without_capture:{event_id}")
+        route = event_routes[event_id]
+        staged = reduce_ingress_comments(
+            comments_by_issue[route["issue"]], event_id=event_id,
+            repo=route["repository"], issue=route["issue"],
+        )
+        if staged["promotion"] != promotion:
+            raise ValueError(f"promotion_state_mismatch:{event_id}")
+        captures[event_id]["promotion"] = promotion
+        captures[event_id]["promotion_state"] = "staged"
+    candidates = captures.items()
     if workstream:
-        result = [event for event in result if event.get("workstream_id") == workstream]
+        candidates = [item for item in candidates if item[1].get("workstream_id") == workstream]
+    verified_processed: set[str] = set()
+    for event_id, event in candidates:
+        disposition = processed.get(event_id)
+        if not disposition:
+            continue
+        if disposition.get("disposition") != "promoted":
+            raise ValueError(f"processed_disposition_invalid:{event_id}")
+        route = event_routes[event_id]
+        state = reduce_ingress_comments(
+            comments_by_issue[route["issue"]], event_id=event_id,
+            repo=route["repository"], issue=route["issue"],
+        )
+        promotion = state["promotion"]
+        if not promotion:
+            raise ValueError(f"processed_without_promotion:{event_id}")
+        adapter = linear_adapter_for_promotion(promotion)
+        verify_processed_promotion(adapter, promotion_delta(promotion), disposition)
+        verified_processed.add(event_id)
+    result = [event for event_id, event in candidates if event_id not in verified_processed]
     return sorted(result, key=lambda event: event.get("captured_at", ""))
 
 
@@ -819,25 +1374,163 @@ def command_recover(args: argparse.Namespace) -> int:
 
 
 def command_process(args: argparse.Namespace) -> int:
-    payload = {
-        "schema_version": SCHEMA_VERSION,
-        "event_id": args.event,
+    if args.disposition == "promoted":
+        raise ValueError(
+            "material promotion requires the receipt-verifying promote command"
+        )
+    raise ValueError(
+        "non_material_classification_not_durable: GitHub comments are mutable hints; "
+        "leave the capture open until an immutable classification receipt exists"
+    )
+
+
+def command_promote(args: argparse.Namespace) -> int:
+    """Durably stage, apply, and acknowledge one reviewed ingress promotion.
+
+    A request is needed only for the first attempt. Once its immutable intent
+    marker exists, a successor machine can resume from repo/issue/event alone.
+    """
+    if (
+        not isinstance(args.max_conflicts, int) or isinstance(args.max_conflicts, bool)
+        or not 0 <= args.max_conflicts <= MAX_PROMOTION_CONFLICTS
+    ):
+        raise ValueError(f"promotion_max_conflicts_must_be_0_to_{MAX_PROMOTION_CONFLICTS}")
+    request = load_promotion_request(args.request) if args.request else None
+    config = load_config()
+    if request:
+        ingress = request["ingress"]
+        repo, issue, event_id = ingress["repo"], ingress["remote_issue"], ingress["event_id"]
+        if args.repo and args.repo != repo:
+            raise ValueError("promotion_repo_mismatch")
+        if args.remote_issue and args.remote_issue != issue:
+            raise ValueError("promotion_issue_mismatch")
+        if args.event and args.event != event_id:
+            raise ValueError("promotion_event_mismatch")
+    else:
+        repo = args.repo or config.get("repo")
+        issue = args.remote_issue or config.get("issue")
+        event_id = args.event
+        if not repo or not issue or not event_id:
+            raise ValueError(
+                "promotion recovery requires --repo, --remote-issue, and --event "
+                "(repo/issue may come from local config)"
+            )
+
+    state = remote_event_state(repo, int(issue), event_id)
+    capture = state["capture"]
+    if not capture:
+        raise ValueError(f"ingress_capture_not_found:{event_id}")
+    if request:
+        if capture.get("prompt_sha256") != request["ingress"]["prompt_sha256"]:
+            raise ValueError("promotion_prompt_sha256_mismatch")
+        if capture.get("workstream_id") != request["workstream_id"]:
+            raise ValueError("promotion_workstream_mismatch")
+        proposed = promotion_payload(request, capture)
+        validate_promotion_payload(proposed)
+        if state["promotion"] and state["promotion"] != proposed:
+            raise ValueError(f"conflicting_promotion:{event_id}")
+        promotion = state["promotion"] or proposed
+    else:
+        promotion = state["promotion"]
+        if not promotion:
+            raise ValueError(
+                f"promotion_intent_missing:{event_id}; supply the reviewed --request once"
+            )
+
+    delta = promotion_delta(promotion)
+    processed = state["processed"]
+    if processed:
+        if (
+            processed.get("disposition") != "promoted"
+            or processed.get("promotion_id") != promotion["promotion_id"]
+            or processed.get("material_event_id") != delta.event_id
+        ):
+            raise ValueError(f"conflicting_processed:{event_id}")
+        adapter = linear_adapter_for_promotion(promotion, config_path=args.config)
+        verify_processed_promotion(adapter, delta, processed)
+        _record_local_processed(event_id, processed)
+        print(json.dumps({
+            "event_id": event_id, "promotion_id": promotion["promotion_id"],
+            "material_event_id": delta.event_id, "disposition": "promoted",
+            "replay": True,
+        }, sort_keys=True))
+        return 0
+
+    if not args.apply:
+        print(json.dumps({
+            "event_id": event_id, "promotion_id": promotion["promotion_id"],
+            "material_event_id": delta.event_id, "workstream_id": promotion["workstream_id"],
+            "plan_revision": promotion["plan_revision"],
+            "expected_material_revision": promotion["expected_material_revision"],
+            "changes": len(promotion["changes"]), "would_stage": state["promotion"] is None,
+            "would_apply": True,
+        }, indent=2, sort_keys=True))
+        return 0
+
+    if state["promotion"] is None:
+        try:
+            append_ingress_marker(repo, int(issue), PROMOTION_MARKER, promotion)
+        except Exception:
+            # A lost response is indistinguishable from a failed request until
+            # authoritative readback. Accept only the exact staged intent.
+            reread = remote_event_state(repo, int(issue), event_id)
+            if reread["promotion"] != promotion:
+                raise
+        state = remote_event_state(repo, int(issue), event_id)
+        if state["promotion"] != promotion:
+            raise ValueError("promotion_stage_not_observed")
+    promotion_failpoint("after_stage")
+
+    adapter = linear_adapter_for_promotion(promotion, config_path=args.config)
+    receipt = apply_promotion_delta(adapter, delta, max_conflicts=args.max_conflicts)
+    promotion_failpoint("after_linear")
+    processed_payload = {
+        "schema_version": 1,
+        "event_id": event_id,
         "processed_at": utc_now(),
-        "disposition": args.disposition,
-        "promoted_issue": args.issue,
+        "disposition": "promoted",
+        "promoted_issue": promotion["workstream_id"],
+        "promotion_id": promotion["promotion_id"],
+        "material_event_id": delta.event_id,
+        "material_revision": receipt.revision,
+        "material_remote_id": receipt.remote_id,
     }
-    response = gh(
-        ["api", f"repos/{args.repo}/issues/{args.remote_issue}/comments", "--input", "-"],
-        stdin=json.dumps({"body": comment_body(PROCESSED_MARKER, payload)}), timeout=10,
-    )
-    conn = connect()
-    conn.execute(
-        "UPDATE events SET processed_at=?,disposition=?,promoted_issue=? WHERE event_id=?",
-        (payload["processed_at"], args.disposition, args.issue, args.event),
-    )
-    conn.commit()
-    print(json.dumps({"event_id": args.event, "processed_url": response["html_url"]}, sort_keys=True))
+    try:
+        append_ingress_marker(repo, int(issue), PROCESSED_MARKER, processed_payload)
+    except Exception:
+        reread = remote_event_state(repo, int(issue), event_id)
+        observed = reread["processed"]
+        if not observed or _payload_without_time(observed) != _payload_without_time(processed_payload):
+            raise
+    final = remote_event_state(repo, int(issue), event_id)
+    observed = final["processed"]
+    if not observed or _payload_without_time(observed) != _payload_without_time(processed_payload):
+        raise ValueError("promotion_processed_not_observed")
+    promotion_failpoint("after_processed")
+    _record_local_processed(event_id, observed)
+    print(json.dumps({
+        "event_id": event_id, "promotion_id": promotion["promotion_id"],
+        "material_event_id": delta.event_id, "material_revision": receipt.revision,
+        "material_remote_id": receipt.remote_id, "disposition": "promoted", "replay": False,
+    }, sort_keys=True))
     return 0
+
+
+def _record_local_processed(event_id: str, payload: dict[str, Any]) -> None:
+    """Best-effort local cache update after remote successor proof exists."""
+    try:
+        conn = connect()
+        conn.execute(
+            "UPDATE events SET processed_at=?,disposition=?,promoted_issue=? WHERE event_id=?",
+            (payload.get("processed_at") or utc_now(), payload.get("disposition"),
+             payload.get("promoted_issue"), event_id),
+        )
+        conn.commit()
+        conn.close()
+    except (OSError, sqlite3.Error) as error:
+        # The authoritative processed marker and Linear receipt already exist.
+        # A successor machine may have no writable local ingress cache at all.
+        record_failure("local-processed-cache", error)
 
 
 def command_status(args: argparse.Namespace) -> int:
@@ -1031,9 +1724,18 @@ def parser() -> argparse.ArgumentParser:
     process.add_argument("--repo", required=True)
     process.add_argument("--remote-issue", type=int, required=True)
     process.add_argument("--event", required=True)
-    process.add_argument("--disposition", choices=("promoted", "no-material-delta", "superseded"), required=True)
+    process.add_argument("--disposition", choices=("no-material-delta", "superseded"), required=True)
     process.add_argument("--issue")
     process.set_defaults(func=command_process)
+    promote = sub.add_parser("promote")
+    promote.add_argument("--request", help="reviewed bounded JSON request, or - for stdin")
+    promote.add_argument("--repo")
+    promote.add_argument("--remote-issue", type=int)
+    promote.add_argument("--event")
+    promote.add_argument("--config", help="explicit .workstream.json route")
+    promote.add_argument("--max-conflicts", type=int, default=MAX_PROMOTION_CONFLICTS)
+    promote.add_argument("--apply", action="store_true")
+    promote.set_defaults(func=command_promote)
     status = sub.add_parser("status")
     status.set_defaults(func=command_status)
     sub.add_parser("ratchet").set_defaults(func=command_ratchet)

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
+import json
 import unittest
 from unittest import mock
 
@@ -16,6 +18,7 @@ from workstream_linear_checkpoints import (
 )
 from workstream_linear_events import (
     LinearCommentEventAdapter,
+    encode_ledger_reservation,
     encode_event_comment,
     ledger_boundary_slot_id,
 )
@@ -153,6 +156,44 @@ class LinearCheckpointAdapterTests(unittest.TestCase):
             },
         )
         self.assertNotIn("remote_acknowledged", client.comments[0]["body"])
+
+    def test_checkpoint_refuses_while_shared_identity_reservation_is_pending(self):
+        client = FakeCommentClient()
+        authority = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "issue-37",
+        }
+        from workstream_linear_projection import build_projection_event
+        intent = build_projection_event(
+            workstream_id="GEN-37", kind="scope", key="root",
+            value={"test": "intent"}, plan_revision="a" * 64,
+            expected_revision=0, created_at="2026-08-29T12:00:00Z",
+            authority=authority,
+        )
+        reservation = {
+            "schema_version": 1, "workstream_id": "GEN-37",
+            "material_revision": 0, "plan_revision": "a" * 64,
+            "projection_revision": 0, "projection_frontier_ids": [],
+            "frontier_ids": [], "authority": authority,
+            "intent_kind": "repository_identity_projection",
+            "intent_event": intent,
+            "intent_sha256": hashlib.sha256(json.dumps(
+                intent, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest(),
+        }
+        client.comments.append({
+            "id": ledger_boundary_slot_id("GEN-37", 0, [], authority),
+            "body": encode_ledger_reservation(reservation),
+            "createdAt": "now", "updatedAt": "now",
+        })
+        client.comments.extend({
+            "id": f"malformed-after-{index}",
+            "body": "<!-- workstream-ledger-reservation:v1:not-valid -->",
+            "createdAt": f"now-{index}", "updatedAt": f"now-{index}",
+        } for index in range(4))
+        with self.assertRaisesRegex(LinearTransportError, "ledger_boundary_reserved"):
+            self.adapter(client).persist(checkpoint(0, plan="a" * 64))
+        self.assertFalse(any("commentCreate" in query for query, _ in client.calls))
 
     def test_crash_replay_returns_existing_ack_without_second_comment(self):
         client = FakeCommentClient()

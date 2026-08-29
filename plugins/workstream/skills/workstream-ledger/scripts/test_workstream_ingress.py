@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -106,18 +107,24 @@ class WorkstreamIngressTests(unittest.TestCase):
         self.assertEqual(row[0], 44)
         self.assertIsNotNone(row[1])
 
-    def test_remote_recovery_deduplicates_and_hides_processed(self):
+    def test_remote_recovery_deduplicates_but_keeps_mutable_classification_open(self):
         capture = {"event_id": "e1", "captured_at": "2026-08-14T01:00:00Z", "workstream_id": "ABC-12"}
-        processed = {"event_id": "e1", "processed_at": "2026-08-14T02:00:00Z"}
+        processed = {
+            "schema_version": 2, "event_id": "e1", "processed_at": "2026-08-14T02:00:00Z",
+            "disposition": "no-material-delta", "promoted_issue": None,
+        }
         comments = [
-            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture), "html_url": "u1"},
-            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture), "html_url": "u2"},
-            {"body": MODULE.comment_body(MODULE.PROCESSED_MARKER, processed), "html_url": "u3"},
+            {"id": 1, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture), "html_url": "u1"},
+            {"id": 2, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture), "html_url": "u2"},
+            {"id": 3, "body": MODULE.comment_body(MODULE.PROCESSED_MARKER, processed),
+             "html_url": "u3", "user": {"login": "trusted-bot"}},
         ]
         with mock.patch.object(MODULE, "gh", side_effect=[
             [{"number": 7, "url": "i", "title": "ingress"}], [comments]
         ]):
-            self.assertEqual(MODULE.remote_events("o/r", "ABC-12"), [])
+            events = MODULE.remote_events("o/r", "ABC-12")
+        self.assertEqual(len(events), 1)
+        self.assertFalse(events[0]["classification_hint"]["authoritative"])
 
     def test_remote_binding_promotes_an_initially_unbound_event(self):
         capture = {"event_id": "e1", "captured_at": "2026-08-14T01:00:00Z", "workstream_id": None}
@@ -821,6 +828,535 @@ class RatchetTests(unittest.TestCase):
         self._ratchet()
         mode = (MODULE.state_root() / "ratchet.json").stat().st_mode & 0o777
         self.assertEqual(mode, 0o600)
+
+
+class ClassificationAuthorityTests(unittest.TestCase):
+    """Mutable GitHub classification comments never close a raw capture."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {
+            "WORKSTREAM_INGRESS_STATE_DIR": str(Path(self.temp.name) / "state"),
+            "WORKSTREAM_INGRESS_CONFIG": str(Path(self.temp.name) / "config.json"),
+        }, clear=False)
+        self.env.start()
+        self.repo = "private/ingress"
+        self.issue = 7
+        self.capture = {
+            "schema_version": 1, "event_id": "wsi_classify",
+            "captured_at": "2026-08-29T01:00:00Z", "provider": "codex",
+            "session_id": "expired", "workstream_id": "GEN-37",
+            "prompt": "No longer material", "prompt_sha256": "a" * 64,
+        }
+
+    def tearDown(self):
+        self.env.stop()
+        self.temp.cleanup()
+
+    def payload(self, disposition, *, schema_version=2):
+        return {
+            "schema_version": schema_version, "event_id": "wsi_classify",
+            "processed_at": "2026-08-29T01:01:00Z", "disposition": disposition,
+            "promoted_issue": None,
+            "ingress_route": {"provider": "github", "repository": self.repo, "issue": self.issue},
+            "capture_sha256": "b" * 64,
+            "classification_actor": {"provider": "github", "login": "trusted-bot", "id": 100},
+            "classification_source": "reviewed_agent_classification",
+            "classification_id": "wsc_" + "c" * 32,
+        }
+
+    def recover(self, payload, *, comment_metadata=None):
+        comments = [
+            {"id": 1, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, self.capture)},
+            {
+                "id": 2, "body": MODULE.comment_body(MODULE.PROCESSED_MARKER, payload),
+                **(comment_metadata or {
+                    "created_at": "2026-08-29T01:01:00Z",
+                    "updated_at": "2026-08-29T01:01:00Z",
+                    "user": {"login": "trusted-bot", "id": 100},
+                }),
+            },
+        ]
+        with mock.patch.object(MODULE, "gh", side_effect=[
+            [{"number": self.issue, "url": "i", "title": "ingress"}], [comments],
+        ]):
+            return MODULE.remote_events(self.repo, "GEN-37")
+
+    def assert_visible_hint(self, payload, *, metadata=None):
+        events = self.recover(payload, comment_metadata=metadata)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_id"], "wsi_classify")
+        self.assertEqual(events[0]["classification_hint"], {
+            "authoritative": False,
+            "reason": "mutable_github_comment",
+            "observed_count": 1,
+            "additional_hints_omitted": 0,
+            "dispositions": [payload["disposition"]],
+            "ambiguous": False,
+        })
+
+    def test_every_mutable_classification_variant_remains_open_for_both_dispositions(self):
+        variants = {
+            "valid-looking-trusted-author": lambda payload: ({}, {}),
+            "edited-comment": lambda payload: ({}, {
+                "created_at": "2026-08-29T01:01:00Z",
+                "updated_at": "2026-08-29T01:02:00Z",
+                "user": {"login": "trusted-bot", "id": 100},
+            }),
+            "schema-float": lambda payload: ({"schema_version": 2.0}, {}),
+            "login-recycle": lambda payload: ({}, {
+                "created_at": "2026-08-29T01:01:00Z",
+                "updated_at": "2026-08-29T01:01:00Z",
+                "user": {"login": "trusted-bot", "id": 200},
+            }),
+            "wrong-user-id": lambda payload: ({
+                "classification_actor": {
+                    "provider": "github", "login": "trusted-bot", "id": 999,
+                },
+            }, {}),
+        }
+        for disposition in ("no-material-delta", "superseded"):
+            for name, mutate in variants.items():
+                with self.subTest(disposition=disposition, variant=name):
+                    payload = self.payload(disposition)
+                    changes, metadata = mutate(payload)
+                    payload.update(changes)
+                    self.assert_visible_hint(payload, metadata=metadata or None)
+
+    def test_conflicting_orphan_and_cross_route_hints_never_block_inventory(self):
+        other_capture = {
+            **self.capture, "event_id": "wsi_other",
+            "captured_at": "2026-08-29T01:02:00Z", "prompt": "Still open",
+        }
+        first = self.payload("no-material-delta")
+        conflicting_actor = self.payload("no-material-delta")
+        conflicting_actor["classification_actor"] = {
+            "provider": "github", "login": "other", "id": 200,
+        }
+        conflicting_disposition = self.payload("superseded")
+        cross_route = self.payload("no-material-delta")
+        orphan = self.payload("superseded")
+        orphan["event_id"] = "wsi_orphan"
+        issue_seven = [
+            {"id": 1, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, self.capture)},
+            {"id": 2, "body": MODULE.comment_body(MODULE.PROCESSED_MARKER, first),
+             "user": {"login": "trusted-bot", "id": 100}},
+            {"id": 3, "body": MODULE.comment_body(
+                MODULE.PROCESSED_MARKER, conflicting_actor),
+             "user": {"login": "other", "id": 200}},
+            {"id": 4, "body": MODULE.comment_body(
+                MODULE.PROCESSED_MARKER, conflicting_disposition)},
+            {"id": 5, "body": MODULE.comment_body(
+                MODULE.PROCESSED_MARKER, ["malformed", "hint"])},
+        ]
+        issue_eight = [
+            {"id": 6, "body": MODULE.comment_body(
+                MODULE.CAPTURE_MARKER, other_capture)},
+            {"id": 7, "body": MODULE.comment_body(MODULE.PROCESSED_MARKER, cross_route)},
+            {"id": 8, "body": MODULE.comment_body(MODULE.PROCESSED_MARKER, orphan)},
+        ]
+        with mock.patch.object(MODULE, "gh", side_effect=[
+            [
+                {"number": 7, "url": "i7", "title": "ingress"},
+                {"number": 8, "url": "i8", "title": "ingress"},
+            ],
+            [issue_seven], [issue_eight],
+        ]):
+            events = MODULE.remote_events(self.repo, "GEN-37")
+        self.assertEqual([event["event_id"] for event in events], [
+            "wsi_classify", "wsi_other",
+        ])
+        self.assertEqual(events[0]["classification_hint"], {
+            "authoritative": False,
+            "reason": "mutable_github_comment",
+            "observed_count": 3,
+            "additional_hints_omitted": 0,
+            "dispositions": ["no-material-delta", "superseded"],
+            "ambiguous": True,
+        })
+        self.assertNotIn("classification_hint", events[1])
+
+    def test_process_refuses_to_publish_nonauthoritative_classifications(self):
+        for disposition in ("no-material-delta", "superseded"):
+            args = argparse.Namespace(
+                disposition=disposition, event="wsi_classify", issue=None,
+                repo=self.repo, remote_issue=self.issue,
+            )
+            with self.subTest(disposition=disposition), \
+                 mock.patch.object(MODULE, "gh") as gh:
+                with self.assertRaisesRegex(ValueError, "classification_not_durable"):
+                    MODULE.command_process(args)
+                gh.assert_not_called()
+
+
+class ManagedPromotionTests(unittest.TestCase):
+    """Raw capture must survive every boundary through processed successor proof."""
+
+    class Remote:
+        def __init__(self, capture):
+            self.comments = [{"id": "capture", "body": MODULE.comment_body(
+                MODULE.CAPTURE_MARKER, capture)}]
+            self.writes = []
+
+        def gh(self, args, *, stdin=None, timeout=4):
+            if "--paginate" in args:
+                return [list(self.comments)]
+            if args[-2:] == ["--input", "-"]:
+                body = json.loads(stdin)["body"]
+                item = {"id": f"comment-{len(self.comments)}", "body": body,
+                        "html_url": f"https://example/{len(self.comments)}"}
+                self.comments.append(item)
+                self.writes.append(body)
+                return item
+            raise AssertionError(args)
+
+        def logical(self, marker):
+            return [MODULE.parse_comment(item["body"], marker) for item in self.comments
+                    if MODULE.parse_comment(item["body"], marker)]
+
+    class Linear:
+        def __init__(self):
+            self.events = {}
+            self.mutations = 0
+
+        def current_revision(self, workstream_id):
+            return len(self.events)
+
+        def comments(self):
+            return [
+                {"id": receipt[2], "body": MODULE.encode_event_comment(receipt[0])}
+                for receipt in self.events.values()
+            ]
+
+        def apply(self, delta):
+            existing = self.events.get(delta.event_id)
+            if existing:
+                self.assert_replay(existing, delta)
+                return MODULE.MutationReceipt(delta.event_id, existing[1], existing[2])
+            if delta.expected_revision != len(self.events):
+                raise MODULE.RevisionConflict("stale")
+            self.mutations += 1
+            receipt = (delta, len(self.events) + 1, f"linear-{len(self.events) + 1}")
+            self.events[delta.event_id] = receipt
+            return MODULE.MutationReceipt(delta.event_id, receipt[1], receipt[2])
+
+        @staticmethod
+        def assert_replay(existing, requested):
+            recorded = existing[0]
+            if not (
+                recorded.event_id == requested.event_id
+                and recorded.workstream_id == requested.workstream_id
+                and recorded.kind == requested.kind
+                and recorded.source == requested.source
+                and recorded.payload == requested.payload
+                and recorded.created_at == requested.created_at
+                and recorded.expected_revision >= requested.expected_revision
+            ):
+                raise AssertionError("conflicting replay")
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.env = mock.patch.dict(os.environ, {
+            "WORKSTREAM_INGRESS_STATE_DIR": str(self.root / "state"),
+            "WORKSTREAM_INGRESS_CONFIG": str(self.root / "config.json"),
+        }, clear=False)
+        self.env.start()
+        self.capture = {
+            "schema_version": 1, "event_id": "wsi_raw", "captured_at": "2026-08-29T01:00:00Z",
+            "provider": "codex", "session_id": "expired", "workstream_id": "GEN-37",
+            "context_url": "https://linear.app/generous/issue/GEN-37/x",
+            "prompt": "Add the missing recovery gate", "prompt_sha256": "a" * 64,
+        }
+        self.remote = self.Remote(self.capture)
+        self.linear = self.Linear()
+        self.request = self.root / "promotion.json"
+        self.request.write_text(json.dumps({
+            "schema_version": 1,
+            "ingress": {"repo": "private/ingress", "remote_issue": 7,
+                        "event_id": "wsi_raw", "prompt_sha256": "a" * 64},
+            "authority": {
+                "workspace_id": "11111111-1111-4111-8111-111111111111",
+                "team_id": "22222222-2222-4222-8222-222222222222",
+                "project_id": "33333333-3333-4333-8333-333333333333",
+                "root_issue_id": "44444444-4444-4444-8444-444444444444",
+            },
+            "workstream_id": "GEN-37", "plan_revision": "b" * 64,
+            "expected_material_revision": 0,
+            "changes": [{"kind": "requirement", "payload": {
+                "text": "Add the missing recovery gate", "acceptance": "planted crash passes"}}],
+        }))
+        self.patches = [
+            mock.patch.object(MODULE, "gh", side_effect=self.remote.gh),
+            mock.patch.object(MODULE, "linear_adapter_for_promotion", return_value=self.linear),
+        ]
+        for patcher in self.patches:
+            patcher.start()
+
+    def tearDown(self):
+        for patcher in reversed(self.patches):
+            patcher.stop()
+        self.env.stop()
+        self.temp.cleanup()
+
+    def args(self, *, request=True):
+        return argparse.Namespace(
+            request=str(self.request) if request else None,
+            repo=None if request else "private/ingress", remote_issue=None if request else 7,
+            event=None if request else "wsi_raw", config=None, max_conflicts=8, apply=True,
+        )
+
+    def _promote(self, *, request=True):
+        output = io.StringIO()
+        with mock.patch.object(MODULE.sys, "stdout", output):
+            code = MODULE.command_promote(self.args(request=request))
+        return code, json.loads(output.getvalue())
+
+    def test_crash_after_durable_stage_recovers_without_source_files(self):
+        with mock.patch.object(MODULE, "promotion_failpoint", side_effect=RuntimeError("crash")):
+            with self.assertRaisesRegex(RuntimeError, "crash"):
+                self._promote()
+        self.assertEqual(len(self.remote.logical(MODULE.PROMOTION_MARKER)), 1)
+        self.assertEqual(self.linear.mutations, 0)
+        # The successor has neither the reviewed request nor the source outbox.
+        self.request.unlink()
+        shutil.rmtree(MODULE.state_root(), ignore_errors=True)
+        code, result = self._promote(request=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(result["disposition"], "promoted")
+        self.assertEqual(self.linear.mutations, 1)
+        self.assertEqual(len(self.remote.logical(MODULE.PROCESSED_MARKER)), 1)
+
+    def test_crash_after_linear_accept_replays_without_duplicate_material(self):
+        def fail(stage):
+            if stage == "after_linear":
+                raise RuntimeError("crash after linear")
+        with mock.patch.object(MODULE, "promotion_failpoint", side_effect=fail):
+            with self.assertRaisesRegex(RuntimeError, "crash after linear"):
+                self._promote()
+        self.assertEqual(self.linear.mutations, 1)
+        self.assertEqual(self.remote.logical(MODULE.PROCESSED_MARKER), [])
+        self.request.unlink()
+        shutil.rmtree(MODULE.state_root(), ignore_errors=True)
+        self._promote(request=False)
+        self.assertEqual(self.linear.mutations, 1, "replay duplicated the Linear material event")
+        self.assertEqual(len(self.remote.logical(MODULE.PROCESSED_MARKER)), 1)
+
+    def test_crash_after_processed_marker_is_a_zero_write_successor_replay(self):
+        def fail(stage):
+            if stage == "after_processed":
+                raise RuntimeError("crash after processed")
+        with mock.patch.object(MODULE, "promotion_failpoint", side_effect=fail):
+            with self.assertRaisesRegex(RuntimeError, "crash after processed"):
+                self._promote()
+        writes = len(self.remote.writes)
+        self.request.unlink()
+        shutil.rmtree(MODULE.state_root(), ignore_errors=True)
+        _, result = self._promote(request=False)
+        self.assertTrue(result["replay"])
+        self.assertEqual(self.linear.mutations, 1)
+        self.assertEqual(len(self.remote.writes), writes, "successor appended a second marker")
+
+    def test_preview_performs_no_remote_or_linear_mutation(self):
+        args = self.args()
+        args.apply = False
+        with mock.patch.object(MODULE.sys, "stdout", io.StringIO()):
+            self.assertEqual(MODULE.command_promote(args), 0)
+        self.assertEqual(self.remote.writes, [])
+        self.assertEqual(self.linear.mutations, 0)
+
+    def test_conflicting_durable_intent_refuses_before_linear_mutation(self):
+        other = json.loads(self.request.read_text())
+        other["changes"][0]["payload"]["text"] = "different"
+        promotion = MODULE.promotion_payload(other, self.capture)
+        self.remote.comments.append({"id": "bad", "body": MODULE.comment_body(
+            MODULE.PROMOTION_MARKER, promotion)})
+        with self.assertRaisesRegex(ValueError, "conflicting_promotion"):
+            self._promote()
+        self.assertEqual(self.linear.mutations, 0)
+
+    def test_forged_processed_marker_cannot_replace_linear_readback(self):
+        request = json.loads(self.request.read_text())
+        promotion = MODULE.promotion_payload(request, self.capture)
+        delta = MODULE.promotion_delta(promotion)
+        processed = {
+            "schema_version": 1, "event_id": "wsi_raw",
+            "processed_at": "2026-08-29T01:01:00Z", "disposition": "promoted",
+            "promoted_issue": "GEN-37", "promotion_id": promotion["promotion_id"],
+            "material_event_id": delta.event_id, "material_revision": 1,
+            "material_remote_id": "claimed-linear-receipt",
+        }
+        self.remote.comments.extend([
+            {"id": "promotion", "body": MODULE.comment_body(
+                MODULE.PROMOTION_MARKER, promotion)},
+            {"id": "processed", "body": MODULE.comment_body(
+                MODULE.PROCESSED_MARKER, processed)},
+        ])
+        with self.assertRaisesRegex(ValueError, "processed_material_event_missing"):
+            self._promote(request=False)
+        self.assertEqual(self.linear.mutations, 0)
+
+    def test_boolean_revision_is_rejected_before_remote_reads(self):
+        request = json.loads(self.request.read_text())
+        request["expected_material_revision"] = False
+        self.request.write_text(json.dumps(request))
+        with self.assertRaisesRegex(ValueError, "expected_revision_invalid"):
+            self._promote()
+        self.assertEqual(self.remote.writes, [])
+
+    def test_plan_revision_is_required_and_validated_before_remote_reads(self):
+        request = json.loads(self.request.read_text())
+        request["plan_revision"] = "not-a-plan-digest"
+        self.request.write_text(json.dumps(request))
+        with self.assertRaisesRegex(ValueError, "promotion_request_plan_revision_invalid"):
+            self._promote()
+        self.assertEqual(self.remote.writes, [])
+
+    def test_plan_revision_is_bound_into_promotion_identity(self):
+        request = MODULE.load_promotion_request(str(self.request))
+        first = MODULE.promotion_payload(request, self.capture)
+        request["plan_revision"] = "c" * 64
+        second = MODULE.promotion_payload(request, self.capture)
+        self.assertNotEqual(first["promotion_id"], second["promotion_id"])
+        self.assertEqual(first["plan_revision"], "b" * 64)
+        self.assertEqual(second["plan_revision"], "c" * 64)
+
+    def test_promotion_request_schema_float_is_rejected_before_remote_reads(self):
+        request = json.loads(self.request.read_text())
+        request["schema_version"] = 1.0
+        self.request.write_text(json.dumps(request))
+        with self.assertRaisesRegex(ValueError, "promotion_request_schema_unsupported"):
+            self._promote()
+        self.assertEqual(self.remote.writes, [])
+
+    def test_legacy_process_cannot_bypass_material_receipt_verification(self):
+        args = argparse.Namespace(
+            disposition="promoted", event="wsi_raw", issue="GEN-37",
+            repo="private/ingress", remote_issue=7,
+        )
+        with self.assertRaisesRegex(ValueError, "requires.*promote"):
+            MODULE.command_process(args)
+        self.assertEqual(self.remote.writes, [])
+
+    def test_final_encoded_marker_budget_is_checked_before_write(self):
+        request = json.loads(self.request.read_text())
+        request["changes"][0]["payload"]["padding"] = ""
+        compact = json.dumps(request, separators=(",", ":"))
+        target = 16_341
+        request["changes"][0]["payload"]["padding"] = "x" * (target - len(compact))
+        compact = json.dumps(request, separators=(",", ":"))
+        self.assertEqual(len(compact.encode()), target)
+        self.request.write_text(compact)
+        with self.assertRaisesRegex(ValueError, "output_envelope_over_budget"):
+            self._promote()
+        self.assertEqual(self.remote.writes, [])
+        self.assertEqual(self.linear.mutations, 0)
+
+    def test_ingress_repo_issue_route_is_part_of_promotion_identity(self):
+        request = json.loads(self.request.read_text())
+        first = MODULE.promotion_payload(request, self.capture)
+        other = json.loads(self.request.read_text())
+        other["ingress"]["repo"] = "public/other"
+        other["ingress"]["remote_issue"] = 999
+        second = MODULE.promotion_payload(other, self.capture)
+        self.assertNotEqual(first["promotion_id"], second["promotion_id"])
+        self.assertNotEqual(first["ingress_route"], second["ingress_route"])
+
+    def test_route_bearing_promotion_requires_exact_schema_two(self):
+        request = json.loads(self.request.read_text())
+        current = MODULE.promotion_payload(request, self.capture)
+        self.assertEqual(current["schema_version"], 2)
+        self.assertEqual(MODULE.validate_promotion_payload(current), current)
+        legacy = dict(current, schema_version=1)
+        legacy["promotion_id"] = MODULE.promotion_id_for({
+            key: value for key, value in legacy.items() if key != "promotion_id"
+        })
+        with self.assertRaisesRegex(ValueError, "promotion_marker_schema_unsupported"):
+            MODULE.validate_promotion_payload(legacy)
+        schema_float = dict(current, schema_version=2.0)
+        schema_float["promotion_id"] = MODULE.promotion_id_for({
+            key: value for key, value in schema_float.items() if key != "promotion_id"
+        })
+        with self.assertRaisesRegex(ValueError, "promotion_marker_schema_unsupported"):
+            MODULE.validate_promotion_payload(schema_float)
+
+    def test_only_linear_receipted_promotion_suppresses_remote_capture(self):
+        request = json.loads(self.request.read_text())
+        promotion = MODULE.promotion_payload(request, self.capture)
+        delta = MODULE.promotion_delta(promotion)
+        receipt = self.linear.apply(delta)
+        processed = {
+            "schema_version": 1, "event_id": "wsi_raw",
+            "processed_at": "2026-08-29T01:01:00Z", "disposition": "promoted",
+            "promoted_issue": "GEN-37", "promotion_id": promotion["promotion_id"],
+            "material_event_id": delta.event_id, "material_revision": receipt.revision,
+            "material_remote_id": receipt.remote_id,
+        }
+        comments = [
+            {"id": 1, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, self.capture)},
+            {"id": 2, "body": MODULE.comment_body(MODULE.PROMOTION_MARKER, promotion)},
+            {"id": 3, "body": MODULE.comment_body(MODULE.PROCESSED_MARKER, processed)},
+        ]
+        with mock.patch.object(MODULE, "gh", side_effect=[
+            [{"number": 7, "url": "i", "title": "ingress"}], [comments],
+        ]):
+            self.assertEqual(MODULE.remote_events("private/ingress", "GEN-37"), [])
+
+    def test_processed_promotion_schema_float_is_rejected(self):
+        request = json.loads(self.request.read_text())
+        promotion = MODULE.promotion_payload(request, self.capture)
+        delta = MODULE.promotion_delta(promotion)
+        processed = {
+            "schema_version": 1.0, "event_id": "wsi_raw",
+            "processed_at": "2026-08-29T01:01:00Z", "disposition": "promoted",
+            "promoted_issue": "GEN-37", "promotion_id": promotion["promotion_id"],
+            "material_event_id": delta.event_id, "material_revision": 1,
+            "material_remote_id": "linear-1",
+        }
+        comments = [
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, self.capture)},
+            {"body": MODULE.comment_body(MODULE.PROMOTION_MARKER, promotion)},
+            {"body": MODULE.comment_body(MODULE.PROCESSED_MARKER, processed)},
+        ]
+        with self.assertRaisesRegex(ValueError, "processed_promotion_value_invalid"):
+            MODULE.reduce_ingress_comments(
+                comments, event_id="wsi_raw", repo="private/ingress", issue=7,
+            )
+
+    def test_staged_intent_cannot_be_replayed_from_a_different_repo_issue(self):
+        request = json.loads(self.request.read_text())
+        promotion = MODULE.promotion_payload(request, self.capture)
+        self.remote.comments.append({"id": "promotion", "body": MODULE.comment_body(
+            MODULE.PROMOTION_MARKER, promotion)})
+        args = self.args(request=False)
+        args.repo = "public/other"
+        args.remote_issue = 999
+        with self.assertRaisesRegex(ValueError, "promotion_ingress_route_mismatch"):
+            with mock.patch.object(MODULE.sys, "stdout", io.StringIO()):
+                MODULE.command_promote(args)
+        self.assertEqual(self.linear.mutations, 0)
+
+    def test_remote_recover_refuses_forged_processed_receipt(self):
+        request = json.loads(self.request.read_text())
+        promotion = MODULE.promotion_payload(request, self.capture)
+        delta = MODULE.promotion_delta(promotion)
+        processed = {
+            "schema_version": 1, "event_id": "wsi_raw",
+            "processed_at": "2026-08-29T01:01:00Z", "disposition": "promoted",
+            "promoted_issue": "GEN-37", "promotion_id": promotion["promotion_id"],
+            "material_event_id": delta.event_id, "material_revision": 1,
+            "material_remote_id": "forged",
+        }
+        comments = [
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, self.capture)},
+            {"body": MODULE.comment_body(MODULE.PROMOTION_MARKER, promotion)},
+            {"body": MODULE.comment_body(MODULE.PROCESSED_MARKER, processed)},
+        ]
+        with mock.patch.object(MODULE, "gh", side_effect=[
+            [{"number": 7, "url": "i", "title": "ingress"}], [comments],
+        ]):
+            with self.assertRaisesRegex(ValueError, "processed_material_event_missing"):
+                MODULE.remote_events("private/ingress", "GEN-37")
 
 
 if __name__ == "__main__":

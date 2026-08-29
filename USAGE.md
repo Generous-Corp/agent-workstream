@@ -129,6 +129,11 @@ plugins/workstream/bin/workstreamctl resume GEN-123 \
 # Inspect an older root without claiming authority to continue it.
 plugins/workstream/bin/workstreamctl resume GEN-123 --inspection-only
 
+# Apply a reviewed repository rename/transfer request. The JSON names the exact
+# immutable repository ID and material/projection/scope frontiers.
+plugins/workstream/bin/workstreamctl repository-identity \
+  --request repository-identity.json --apply
+
 # After a current remote checkpoint, create one private Shipyard launch profile.
 install -d -m 700 ~/.local/share/agent-workstream/launch-profiles
 plugins/workstream/bin/workstreamctl shipyard-profile GEN-123 \

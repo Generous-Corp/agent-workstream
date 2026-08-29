@@ -14,10 +14,11 @@ authority or task tracker:
    Claude prompt-event payload.
 2. `capture` first inserts one idempotent event into a mode-0600 local SQLite
    outbox, then attempts a bounded upload to a configured private GitHub issue.
-3. `recover` reads remote capture, bind, and processed markers and deduplicates
-   them by `event_id`.
-4. Only after a separate agent successfully promotes a material change to
-   Linear may `process` append the remote processed marker.
+3. `recover` reads remote capture, bind, promotion-intent, and processed markers
+   and deduplicates them by `event_id`.
+4. A successor stages one reviewed, bounded promotion intent in that private
+   stream, applies its deterministic material event to Linear, verifies the
+   Linear receipt, and only then appends the processed successor marker.
 
 No capture integration ships in v1 because a plugin-cache path is not a stable
 launcher path. A deployment that wants ingress must supply and own a stable
@@ -35,9 +36,10 @@ python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" status
 
 `configure` is a remote mutation: it creates or reuses a private, monthly
 GitHub issue and writes its coordinates to the local mode-0600 config. `capture`
-writes the local outbox and may append a remote comment. `bind`, `unbind`, and
-`process` may append remote comments. `flush` retries pending uploads. None of
-these commands runs during ordinary plugin installation.
+writes the local outbox and may append a remote comment. `bind` and `unbind`
+may append remote comments; `process` refuses mutable classifications. `flush`
+retries pending uploads. None of these commands runs during ordinary plugin
+installation.
 
 ## Identity and recovery
 
@@ -54,15 +56,80 @@ cross-session identity.
 python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" flush
 python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" recover \
   --workstream ABC-123
-python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" process \
-  --repo your-org/private-workstream-ingress --remote-issue 42 --event wsi_... \
-  --disposition promoted --issue ABC-124
+python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" promote \
+  --request reviewed-promotion.json --apply
 ```
 
 An unprocessed event is an open triage obligation, not evidence that its request
 was accepted. Binding fails closed without an exact event, provider session, or
 trusted adapter surface. Correct a mistaken binding with `unbind`; never bind by
 repository cwd.
+
+The reviewed promotion request is exact JSON:
+
+```json
+{
+  "schema_version": 1,
+  "ingress": {
+    "repo": "your-org/private-workstream-ingress",
+    "remote_issue": 42,
+    "event_id": "wsi_...",
+    "prompt_sha256": "<64 lowercase hex>"
+  },
+  "authority": {
+    "workspace_id": "<Linear workspace UUID>",
+    "team_id": "<Linear team UUID>",
+    "project_id": "<Linear project UUID>",
+    "root_issue_id": "<immutable Linear root issue UUID>"
+  },
+  "workstream_id": "ABC-123",
+  "plan_revision": "<authenticated plan source digest, 64 lowercase hex>",
+  "expected_material_revision": 7,
+  "changes": [
+    {"kind": "requirement", "payload": {"text": "...", "acceptance": "..."}}
+  ]
+}
+```
+
+`promote` does not classify prompt text. Without `--apply` it is a zero-write
+preview. With `--apply`, it first appends the immutable promotion intent. If the
+agent or source machine then disappears, a successor needs only the private
+repo, issue, and event identifiers:
+
+```sh
+python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" promote \
+  --repo your-org/private-workstream-ingress --remote-issue 42 \
+  --event wsi_... --apply
+```
+
+Replay reuses one deterministic Linear material-event ID. A crash after the
+Linear mutation but before the processed marker therefore cannot duplicate the
+work, and a crash after the processed marker is a zero-write replay. GitHub does
+not offer client-supplied comment IDs, so simultaneous identical writers may
+append duplicate physical comments; the authenticated reducer treats them as
+one logical marker and refuses conflicting copies.
+
+The promotion identity includes the canonical lowercase GitHub `owner/repo`
+and exact ingress issue number as well as the raw event and immutable Linear
+route. Route-bearing promotion markers use schema version 2; version 1 markers
+are refused because they did not carry that identity. Replaying the same-looking
+event from another repository or issue refuses. Both the reviewed request and the final encoded promotion/processed
+comment envelopes are capped at 16 KiB; expansion during encoding is checked
+before any write. Recovery does not hide a promoted capture until read-only
+Linear validation proves the marker's exact event and receipt.
+
+Material promotion must use `promote`, which proves the immutable Linear event
+and exact receipt before acknowledging the raw event. GitHub issue comments are
+editable and deletable, so `no-material-delta` and `superseded` comments are
+never durable processed authority—even when their body, author login, numeric
+user ID, and timestamps currently look valid. Recovery may expose such a
+comment as bounded nonauthoritative metadata only when it shares the capture's
+physical repo/issue route, but keeps the capture open. Conflicting, malformed,
+orphaned, and cross-route hints neither become routing evidence nor abort the
+remaining inventory. The legacy
+`process` command refuses to publish these classifications until an immutable
+or signed receipt design exists; no signing keys or key-management surface are
+part of the current implementation.
 
 ## Privacy and retention
 

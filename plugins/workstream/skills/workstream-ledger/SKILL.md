@@ -27,6 +27,27 @@ creates a second repository identity. Coordinate-only fallback requires
 explicit redirect-resolution evidence and fails closed when equivalence is
 unproven.
 
+For a GitHub rename or transfer already represented by one projected scope,
+use the no-model `workstreamctl repository-identity --request REQUEST.json
+--apply` path. It authenticates both the exact old coordinate and GitHub's
+returned canonical coordinate, requires the same immutable repository ID, and
+accepts only one redirect hop. The request fences the material revision,
+projection revision, active scope event ID, and scope value digest. It appends
+one scope replacement containing the immutable identity-update event; exact
+replay is a zero-write no-op. A stale frontier, recycled alias, multi-hop
+redirect, or coordinate owned by another repository refuses before mutation.
+The identity writer and material/checkpoint writers serialize through one
+durable Linear boundary reservation. Material work cannot pass a pending
+identity intent; a competing material write that wins the boundary first
+causes the identity update to refuse with zero identity writes.
+Reservations carry the full immutable projection intent and both authenticated
+frontiers. Only an exact deterministic remote slot can block; malformed,
+oversized, arbitrary-ID, or stale-plan markers are quarantined into the next
+frontier. The exact projection event or a durable authenticated successor
+releases the reservation without a time-based lease.
+Chained coordinate history such as A to B to C is intentionally not supported;
+it requires reviewed manual consolidation before this single-hop writer runs.
+
 Neither a provider ID nor a Linear destination is trusted merely because it is
 nonempty. Repository identity includes a timestamped authenticated-provider
 readback binding the immutable ID to the resolved current coordinate; every
@@ -572,8 +593,13 @@ deletion-resistance canary.
      recover --workstream ABC-123
    ```
 
-   Promote each material event into the issue graph, then mark it processed.
-   A repeated event ID is one event. An unprocessed event is evidence that the
+   Classify each material event into one reviewed bounded promotion request,
+   then use `workstream_ingress.py promote --request <json> --apply`. The
+   command durably stages the intent before its deterministic Linear mutation
+   and posts the processed successor only after Linear readback. If the source
+   disappears after staging, resume with `promote --repo <private-repo>
+   --remote-issue <number> --event <wsi-id> --apply`; no source outbox or request
+   file is required. A repeated event ID is one logical event. An unprocessed event is evidence that the
    next agent must triage it, not evidence that the request was accepted.
    A normal plugin installation skips this step and resumes from the last
    durable checkpoint. Do not invoke ingress merely to probe whether it is
@@ -618,9 +644,11 @@ python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" \
   unbind --workstream ABC-123 --session <exact-provider-session-id>
 ```
 
-After triage, post the remote processed marker with `process`; use disposition
-`promoted`, `superseded`, or `no-material-delta`. Never mark an event processed
-before the corresponding Linear mutation succeeds when one is needed.
+After triage, use `promote` for a material event. Never mark a material event
+processed before the promotion path verifies the corresponding immutable
+Linear event and exact receipt. GitHub comments for `superseded` or
+`no-material-delta` are mutable hints only and never suppress an open capture;
+`process` therefore refuses to publish them as durable classifications.
 
 Issue titles must be understandable outside the project view and use a
 plan/workstream-derived prefix. Every issue independently includes the stable
@@ -674,7 +702,8 @@ still cannot be recovered after its source machine disappears. State that
 physical limit honestly.
 
 The ingress is an at-least-once transport, not a second task tracker. Remote
-consumers deduplicate by `event_id`; Linear holds the promoted business logic.
+consumers deduplicate capture by `event_id` and promotion by its deterministic
+promotion/material-event IDs; Linear holds the promoted business logic.
 Local remote-acknowledged rows rotate after 30 days, remote issues rotate by
 machine/month, prompts are capped at 16 KiB, and documented credential patterns
 are sanitized. See [durable ingress](references/durable-ingress.md) for the

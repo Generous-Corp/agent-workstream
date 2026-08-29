@@ -34,6 +34,8 @@ from workstream_linear_events import (
     COMMENT_CREATE_CAPABILITY_QUERY,
     COMMENT_CREATE_MUTATION,
     COMMENTS_QUERY,
+    assert_no_pending_ledger_reservation,
+    ledger_serialization_frontier,
     ledger_boundary_slot_id,
     reduce_event_comments,
 )
@@ -376,6 +378,11 @@ class LinearCheckpointAdapter:
 
         material = reduce_event_comments(comments, workstream_id=self.workstream_id)
         self._validate_material_history(before, material.revision)
+        assert_no_pending_ledger_reservation(
+            comments, workstream_id=self.workstream_id,
+            authenticated_route=self._observed_authority,
+            current_plan_revision=checkpoint["plan_revision"],
+        )
 
         current = generations.get(checkpoint["plan_revision"])
         expected_predecessor = (
@@ -400,7 +407,13 @@ class LinearCheckpointAdapter:
             )
         if self._observed_authority is None:
             raise LinearCheckpointError("comment_slot_authority_incomplete")
-        frontier = sorted(item["event_id"] for item in before.checkpoints)
+        frontier = ledger_serialization_frontier(
+            sorted(item["event_id"] for item in before.checkpoints), comments,
+            workstream_id=self.workstream_id,
+            authenticated_route=self._observed_authority,
+            current_plan_revision=checkpoint["plan_revision"],
+            material_revision=material.revision,
+        )
         slot_id = ledger_boundary_slot_id(
             self.workstream_id, material.revision, frontier,
             self._observed_authority,
