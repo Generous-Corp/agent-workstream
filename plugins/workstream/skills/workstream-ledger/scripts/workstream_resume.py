@@ -258,6 +258,27 @@ def _validate_child_route(
         raise ResumeError(f"child_route_mismatch:{token}:project_id")
 
 
+def _recover_checkpoint_generations(
+    checkpoints: list[dict[str, Any]], token: str, *, error_prefix: str,
+) -> dict[str, dict[str, Any]]:
+    """Validate every immutable plan generation and return each chain tip."""
+    generations: dict[str, list[dict[str, Any]]] = {}
+    for checkpoint in checkpoints:
+        revision = checkpoint.get("plan_revision")
+        if not isinstance(revision, str) or not revision:
+            raise ResumeError(f"{error_prefix}:{token}:invalid_plan_revision")
+        generations.setdefault(revision, []).append(checkpoint)
+    recovered: dict[str, dict[str, Any]] = {}
+    for revision, records in generations.items():
+        try:
+            recovered[revision] = recover_latest(
+                records, token, expected_plan_revision=revision,
+            )
+        except CheckpointError as error:
+            raise ResumeError(f"{error_prefix}:{token}:{error}") from error
+    return recovered
+
+
 def add_child_material_history(
     snapshot: dict[str, Any], child_comments: dict[str, list[dict[str, Any]]],
     *, authenticated_route: dict[str, str],
@@ -291,6 +312,10 @@ def add_child_material_history(
             result["children"].append(child)
             continue
         events = [_event_record(event) for event in event_log.events]
+        checkpoints = list(checkpoint_log.checkpoints)
+        recovered_generations = _recover_checkpoint_generations(
+            checkpoints, token, error_prefix="invalid_child_checkpoint_history",
+        )
         current_checkpoints = [
             checkpoint for checkpoint in checkpoint_log.checkpoints
             if checkpoint["plan_revision"] == plan_revision
@@ -298,9 +323,7 @@ def add_child_material_history(
         stale_checkpoint_count = len(checkpoint_log.checkpoints) - len(current_checkpoints)
         latest_checkpoint = None
         if current_checkpoints:
-            latest_checkpoint = recover_latest(
-                current_checkpoints, token, expected_plan_revision=plan_revision,
-            )
+            latest_checkpoint = recovered_generations[plan_revision]
             if latest_checkpoint["root_revision"] > event_log.revision:
                 raise ResumeError(
                     f"child_checkpoint_ahead_of_material_event_log:{token}"
@@ -308,7 +331,7 @@ def add_child_material_history(
         child["issue_next_action"] = child.get("next_action")
         child["material_events"] = events
         child["material_event_revision"] = event_log.revision
-        child["checkpoint_history"] = list(checkpoint_log.checkpoints)
+        child["checkpoint_history"] = checkpoints
         child["latest_checkpoint"] = latest_checkpoint
         child["checkpoint_recovery"] = {
             "state": (
@@ -479,6 +502,10 @@ def add_material_history(
     result["root"]["issue_revision"] = result["root"].get("revision", 0)
     result["root"]["revision"] = event_log.revision
     result["latest_checkpoint"] = None
+    checkpoints = list(checkpoint_log.checkpoints)
+    recovered_generations = _recover_checkpoint_generations(
+        checkpoints, token, error_prefix="invalid_checkpoint_history",
+    )
     current_checkpoints = [
         checkpoint for checkpoint in checkpoint_log.checkpoints
         if checkpoint["plan_revision"] == result["root"].get("plan_revision")
@@ -493,10 +520,9 @@ def add_material_history(
         "stale_plan_count": stale_checkpoint_count,
     }
     if current_checkpoints:
-        result["latest_checkpoint"] = recover_latest(
-            current_checkpoints, token,
-            expected_plan_revision=result["root"].get("plan_revision"),
-        )
+        result["latest_checkpoint"] = recovered_generations[
+            result["root"].get("plan_revision")
+        ]
         if result["latest_checkpoint"]["root_revision"] > event_log.revision:
             raise ResumeError("checkpoint_ahead_of_material_event_log")
     result["root"]["next_action"] = _resolved_next_action(
@@ -704,6 +730,10 @@ def validate_snapshot(
                     )
                 if checkpoint_keys != sorted(checkpoint_keys):
                     raise ResumeError(f"unordered_child_checkpoint_history:{key}")
+                recovered_generations = _recover_checkpoint_generations(
+                    checkpoint_history, key,
+                    error_prefix="invalid_child_checkpoint_history",
+                )
                 current_checkpoints = [
                     checkpoint for checkpoint in checkpoint_history
                     if checkpoint["plan_revision"] == root["plan_revision"]
@@ -714,15 +744,7 @@ def validate_snapshot(
                 ):
                     raise ResumeError(f"child_checkpoint_history_count_mismatch:{key}")
                 if current_checkpoints:
-                    try:
-                        recovered = recover_latest(
-                            current_checkpoints, key,
-                            expected_plan_revision=root["plan_revision"],
-                        )
-                    except CheckpointError as error:
-                        raise ResumeError(
-                            f"invalid_child_checkpoint_history:{key}:{error}"
-                        ) from error
+                    recovered = recovered_generations[root["plan_revision"]]
                     if recovered != child.get("latest_checkpoint"):
                         raise ResumeError(f"child_checkpoint_history_tip_mismatch:{key}")
                 elif child.get("latest_checkpoint") is not None:

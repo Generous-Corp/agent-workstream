@@ -238,6 +238,37 @@ class ResumeTests(unittest.TestCase):
                 enriched, "GEN-37", include_history=True, max_items=10,
             )
 
+    def test_child_stale_checkpoint_generation_must_be_a_complete_chain(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        snapshot = self.live_snapshot(self.snapshot(), route)
+        truncated = build_checkpoint(
+            workstream_id="GEN-38", boundary_id="stale-truncated",
+            root_revision=2, plan_revision="old-sha",
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai",
+                "session_id": "old-session", "machine": "M3",
+                "worktree": {"state": "unknown"},
+            },
+            exact_head=None, evidence=[], blocker=None,
+            next_action="obsolete action",
+            predecessor_event_id="missing-predecessor",
+        )
+        snapshot["child_comments"]["GEN-38"] = [{
+            "id": "stale-truncated", "body": encode_checkpoint_comment(truncated),
+        }]
+
+        with self.assertRaisesRegex(
+            MODULE.ResumeError,
+            "invalid_child_checkpoint_history:GEN-38:checkpoint_chain_truncated",
+        ):
+            MODULE.add_child_material_history(
+                snapshot, snapshot["child_comments"], authenticated_route=route,
+            )
+
     def test_legacy_string_child_blocker_is_preserved_as_structured_state(self):
         route = {
             "workspace_id": "workspace", "team_id": "team",
@@ -605,6 +636,29 @@ class ResumeTests(unittest.TestCase):
             context["checkpoint_recovery"],
             {"state": "stale_plan", "stale_plan_count": 1},
         )
+
+    def test_stale_root_checkpoint_generation_must_be_a_complete_chain(self):
+        checkpoint = build_checkpoint(
+            workstream_id="GEN-37", boundary_id="old-plan-truncated",
+            root_revision=2, plan_revision="old-sha",
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai",
+                "session_id": "old-session", "machine": "M3",
+                "worktree": {"state": "unknown"},
+            },
+            exact_head=None, evidence=[], blocker=None, next_action="obsolete",
+            predecessor_event_id="missing-predecessor",
+        )
+        with self.assertRaisesRegex(
+            MODULE.ResumeError,
+            "invalid_checkpoint_history:GEN-37:checkpoint_chain_truncated",
+        ):
+            MODULE.add_material_history(
+                self.snapshot(), [{
+                    "id": "old-checkpoint", "body": encode_checkpoint_comment(checkpoint),
+                }], "GEN-37",
+            )
 
     def test_checkpoint_cannot_claim_unrecorded_material_revision(self):
         checkpoint = build_checkpoint(
