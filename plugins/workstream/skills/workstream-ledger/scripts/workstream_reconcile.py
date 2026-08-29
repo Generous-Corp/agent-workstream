@@ -25,19 +25,20 @@ from workstream_config import load_linear_api_key, resolve_linear_route
 from workstream_http import default_ssl_context
 from workstream_linear import (
     HttpGraphQLClient, LinearGraphQLTransport, LinearTransportError,
-    parse_plan_revision, resolve_authenticated_issue_route,
+    resolve_authenticated_issue_route,
 )
 from workstream_linear_events import LinearCommentEventAdapter
 from workstream_linear_projection import (
     build_projection_event, LinearProjectionAdapter, LinearProjectionError,
-    reduce_projection_comments, TOMBSTONE,
+    TOMBSTONE,
 )
 from workstream_plan import plan_payload
 from workstream_projection import stable_live_readback
 from workstream_resume import (
     add_material_history, closure_snapshot_digest, extract_token, ResumeError,
 )
-from workstream_scope import relation_target_key, repository_key
+from workstream_relation_readback import add_relation_target_readback
+from workstream_scope import repository_key
 
 
 OID = re.compile(r"[0-9a-f]{40}")
@@ -48,15 +49,6 @@ SAFE_COMMAND_ENV = {
     "PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT",
     "TMP", "TEMP", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
 }
-RELATION_TARGET_QUERY = """
-query WorkstreamRelationTarget($issueId: String!) {
-  issue(id: $issueId) {
-    id identifier description
-    team { id organization { id } }
-    project { id }
-  }
-}
-"""
 
 
 class ReconcileError(RuntimeError):
@@ -366,70 +358,6 @@ def parse_repository_bindings(args: argparse.Namespace) -> list[dict[str, Any]]:
     if len(keys) != len(set(keys)):
         raise ReconcileError("duplicate_repository_binding")
     return bindings
-
-
-def read_relation_targets(
-    client: HttpGraphQLClient, relations: list[dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    """Resolve every immutable target and reduce its complete peer-edge state."""
-    resolved: dict[str, dict[str, Any]] = {}
-    for relation in relations:
-        if not isinstance(relation, dict) or not isinstance(relation.get("target"), dict):
-            raise ReconcileError("invalid_relation_target")
-        target = relation["target"]
-        key = relation_target_key(target)
-        if key in resolved:
-            continue
-        response = client.execute(
-            RELATION_TARGET_QUERY, {"issueId": target.get("issue_id")}
-        )
-        issue = response.get("issue") if isinstance(response, dict) else None
-        team = issue.get("team") if isinstance(issue, dict) else None
-        workspace_id = ((team or {}).get("organization") or {}).get("id")
-        if (
-            not isinstance(issue, dict)
-            or issue.get("id") != target.get("issue_id")
-            or issue.get("identifier") != target.get("identifier")
-            or workspace_id != target.get("workspace_id")
-        ):
-            raise ReconcileError(f"dangling_relation_target:{target.get('identifier')}")
-        team_id = (team or {}).get("id")
-        project_id = (issue.get("project") or {}).get("id")
-        plan_revision = parse_plan_revision(issue.get("description"))
-        if not all(isinstance(item, str) and item for item in (
-            team_id, project_id, plan_revision,
-        )):
-            raise ReconcileError(
-                f"relation_target_readback_incomplete:{target.get('identifier')}"
-            )
-        route = {
-            "workspace_id": workspace_id, "team_id": team_id,
-            "project_id": project_id, "root_issue_id": issue["id"],
-        }
-        comments = LinearCommentEventAdapter(
-            client, issue_id=issue["identifier"], workspace_id=workspace_id,
-            team_id=team_id, project_id=project_id,
-        ).comments()
-        projection = reduce_projection_comments(
-            comments, workstream_id=issue["identifier"],
-            expected_plan_revision=plan_revision, authenticated_route=route,
-        ).snapshot
-        resolved[key] = {
-            "workspace_id": workspace_id, "issue_id": issue["id"],
-            "identifier": issue["identifier"],
-            "relations": projection.get("relations") or [],
-        }
-    return resolved
-
-
-def add_relation_target_readback(
-    snapshot: dict[str, Any], client: HttpGraphQLClient,
-) -> dict[str, Any]:
-    value = deepcopy(snapshot)
-    relations = value.get("relations") or []
-    if relations:
-        value["relation_targets"] = read_relation_targets(client, relations)
-    return value
 
 
 def _active_lifecycle(state: Any) -> dict[str, Any] | None:

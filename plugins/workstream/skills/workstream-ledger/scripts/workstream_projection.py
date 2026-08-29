@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
@@ -23,7 +24,9 @@ from workstream_linear_projection import (
     build_projection_event, LinearProjectionAdapter, LinearProjectionError, TOMBSTONE,
 )
 from workstream_plan import plan_payload
+from workstream_relation_readback import read_relation_targets
 from workstream_resume import add_material_history, compact_context, extract_token, ResumeError
+from workstream_scope import ScopeError, validate_relation_graph
 from workstream_successor import choose_disposition, SuccessorError
 
 
@@ -234,6 +237,9 @@ def reconcile_required_projection(
     adapter: LinearProjectionAdapter, snapshot: dict[str, Any],
     manifest: dict[str, Any], *, remote_head: str, created_at: str,
     authenticated_source: dict[str, Any],
+    relation_target_resolver: (
+        Callable[[list[dict[str, Any]]], dict[str, dict[str, Any]]] | None
+    ) = None,
 ) -> dict[str, Any]:
     """Append only missing/changed values and verify the complete current view."""
     if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", remote_head):
@@ -320,6 +326,33 @@ def reconcile_required_projection(
         retirements.append({
             "kind": identity[0], "key": identity[1], "value": TOMBSTONE,
         })
+
+    effective_relations = {
+        key: deepcopy(event["value"])
+        for (kind, key), event in active_heads.items()
+        if kind == "relation"
+    }
+    effective_relations.update({
+        key: deepcopy(value)
+        for (kind, key), value in desired_by_identity.items()
+        if kind == "relation"
+    })
+    for retirement in retirements:
+        if retirement["kind"] == "relation":
+            effective_relations.pop(retirement["key"], None)
+    if effective_relations:
+        if relation_target_resolver is None:
+            raise LinearProjectionError("relation_target_readback_required")
+        relations = [effective_relations[key] for key in sorted(effective_relations)]
+        try:
+            validate_relation_graph(
+                relations, root_id=adapter.workstream_id,
+                workspace_id=adapter.workspace_id,
+                root_issue_id=adapter.root_issue_id,
+                resolve_target=relation_target_resolver(relations),
+            )
+        except ScopeError as error:
+            raise LinearProjectionError(str(error)) from error
 
     for item in [*desired, *retirements]:
         build_projection_event(
@@ -518,6 +551,9 @@ def main() -> int:
         snapshot = add_material_history(
             graph, comments, token, authenticated_route=route,
             authenticated_source=authenticated_source,
+            relation_target_resolver=lambda relations: read_relation_targets(
+                client, relations,
+            ),
         )
         adapter = LinearProjectionAdapter(
             client, issue_id=token, workstream_id=token,
@@ -529,6 +565,9 @@ def main() -> int:
             adapter, snapshot, manifest, remote_head=args.remote_head,
             created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             authenticated_source=authenticated_source,
+            relation_target_resolver=lambda relations: read_relation_targets(
+                client, relations,
+            ),
         )
         # Double-collect graph and comments so a concurrent root/child/checkpoint
         # mutation cannot be certified from a mixed pre/post-write snapshot.
@@ -542,6 +581,9 @@ def main() -> int:
         verified = add_material_history(
             graph_after, comments_after, token, authenticated_route=route,
             authenticated_source=authenticated_source,
+            relation_target_resolver=lambda relations: read_relation_targets(
+                client, relations,
+            ),
         )
         context = compact_context(
             verified, token, max_bytes=args.max_bytes, max_items=args.max_items,

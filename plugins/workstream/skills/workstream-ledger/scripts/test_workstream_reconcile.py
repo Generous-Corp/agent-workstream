@@ -20,9 +20,10 @@ from workstream_linear_projection import (
 )
 from workstream_reconcile import (
     _bounded_command, canonical_digest, github_token_from_command, GitHubTruthReader,
-    parse_repository_bindings, read_relation_targets, ReconcileError, reconcile_lifecycle,
+    parse_repository_bindings, ReconcileError, reconcile_lifecycle,
     ShipyardTruthReader,
 )
+from workstream_relation_readback import read_relation_targets
 from workstream_resume import (
     add_material_history, closure_snapshot_digest, compact_context, ResumeError,
 )
