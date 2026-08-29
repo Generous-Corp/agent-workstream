@@ -32,6 +32,7 @@ from workstream_resume import (
 from workstream_relation_readback import RelationReadbackError
 import workstream_projection
 import workstream_linear_projection as projection_module
+import workstream_resume as resume_module
 from workstream_projection import (
     load_material_history_for_projection_reconcile, projection_review_contract,
     prepare_terminal_child_evidence_seeds, prepare_terminal_child_repairs,
@@ -775,6 +776,10 @@ class ProjectionTests(unittest.TestCase):
         ).encode()
         self.assertLessEqual(len(encoded), int(14.5 * 1024))
         self.assertEqual(context["resume_authority"], "full")
+        self.assertEqual(context["context_schema"], {
+            "name": "agent-workstream.resume-context", "version": 2,
+            "representation": "compact_validated",
+        })
         self.assertEqual(
             [child["identifier"] for child in context["children"]],
             ["GEN-43", "GEN-85"],
@@ -795,9 +800,11 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(len(context["child_closures"]), 5)
         self.assertEqual(len(context["evidence_contracts"]), 5)
         for closure in context["child_closures"]:
-            self.assertEqual(closure["representation"], "compact_validated")
             self.assertNotIn("child_issue_id", closure)
             self.assertNotIn("evidence_heads", closure)
+            self.assertIn("assignee_id", closure)
+            self.assertEqual(closure["state_name"], "Done")
+            self.assertEqual(closure["state_type"], "completed")
             self.assertEqual(closure["evidence_head_count"], 1)
             self.assertRegex(closure["evidence_heads_sha256"], r"^[0-9a-f]{64}$")
             self.assertRegex(
@@ -805,7 +812,6 @@ class ProjectionTests(unittest.TestCase):
             )
         for compact, complete in zip(context["evidence_contracts"], contracts):
             self.assertNotIn("layers", compact)
-            self.assertEqual(compact["representation"], "compact_validated")
             self.assertEqual(compact["contract_sha256"], canonical_digest(complete))
             self.assertEqual(compact["exact_head"], HEAD)
             self.assertEqual(compact["receipt_count"], 5)
@@ -834,6 +840,7 @@ class ProjectionTests(unittest.TestCase):
             require_projection_authority=True, include_history=True,
         )
         self.assertEqual(full["evidence_contracts"], contracts)
+        self.assertEqual(full["context_schema"]["representation"], "full_validated")
         self.assertIn("layers", full["evidence_contracts"][0])
         self.assertIsInstance(full["provenance"], list)
         self.assertIn("description", full["children"][0])
@@ -854,6 +861,89 @@ class ProjectionTests(unittest.TestCase):
                 tampered, "GEN-37", max_bytes=16 * 1024, max_items=100,
                 require_projection_authority=True,
             )
+
+    def test_authoritative_compaction_requires_exact_projection_heads(self):
+        strict, _contracts = self.gen37_production_shaped_fixture()
+        with mock.patch.object(
+            resume_module, "_projection_head_for_value", return_value=None,
+        ), self.assertRaisesRegex(
+            ResumeError, "evidence_compaction_projection_head_missing",
+        ):
+            compact_context(
+                strict, "GEN-37", max_bytes=16 * 1024, max_items=100,
+                require_projection_authority=True,
+            )
+        with self.assertRaisesRegex(
+            ResumeError, "child_closure_compaction_projection_head_missing",
+        ):
+            resume_module._compact_child_closures(
+                strict["child_closures"], [], require_projection_authority=True,
+            )
+
+    def test_evidence_key_must_equal_slice_id(self):
+        contract = evidence_contract()
+        with self.assertRaisesRegex(
+            LinearProjectionError, "projection_evidence_key_mismatch",
+        ):
+            build_projection_event(
+                workstream_id="GEN-37", kind="evidence_contract",
+                key="different-projection-key", value=contract,
+                plan_revision=PLAN, expected_revision=0,
+                created_at="2026-08-29T20:00:00Z", authority=AUTHORITY,
+            )
+
+    def test_closure_unknown_field_and_digest_mutation_refuse(self):
+        strict, _contracts = self.gen37_production_shaped_fixture()
+        closure = deepcopy(strict["child_closures"][0])
+        closure["unexpected"] = "must refuse"
+        with self.assertRaisesRegex(
+            LinearProjectionError, "invalid_projection_child_closure",
+        ):
+            build_projection_event(
+                workstream_id="GEN-37", kind="child_closure",
+                key=closure["child_identifier"], value=closure,
+                plan_revision=PLAN, expected_revision=0,
+                created_at="2026-08-29T20:00:00Z", authority=AUTHORITY,
+            )
+
+        tampered = deepcopy(strict)
+        tampered["child_closures"][0]["child_readback_sha256"] = "0" * 64
+        with self.assertRaisesRegex(
+            ResumeError, "projection_current_view_mismatch:child_closures",
+        ):
+            compact_context(
+                tampered, "GEN-37", max_bytes=16 * 1024, max_items=100,
+                require_projection_authority=True,
+            )
+
+    def test_compact_provenance_uses_projection_order_not_canonical_value_order(self):
+        older = {
+            "agent": "zeta", "machine": "M5", "session_id": "older",
+            "worktree": {"state": "safe", "head": HEAD},
+        }
+        later = {
+            "agent": "alpha", "machine": "M3", "session_id": "later",
+            "worktree": {"state": "safe", "head": HEAD},
+        }
+        items = sorted(
+            [older, later],
+            key=lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")),
+        )
+        self.assertEqual(items[-1]["session_id"], "older")
+        projection_events = [
+            {"kind": "provenance", "key": "older", "event_id": "event-old",
+             "value": older},
+            {"kind": "provenance", "key": "later", "event_id": "event-new",
+             "value": later},
+        ]
+        compact = resume_module._compact_provenance(
+            items, projection_events, scope(),
+        )
+        self.assertEqual(compact["latest"]["session_id"], "later")
+        self.assertEqual(compact["latest_projection_head"], {
+            "key": "later", "event_id": "event-new",
+            "value_sha256": canonical_digest(later),
+        })
 
     def test_multi_terminal_repair_is_ordered_full_and_idempotent(self):
         client, adapter, source, graph, _children, stale_manifest = (
@@ -989,6 +1079,8 @@ class ProjectionTests(unittest.TestCase):
             if closure["child_identifier"] == "GEN-70"
         )
         self.assertIsNone(gen70["assignee_id"])
+        self.assertEqual(gen70["state_name"], "Done")
+        self.assertEqual(gen70["state_type"], "completed")
         self.assertEqual(context["resume_authority"], "full")
 
     def test_terminal_readback_distinguishes_unassigned_from_missing_field(self):
@@ -3120,7 +3212,8 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(context["choice_events"][0]["choice_id"], "choice-comment-authority")
         self.assertEqual(context["evidence_contracts"][0]["owning_child"], "GEN-38")
         self.assertEqual(context["source"]["sha256"], PLAN)
-        self.assertEqual(context["provenance"]["latest"]["machine"], "M5")
+        self.assertIsNone(context["provenance"]["latest"])
+        self.assertIsNone(context["provenance"]["latest_projection_head"])
         self.assertEqual(context["provenance"]["count"], 1)
         self.assertRegex(context["provenance"]["sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(context["projection_revision"], 7)

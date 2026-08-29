@@ -358,14 +358,19 @@ source identity. `--plan-source` overrides the fetch location for an
 authenticated checkout; `--plan-identity` preserves its durable identity. It
 refuses success unless those exact bytes match the root and projection.
 The default bounded context validates the complete Linear history, preserves
-current child details and exact uncheckpointed requirements, blockers,
-decisions, and follow-ups, keeps actionable checkpoint evidence and routing,
-then returns digests/counts for acknowledged history and validated routing
-evidence instead of duplicating them into every agent prompt.
+current child identity, status, next action, blockers, worktree/checkpoint
+identity, and exact uncheckpointed requirements, decisions, and follow-ups.
+Its `context_schema` is `agent-workstream.resume-context` version 2 with
+`representation: compact_validated`; verbose descriptions, receipt bodies,
+checkpoint evidence, provenance, and terminal readbacks are represented by
+counts, digests, exact repository heads, and active projection-head bindings
+instead of being duplicated into every agent prompt.
 After initial bounded recovery, an explicitly requested audit or closure pass
 may use a second `--include-history` invocation and raise the explicit byte/item
-caps when that complete history is known to exceed the normal resume budget;
-required current state is never truncated.
+caps when that complete history is known to exceed the normal resume budget.
+That response uses the same schema version with `representation:
+full_validated` and preserves the complete validated values; required current
+state is never truncated.
 For an immutable `github.com/.../blob/<40-hex-commit>/<path>` source, HTTPS is
 tried first; a 404 may fall back to existing noninteractive GitHub SSH access
 in a temporary isolated repository. A synchronized living plan may use the

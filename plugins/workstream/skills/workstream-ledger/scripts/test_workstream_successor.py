@@ -14,6 +14,31 @@ class SuccessorTests(unittest.TestCase):
         snapshot = {"root": {"identifier": "GEN-37"}, "provenance": {"worktree": {"state": "safe", "head": "abc"}}}
         self.assertEqual(choose_disposition(snapshot, remote_head="abc")["disposition"], "attach")
 
+    def test_compact_provenance_requires_projection_bound_latest(self):
+        head = "a" * 40
+        snapshot = {
+            "root": {"identifier": "GEN-37"},
+            "context_schema": {
+                "name": "agent-workstream.resume-context", "version": 2,
+                "representation": "compact_validated",
+            },
+            "provenance": {
+                "latest": {"worktree": {"state": "safe", "head": head}},
+                "latest_projection_head": {
+                    "key": "session", "event_id": "event",
+                    "value_sha256": "b" * 64,
+                },
+            },
+        }
+        self.assertEqual(
+            choose_disposition(snapshot, remote_head=head)["disposition"], "attach",
+        )
+        snapshot["provenance"]["latest_projection_head"] = None
+        self.assertEqual(
+            choose_disposition(snapshot, remote_head=head)["disposition"],
+            "create_successor",
+        )
+
     def test_recovered_checkpoint_is_the_worktree_authority(self):
         snapshot = {
             "root": {"identifier": "GEN-37"},

@@ -29,8 +29,8 @@ variable.
 
 Before repository, memory, worktree, PR, or plan exploration, run that command
 exactly once. Do not probe `workstreamctl` on `PATH`. Never add
-`--include-history` during initial recovery. The default helper validates full
-history while returning bounded current authority.
+`--include-history` during initial recovery. The default validates full history
+and returns `context_schema` v2 `compact_validated` authority.
 
 If recovery refuses, report its exact error and stop. Do not fall back to local
 context or load the lifecycle skill. Success requires `resume_authority` to be

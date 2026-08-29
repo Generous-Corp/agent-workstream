@@ -62,7 +62,16 @@ def choose_disposition(snapshot: dict[str, Any], *, remote_head: str | None = No
         worktree = (candidates[0] if candidates else {}).get("worktree") or {}
         recovered_from = None
     elif isinstance(provenance, dict):
-        worktree = provenance.get("worktree") or {}
+        compact_latest = provenance.get("latest")
+        if (
+            (snapshot.get("context_schema") or {}).get("representation")
+            == "compact_validated"
+            and isinstance(compact_latest, dict)
+            and isinstance(provenance.get("latest_projection_head"), dict)
+        ):
+            worktree = compact_latest.get("worktree") or {}
+        else:
+            worktree = provenance.get("worktree") or {}
         recovered_from = None
     else:
         worktree = {}

@@ -47,7 +47,9 @@ from workstream_child_closure import (
     canonical_digest, evidence_receipts_sha256, terminal_child_readback,
     ChildClosureError,
 )
-from workstream_scope import repository_key, ScopeError, validate_relations, validate_scope
+from workstream_scope import (
+    is_full_oid, repository_key, ScopeError, validate_relations, validate_scope,
+)
 
 
 TOKEN = re.compile(r"\b[A-Z][A-Z0-9]*-\d+\b", re.I)
@@ -513,6 +515,7 @@ def _projection_head_for_value(
 
 def _compact_evidence_contracts(
     contracts: list[dict[str, Any]], projection_events: list[dict[str, Any]],
+    *, require_projection_authority: bool,
 ) -> list[dict[str, Any]]:
     """Return digest-bound routing facts without embedding receipt prose.
 
@@ -531,7 +534,6 @@ def _compact_evidence_contracts(
                 "slice_id", "owning_child", "repository_key", "exact_head",
             )
         }
-        summary["representation"] = "compact_validated"
         summary["receipt_count"] = sum(
             len(layer.get("receipts", []))
             for layer in contract["layers"].values()
@@ -542,6 +544,10 @@ def _compact_evidence_contracts(
             contract, active_heads,
             f"evidence_compaction:{contract['slice_id']}",
         )
+        if require_projection_authority and head is None:
+            raise ResumeError(
+                f"evidence_compaction_projection_head_missing:{contract['slice_id']}"
+            )
         if head is not None:
             # Do not infer that a projection key equals slice_id.  The exact
             # active event tuple is what closure authority binds.
@@ -552,6 +558,7 @@ def _compact_evidence_contracts(
 
 def _compact_child_closures(
     closures: list[dict[str, Any]], projection_events: list[dict[str, Any]],
+    *, require_projection_authority: bool,
 ) -> list[dict[str, Any]]:
     active_heads = _active_projection_heads(projection_events, "child_closure")
     result = []
@@ -560,11 +567,9 @@ def _compact_child_closures(
             key: closure[key]
             for key in (
                 "child_identifier", "repository_key", "exact_head",
-                "child_readback_sha256",
-                "evidence_receipts_sha256",
+                "assignee_id", "state_name", "state_type", "child_readback_sha256",
             )
         }
-        summary["representation"] = "compact_validated"
         summary["evidence_head_count"] = len(closure["evidence_heads"])
         summary["evidence_heads_sha256"] = canonical_digest(
             closure["evidence_heads"]
@@ -573,6 +578,11 @@ def _compact_child_closures(
             closure, active_heads,
             f"child_closure_compaction:{closure['child_identifier']}",
         )
+        if require_projection_authority and head is None:
+            raise ResumeError(
+                "child_closure_compaction_projection_head_missing:"
+                + closure["child_identifier"]
+            )
         if head is not None:
             summary["projection_head"] = head
         result.append(summary)
@@ -606,20 +616,55 @@ def _compact_child(child: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _compact_provenance(items: list[dict[str, Any]]) -> dict[str, Any]:
+def _compact_provenance(
+    items: list[dict[str, Any]], projection_events: list[dict[str, Any]],
+    scope: dict[str, Any] | None,
+) -> dict[str, Any]:
     encoded = json.dumps(
         items, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode()
-    latest = items[-1] if items else None
+    active: dict[str, tuple[int, dict[str, Any]]] = {}
+    for index, event in enumerate(projection_events):
+        if event.get("kind") != "provenance":
+            continue
+        key = event.get("key")
+        if not isinstance(key, str):
+            continue
+        if event.get("value") == TOMBSTONE:
+            active.pop(key, None)
+        else:
+            active[key] = (index, event)
+    valid_heads = {
+        repository.get("exact_head")
+        for repository in (scope or {}).get("repositories", [])
+    }
+    item_digests = {canonical_digest(item) for item in items}
+    bound = []
+    for candidate in active.values():
+        value = candidate[1]["value"]
+        worktree = value.get("worktree") if isinstance(value, dict) else None
+        if (
+            isinstance(worktree, dict)
+            and is_full_oid(str(worktree.get("head") or ""))
+            and worktree.get("head") in valid_heads
+            and canonical_digest(value) in item_digests
+        ):
+            bound.append(candidate)
+    latest_event = max(bound, default=None, key=lambda item: item[0])
+    latest = latest_event[1]["value"] if latest_event is not None else None
     return {
-        "representation": "compact_validated",
         "count": len(items),
         "sha256": hashlib.sha256(encoded).hexdigest(),
         "latest": ({
             key: latest[key]
             for key in ("agent", "machine", "session_id", "worktree")
             if latest.get(key) is not None
-        } if latest else None),
+        } if latest is not None else None),
+        "latest_projection_head": ({
+            "key": latest_event[1]["key"],
+            "event_id": latest_event[1]["event_id"],
+            "value_sha256": canonical_digest(latest),
+        } if latest is not None else None),
     }
 
 
@@ -1380,6 +1425,13 @@ def compact_context(
         clean["material_events"], checkpoint_revision,
     )
     context = {
+        "context_schema": {
+            "name": "agent-workstream.resume-context",
+            "version": 2,
+            "representation": (
+                "full_validated" if include_history else "compact_validated"
+            ),
+        },
         "workstream_id": root["identifier"].upper(),
         "context_url": root["url"],
         "plan_revision": root["plan_revision"],
@@ -1397,18 +1449,22 @@ def compact_context(
             clean["evidence_contracts"] if include_history
             else _compact_evidence_contracts(
                 clean["evidence_contracts"], clean["projection_events"],
+                require_projection_authority=require_projection_authority,
             )
         ),
         "child_closures": (
             clean["child_closures"] if include_history
             else _compact_child_closures(
                 clean["child_closures"], clean["projection_events"],
+                require_projection_authority=require_projection_authority,
             )
         ),
         "surface_availability": clean["surface_availability"],
         "provenance": (
             clean["provenance"] if include_history
-            else _compact_provenance(clean["provenance"])
+            else _compact_provenance(
+                clean["provenance"], clean["projection_events"], clean["scope"],
+            )
         ),
         "material_event_revision": clean["material_event_revision"],
         "latest_checkpoint": (
