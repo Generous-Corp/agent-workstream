@@ -45,7 +45,10 @@ Capture may receive generic `WORKSTREAM_ID`, `WORKSTREAM_SURFACE_ID`, and
 `WORKSTREAM_WORKSPACE_ID` environment values. Provider session IDs and explicit
 `--event`, `--session`, or `--surface` values are also accepted. Compatibility
 inputs such as cmux surface variables may be used by an optional adapter, but
-cwd is never a workstream identity.
+cwd is never a workstream identity. Herdr public IDs are scoped to one socket:
+an adapter must bind `HERDR_PANE_ID`/`HERDR_WORKSPACE_ID` to a digest of the
+inherited `HERDR_SOCKET_PATH` and must never persist a bare `w1:p1` or `w1` as a
+cross-session identity.
 
 ```sh
 python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" flush
@@ -87,6 +90,7 @@ remote-repository default.
 ## Optional adapters
 
 Session managers may provide stable surface identity and continuation UX.
-Landing controllers may provide exact-head ownership and receipts. cmux and
-Shipyard are examples; neither is required, auto-detected, or an authority for
-the Linear workstream graph.
+Landing controllers may provide exact-head ownership and receipts. cmux, Herdr,
+and Shipyard are examples; none is required or an authority for the Linear
+workstream graph. Herdr is detected only through its explicit inherited
+environment, never by probing a focused/default session.

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Safely carry one workstream token in an existing cmux tab title."""
+"""Safely carry one workstream token in an existing session-manager tab."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -72,20 +73,25 @@ def plan_title(before: str, token: str) -> tuple[str, str]:
 
 def _run(
     runner: Runner, argv: Sequence[str], *, allow_unavailable: bool = False,
+    environment: Mapping[str, str] | None = None,
+    command_error: str = "cmux_command_failed",
 ) -> subprocess.CompletedProcess[str] | None:
     try:
-        result = runner(
-            list(argv), stdin=subprocess.DEVNULL, capture_output=True, text=True,
-            timeout=TIMEOUT_SECONDS, check=False,
-        )
+        options: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL, "capture_output": True, "text": True,
+            "timeout": TIMEOUT_SECONDS, "check": False,
+        }
+        if environment is not None:
+            options["env"] = dict(environment)
+        result = runner(list(argv), **options)
     except (OSError, subprocess.TimeoutExpired) as error:
         if allow_unavailable:
             return None
-        raise TabTitleError("cmux_command_failed") from error
+        raise TabTitleError(command_error) from error
     if result.returncode != 0:
         if allow_unavailable:
             return None
-        raise TabTitleError("cmux_command_failed")
+        raise TabTitleError(command_error)
     return result
 
 
@@ -138,12 +144,98 @@ def _read_title(cmux: str, context: SurfaceContext, runner: Runner) -> str:
     return matches[0]["title"]
 
 
+def _herdr_tab(
+    herdr: str, tab_id: str, workspace_id: str, runner: Runner,
+    environ: Mapping[str, str], *, allow_unavailable: bool,
+) -> dict[str, Any] | None:
+    result = _run(
+        runner, [herdr, "tab", "get", tab_id],
+        allow_unavailable=allow_unavailable, environment=environ,
+        command_error="herdr_command_failed",
+    )
+    if result is None:
+        return None
+    value = _json_result(result, "invalid_herdr_tab_response")
+    response = value.get("result")
+    tab = response.get("tab") if isinstance(response, dict) else None
+    if (
+        not isinstance(response, dict)
+        or response.get("type") != "tab_info"
+        or not isinstance(tab, dict)
+        or not isinstance(tab.get("label"), str)
+    ):
+        raise TabTitleError("invalid_herdr_tab_response")
+    if tab.get("tab_id") != tab_id or tab.get("workspace_id") != workspace_id:
+        if allow_unavailable:
+            return None
+        raise TabTitleError("herdr_title_readback_mismatch")
+    return tab
+
+
+def _apply_herdr_title(
+    token: str, *, environ: Mapping[str, str], runner: Runner,
+    which: Callable[[str], str | None],
+) -> dict[str, Any]:
+    tab_id = environ.get("HERDR_TAB_ID")
+    workspace_id = environ.get("HERDR_WORKSPACE_ID")
+    socket_path = environ.get("HERDR_SOCKET_PATH")
+    if not all(isinstance(value, str) and value for value in (
+        tab_id, workspace_id, socket_path,
+    )):
+        return {
+            "status": "unavailable", "reason": "herdr_identity_unavailable",
+            "token": token, "manager": "herdr",
+        }
+    injected_binary = environ.get("HERDR_BIN_PATH")
+    herdr = (
+        injected_binary
+        if isinstance(injected_binary, str) and os.path.isabs(injected_binary)
+        else which("herdr")
+    )
+    if not herdr:
+        return {
+            "status": "unavailable", "reason": "herdr_cli_unavailable",
+            "token": token, "manager": "herdr",
+        }
+    before_tab = _herdr_tab(
+        herdr, tab_id, workspace_id, runner, environ, allow_unavailable=True,
+    )
+    if before_tab is None:
+        return {
+            "status": "unavailable", "reason": "herdr_target_unresolved",
+            "token": token, "manager": "herdr",
+        }
+    status, after = plan_title(before_tab["label"], token)
+    if status == "updated":
+        _run(
+            runner, [herdr, "tab", "rename", tab_id, after],
+            environment=environ,
+            command_error="herdr_command_failed",
+        )
+        observed = _herdr_tab(
+            herdr, tab_id, workspace_id, runner, environ,
+            allow_unavailable=False,
+        )
+        if observed is None or observed["label"] != after:
+            raise TabTitleError("herdr_title_readback_mismatch")
+    namespace = hashlib.sha256(socket_path.encode("utf-8")).hexdigest()
+    return {
+        "status": status, "token": token, "manager": "herdr",
+        "tab": tab_id, "workspace": workspace_id, "title": after,
+        "session_namespace_sha256": namespace,
+    }
+
+
 def apply_title(
     token_value: str, *, target: str | None = None,
     environ: Mapping[str, str] = os.environ, runner: Runner = subprocess.run,
     which: Callable[[str], str | None] = shutil.which,
 ) -> dict[str, Any]:
     token = canonical_token(token_value)
+    if environ.get("HERDR_ENV") == "1":
+        return _apply_herdr_title(
+            token, environ=environ, runner=runner, which=which,
+        )
     target = target or environ.get("CMUX_TAB_ID") or environ.get("CMUX_SURFACE_ID")
     if not target:
         return {"status": "unavailable", "reason": "not_in_cmux_surface", "token": token}
@@ -181,7 +273,9 @@ def apply_title(
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("token", help="canonical workstream issue token, for example GEN-37")
-    value.add_argument("--surface", help="explicit cmux tab/surface ref; defaults to cmux environment")
+    value.add_argument(
+        "--surface", help="explicit cmux tab/surface ref; Herdr uses inherited IDs",
+    )
     return value
 
 
