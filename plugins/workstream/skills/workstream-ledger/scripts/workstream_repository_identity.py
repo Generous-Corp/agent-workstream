@@ -27,9 +27,10 @@ from workstream_config import load_linear_api_key, unique_object
 from workstream_http import default_ssl_context
 from workstream_linear import HttpGraphQLClient, LinearTransportError
 from workstream_linear_events import (
-    COMMENT_CREATE_MUTATION, encode_ledger_reservation, MAX_WORKSTREAM_ID_BYTES,
+    _proven_ledger_reservations, COMMENT_CREATE_MUTATION, encode_ledger_reservation,
+    MAX_WORKSTREAM_ID_BYTES,
     ledger_boundary_slot_id, ledger_serialization_frontier,
-    reduce_event_comments, reduce_ledger_reservations,
+    pending_ledger_reservations, reduce_event_comments, reduce_ledger_reservations,
 )
 from workstream_linear_projection import (
     build_projection_event, LinearProjectionAdapter, LinearProjectionError,
@@ -272,6 +273,7 @@ def _reserve_material_frontier(
         sorted(item["event_id"] for item in checkpoints.checkpoints), comments,
         workstream_id=adapter.workstream_id,
         authenticated_route=adapter.authority,
+        current_plan_revision=adapter.plan_revision,
     )
     projection = reduce_projection_comments(
         comments, workstream_id=adapter.workstream_id,
@@ -361,6 +363,104 @@ def _provider_evidence(resolution: dict[str, Any]) -> dict[str, Any]:
         "requested_response_url": resolution["requested_response_url"],
         "canonical_response_url": resolution["canonical_response_url"],
     }
+
+
+def _recover_pending_resolution(
+    adapter: LinearProjectionAdapter, request: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Recover the exact stored provider proof before attempting a fresh read."""
+    comments = adapter._comments()
+    pending = pending_ledger_reservations(
+        comments, workstream_id=adapter.workstream_id,
+        authenticated_route=adapter.authority,
+        current_plan_revision=adapter.plan_revision,
+    )
+    recoverable = [
+        item for item, _remote_id in _proven_ledger_reservations(
+            comments, workstream_id=adapter.workstream_id,
+            authenticated_route=adapter.authority,
+            current_plan_revision=adapter.plan_revision,
+        )
+    ]
+    frontier = request["expected_frontier"]
+    candidates: list[dict[str, Any]] = []
+    for reservation in recoverable:
+        event = reservation["intent_event"]
+        if (
+            reservation["intent_kind"] != "repository_identity_projection"
+            or reservation["material_revision"] != frontier["material_revision"]
+            or reservation["projection_revision"] != frontier["projection_revision"]
+            or event.get("expected_revision") != frontier["projection_revision"]
+            or event.get("supersedes_event_id") != frontier["scope_event_id"]
+            or event.get("kind") != "scope"
+            or event.get("key") != "root"
+        ):
+            continue
+        target = request["repository"]
+        repositories = event.get("value", {}).get("repositories", [])
+        matches = [
+            repository for repository in repositories
+            if isinstance(repository, dict)
+            and repository.get("provider_repository_id")
+                == target["provider_repository_id"]
+        ]
+        if len(matches) != 1:
+            continue
+        updates = matches[0].get("identity_updates", [])
+        matching = [
+            update for update in updates
+            if isinstance(update, dict)
+            and update.get("from") == target["requested_slug"]
+            and update.get("provider_repository_id")
+                == target["provider_repository_id"]
+        ]
+        if len(matching) != 1:
+            continue
+        update = matching[0]
+        evidence = update.get("evidence")
+        if not isinstance(evidence, list) or len(evidence) != 1:
+            continue
+        proof = evidence[0]
+        if not isinstance(proof, dict):
+            continue
+        candidate = {
+            "provider": "github.com",
+            "provider_repository_id": target["provider_repository_id"],
+            "repository_key": update.get("repository_key"),
+            "requested_slug": target["requested_slug"],
+            "resolved_slug": update.get("to"),
+            "observed_at": update.get("observed_at"),
+            "redirect_count": proof.get("redirect_count"),
+            "requested_response_url": proof.get("requested_response_url"),
+            "canonical_response_url": proof.get("canonical_response_url"),
+            "authenticated": proof.get("authenticated"),
+        }
+        try:
+            desired, rebuilt_update, _replay = _updated_scope(
+                _scope_head(reduce_projection_comments(
+                    comments, workstream_id=adapter.workstream_id,
+                    expected_plan_revision=adapter.plan_revision,
+                    authenticated_route=adapter.authority,
+                ))["value"],
+                candidate, root_id=adapter.workstream_id,
+            )
+            rebuilt = build_projection_event(
+                workstream_id=adapter.workstream_id, kind="scope", key="root",
+                value=desired, plan_revision=adapter.plan_revision,
+                expected_revision=frontier["projection_revision"],
+                created_at=candidate["observed_at"],
+                supersedes_event_id=frontier["scope_event_id"],
+                authority=adapter.authority,
+            )
+        except (KeyError, TypeError, ScopeError, LinearTransportError, RepositoryIdentityError):
+            continue
+        if rebuilt_update == update and rebuilt == event:
+            candidates.append(candidate)
+    if len(candidates) > 1:
+        raise RepositoryIdentityError("repository_pending_identity_intent_ambiguous")
+    if pending and not candidates:
+        raise RepositoryIdentityError("repository_pending_identity_intent_conflict")
+    return candidates[0] if candidates else None
 
 
 def _validate_replay_update(
@@ -718,10 +818,6 @@ def main(argv: list[str] | None = None) -> int:
         linear_token = load_linear_api_key()
         if not linear_token:
             raise RepositoryIdentityError("linear_auth_unavailable")
-        github_token = os.environ.get("GITHUB_TOKEN", "")
-        resolution = GitHubRepositoryResolver(github_token).resolve(
-            **request["repository"],
-        )
         authority = request["authority"]
         client = _MutationTrackingClient(HttpGraphQLClient(
             linear_token, LINEAR_OFFICIAL_ENDPOINT,
@@ -734,6 +830,12 @@ def main(argv: list[str] | None = None) -> int:
             workspace_id=authority["workspace_id"], team_id=authority["team_id"],
             project_id=authority["project_id"], root_issue_id=authority["root_issue_id"],
         )
+        resolution = _recover_pending_resolution(adapter, request)
+        if resolution is None:
+            github_token = os.environ.get("GITHUB_TOKEN", "")
+            resolution = GitHubRepositoryResolver(github_token).resolve(
+                **request["repository"],
+            )
         result = reconcile_repository_identity(
             adapter, resolution=resolution,
             expected_material_revision=request["expected_frontier"]["material_revision"],

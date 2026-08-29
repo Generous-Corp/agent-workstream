@@ -23,7 +23,7 @@ from workstream_linear_projection import (
 )
 from workstream_repository_identity import (
     MAX_REQUEST_BYTES, _MutationTrackingClient, _reserve_material_frontier,
-    _value_digest, GitHubRepositoryResolver,
+    _recover_pending_resolution, _value_digest, GitHubRepositoryResolver,
     main, reconcile_repository_identity, RepositoryIdentityError,
 )
 
@@ -424,7 +424,16 @@ class RepositoryIdentityWriterTests(unittest.TestCase):
             "createdAt": "2026-08-29T12:00:00Z",
             "updatedAt": "2026-08-29T12:00:00Z",
         })
-        material_adapter = LinearCommentEventAdapter(client, issue_id="GEN-37")
+        for index in range(3):
+            client.comments.append({
+                "id": f"malformed-after-{index}",
+                "body": "<!-- workstream-ledger-reservation:v1:not-valid -->",
+                "createdAt": f"2026-08-29T12:00:1{index}Z",
+                "updatedAt": f"2026-08-29T12:00:1{index}Z",
+            })
+        material_adapter = LinearCommentEventAdapter(
+            client, issue_id="GEN-37", plan_revision=PLAN,
+        )
         delta = Delta(
             "wsd_waiting", "GEN-37", "requirement", "agent",
             {"text": "must wait"}, 0, "2026-08-29T12:00:00Z",
@@ -449,11 +458,127 @@ class RepositoryIdentityWriterTests(unittest.TestCase):
         self.assertEqual(receipt.event_id, "wsd_waiting")
         self.assertEqual(client.write_count, 1)
 
+    def test_high_volume_quarantine_is_bounded_and_valid_lock_survives(self):
+        adapter, client, initial = adapter_with_scope()
+        for index in range(1000):
+            client.comments.append({
+                "id": f"noise-{index}",
+                "body": "<!-- workstream-ledger-reservation:v1:not-valid -->",
+                "createdAt": f"2026-08-28T{index // 3600:02d}:"
+                             f"{(index // 60) % 60:02d}:{index % 60:02d}Z",
+                "updatedAt": "2026-08-28T00:00:00Z",
+            })
+        intended = build_projection_event(
+            workstream_id="GEN-37", kind="scope", key="root", value=scope(),
+            plan_revision=PLAN, expected_revision=1,
+            created_at="2026-08-29T12:00:00Z",
+            supersedes_event_id=initial["event_id"], authority=AUTHORITY,
+        )
+        receipt = _reserve_material_frontier(
+            adapter, comments=client.comments, material_revision=0,
+            intent_event=intended,
+        )
+        reservation_comment = next(
+            item for item in client.comments if item["id"] == receipt["remote_id"]
+        )
+        self.assertLess(len(reservation_comment["body"].encode()), 64 * 1024)
+        material = LinearCommentEventAdapter(
+            client, issue_id="GEN-37", plan_revision=PLAN,
+        )
+        with self.assertRaisesRegex(LinearTransportError, "ledger_boundary_reserved"):
+            material.apply(Delta(
+                "wsd_noise", "GEN-37", "requirement", "agent",
+                {"text": "wait"}, 0, "2026-08-29T12:01:00Z",
+            ))
+        self.assertEqual(client.write_count, 0)
+
+    def test_pending_intent_recovers_exact_provider_proof_without_fresh_read(self):
+        adapter, client, initial = adapter_with_scope()
+        request = {
+            "schema_version": 1, "workstream_id": "GEN-37",
+            "authority": deepcopy(AUTHORITY), "plan_revision": PLAN,
+            "repository": {
+                "requested_slug": OLD, "provider_repository_id": "R_pulp",
+            },
+            "expected_frontier": {
+                "material_revision": 0, "projection_revision": 1,
+                "scope_event_id": initial["event_id"],
+                "scope_sha256": _value_digest(initial["value"]),
+            },
+        }
+        desired, _update, _replay = __import__(
+            "workstream_repository_identity"
+        )._updated_scope(scope(), resolution(), root_id="GEN-37")
+        intended = build_projection_event(
+            workstream_id="GEN-37", kind="scope", key="root", value=desired,
+            plan_revision=PLAN, expected_revision=1,
+            created_at=resolution()["observed_at"],
+            supersedes_event_id=initial["event_id"], authority=AUTHORITY,
+        )
+        first = _reserve_material_frontier(
+            adapter, comments=client.comments, material_revision=0,
+            intent_event=intended,
+        )
+        recovered = _recover_pending_resolution(adapter, request)
+        self.assertEqual(recovered, resolution())
+        contradictory = deepcopy(request)
+        contradictory["repository"]["requested_slug"] = NEW
+        with self.assertRaisesRegex(
+            RepositoryIdentityError, "pending_identity_intent_conflict",
+        ):
+            _recover_pending_resolution(adapter, contradictory)
+        second = _reserve_material_frontier(
+            adapter, comments=adapter._comments(), material_revision=0,
+            intent_event=intended,
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(client.reservation_count, 1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "request.json"
+            path.write_text(json.dumps(request))
+            with mock.patch(
+                "workstream_repository_identity.load_linear_api_key",
+                return_value="linear",
+            ), mock.patch(
+                "workstream_repository_identity.HttpGraphQLClient",
+                return_value=client,
+            ), mock.patch(
+                "workstream_repository_identity.GitHubRepositoryResolver",
+                side_effect=AssertionError("provider must not be consulted"),
+            ) as provider, mock.patch(
+                "workstream_repository_identity.sys.stdout", io.StringIO(),
+            ):
+                self.assertEqual(main(["--request", str(path), "--apply"]), 0)
+            provider.assert_not_called()
+        self.assertEqual(client.reservation_count, 1)
+        self.assertEqual(client.write_count, 1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "request.json"
+            path.write_text(json.dumps(request))
+            with mock.patch(
+                "workstream_repository_identity.load_linear_api_key",
+                return_value="linear",
+            ), mock.patch(
+                "workstream_repository_identity.HttpGraphQLClient",
+                return_value=client,
+            ), mock.patch(
+                "workstream_repository_identity.GitHubRepositoryResolver",
+                side_effect=AssertionError("provider must not be consulted"),
+            ) as provider, mock.patch(
+                "workstream_repository_identity.sys.stdout", io.StringIO(),
+            ):
+                self.assertEqual(main(["--request", str(path), "--apply"]), 0)
+            provider.assert_not_called()
+        self.assertEqual(client.reservation_count, 1)
+        self.assertEqual(client.write_count, 1)
+
     def test_unproven_arbitrary_high_revision_and_old_plan_reservations_do_not_block(self):
         def material_result(extra_comments):
             _adapter, client, _initial = adapter_with_scope()
             client.comments.extend(extra_comments(client))
-            material_adapter = LinearCommentEventAdapter(client, issue_id="GEN-37")
+            material_adapter = LinearCommentEventAdapter(
+                client, issue_id="GEN-37", plan_revision=PLAN,
+            )
             receipt = material_adapter.apply(Delta(
                 "wsd_safe", "GEN-37", "requirement", "agent",
                 {"text": "not poisoned"}, 0, "2026-08-29T12:02:00Z",
@@ -539,10 +664,10 @@ class RepositoryIdentityWriterTests(unittest.TestCase):
             }
             return [
                 {"id": old_id, "body": encode_projection_comment(old),
-                 "createdAt": "2026-08-19T12:00:00Z", "updatedAt": "2026-08-19T12:00:00Z"},
+                 "createdAt": "9999-08-19T12:00:00Z", "updatedAt": "9999-08-19T12:00:00Z"},
                 {"id": ledger_boundary_slot_id("GEN-37", 0, [], AUTHORITY),
                  "body": encode_ledger_reservation(reservation),
-                 "createdAt": "2026-08-19T12:01:00Z", "updatedAt": "2026-08-19T12:01:00Z"},
+                 "createdAt": "9999-08-19T12:01:00Z", "updatedAt": "9999-08-19T12:01:00Z"},
             ]
 
         for name, factory in (
@@ -866,6 +991,7 @@ class RepositoryIdentityCliTests(unittest.TestCase):
              mock.patch("workstream_repository_identity.os.environ.get", return_value="github"), \
              mock.patch("workstream_repository_identity.HttpGraphQLClient", return_value=fake_http) as http, \
              mock.patch("workstream_repository_identity.GitHubRepositoryResolver", return_value=fake_resolver), \
+             mock.patch("workstream_repository_identity._recover_pending_resolution", return_value=None), \
              mock.patch("workstream_repository_identity.reconcile_repository_identity") as reconcile, \
              mock.patch("workstream_repository_identity.sys.stdout", io.StringIO()):
             reconcile.return_value = {"disposition": "existing", "write_count": 0}

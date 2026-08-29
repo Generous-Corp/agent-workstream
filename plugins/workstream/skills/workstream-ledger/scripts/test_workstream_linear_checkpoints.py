@@ -186,8 +186,13 @@ class LinearCheckpointAdapterTests(unittest.TestCase):
             "body": encode_ledger_reservation(reservation),
             "createdAt": "now", "updatedAt": "now",
         })
+        client.comments.extend({
+            "id": f"malformed-after-{index}",
+            "body": "<!-- workstream-ledger-reservation:v1:not-valid -->",
+            "createdAt": f"now-{index}", "updatedAt": f"now-{index}",
+        } for index in range(4))
         with self.assertRaisesRegex(LinearTransportError, "ledger_boundary_reserved"):
-            self.adapter(client).persist(checkpoint(0))
+            self.adapter(client).persist(checkpoint(0, plan="a" * 64))
         self.assertFalse(any("commentCreate" in query for query, _ in client.calls))
 
     def test_crash_replay_returns_existing_ack_without_second_comment(self):

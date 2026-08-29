@@ -381,6 +381,7 @@ class LinearCheckpointAdapter:
         assert_no_pending_ledger_reservation(
             comments, workstream_id=self.workstream_id,
             authenticated_route=self._observed_authority,
+            current_plan_revision=checkpoint["plan_revision"],
         )
 
         current = generations.get(checkpoint["plan_revision"])
@@ -410,6 +411,7 @@ class LinearCheckpointAdapter:
             sorted(item["event_id"] for item in before.checkpoints), comments,
             workstream_id=self.workstream_id,
             authenticated_route=self._observed_authority,
+            current_plan_revision=checkpoint["plan_revision"],
         )
         slot_id = ledger_boundary_slot_id(
             self.workstream_id, material.revision, frontier,
