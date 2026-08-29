@@ -1009,6 +1009,21 @@ def validate_snapshot(
             if scoped_repository is None or scoped_repository.get("exact_head") != closure.get("exact_head"):
                 raise ResumeError(f"child_closure_repository_mismatch:{index}")
             contracts: list[dict[str, Any]] = []
+            current_evidence_heads = [
+                {
+                    "key": key,
+                    "event_id": event["event_id"],
+                    "value_sha256": canonical_digest(event["value"]),
+                }
+                for (kind, key), event in active.items()
+                if kind == "evidence_contract"
+                and event["value"].get("owning_child") == child_id
+            ]
+            current_evidence_heads.sort(
+                key=lambda item: (item["key"], item["event_id"])
+            )
+            if current_evidence_heads != closure.get("evidence_heads"):
+                raise ResumeError(f"child_closure_evidence_set_mismatch:{index}")
             for head in closure.get("evidence_heads", []):
                 event = active.get(("evidence_contract", head.get("key")))
                 if (

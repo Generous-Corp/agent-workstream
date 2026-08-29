@@ -451,14 +451,25 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             "child_readback_sha256",
         }
         evidence_heads = value.get("evidence_heads")
+        valid_evidence_heads = (
+            isinstance(evidence_heads, list)
+            and bool(evidence_heads)
+            and all(
+                isinstance(item, dict)
+                and set(item) == {"key", "event_id", "value_sha256"}
+                and all(isinstance(item.get(field), str) and item[field]
+                        for field in ("key", "event_id"))
+                and re.fullmatch(r"[0-9a-f]{64}", str(item.get("value_sha256", "")))
+                for item in evidence_heads
+            )
+        )
         if (
             set(value) != required_closure
             or value.get("schema_version") != 1
             or event["key"] != value.get("child_identifier")
             or value.get("plan_revision") != event["plan_revision"]
             or value.get("state_type") != "completed"
-            or not isinstance(evidence_heads, list)
-            or not evidence_heads
+            or not valid_evidence_heads
             or evidence_heads != sorted(
                 evidence_heads, key=lambda item: (item.get("key", ""), item.get("event_id", ""))
             )
@@ -472,14 +483,6 @@ def validate_projection_event(event: dict[str, Any]) -> None:
                     "workspace_id", "team_id", "project_id", "assignee_id",
                     "state_id", "state_name", "repository_key",
                 )
-            )
-            or not all(
-                isinstance(item, dict)
-                and set(item) == {"key", "event_id", "value_sha256"}
-                and all(isinstance(item.get(field), str) and item[field]
-                        for field in ("key", "event_id"))
-                and re.fullmatch(r"[0-9a-f]{64}", str(item.get("value_sha256", "")))
-                for item in (evidence_heads or [])
             )
         ):
             raise LinearProjectionError("invalid_projection_child_closure")
