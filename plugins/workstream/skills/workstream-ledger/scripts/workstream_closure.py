@@ -13,6 +13,9 @@ from workstream_scope import (
     is_full_oid, repository_key, ScopeError, validate_relation_graph,
     validate_relations, validate_scope,
 )
+from workstream_projection_history import (
+    closure_bound_historical_evidence, ProjectionHistoryError,
+)
 
 
 TERMINAL = {"done", "cancelled", "canceled", "superseded"}
@@ -98,6 +101,25 @@ def review(snapshot: dict[str, Any], *, expected_plan_revision: str,
         errors.append("durable_surface_malformed:evidence_contracts")
     scope = snapshot.get("scope")
     relations = snapshot.get("relations")
+    projection_events = snapshot.get("projection_events")
+    historical_evidence_event_ids: frozenset[str] = frozenset()
+    active_evidence_events: dict[str, dict[str, Any]] = {}
+    if isinstance(projection_events, list):
+        for event in projection_events:
+            identity = (event.get("kind"), event.get("key"))
+            if identity[0] != "evidence_contract":
+                continue
+            if event.get("value") == {"_projection_tombstone": True}:
+                active_evidence_events.pop(str(identity[1]), None)
+            else:
+                active_evidence_events[str(identity[1])] = event
+    if isinstance(scope, dict) and isinstance(projection_events, list):
+        try:
+            historical_evidence_event_ids = closure_bound_historical_evidence(
+                projection_events, scope,
+            )
+        except ProjectionHistoryError as error:
+            errors.append(str(error))
     if isinstance(choice_events, list):
         if not exact_head and repository_heads is None:
             errors.append("choice_reconciliation_missing_exact_head")
@@ -178,7 +200,18 @@ def review(snapshot: dict[str, Any], *, expected_plan_revision: str,
                 expected_key = scope["child_ownership"].get(child)
                 if contract.get("repository_key") != expected_key:
                     errors.append(f"evidence_repository_mismatch:{child}")
-                elif repository_heads.get(expected_key) != contract.get("exact_head"):
+                evidence_event = active_evidence_events.get(slice_id)
+                historically_closed = (
+                    evidence_event is not None
+                    and evidence_event.get("event_id")
+                    in historical_evidence_event_ids
+                )
+                if (
+                    contract.get("repository_key") == expected_key
+                    and repository_heads.get(expected_key)
+                    != contract.get("exact_head")
+                    and not historically_closed
+                ):
                     errors.append(f"evidence_head_mismatch:{child}")
             for child in sorted(required):
                 if not contracts_by_child.get(child):
