@@ -385,6 +385,23 @@ class ProjectionTests(unittest.TestCase):
 
         self.assertEqual(client.comments, [])
 
+    def test_child_extension_boolean_frontiers_refuse_before_remote_access(self):
+        class NoRemoteAccessClient(FakeProjectionClient):
+            def execute(self, query, variables):
+                raise AssertionError("invalid frontier must fail before remote access")
+
+        for overrides, message in (
+            ({"expected_material_revision": False},
+             "invalid_child_extension_material_frontier"),
+            ({"expected_projection_revision": False},
+             "invalid_child_extension_projection_frontier"),
+        ):
+            client = NoRemoteAccessClient()
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(LinearProjectionError, message):
+                    self.reserve_child(self.authorization_adapter(client), **overrides)
+            self.assertEqual(client.comments, [])
+
     def test_child_extension_authorization_lost_response_converges(self):
         class LostResponseClient(FakeProjectionClient):
             def __init__(self):

@@ -67,7 +67,7 @@ def projection_slot_id(
         raise LinearProjectionError("invalid_projection_workstream")
     if not isinstance(plan_revision, str) or not plan_revision:
         raise LinearProjectionError("projection_missing:plan_revision")
-    if not isinstance(revision, int) or revision < 0:
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
         raise LinearProjectionError("invalid_projection_revision")
     validate_projection_authority(authority)
     material = _canonical([
@@ -245,6 +245,7 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             or value.get("expected_projection_revision")
             != event["expected_revision"]
             or not isinstance(value.get("expected_material_revision"), int)
+            or isinstance(value.get("expected_material_revision"), bool)
             or value["expected_material_revision"] < 0
             or value.get("initial_state") != "planned_pending_projection"
         ):
@@ -579,7 +580,7 @@ def validate_projection_event(event: dict[str, Any]) -> None:
         ):
             raise LinearProjectionError("invalid_projection_child_closure")
     revision = event.get("expected_revision")
-    if not isinstance(revision, int) or revision < 0:
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
         raise LinearProjectionError("invalid_projection_revision")
     supersedes = event.get("supersedes_event_id")
     if supersedes is not None and (not isinstance(supersedes, str) or not supersedes):
@@ -1130,9 +1131,16 @@ class LinearProjectionAdapter:
         """Win one durable projection-CAS authorization before child creation."""
         if (
             not isinstance(expected_material_revision, int)
+            or isinstance(expected_material_revision, bool)
             or expected_material_revision < 0
         ):
             raise LinearProjectionError("invalid_child_extension_material_frontier")
+        if (
+            not isinstance(expected_projection_revision, int)
+            or isinstance(expected_projection_revision, bool)
+            or expected_projection_revision < 0
+        ):
+            raise LinearProjectionError("invalid_child_extension_projection_frontier")
         before_comments = self._comments()
         from workstream_linear_events import reduce_event_comments
 
