@@ -57,6 +57,10 @@ at-least-once replay and explicit binding to a reviewed workstream, and remain
 inactive by default. Captured text is evidence of a user turn, not authority to
 classify, mutate, execute, or close a workstream.
 
+The portable plugin already provides the reviewed raw-capture-to-Linear
+promotion protocol and crash replay. This roadmap item is the managed hook and
+deployment layer that feeds it, not a second promotion or ledger authority.
+
 ## Hosted control plane
 
 Agent Workstream may eventually gain an optional hosted or self-hosted control

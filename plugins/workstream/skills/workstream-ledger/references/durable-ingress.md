@@ -14,10 +14,11 @@ authority or task tracker:
    Claude prompt-event payload.
 2. `capture` first inserts one idempotent event into a mode-0600 local SQLite
    outbox, then attempts a bounded upload to a configured private GitHub issue.
-3. `recover` reads remote capture, bind, and processed markers and deduplicates
-   them by `event_id`.
-4. Only after a separate agent successfully promotes a material change to
-   Linear may `process` append the remote processed marker.
+3. `recover` reads remote capture, bind, promotion-intent, and processed markers
+   and deduplicates them by `event_id`.
+4. A successor stages one reviewed, bounded promotion intent in that private
+   stream, applies its deterministic material event to Linear, verifies the
+   Linear receipt, and only then appends the processed successor marker.
 
 No capture integration ships in v1 because a plugin-cache path is not a stable
 launcher path. A deployment that wants ingress must supply and own a stable
@@ -54,15 +55,61 @@ cross-session identity.
 python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" flush
 python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" recover \
   --workstream ABC-123
-python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" process \
-  --repo your-org/private-workstream-ingress --remote-issue 42 --event wsi_... \
-  --disposition promoted --issue ABC-124
+python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" promote \
+  --request reviewed-promotion.json --apply
 ```
 
 An unprocessed event is an open triage obligation, not evidence that its request
 was accepted. Binding fails closed without an exact event, provider session, or
 trusted adapter surface. Correct a mistaken binding with `unbind`; never bind by
 repository cwd.
+
+The reviewed promotion request is exact JSON:
+
+```json
+{
+  "schema_version": 1,
+  "ingress": {
+    "repo": "your-org/private-workstream-ingress",
+    "remote_issue": 42,
+    "event_id": "wsi_...",
+    "prompt_sha256": "<64 lowercase hex>"
+  },
+  "authority": {
+    "workspace_id": "<Linear workspace UUID>",
+    "team_id": "<Linear team UUID>",
+    "project_id": "<Linear project UUID>",
+    "root_issue_id": "<immutable Linear root issue UUID>"
+  },
+  "workstream_id": "ABC-123",
+  "expected_material_revision": 7,
+  "changes": [
+    {"kind": "requirement", "payload": {"text": "...", "acceptance": "..."}}
+  ]
+}
+```
+
+`promote` does not classify prompt text. Without `--apply` it is a zero-write
+preview. With `--apply`, it first appends the immutable promotion intent. If the
+agent or source machine then disappears, a successor needs only the private
+repo, issue, and event identifiers:
+
+```sh
+python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" promote \
+  --repo your-org/private-workstream-ingress --remote-issue 42 \
+  --event wsi_... --apply
+```
+
+Replay reuses one deterministic Linear material-event ID. A crash after the
+Linear mutation but before the processed marker therefore cannot duplicate the
+work, and a crash after the processed marker is a zero-write replay. GitHub does
+not offer client-supplied comment IDs, so simultaneous identical writers may
+append duplicate physical comments; the authenticated reducer treats them as
+one logical marker and refuses conflicting copies.
+
+Use the older `process` command only for reviewed `no-material-delta` or
+`superseded` dispositions. Material promotion must use `promote`, which proves
+the Linear receipt before acknowledging the raw event.
 
 ## Privacy and retention
 

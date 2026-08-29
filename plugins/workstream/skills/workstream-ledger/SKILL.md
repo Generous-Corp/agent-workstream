@@ -572,8 +572,13 @@ deletion-resistance canary.
      recover --workstream ABC-123
    ```
 
-   Promote each material event into the issue graph, then mark it processed.
-   A repeated event ID is one event. An unprocessed event is evidence that the
+   Classify each material event into one reviewed bounded promotion request,
+   then use `workstream_ingress.py promote --request <json> --apply`. The
+   command durably stages the intent before its deterministic Linear mutation
+   and posts the processed successor only after Linear readback. If the source
+   disappears after staging, resume with `promote --repo <private-repo>
+   --remote-issue <number> --event <wsi-id> --apply`; no source outbox or request
+   file is required. A repeated event ID is one logical event. An unprocessed event is evidence that the
    next agent must triage it, not evidence that the request was accepted.
    A normal plugin installation skips this step and resumes from the last
    durable checkpoint. Do not invoke ingress merely to probe whether it is
@@ -618,9 +623,9 @@ python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" \
   unbind --workstream ABC-123 --session <exact-provider-session-id>
 ```
 
-After triage, post the remote processed marker with `process`; use disposition
-`promoted`, `superseded`, or `no-material-delta`. Never mark an event processed
-before the corresponding Linear mutation succeeds when one is needed.
+After triage, use `promote` for a material event. Use `process` only for
+`superseded` or `no-material-delta`. Never mark a material event processed
+before the promotion path verifies the corresponding Linear mutation.
 
 Issue titles must be understandable outside the project view and use a
 plan/workstream-derived prefix. Every issue independently includes the stable
@@ -674,7 +679,8 @@ still cannot be recovered after its source machine disappears. State that
 physical limit honestly.
 
 The ingress is an at-least-once transport, not a second task tracker. Remote
-consumers deduplicate by `event_id`; Linear holds the promoted business logic.
+consumers deduplicate capture by `event_id` and promotion by its deterministic
+promotion/material-event IDs; Linear holds the promoted business logic.
 Local remote-acknowledged rows rotate after 30 days, remote issues rotate by
 machine/month, prompts are capped at 16 KiB, and documented credential patterns
 are sanitized. See [durable ingress](references/durable-ingress.md) for the

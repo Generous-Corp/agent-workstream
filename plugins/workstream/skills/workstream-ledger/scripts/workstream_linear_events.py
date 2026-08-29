@@ -271,6 +271,7 @@ class LinearCommentEventAdapter:
         workspace_id: str | None = None,
         team_id: str | None = None,
         project_id: str | None = None,
+        root_issue_id: str | None = None,
     ):
         if not issue_id:
             raise ValueError("Linear issue ID is required")
@@ -279,10 +280,13 @@ class LinearCommentEventAdapter:
         self.workspace_id = workspace_id
         self.team_id = team_id
         self.project_id = project_id
+        self.root_issue_id = root_issue_id
         self._observed_authority: dict[str, str] | None = None
         self._comment_id_capability_verified = False
         if any((workspace_id, team_id, project_id)) and not all((workspace_id, team_id, project_id)):
             raise ValueError("Linear workspace, team, and project IDs must be supplied together")
+        if root_issue_id and not all((workspace_id, team_id, project_id)):
+            raise ValueError("Linear root issue ID requires workspace, team, and project IDs")
 
     @classmethod
     def from_env(
@@ -337,6 +341,8 @@ class LinearCommentEventAdapter:
             }
             if not all(isinstance(value, str) and value for value in authority.values()):
                 raise LinearEventError("comment_slot_authority_incomplete")
+            if self.root_issue_id and authority["root_issue_id"] != self.root_issue_id:
+                raise LinearEventError("root_issue_id_mismatch")
             if self._observed_authority is not None and self._observed_authority != authority:
                 raise LinearEventError("comment_slot_authority_changed")
             self._observed_authority = authority  # type: ignore[assignment]

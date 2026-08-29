@@ -523,6 +523,16 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
             adapter.apply(delta("event-a", {"order": 1}))
         self.assertFalse(any("commentCreate" in query for query, _ in client.calls))
 
+    def test_immutable_root_issue_id_fences_comment_writes(self):
+        client = FakeCommentClient()
+        adapter = LinearCommentEventAdapter(
+            client, issue_id="GEN-37", workspace_id="workspace", team_id="team",
+            project_id="project", root_issue_id="different-root",
+        )
+        with self.assertRaisesRegex(LinearEventError, "root_issue_id_mismatch"):
+            adapter.apply(delta("event-a", {"order": 1}))
+        self.assertFalse(any("commentCreate" in query for query, _ in client.calls))
+
     def test_from_env_consumes_config_route(self):
         route = {"workspace_id": "workspace", "team_id": "team", "project_id": "project"}
         client = mock.Mock()

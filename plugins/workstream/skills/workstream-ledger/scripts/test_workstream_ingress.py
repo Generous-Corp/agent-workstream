@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -821,6 +822,230 @@ class RatchetTests(unittest.TestCase):
         self._ratchet()
         mode = (MODULE.state_root() / "ratchet.json").stat().st_mode & 0o777
         self.assertEqual(mode, 0o600)
+
+
+class ManagedPromotionTests(unittest.TestCase):
+    """Raw capture must survive every boundary through processed successor proof."""
+
+    class Remote:
+        def __init__(self, capture):
+            self.comments = [{"id": "capture", "body": MODULE.comment_body(
+                MODULE.CAPTURE_MARKER, capture)}]
+            self.writes = []
+
+        def gh(self, args, *, stdin=None, timeout=4):
+            if "--paginate" in args:
+                return [list(self.comments)]
+            if args[-2:] == ["--input", "-"]:
+                body = json.loads(stdin)["body"]
+                item = {"id": f"comment-{len(self.comments)}", "body": body,
+                        "html_url": f"https://example/{len(self.comments)}"}
+                self.comments.append(item)
+                self.writes.append(body)
+                return item
+            raise AssertionError(args)
+
+        def logical(self, marker):
+            return [MODULE.parse_comment(item["body"], marker) for item in self.comments
+                    if MODULE.parse_comment(item["body"], marker)]
+
+    class Linear:
+        def __init__(self):
+            self.events = {}
+            self.mutations = 0
+
+        def current_revision(self, workstream_id):
+            return len(self.events)
+
+        def comments(self):
+            return [
+                {"id": receipt[2], "body": MODULE.encode_event_comment(receipt[0])}
+                for receipt in self.events.values()
+            ]
+
+        def apply(self, delta):
+            existing = self.events.get(delta.event_id)
+            if existing:
+                self.assert_replay(existing, delta)
+                return MODULE.MutationReceipt(delta.event_id, existing[1], existing[2])
+            if delta.expected_revision != len(self.events):
+                raise MODULE.RevisionConflict("stale")
+            self.mutations += 1
+            receipt = (delta, len(self.events) + 1, f"linear-{len(self.events) + 1}")
+            self.events[delta.event_id] = receipt
+            return MODULE.MutationReceipt(delta.event_id, receipt[1], receipt[2])
+
+        @staticmethod
+        def assert_replay(existing, requested):
+            recorded = existing[0]
+            if not (
+                recorded.event_id == requested.event_id
+                and recorded.workstream_id == requested.workstream_id
+                and recorded.kind == requested.kind
+                and recorded.source == requested.source
+                and recorded.payload == requested.payload
+                and recorded.created_at == requested.created_at
+                and recorded.expected_revision >= requested.expected_revision
+            ):
+                raise AssertionError("conflicting replay")
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.env = mock.patch.dict(os.environ, {
+            "WORKSTREAM_INGRESS_STATE_DIR": str(self.root / "state"),
+            "WORKSTREAM_INGRESS_CONFIG": str(self.root / "config.json"),
+        }, clear=False)
+        self.env.start()
+        self.capture = {
+            "schema_version": 1, "event_id": "wsi_raw", "captured_at": "2026-08-29T01:00:00Z",
+            "provider": "codex", "session_id": "expired", "workstream_id": "GEN-37",
+            "context_url": "https://linear.app/generous/issue/GEN-37/x",
+            "prompt": "Add the missing recovery gate", "prompt_sha256": "a" * 64,
+        }
+        self.remote = self.Remote(self.capture)
+        self.linear = self.Linear()
+        self.request = self.root / "promotion.json"
+        self.request.write_text(json.dumps({
+            "schema_version": 1,
+            "ingress": {"repo": "private/ingress", "remote_issue": 7,
+                        "event_id": "wsi_raw", "prompt_sha256": "a" * 64},
+            "authority": {
+                "workspace_id": "11111111-1111-4111-8111-111111111111",
+                "team_id": "22222222-2222-4222-8222-222222222222",
+                "project_id": "33333333-3333-4333-8333-333333333333",
+                "root_issue_id": "44444444-4444-4444-8444-444444444444",
+            },
+            "workstream_id": "GEN-37", "expected_material_revision": 0,
+            "changes": [{"kind": "requirement", "payload": {
+                "text": "Add the missing recovery gate", "acceptance": "planted crash passes"}}],
+        }))
+        self.patches = [
+            mock.patch.object(MODULE, "gh", side_effect=self.remote.gh),
+            mock.patch.object(MODULE, "linear_adapter_for_promotion", return_value=self.linear),
+        ]
+        for patcher in self.patches:
+            patcher.start()
+
+    def tearDown(self):
+        for patcher in reversed(self.patches):
+            patcher.stop()
+        self.env.stop()
+        self.temp.cleanup()
+
+    def args(self, *, request=True):
+        return argparse.Namespace(
+            request=str(self.request) if request else None,
+            repo=None if request else "private/ingress", remote_issue=None if request else 7,
+            event=None if request else "wsi_raw", config=None, max_conflicts=8, apply=True,
+        )
+
+    def _promote(self, *, request=True):
+        output = io.StringIO()
+        with mock.patch.object(MODULE.sys, "stdout", output):
+            code = MODULE.command_promote(self.args(request=request))
+        return code, json.loads(output.getvalue())
+
+    def test_crash_after_durable_stage_recovers_without_source_files(self):
+        with mock.patch.object(MODULE, "promotion_failpoint", side_effect=RuntimeError("crash")):
+            with self.assertRaisesRegex(RuntimeError, "crash"):
+                self._promote()
+        self.assertEqual(len(self.remote.logical(MODULE.PROMOTION_MARKER)), 1)
+        self.assertEqual(self.linear.mutations, 0)
+        # The successor has neither the reviewed request nor the source outbox.
+        self.request.unlink()
+        shutil.rmtree(MODULE.state_root(), ignore_errors=True)
+        code, result = self._promote(request=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(result["disposition"], "promoted")
+        self.assertEqual(self.linear.mutations, 1)
+        self.assertEqual(len(self.remote.logical(MODULE.PROCESSED_MARKER)), 1)
+
+    def test_crash_after_linear_accept_replays_without_duplicate_material(self):
+        def fail(stage):
+            if stage == "after_linear":
+                raise RuntimeError("crash after linear")
+        with mock.patch.object(MODULE, "promotion_failpoint", side_effect=fail):
+            with self.assertRaisesRegex(RuntimeError, "crash after linear"):
+                self._promote()
+        self.assertEqual(self.linear.mutations, 1)
+        self.assertEqual(self.remote.logical(MODULE.PROCESSED_MARKER), [])
+        self.request.unlink()
+        shutil.rmtree(MODULE.state_root(), ignore_errors=True)
+        self._promote(request=False)
+        self.assertEqual(self.linear.mutations, 1, "replay duplicated the Linear material event")
+        self.assertEqual(len(self.remote.logical(MODULE.PROCESSED_MARKER)), 1)
+
+    def test_crash_after_processed_marker_is_a_zero_write_successor_replay(self):
+        def fail(stage):
+            if stage == "after_processed":
+                raise RuntimeError("crash after processed")
+        with mock.patch.object(MODULE, "promotion_failpoint", side_effect=fail):
+            with self.assertRaisesRegex(RuntimeError, "crash after processed"):
+                self._promote()
+        writes = len(self.remote.writes)
+        self.request.unlink()
+        shutil.rmtree(MODULE.state_root(), ignore_errors=True)
+        _, result = self._promote(request=False)
+        self.assertTrue(result["replay"])
+        self.assertEqual(self.linear.mutations, 1)
+        self.assertEqual(len(self.remote.writes), writes, "successor appended a second marker")
+
+    def test_preview_performs_no_remote_or_linear_mutation(self):
+        args = self.args()
+        args.apply = False
+        with mock.patch.object(MODULE.sys, "stdout", io.StringIO()):
+            self.assertEqual(MODULE.command_promote(args), 0)
+        self.assertEqual(self.remote.writes, [])
+        self.assertEqual(self.linear.mutations, 0)
+
+    def test_conflicting_durable_intent_refuses_before_linear_mutation(self):
+        other = json.loads(self.request.read_text())
+        other["changes"][0]["payload"]["text"] = "different"
+        promotion = MODULE.promotion_payload(other, self.capture)
+        self.remote.comments.append({"id": "bad", "body": MODULE.comment_body(
+            MODULE.PROMOTION_MARKER, promotion)})
+        with self.assertRaisesRegex(ValueError, "conflicting_promotion"):
+            self._promote()
+        self.assertEqual(self.linear.mutations, 0)
+
+    def test_forged_processed_marker_cannot_replace_linear_readback(self):
+        request = json.loads(self.request.read_text())
+        promotion = MODULE.promotion_payload(request, self.capture)
+        delta = MODULE.promotion_delta(promotion)
+        processed = {
+            "schema_version": 1, "event_id": "wsi_raw",
+            "processed_at": "2026-08-29T01:01:00Z", "disposition": "promoted",
+            "promoted_issue": "GEN-37", "promotion_id": promotion["promotion_id"],
+            "material_event_id": delta.event_id, "material_revision": 1,
+            "material_remote_id": "claimed-linear-receipt",
+        }
+        self.remote.comments.extend([
+            {"id": "promotion", "body": MODULE.comment_body(
+                MODULE.PROMOTION_MARKER, promotion)},
+            {"id": "processed", "body": MODULE.comment_body(
+                MODULE.PROCESSED_MARKER, processed)},
+        ])
+        with self.assertRaisesRegex(ValueError, "processed_material_event_missing"):
+            self._promote(request=False)
+        self.assertEqual(self.linear.mutations, 0)
+
+    def test_boolean_revision_is_rejected_before_remote_reads(self):
+        request = json.loads(self.request.read_text())
+        request["expected_material_revision"] = False
+        self.request.write_text(json.dumps(request))
+        with self.assertRaisesRegex(ValueError, "expected_revision_invalid"):
+            self._promote()
+        self.assertEqual(self.remote.writes, [])
+
+    def test_legacy_process_cannot_bypass_material_receipt_verification(self):
+        args = argparse.Namespace(
+            disposition="promoted", event="wsi_raw", issue="GEN-37",
+            repo="private/ingress", remote_issue=7,
+        )
+        with self.assertRaisesRegex(ValueError, "requires.*promote"):
+            MODULE.command_process(args)
+        self.assertEqual(self.remote.writes, [])
 
 
 if __name__ == "__main__":
