@@ -16,6 +16,7 @@ import zlib
 from workstream_checkpoint import build_checkpoint
 from workstream_choices import record_choice
 from workstream_delta import Delta
+from workstream_evidence import evidence_errors
 from workstream_linear_checkpoints import encode_checkpoint_comment
 from workstream_linear import bootstrap_linear_route, LinearGraphQLTransport
 from workstream_linear_events import (
@@ -566,6 +567,172 @@ class ProjectionTests(unittest.TestCase):
             "terminal_child_repairs": repairs,
         }
         return client, adapter, source, graph, children, manifest
+
+    def five_terminal_verbose_evidence_fixture(self):
+        """Build a GEN-37-shaped strict snapshot with receipt-heavy evidence."""
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        source = {"identity": "https://example.test/plan", "sha256": PLAN}
+        identifiers = [f"GEN-{number}" for number in range(38, 43)]
+        owned_scope = scope()
+        owned_scope["child_ownership"] = {
+            identifier: "github.com:id:R_agent_workstream"
+            for identifier in identifiers
+        }
+        children = []
+        contracts = []
+        for number, identifier in enumerate(identifiers, start=38):
+            contract = evidence_contract()
+            contract["slice_id"] = f"{identifier.lower()}-terminal"
+            contract["owning_child"] = identifier
+            for layer in contract["layers"].values():
+                for receipt in layer.get("receipts", []):
+                    receipt["proof"] += ":" + (identifier + "-proof-") * 180
+            contracts.append(contract)
+            children.append({
+                "id": f"child-{number}", "identifier": identifier,
+                "title": f"terminal child {identifier}",
+                "parent": {"id": ROOT_UUID, "identifier": "GEN-37"},
+                "team": {"id": "team", "organization": {"id": "workspace"}},
+                "project": {"id": "project"},
+                "assignee": {"id": f"assignee-{number}"},
+                "state_id": f"done-state-{number}",
+                "status": "Done", "status_type": "completed",
+            })
+        base = [
+            {"kind": "scope", "key": "root", "value": owned_scope},
+            {"kind": "source", "key": "root", "value": source},
+            {"kind": "provenance", "key": "session", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "session",
+                "worktree": {"state": "safe", "head": HEAD},
+            }},
+            *[
+                {"kind": "evidence_contract", "key": contract["slice_id"],
+                 "value": contract}
+                for contract in contracts
+            ],
+        ]
+        reconcile_required_projection(
+            adapter, {"root": {"identifier": "GEN-37"}},
+            reviewed_manifest(adapter, base), remote_head=HEAD,
+            created_at="2026-08-29T18:00:00Z", authenticated_source=source,
+        )
+        graph = self.graph_snapshot()
+        graph["children"] = children
+        evidence_events = {
+            event["value"]["owning_child"]: event
+            for event in adapter.state().events
+            if event["kind"] == "evidence_contract"
+        }
+        repairs = []
+        for child in children:
+            event = evidence_events[child["identifier"]]
+            repairs.append({
+                "child_identifier": child["identifier"],
+                "child_issue_id": child["id"],
+                "expected_child_readback_sha256": canonical_digest(
+                    terminal_child_readback(child)
+                ),
+                "expected_assignee_id": child["assignee"]["id"],
+                "approved_evidence_heads": [{
+                    "key": event["key"], "event_id": event["event_id"],
+                    "value_sha256": canonical_digest(event["value"]),
+                }],
+            })
+        manifest = {
+            **reviewed_manifest(adapter, deepcopy(base)),
+            "terminal_child_repairs": repairs,
+        }
+        prepared = prepare_terminal_child_repairs(
+            manifest, graph, adapter.state(),
+        )
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", prepared, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        expected = {
+            repair["child_identifier"]: repair["expected_child_readback_sha256"]
+            for repair in repairs
+        }
+        reconcile_required_projection(
+            adapter, preview, prepared, remote_head=HEAD,
+            created_at="2026-08-29T19:00:00Z", authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda child_ids: {
+                child_id: expected[child_id] for child_id in child_ids
+            },
+            legacy_unresolved_relation_heads=unresolved,
+        )
+        strict = add_material_history(
+            graph, client.comments, "GEN-37", authenticated_route=AUTHORITY,
+            authenticated_source=source,
+        )
+        return strict, contracts
+
+    def test_five_terminal_contracts_fit_compact_resume_budget(self):
+        strict, contracts = self.five_terminal_verbose_evidence_fixture()
+        context = compact_context(
+            strict, "GEN-37", max_bytes=16 * 1024, max_items=100,
+            require_projection_authority=True,
+        )
+        encoded = json.dumps(
+            context, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()
+        self.assertLessEqual(len(encoded), 16 * 1024)
+        self.assertEqual(context["resume_authority"], "full")
+        self.assertEqual(len(context["child_closures"]), 5)
+        self.assertEqual(len(context["evidence_contracts"]), 5)
+        for compact, complete in zip(context["evidence_contracts"], contracts):
+            self.assertNotIn("layers", compact)
+            self.assertEqual(compact["representation"], "compact_validated")
+            self.assertEqual(compact["contract_sha256"], canonical_digest(complete))
+            self.assertEqual(compact["exact_head"], HEAD)
+            self.assertEqual(compact["receipt_count"], 5)
+            self.assertTrue(evidence_errors(compact))
+            self.assertEqual(
+                compact["projection_head"]["key"], complete["slice_id"],
+            )
+            self.assertEqual(
+                compact["projection_head"]["value_sha256"],
+                compact["contract_sha256"],
+            )
+            self.assertRegex(
+                compact["projection_head"]["event_id"],
+                r"^wsp_[0-9a-f]{32}$",
+            )
+
+    def test_explicit_history_retains_full_verbose_evidence_contracts(self):
+        strict, contracts = self.five_terminal_verbose_evidence_fixture()
+        with self.assertRaisesRegex(ResumeError, "resume_context_over_budget"):
+            compact_context(
+                strict, "GEN-37", max_bytes=16 * 1024, max_items=500,
+                require_projection_authority=True, include_history=True,
+            )
+        full = compact_context(
+            strict, "GEN-37", max_bytes=1024 * 1024, max_items=500,
+            require_projection_authority=True, include_history=True,
+        )
+        self.assertEqual(full["evidence_contracts"], contracts)
+        self.assertIn("layers", full["evidence_contracts"][0])
+
+    def test_compaction_does_not_weaken_contract_tamper_validation(self):
+        strict, _contracts = self.five_terminal_verbose_evidence_fixture()
+        tampered = deepcopy(strict)
+        tampered["evidence_contracts"][0]["layers"]["logic"]["receipts"][0][
+            "proof"
+        ] = "tampered after authenticated projection"
+        with self.assertRaisesRegex(
+            ResumeError, "projection_current_view_mismatch:evidence_contracts",
+        ):
+            compact_context(
+                tampered, "GEN-37", max_bytes=16 * 1024, max_items=100,
+                require_projection_authority=True,
+            )
 
     def test_multi_terminal_repair_is_ordered_full_and_idempotent(self):
         client, adapter, source, graph, _children, stale_manifest = (

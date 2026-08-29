@@ -471,6 +471,68 @@ def _compact_scope(scope: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+def _compact_evidence_contracts(
+    contracts: list[dict[str, Any]], projection_events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return digest-bound routing facts without embedding receipt prose.
+
+    Full contracts have already passed projection, scope, exact-head, and
+    terminal-closure validation before this function runs.  Default resume
+    needs their stable identity and authority bindings, not every receipt body.
+    ``--include-history`` remains the explicit audit surface for those bodies.
+    """
+    active_heads: dict[str, dict[str, str]] = {}
+    for event in projection_events:
+        if event.get("kind") != "evidence_contract":
+            continue
+        key = event.get("key")
+        if not isinstance(key, str):
+            continue
+        if event.get("value") == TOMBSTONE:
+            active_heads.pop(key, None)
+            continue
+        active_heads[key] = {
+            "key": key,
+            "event_id": event["event_id"],
+            "value_sha256": canonical_digest(event["value"]),
+        }
+
+    result = []
+    for contract in contracts:
+        summary = {
+            key: contract[key]
+            for key in (
+                "slice_id", "owning_child", "repository", "repository_key",
+                "plan_revision", "exact_head",
+            )
+        }
+        summary["representation"] = "compact_validated"
+        summary["layer_statuses"] = {
+            name: layer["status"]
+            for name, layer in sorted(contract["layers"].items())
+        }
+        summary["receipt_count"] = sum(
+            len(layer.get("receipts", []))
+            for layer in contract["layers"].values()
+        )
+        summary["contract_sha256"] = canonical_digest(contract)
+        summary["evidence_receipts_sha256"] = evidence_receipts_sha256([contract])
+        matches = [
+            head for head in active_heads.values()
+            if head["value_sha256"] == summary["contract_sha256"]
+        ]
+        if len(matches) > 1:
+            raise ResumeError(
+                f"evidence_compaction_projection_head_ambiguous:{contract['slice_id']}"
+            )
+        if matches:
+            # Do not infer that a projection key equals slice_id.  The exact
+            # active event tuple is what closure authority binds.
+            summary["projection_head"] = matches[0]
+        result.append(summary)
+    return result
+
+
 def add_material_history(
     snapshot: dict[str, Any], comments: list[dict[str, Any]], token: str,
     *, authenticated_route: dict[str, str] | None = None,
@@ -1246,7 +1308,12 @@ def compact_context(
         "choice_events": clean["choice_events"],
         "scope": clean["scope"] if include_history else _compact_scope(clean["scope"]),
         "relations": clean["relations"],
-        "evidence_contracts": clean["evidence_contracts"],
+        "evidence_contracts": (
+            clean["evidence_contracts"] if include_history
+            else _compact_evidence_contracts(
+                clean["evidence_contracts"], clean["projection_events"],
+            )
+        ),
         "child_closures": clean["child_closures"],
         "surface_availability": clean["surface_availability"],
         "provenance": clean["provenance"],
