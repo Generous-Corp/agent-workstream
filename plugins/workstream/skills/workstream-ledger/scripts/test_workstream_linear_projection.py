@@ -1168,6 +1168,75 @@ class ProjectionTests(unittest.TestCase):
                         "GEN-37", require_projection_authority=True,
                     )
 
+    def test_terminal_closure_cannot_be_retired_while_ownership_and_evidence_remain(self):
+        client, adapter, source, graph, _child, stale_manifest = (
+            self.terminal_repair_fixture()
+        )
+        prepared = prepare_terminal_child_repairs(
+            stale_manifest, graph, adapter.state(),
+        )
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", prepared, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        expected = stale_manifest["terminal_child_repairs"][0][
+            "expected_child_readback_sha256"
+        ]
+        reconcile_required_projection(
+            adapter, preview, prepared, remote_head=HEAD,
+            created_at="2026-08-27T20:00:00Z",
+            authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda _identifier: expected,
+            legacy_unresolved_relation_heads=unresolved,
+        )
+        closure_head = next(
+            event for event in reversed(adapter.state().events)
+            if event["kind"] == "child_closure" and event["key"] == "GEN-72"
+        )
+        retirement = reviewed_retirement(
+            adapter, "child_closure", "GEN-72",
+        )
+        desired = [
+            item for item in prepared["projection"]
+            if (item["kind"], item["key"]) != ("child_closure", "GEN-72")
+        ]
+        retirement_manifest = reviewed_manifest(
+            adapter, desired, [retirement],
+        )
+        writes_before = len(client.comments)
+        with self.assertRaisesRegex(
+            ResumeError, "completed_owned_child_closure_missing:GEN-72",
+        ):
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37", retirement_manifest, adapter,
+                authenticated_route=AUTHORITY,
+                authenticated_source=source, remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+
+        adapter.append(build_projection_event(
+            workstream_id="GEN-37", kind="child_closure", key="GEN-72",
+            value=TOMBSTONE, plan_revision=PLAN,
+            expected_revision=adapter.state().revision,
+            created_at="2026-08-27T20:30:00Z",
+            supersedes_event_id=closure_head["event_id"], authority=AUTHORITY,
+        ))
+        with self.assertRaisesRegex(
+            ResumeError, "completed_owned_child_closure_missing:GEN-72",
+        ):
+            compact_context(
+                add_material_history(
+                    graph, client.comments, "GEN-37",
+                    authenticated_route=AUTHORITY,
+                    authenticated_source=source,
+                ),
+                "GEN-37", require_projection_authority=True,
+            )
+
     def test_legacy_unresolved_relation_retirement_precedes_unrelated_writes(self):
         client, adapter, base, source = self.legacy_relation_fixture()
         retirement = reviewed_retirement(adapter, "relation", "blocks:GEN-14")

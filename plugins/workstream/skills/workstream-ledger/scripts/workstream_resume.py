@@ -986,8 +986,12 @@ def validate_snapshot(
         child_by_identifier = {
             str(child.get("identifier", "")).upper(): child for child in children
         }
+        closure_ids: set[str] = set()
         for index, closure in enumerate(child_closures):
             child_id = str(closure.get("child_identifier", "")).upper()
+            if child_id in closure_ids:
+                raise ResumeError(f"duplicate_child_closure:{child_id}")
+            closure_ids.add(child_id)
             child = child_by_identifier.get(child_id)
             if child is None:
                 raise ResumeError(f"child_closure_child_missing:{index}")
@@ -1043,6 +1047,25 @@ def validate_snapshot(
                 contracts.append(contract)
             if evidence_receipts_sha256(contracts) != closure.get("evidence_receipts_sha256"):
                 raise ResumeError(f"child_closure_receipts_mismatch:{index}")
+        evidence_owned_children = {
+            str(event["value"].get("owning_child", "")).upper()
+            for (kind, _key), event in active.items()
+            if kind == "evidence_contract"
+        }
+        if scope is not None:
+            for child_id, child in child_by_identifier.items():
+                status_type = str(
+                    child.get("status_type") or child.get("status") or ""
+                ).lower()
+                if (
+                    status_type in {"completed", "done"}
+                    and child_id in scope["child_ownership"]
+                    and child_id in evidence_owned_children
+                    and child_id not in closure_ids
+                ):
+                    raise ResumeError(
+                        f"completed_owned_child_closure_missing:{child_id}"
+                    )
         for choice_id, view in choice_view.items():
             event = view["record"]
             if event["workstream_id"] != identifier.upper():

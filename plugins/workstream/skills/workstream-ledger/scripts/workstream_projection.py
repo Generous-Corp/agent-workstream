@@ -699,12 +699,17 @@ def load_material_history_for_projection_reconcile(
             "legacy_unresolved_relation_migration_required:"
             + ",".join(uncovered)
         )
-    scope_or_source_changes = any(
-        identity[0] in {"scope", "source"}
+    authority_sensitive_changes = any(
+        identity[0] in {
+            "scope", "source", "evidence_contract", "child_closure",
+        }
         and (identity not in active or active[identity]["value"] != value)
         for identity, value in desired_by_identity.items()
+    ) or any(
+        retirement["kind"] in {"evidence_contract", "child_closure"}
+        for retirement in reviewed_retirements
     )
-    if scope_or_source_changes:
+    if authority_sensitive_changes:
         if remote_head is None:
             raise LinearProjectionError("prospective_remote_head_required")
         if projection_review_contract(initial) != reviewed_contract:
