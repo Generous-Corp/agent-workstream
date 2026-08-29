@@ -50,6 +50,16 @@ class ResumeTests(unittest.TestCase):
         }
         return snapshot
 
+    def test_expected_missing_closures_requires_authority_validation(self):
+        with self.assertRaisesRegex(
+            MODULE.ResumeError,
+            "expected_missing_terminal_closures_requires_projection_authority",
+        ):
+            MODULE.validate_snapshot(
+                self.snapshot(), "GEN-37",
+                expected_missing_terminal_closures=frozenset({"GEN-70"}),
+            )
+
     def test_compact_context_keeps_root_and_only_nonterminal_children(self):
         snapshot = self.snapshot()
         snapshot["children"][0]["description"] = "large redundant prose"

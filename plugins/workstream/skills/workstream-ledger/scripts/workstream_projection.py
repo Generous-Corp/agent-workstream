@@ -125,7 +125,7 @@ def synchronize_manifest_source(
     if (
         isinstance(supplied_identity, str)
         and supplied_identity.startswith(("http://", "https://"))
-        and not same_plan_document(canonical, supplied_identity)
+        and canonical != supplied_identity
     ):
         raise LinearProjectionError("plan_source_conflicts_canonical_issue_url")
     result = deepcopy(manifest)
@@ -248,9 +248,10 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
     }
     repairs_allowed = required | {"terminal_child_repairs"}
     seeds_allowed = required | {"terminal_child_evidence_seeds"}
+    source_transition_allowed = required | {"terminal_child_source_transition"}
     if not isinstance(manifest, dict) or frozenset(manifest) not in {
         frozenset(required), frozenset(repairs_allowed),
-        frozenset(seeds_allowed),
+        frozenset(seeds_allowed), frozenset(source_transition_allowed),
     }:
         raise LinearProjectionError("manifest_review_contract_required")
     revision = manifest["expected_projection_revision"]
@@ -431,6 +432,45 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         seed_evidence_keys.update(keys)
     if seeds != sorted(seeds, key=lambda item: item["child_identifier"].upper()):
         raise LinearProjectionError("terminal_child_evidence_seeds_not_canonical")
+    transition = manifest.get("terminal_child_source_transition")
+    if transition is not None:
+        if not isinstance(transition, dict) or set(transition) != {
+            "from_identity", "to_identity", "sha256", "pending_children",
+        }:
+            raise LinearProjectionError("invalid_terminal_child_source_transition")
+        pending = transition.get("pending_children")
+        if (
+            not all(isinstance(transition.get(field), str) and transition[field]
+                    for field in ("from_identity", "to_identity"))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(transition.get("sha256", "")))
+            or not isinstance(pending, list) or not pending
+        ):
+            raise LinearProjectionError("invalid_terminal_child_source_transition")
+        seen_children: set[str] = set()
+        seen_issues: set[str] = set()
+        for index, child in enumerate(pending):
+            child_id = str(child.get("child_identifier", "")).upper() if isinstance(child, dict) else ""
+            if (
+                not isinstance(child, dict)
+                or set(child) != {"child_identifier", "child_issue_id",
+                                  "expected_child_readback_sha256", "expected_assignee_id"}
+                or not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", child_id)
+                or not isinstance(child.get("child_issue_id"), str)
+                or not child["child_issue_id"]
+                or child.get("expected_assignee_id") is not None
+                and (not isinstance(child.get("expected_assignee_id"), str)
+                     or not child["expected_assignee_id"])
+                or not re.fullmatch(r"[0-9a-f]{64}", str(child.get("expected_child_readback_sha256", "")))
+                or child_id in seen_children
+                or child["child_issue_id"] in seen_issues
+            ):
+                raise LinearProjectionError(
+                    f"invalid_terminal_child_source_transition_child:{index}"
+                )
+            seen_children.add(child_id)
+            seen_issues.add(child["child_issue_id"])
+        if pending != sorted(pending, key=lambda child: child["child_identifier"].upper()):
+            raise LinearProjectionError("terminal_child_source_transition_not_canonical")
     return _desired_items(manifest), retirements
 
 
@@ -448,6 +488,124 @@ def _completed_owned_missing_closures(
             "child_closure", str(child.get("identifier", "")).upper(),
         ) not in active
     }
+
+
+def _valid_main_to_exact_source_transition(first: str, second: str) -> bool:
+    pattern = re.compile(
+        r"https://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.+)"
+    )
+    left = pattern.fullmatch(first)
+    right = pattern.fullmatch(second)
+    return bool(
+        left and right
+        and same_plan_document(first, second)
+        and left.group(3) == "main"
+        and re.fullmatch(r"[0-9a-f]{40}", right.group(3))
+        and (left.group(1).lower(), left.group(2).lower(), left.group(4))
+        == (right.group(1).lower(), right.group(2).lower(), right.group(4))
+    )
+
+
+def prepare_terminal_child_source_transition(
+    manifest: dict[str, Any], snapshot: dict[str, Any], state: Any,
+) -> dict[str, Any]:
+    """Validate or replay one exact main-to-commit source-only transition."""
+    result = deepcopy(manifest)
+    _reviewed_manifest(result)
+    transition = result.get("terminal_child_source_transition")
+    if transition is None:
+        return result
+    if result.get("retirements"):
+        raise LinearProjectionError("terminal_child_source_transition_forbids_retirements")
+    active = _active_heads(state)
+    source_head = active.get(("source", "root"))
+    scope_head = active.get(("scope", "root"))
+    if source_head is None or scope_head is None:
+        raise LinearProjectionError("terminal_child_source_transition_surface_missing")
+    old_source = source_head["value"]
+    expected_source = {
+        "identity": transition["to_identity"], "sha256": transition["sha256"],
+    }
+    if (
+        old_source not in ({"identity": transition["from_identity"],
+                            "sha256": transition["sha256"]}, expected_source)
+        or not _valid_main_to_exact_source_transition(
+            transition["from_identity"], transition["to_identity"],
+        )
+    ):
+        raise LinearProjectionError("terminal_child_source_transition_invalid_route")
+    desired = result["projection"]
+    source_item = next((item for item in desired if item["kind"] == "source"), None)
+    if source_item is None or source_item["value"] != expected_source:
+        raise LinearProjectionError("terminal_child_source_transition_source_mismatch")
+    pending_ids = {child["child_identifier"].upper()
+                   for child in transition["pending_children"]}
+    actual_pending = _completed_owned_missing_closures(
+        snapshot, scope_head["value"], active,
+    )
+    if actual_pending != pending_ids:
+        raise LinearProjectionError(
+            "terminal_child_source_transition_pending_set_mismatch:"
+            + ",".join(sorted(actual_pending ^ pending_ids))
+        )
+    children = {str(child.get("identifier", "")).upper(): child
+                for child in snapshot.get("children", [])}
+    for expected in transition["pending_children"]:
+        child_id = expected["child_identifier"].upper()
+        child = children.get(child_id)
+        if child is None:
+            raise LinearProjectionError(
+                f"terminal_child_source_transition_child_missing:{child_id}"
+            )
+        try:
+            readback = terminal_child_readback(child)
+        except ChildClosureError as error:
+            raise LinearProjectionError(f"{child_id}:{error}") from error
+        if (
+            readback["child_issue_id"] != expected["child_issue_id"]
+            or readback["assignee_id"] != expected["expected_assignee_id"]
+            or canonical_digest(readback)
+            != expected["expected_child_readback_sha256"]
+        ):
+            raise LinearProjectionError(
+                f"terminal_child_readback_changed_reload_required:{child_id}"
+            )
+        linear = scope_head["value"]["linear"]
+        if any(readback[field] != linear[field]
+               for field in ("workspace_id", "team_id", "project_id")) \
+                or readback["parent_issue_id"] != linear["root_issue_id"]:
+            raise LinearProjectionError(
+                f"terminal_child_source_transition_route_mismatch:{child_id}"
+            )
+    for item in desired:
+        identity = (item["kind"], item["key"])
+        if identity == ("source", "root"):
+            continue
+        current = active.get(identity)
+        if current is None or current["value"] != item["value"]:
+            raise LinearProjectionError(
+                f"terminal_child_source_transition_unrelated_change:"
+                f"{identity[0]}:{identity[1]}"
+            )
+    original_contract = {field: deepcopy(result[field])
+                         for field in REVIEW_CONTRACT_FIELDS}
+    current_contract = projection_review_contract(state)
+    if current_contract != original_contract:
+        expected_revision = original_contract["expected_projection_revision"]
+        progress = state.events[expected_revision:]
+        if not (
+            len(progress) == 1
+            and (progress[0]["kind"], progress[0]["key"]) == ("source", "root")
+            and progress[0]["value"] == expected_source
+            and all(
+                field in {"expected_projection_revision", "expected_active_heads"}
+                or current_contract[field] == original_contract[field]
+                for field in REVIEW_CONTRACT_FIELDS
+            )
+        ):
+            raise LinearProjectionError("projection_review_stale_reload_required")
+        result.update(current_contract)
+    return result
 
 
 def _with_validation_only_seed_closures(
@@ -1335,13 +1493,19 @@ def load_material_history_for_projection_reconcile(
         )
         candidate = prospective(candidate_items)
         seeds = manifest.get("terminal_child_evidence_seeds") or []
+        source_transition = manifest.get("terminal_child_source_transition")
         validation_candidate = (
             _with_validation_only_seed_closures(candidate, seeds, adapter)
             if seeds else candidate
         )
+        expected_missing = frozenset(
+            child["child_identifier"].upper()
+            for child in (source_transition or {}).get("pending_children", [])
+        )
         compact_context(
             validation_candidate, token, max_bytes=max_bytes,
             max_items=max_items, require_projection_authority=True,
+            expected_missing_terminal_closures=expected_missing,
         )
         return candidate, frozenset(unresolved)
 
@@ -1485,6 +1649,30 @@ def reconcile_required_projection(
     )
     repairs = manifest.get("terminal_child_repairs") or []
     seeds = manifest.get("terminal_child_evidence_seeds") or []
+    source_transition = manifest.get("terminal_child_source_transition")
+    if source_transition:
+        if initial.events and all(
+            event["schema_version"] == 1 for event in initial.events
+        ):
+            raise LinearProjectionError(
+                "terminal_child_source_transition_requires_v2_projection"
+            )
+        if prepare_terminal_child_source_transition(
+            manifest, snapshot, initial,
+        ) != manifest:
+            raise LinearProjectionError(
+                "terminal_child_source_transition_review_stale_reload_required"
+            )
+        for item in desired:
+            identity = (item["kind"], item["key"])
+            current = active_heads.get(identity)
+            if identity == ("source", "root"):
+                continue
+            if current is None or current["value"] != item["value"]:
+                raise LinearProjectionError(
+                    f"terminal_child_source_transition_unrelated_change:"
+                    f"{identity[0]}:{identity[1]}"
+                )
     if seeds:
         if prepare_terminal_child_evidence_seeds(
             manifest, snapshot, initial,
@@ -1681,7 +1869,10 @@ def reconcile_required_projection(
         raise LinearProjectionError("projection_review_stale_reload_required")
 
     def fence_terminal_repairs() -> None:
-        fenced_children = repairs or seeds
+        fenced_children = (
+            repairs or seeds
+            or ((source_transition or {}).get("pending_children") or [])
+        )
         if not fenced_children:
             return
         if terminal_child_fence is None:
@@ -1842,7 +2033,7 @@ def reconcile_required_projection(
         "writes": receipts,
         "disposition": disposition,
         "readback_verified": True,
-        "resume_authority_verified": not bool(seeds),
+        "resume_authority_verified": not bool(seeds or source_transition),
         "projection_contract": projection_review_contract(final),
     }
 
@@ -1898,6 +2089,9 @@ def main() -> int:
             manifest, graph["root"].get("description"), authenticated_source,
             projection_state.snapshot.get("source"),
             projection_state.snapshot.get("projection_history"),
+        )
+        manifest = prepare_terminal_child_source_transition(
+            manifest, graph, projection_state,
         )
         manifest = prepare_terminal_child_evidence_seeds(
             manifest, graph, projection_state,
@@ -1974,7 +2168,43 @@ def main() -> int:
             ),
         )
         seeds = manifest.get("terminal_child_evidence_seeds") or []
-        if seeds:
+        source_transition = manifest.get("terminal_child_source_transition")
+        if source_transition:
+            final_transition = prepare_terminal_child_source_transition(
+                manifest, graph_after, adapter.state(),
+            )
+            if final_transition["expected_projection_revision"] != adapter.state().revision:
+                raise LinearProjectionError(
+                    "terminal_child_source_transition_final_contract_mismatch"
+                )
+            expected_pending = frozenset(
+                child["child_identifier"].upper()
+                for child in source_transition["pending_children"]
+            )
+            context = compact_context(
+                verified, token, max_bytes=args.max_bytes,
+                max_items=args.max_items, require_projection_authority=True,
+                expected_missing_terminal_closures=expected_pending,
+            )
+            choose_disposition(context, remote_head=args.remote_head)
+            result.update({
+                "operation_status": "partial",
+                "resume_authority": "partial_terminal_closure_required",
+                "resume_authority_verified": False,
+                "pending_terminal_closure": sorted(expected_pending),
+                "source_transition": {
+                    "from_identity": source_transition["from_identity"],
+                    "to_identity": source_transition["to_identity"],
+                    "sha256": source_transition["sha256"],
+                    "verified": True,
+                },
+            })
+            result["source_sync"] = {
+                "identity": authenticated_source["identity"],
+                "sha256": authenticated_source["sha256"],
+                "resume_authority": "partial_terminal_closure_required",
+            }
+        elif seeds:
             expected_pending = {
                 seed["child_identifier"].upper() for seed in seeds
             }
@@ -2006,6 +2236,9 @@ def main() -> int:
             )
             choose_disposition(validated_context, remote_head=args.remote_head)
             result["pending_terminal_closure"] = sorted(expected_pending)
+            result["operation_status"] = "partial"
+            result["resume_authority"] = "partial_terminal_closure_required"
+            result["resume_authority_verified"] = False
             result["source_sync"] = {
                 "identity": authenticated_source["identity"],
                 "sha256": authenticated_source["sha256"],
@@ -2023,6 +2256,9 @@ def main() -> int:
                 "sha256": authenticated_source["sha256"],
                 "resume_authority": context["resume_authority"],
             }
+            result["operation_status"] = "complete"
+            result["resume_authority"] = "full"
+            result["resume_authority_verified"] = True
         json.dump(result, sys.stdout, sort_keys=True, indent=2)
         sys.stdout.write("\n")
         return 0
