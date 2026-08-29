@@ -16,7 +16,7 @@ import re
 import ssl
 import urllib.request
 import uuid
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from workstream_http import default_ssl_context
 from workstream_graph import GraphReviewRequired, build_operations
@@ -880,7 +880,7 @@ class LinearGraphQLTransport:
         source_revision: str,
         plan_revision: str,
         expected_frontier: dict[str, int],
-        frontier_fence: Callable[[], dict[str, int]],
+        authorization_adapter: Any,
     ) -> dict[str, Any]:
         """Create or converge one reviewed child beneath an immutable legacy root.
 
@@ -896,6 +896,8 @@ class LinearGraphQLTransport:
         children = plan.get("children")
         if not isinstance(source, dict) or not isinstance(root_plan, dict):
             raise GraphReviewRequired("reviewed plan source is incomplete")
+        if not isinstance(source.get("identity"), str) or not source["identity"].strip():
+            raise GraphReviewRequired("reviewed source identity is incomplete")
         if source.get("sha256") != source_revision:
             raise GraphReviewRequired("reviewed source revision did not reproduce")
         if root_plan.get("plan_revision") != plan_revision:
@@ -919,25 +921,24 @@ class LinearGraphQLTransport:
             set(expected_frontier) != required_frontier
             or any(
                 not isinstance(expected_frontier[field], int)
+                or isinstance(expected_frontier[field], bool)
                 or expected_frontier[field] < 0
                 for field in required_frontier
             )
         ):
             raise ValueError("expected material/projection frontier is invalid")
-        if not callable(frontier_fence):
-            raise ValueError("a live material/projection frontier fence is required")
+        if not all(
+            callable(getattr(authorization_adapter, method, None))
+            for method in (
+                "reserve_child_extension", "assert_child_extension_authorized",
+            )
+        ):
+            raise ValueError("a durable child-extension authorization adapter is required")
         if not isinstance(root_issue_id, str) or not root_issue_id.strip():
             raise ValueError("existing root issue ID is required")
 
         route = self._intake_route()
         self._ensure_route()
-
-        def verify_frontier() -> None:
-            observed = frontier_fence()
-            if observed != expected_frontier:
-                raise LinearTransportError(
-                    "existing_root_frontier_changed_reload_required"
-                )
 
         current = self.snapshot()["issues"]
         root = next((item for item in current if item.get("id") == root_issue_id), None)
@@ -966,7 +967,6 @@ class LinearGraphQLTransport:
             raise LinearTransportError("duplicate_workstream_child")
         child = matching[0] if matching else None
         disposition = "existing"
-        verify_frontier()
         if child is not None:
             self._validate_intake_issue(
                 child,
@@ -988,24 +988,66 @@ class LinearGraphQLTransport:
                     parent_id=root_issue_id,
                 )
                 child, disposition = occupied, "converged"
-            else:
-                # Re-fence immediately before the only mutation. A concurrent
-                # cooperative writer advances this frontier and forces reload.
-                verify_frontier()
-                child, disposition = self._create_or_converge(
-                    issue_id=child_id,
-                    stable_key=reviewed_candidate_key,
-                    title=candidate["title"],
-                    description=durable_description(
-                        reviewed_candidate_key,
-                        plan_revision,
-                        next_action=candidate.get("next_action"),
-                    ),
-                    plan_revision=plan_revision,
-                    parent_id=root_issue_id,
-                )
 
-        verify_frontier()
+        authorization = authorization_adapter.reserve_child_extension(
+            source={
+                "identity": source.get("identity"), "sha256": source_revision,
+            },
+            reviewed_candidate_key=reviewed_candidate_key,
+            child_issue_id=child_id,
+            expected_material_revision=expected_frontier["material_revision"],
+            expected_projection_revision=expected_frontier["projection_revision"],
+        )
+        authorization_event = authorization.get("event")
+        if not isinstance(authorization_event, dict):
+            raise LinearTransportError("child_extension_authorization_receipt_invalid")
+        authorization_route = {**route, "root_issue_id": root_issue_id}
+        expected_authorization_value = {
+            "root_issue_id": root_issue_id,
+            "route": authorization_route,
+            "source": {
+                "identity": source["identity"], "sha256": source_revision,
+            },
+            "plan_revision": plan_revision,
+            "reviewed_candidate_key": reviewed_candidate_key,
+            "child_issue_id": child_id,
+            "expected_material_revision": expected_frontier["material_revision"],
+            "expected_projection_revision": expected_frontier["projection_revision"],
+            "initial_state": "planned_pending_projection",
+        }
+        if (
+            authorization_event.get("schema_version") != 2
+            or authorization_event.get("workstream_id")
+            != str(root.get("identifier", "")).upper()
+            or authorization_event.get("kind")
+            != "child_extension_authorization"
+            or authorization_event.get("key") != child_id
+            or authorization_event.get("plan_revision") != plan_revision
+            or authorization_event.get("expected_revision")
+            != expected_frontier["projection_revision"]
+            or authorization_event.get("authority") != authorization_route
+            or authorization_event.get("value") != expected_authorization_value
+        ):
+            raise LinearTransportError("child_extension_authorization_receipt_mismatch")
+        if child is None:
+            # The irreversible create is downstream of an append-only CAS
+            # grant. Later ledger events are ordered after that authority.
+            authorization_adapter.assert_child_extension_authorized(
+                authorization_event
+            )
+            child, disposition = self._create_or_converge(
+                issue_id=child_id,
+                stable_key=reviewed_candidate_key,
+                title=candidate["title"],
+                description=durable_description(
+                    reviewed_candidate_key,
+                    plan_revision,
+                    next_action=candidate.get("next_action"),
+                ),
+                plan_revision=plan_revision,
+                parent_id=root_issue_id,
+            )
+
         final = self.snapshot()["issues"]
         final_root = next(
             (item for item in final if item.get("id") == root_issue_id), None
@@ -1030,7 +1072,9 @@ class LinearGraphQLTransport:
             plan_revision=plan_revision,
             parent_id=root_issue_id,
         )
-        verify_frontier()
+        authorization_adapter.assert_child_extension_authorized(
+            authorization_event
+        )
         return {
             "schema_version": 1,
             "source": source,
@@ -1044,6 +1088,8 @@ class LinearGraphQLTransport:
                 disposition=disposition,
             ),
             "frontier": dict(expected_frontier),
+            "authorization": authorization,
+            "initial_state": "planned_pending_projection",
         }
 
     def apply_reviewed_plan(

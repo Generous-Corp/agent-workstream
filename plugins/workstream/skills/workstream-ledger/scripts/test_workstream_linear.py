@@ -20,6 +20,9 @@ from workstream_linear import (
     parse_plan_revision,
     parse_root_revision,
 )
+from workstream_linear_projection import (
+    build_projection_event, encode_projection_comment, LinearProjectionAdapter,
+)
 
 
 class FakeClient:
@@ -71,6 +74,51 @@ class UUIDv4ValidatingFakeClient(FakeClient):
             ):
                 raise LinearTransportError("id must be a UUID")
         return super().execute(query, variables)
+
+
+class FakeChildAuthorization:
+    def __init__(self, failure=None):
+        self.failure = failure
+        self.event = None
+        self.reserve_calls = 0
+        self.assert_calls = 0
+
+    def reserve_child_extension(self, **values):
+        self.reserve_calls += 1
+        if self.failure:
+            raise self.failure
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project",
+            "root_issue_id": "409c1423-f949-4655-9f5f-d3213d7b434f",
+        }
+        value = {
+            "root_issue_id": route["root_issue_id"],
+            "route": route,
+            "source": values["source"],
+            "plan_revision": values["source"]["sha256"],
+            "reviewed_candidate_key": values["reviewed_candidate_key"],
+            "child_issue_id": values["child_issue_id"],
+            "expected_material_revision": values["expected_material_revision"],
+            "expected_projection_revision": values["expected_projection_revision"],
+            "initial_state": "planned_pending_projection",
+        }
+        self.event = build_projection_event(
+            workstream_id="GEN-37", kind="child_extension_authorization",
+            key=values["child_issue_id"], value=value,
+            plan_revision=values["source"]["sha256"],
+            expected_revision=values["expected_projection_revision"],
+            created_at="1970-01-01T00:00:00Z", authority=route,
+        )
+        return {"event": self.event, "remote_id": "comment-a", "revision": 8}
+
+    def assert_child_extension_authorized(self, event):
+        self.assert_calls += 1
+        if self.failure:
+            raise self.failure
+        if event != self.event:
+            raise LinearTransportError("authorization mismatch")
+        return {"event": event, "remote_id": "comment-a", "revision": 8}
 
 
 class LinearTransportTests(unittest.TestCase):
@@ -164,8 +212,12 @@ class LinearTransportTests(unittest.TestCase):
             },
         }
 
-    def extend_legacy(self, transport, *, frontier_fence=None):
-        frontier = {"material_revision": 3, "projection_revision": 7}
+    def extend_legacy(
+        self, transport, *, authorization_adapter=None, expected_frontier=None,
+    ):
+        frontier = expected_frontier or {
+            "material_revision": 3, "projection_revision": 7,
+        }
         return transport.extend_existing_root_reviewed_child(
             self.legacy_extension_plan(),
             root_issue_id="409c1423-f949-4655-9f5f-d3213d7b434f",
@@ -173,7 +225,7 @@ class LinearTransportTests(unittest.TestCase):
             source_revision="sha-demo",
             plan_revision="sha-demo",
             expected_frontier=frontier,
-            frontier_fence=frontier_fence or (lambda: dict(frontier)),
+            authorization_adapter=authorization_adapter or FakeChildAuthorization(),
         )
 
     def test_reviewed_plan_creates_one_root_and_child(self):
@@ -267,7 +319,14 @@ class LinearTransportTests(unittest.TestCase):
         self.assertEqual(result["receipt"]["id"], child_id)
         self.assertEqual(result["receipt"]["parent_id"], self.legacy_root()["id"])
         self.assertEqual(result["receipt"]["disposition"], "created")
+        self.assertEqual(result["initial_state"], "planned_pending_projection")
         self.assertEqual(sum("issueCreate" in query for query, _ in fake.calls), 1)
+        create_input = next(
+            variables["input"] for query, variables in fake.calls
+            if "issueCreate" in query
+        )
+        self.assertNotIn("stateId", create_input)
+        self.assertNotIn("assigneeId", create_input)
 
     def test_existing_root_extension_replay_is_a_zero_write_no_op(self):
         fake = FakeClient()
@@ -299,6 +358,34 @@ class LinearTransportTests(unittest.TestCase):
         self.assertEqual(len(fake.issues), 2)
         self.assertEqual(result["receipt"]["disposition"], "converged")
 
+    def test_existing_root_extension_recovers_crash_after_authorization(self):
+        class CrashBeforeCreateFake(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.crash = True
+
+            def execute(self, query, variables):
+                if "issueCreate" in query and self.crash:
+                    self.crash = False
+                    raise OSError("crash after authorization before create")
+                return super().execute(query, variables)
+
+        fake = CrashBeforeCreateFake()
+        fake.issues.append(self.legacy_root())
+        authorization = FakeChildAuthorization()
+        with self.assertRaisesRegex(
+            LinearTransportError, "intake_create_unconfirmed",
+        ):
+            self.extend_legacy(
+                self.routed_transport(fake), authorization_adapter=authorization,
+            )
+
+        result = self.extend_legacy(
+            self.routed_transport(fake), authorization_adapter=authorization,
+        )
+        self.assertEqual(result["receipt"]["disposition"], "created")
+        self.assertEqual(authorization.reserve_calls, 2)
+
     def test_existing_root_extension_collision_fails_closed(self):
         fake = FakeClient()
         fake.issues.append(self.legacy_root())
@@ -327,9 +414,36 @@ class LinearTransportTests(unittest.TestCase):
         ):
             self.extend_legacy(
                 self.routed_transport(fake),
-                frontier_fence=lambda: {
-                    "material_revision": 4, "projection_revision": 7,
-                },
+                authorization_adapter=FakeChildAuthorization(
+                    LinearTransportError(
+                        "existing_root_frontier_changed_reload_required"
+                    )
+                ),
+            )
+
+        self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
+
+    def test_existing_root_extension_mismatched_authorization_is_zero_write(self):
+        class WrongRouteAuthorization(FakeChildAuthorization):
+            def reserve_child_extension(self, **values):
+                receipt = super().reserve_child_extension(**values)
+                receipt["event"] = {
+                    **receipt["event"],
+                    "authority": {
+                        **receipt["event"]["authority"],
+                        "root_issue_id": "wrong-root",
+                    },
+                }
+                return receipt
+
+        fake = FakeClient()
+        fake.issues.append(self.legacy_root())
+        with self.assertRaisesRegex(
+            LinearTransportError, "child_extension_authorization_receipt_mismatch",
+        ):
+            self.extend_legacy(
+                self.routed_transport(fake),
+                authorization_adapter=WrongRouteAuthorization(),
             )
 
         self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
@@ -337,19 +451,109 @@ class LinearTransportTests(unittest.TestCase):
     def test_existing_root_extension_concurrent_advance_before_create_is_zero_write(self):
         fake = FakeClient()
         fake.issues.append(self.legacy_root())
-        observed = iter([
-            {"material_revision": 3, "projection_revision": 7},
-            {"material_revision": 3, "projection_revision": 8},
-        ])
+        authorization = FakeChildAuthorization()
+
+        def superseded(_event):
+            raise LinearTransportError(
+                "child_extension_authorization_superseded_or_conflicting"
+            )
+
+        authorization.assert_child_extension_authorized = superseded
 
         with self.assertRaisesRegex(
-            LinearTransportError, "existing_root_frontier_changed_reload_required",
+            LinearTransportError,
+            "child_extension_authorization_superseded_or_conflicting",
         ):
             self.extend_legacy(
-                self.routed_transport(fake), frontier_fence=lambda: next(observed),
+                self.routed_transport(fake), authorization_adapter=authorization,
             )
 
         self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
+
+    def test_existing_root_extension_planted_projection_race_never_creates_child(self):
+        class CombinedRaceClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.comments = []
+                self.injected = False
+
+            def execute(self, query, variables):
+                if "WorkstreamProjectionCommentCreateCapability" in query:
+                    return {"__type": {"inputFields": [{"name": "id"}]}}
+                if "query WorkstreamDeltaComments" in query:
+                    return {"issue": {
+                        "id": self.issues[0]["id"], "identifier": "GEN-37",
+                        "team": self.issues[0]["team"],
+                        "project": self.issues[0]["project"],
+                        "comments": {
+                            "nodes": list(self.comments),
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        },
+                    }}
+                if "commentCreate" in query:
+                    if not self.injected:
+                        self.injected = True
+                        winner = build_projection_event(
+                            workstream_id="GEN-37",
+                            kind="child_extension_authorization",
+                            key="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                            value={
+                                "root_issue_id": self.issues[0]["id"],
+                                "route": {
+                                    "workspace_id": "workspace", "team_id": "team",
+                                    "project_id": "project",
+                                    "root_issue_id": self.issues[0]["id"],
+                                },
+                                "source": {
+                                    "identity": "plan:legacy", "sha256": "sha-demo",
+                                },
+                                "plan_revision": "sha-demo",
+                                "reviewed_candidate_key": "candidate-b",
+                                "child_issue_id": (
+                                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                                ),
+                                "expected_material_revision": 0,
+                                "expected_projection_revision": 0,
+                                "initial_state": "planned_pending_projection",
+                            },
+                            plan_revision="sha-demo", expected_revision=0,
+                            created_at="2026-08-20T00:00:00Z",
+                            authority={
+                                "workspace_id": "workspace", "team_id": "team",
+                                "project_id": "project",
+                                "root_issue_id": self.issues[0]["id"],
+                            },
+                        )
+                        self.comments.append({
+                            "id": variables["input"]["id"],
+                            "body": encode_projection_comment(winner),
+                            "createdAt": "2026-08-20T00:00:00Z",
+                            "updatedAt": "2026-08-20T00:00:00Z",
+                        })
+                        raise LinearTransportError("duplicate comment id")
+                return super().execute(query, variables)
+
+        client = CombinedRaceClient()
+        client.issues.append(self.legacy_root())
+        authorization = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision="sha-demo", workspace_id="workspace", team_id="team",
+            project_id="project", root_issue_id=self.legacy_root()["id"],
+        )
+
+        with self.assertRaisesRegex(
+            LinearTransportError, "projection_slot_lost_reload_required",
+        ):
+            self.extend_legacy(
+                self.routed_transport(client),
+                authorization_adapter=authorization,
+                expected_frontier={
+                    "material_revision": 0, "projection_revision": 0,
+                },
+            )
+
+        self.assertEqual(len(client.issues), 1)
+        self.assertFalse(any("issueCreate" in query for query, _ in client.calls))
 
     def test_existing_root_extension_requires_exact_reviewed_source_before_network(self):
         fake = FakeClient()
@@ -366,9 +570,7 @@ class LinearTransportTests(unittest.TestCase):
                 expected_frontier={
                     "material_revision": 3, "projection_revision": 7,
                 },
-                frontier_fence=lambda: {
-                    "material_revision": 3, "projection_revision": 7,
-                },
+                authorization_adapter=FakeChildAuthorization(),
             )
 
         self.assertEqual(fake.calls, [])

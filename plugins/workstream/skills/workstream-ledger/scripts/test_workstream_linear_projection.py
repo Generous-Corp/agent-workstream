@@ -178,7 +178,8 @@ class FakeProjectionClient:
                 raise LinearTransportError("duplicate comment id")
             comment = {"id": comment_id,
                        "body": variables["input"]["body"],
-                       "createdAt": "now", "updatedAt": "now"}
+                       "createdAt": f"2026-08-20T00:00:{len(self.comments):02d}Z",
+                       "updatedAt": f"2026-08-20T00:00:{len(self.comments):02d}Z"}
             self.comments.append(comment)
             return {"commentCreate": {"success": True, "comment": dict(comment)}}
         raise AssertionError("unexpected GraphQL operation")
@@ -333,6 +334,152 @@ def evidence_contract() -> dict:
 
 
 class ProjectionTests(unittest.TestCase):
+    @staticmethod
+    def authorization_adapter(client):
+        return LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+
+    @staticmethod
+    def reserve_child(adapter, **overrides):
+        values = {
+            "source": {"identity": "plan:legacy", "sha256": PLAN},
+            "reviewed_candidate_key": "candidate-a",
+            "child_issue_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "expected_material_revision": 0,
+            "expected_projection_revision": 0,
+        }
+        values.update(overrides)
+        return adapter.reserve_child_extension(**values)
+
+    def test_child_extension_authorization_is_durable_and_replay_is_noop(self):
+        client = FakeProjectionClient()
+        adapter = self.authorization_adapter(client)
+
+        first = self.reserve_child(adapter)
+        replay = self.reserve_child(adapter)
+
+        self.assertEqual(first["event"], replay["event"])
+        self.assertEqual(first["remote_id"], replay["remote_id"])
+        self.assertEqual(len(client.comments), 1)
+        self.assertEqual(first["event"]["kind"], "child_extension_authorization")
+        self.assertEqual(
+            first["event"]["value"]["initial_state"],
+            "planned_pending_projection",
+        )
+
+    def test_child_extension_authorization_lost_response_converges(self):
+        class LostResponseClient(FakeProjectionClient):
+            def __init__(self):
+                super().__init__()
+                self.lost = False
+
+            def execute(self, query, variables):
+                response = super().execute(query, variables)
+                if "commentCreate" in query and not self.lost:
+                    self.lost = True
+                    raise TimeoutError("authorization response lost after commit")
+                return response
+
+        client = LostResponseClient()
+        receipt = self.reserve_child(self.authorization_adapter(client))
+
+        self.assertEqual(len(client.comments), 1)
+        self.assertEqual(receipt["remote_id"], client.comments[0]["id"])
+
+    def test_later_material_event_does_not_revoke_child_authorization(self):
+        client = FakeProjectionClient()
+        adapter = self.authorization_adapter(client)
+        first = self.reserve_child(adapter)
+        later = Delta(
+            "material-later", "GEN-37", "requirement", "agent",
+            {"text": "later"}, 0, "2026-08-20T00:00:01Z",
+        )
+        client.comments.append({
+            "id": "material-later-comment", "body": encode_event_comment(later),
+            "createdAt": "2026-08-20T00:00:01Z",
+            "updatedAt": "2026-08-20T00:00:01Z",
+        })
+
+        replay = self.reserve_child(adapter)
+
+        self.assertEqual(replay["event"], first["event"])
+        self.assertEqual(len(client.comments), 2)
+
+    def test_child_extension_authorization_loses_planted_projection_slot_race(self):
+        winner = build_projection_event(
+            workstream_id="GEN-37", kind="source", key="root",
+            value={"identity": "plan:legacy", "sha256": PLAN},
+            plan_revision=PLAN, expected_revision=0,
+            created_at="2026-08-20T00:00:00Z", authority=AUTHORITY,
+        )
+        client = RacingProjectionClient(winner)
+
+        with self.assertRaisesRegex(
+            LinearProjectionError, "projection_slot_lost_reload_required",
+        ):
+            self.reserve_child(self.authorization_adapter(client))
+
+        state = self.authorization_adapter(client).state()
+        self.assertFalse(any(
+            event["kind"] == "child_extension_authorization"
+            for event in state.events
+        ))
+
+    def test_material_event_before_authorization_is_refused_by_remote_order(self):
+        class MaterialRaceClient(FakeProjectionClient):
+            def __init__(self):
+                super().__init__()
+                self.injected = False
+
+            def execute(self, query, variables):
+                if "commentCreate" in query and not self.injected:
+                    self.injected = True
+                    event = Delta(
+                        "material-race", "GEN-37", "requirement", "agent",
+                        {"text": "raced"}, 0, "2026-08-20T00:00:00Z",
+                    )
+                    self.comments.append({
+                        "id": "material-comment",
+                        "body": encode_event_comment(event),
+                        "createdAt": "2026-08-20T00:00:00Z",
+                        "updatedAt": "2026-08-20T00:00:00Z",
+                    })
+                return super().execute(query, variables)
+
+        client = MaterialRaceClient()
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "child_extension_material_preceded_authorization_reload_required",
+        ):
+            self.reserve_child(self.authorization_adapter(client))
+
+        # The planted race may reserve authority, but callers never receive an
+        # executable grant and therefore must not create the child.
+        self.assertEqual(len(client.comments), 2)
+
+    def test_superseded_child_extension_authorization_refuses_readback(self):
+        client = FakeProjectionClient()
+        adapter = self.authorization_adapter(client)
+        receipt = self.reserve_child(adapter)
+        original = receipt["event"]
+        value = deepcopy(original["value"])
+        value["expected_projection_revision"] = 1
+        replacement = build_projection_event(
+            workstream_id="GEN-37", kind="child_extension_authorization",
+            key=original["key"], value=value, plan_revision=PLAN,
+            expected_revision=1, created_at="1970-01-01T00:00:00Z",
+            supersedes_event_id=original["event_id"], authority=AUTHORITY,
+        )
+        adapter.append(replacement)
+
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "child_extension_authorization_superseded_or_conflicting",
+        ):
+            adapter.assert_child_extension_authorized(original)
+
     @staticmethod
     def relation_target_resolver(relations):
         root = {
