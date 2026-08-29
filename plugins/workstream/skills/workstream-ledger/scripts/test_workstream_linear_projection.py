@@ -1464,6 +1464,42 @@ class ProjectionTests(unittest.TestCase):
                 terminal_child_fence=lambda _identifier: expected,
             )
         self.assertEqual(len(client.comments), writes_before)
+        scope_mutations = {
+            "namespace": lambda value: value.__setitem__(
+                "namespace", "forged-namespace"
+            ),
+            "unrelated_owner": lambda value: value["child_ownership"].__setitem__(
+                "GEN-999", "github.com:id:R_agent_workstream"
+            ),
+            "repository_alias": lambda value: value["repositories"][0][
+                "aliases"
+            ].append("github.com/forged/alias"),
+        }
+        for name, mutate_scope in scope_mutations.items():
+            with self.subTest(scope_mutation=name):
+                widened_projection = deepcopy(prepared["projection"])
+                widened_scope = next(
+                    item["value"] for item in widened_projection
+                    if item["kind"] == "scope"
+                )
+                mutate_scope(widened_scope)
+                widened_manifest = {
+                    **reviewed_manifest(adapter, widened_projection),
+                    "terminal_child_repairs": deepcopy(
+                        stale_manifest["terminal_child_repairs"]
+                    ),
+                }
+                with self.assertRaisesRegex(
+                    LinearProjectionError,
+                    "terminal_child_repair_scope_widened",
+                ):
+                    reconcile_required_projection(
+                        adapter, graph, widened_manifest, remote_head=HEAD,
+                        created_at="2026-08-27T20:55:00Z",
+                        authenticated_source=source,
+                        terminal_child_fence=lambda _identifier: expected,
+                    )
+                self.assertEqual(len(client.comments), writes_before)
         self.assertEqual(closure_item["value"]["child_identifier"], "GEN-72")
 
     def test_legacy_unresolved_relation_retirement_precedes_unrelated_writes(self):

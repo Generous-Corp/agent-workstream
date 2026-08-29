@@ -1056,6 +1056,29 @@ def reconcile_required_projection(
     if manifest.get("terminal_child_repairs"):
         if reviewed_retirements:
             raise LinearProjectionError("terminal_child_repair_forbids_retirements")
+        repair = manifest["terminal_child_repairs"][0]
+        child_id = repair["child_identifier"].upper()
+        current_scope_head = active_heads.get(("scope", "root"))
+        desired_scope_item = next(
+            (item for item in desired if item["kind"] == "scope"), None,
+        )
+        desired_closure_item = next((
+            item for item in desired
+            if (item["kind"], item["key"])
+            == ("child_closure", child_id)
+        ), None)
+        if (
+            current_scope_head is None
+            or desired_scope_item is None
+            or desired_closure_item is None
+        ):
+            raise LinearProjectionError("terminal_child_repair_scope_missing")
+        exact_scope = deepcopy(current_scope_head["value"])
+        exact_scope["child_ownership"][child_id] = desired_closure_item[
+            "value"
+        ]["repository_key"]
+        if desired_scope_item["value"] != exact_scope:
+            raise LinearProjectionError("terminal_child_repair_scope_widened")
         for item in desired:
             identity = (item["kind"], item["key"])
             if item["kind"] in {"scope", "child_closure", "disposition"}:
