@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
 """Fenced, idempotent Linear dependencies between existing owned children.
 
-Linear's current ``IssueRelationCreateInput`` accepts a client-supplied UUID.
-This transport uses that actual API capability as the exclusive remote slot for
-one directed ``blocks`` edge, then verifies the same native relation through the
-blocker's ``relations`` and blocked child's ``inverseRelations`` connections.
-It never creates or updates an issue, project, or workstream root.
+The append-only ``child_dependency_authorization`` event is the immutable
+dependency authority. Linear's client-supplied relation UUID is an idempotent
+derived native cache slot, verified through the blocker's ``relations`` and the
+blocked child's ``inverseRelations`` connections. Later events cannot
+retroactively invalidate a won authorization; contradictions require explicit
+append-only supersession and reconciliation. This transport never creates or
+updates an issue, project, or workstream root.
 """
 
 from __future__ import annotations
 
+import argparse
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import json
 import re
+import sys
 import uuid
 from typing import Any
 
 from workstream_linear import (
-    GraphQLClient, LinearGraphQLTransport, LinearTransportError,
+    GraphQLClient, HttpGraphQLClient, LinearGraphQLTransport, LinearTransportError,
     parse_plan_revision, validate_issue_route,
 )
+from workstream_config import load_linear_api_key
 from workstream_linear_events import LinearCommentEventAdapter, reduce_event_comments
 from workstream_linear_projection import LinearProjectionAdapter, reduce_projection_comments
 
@@ -49,6 +54,9 @@ query WorkstreamChildDependencyCapabilities {
   issueType: __type(name: "Issue") {
     fields { name }
   }
+  queryType: __type(name: "Query") {
+    fields { name args { name } }
+  }
 }
 """
 
@@ -71,7 +79,7 @@ query WorkstreamChildRelations($issueId: String!, $after: String) {
     id identifier parent { id identifier }
     team { id organization { id } }
     project { id }
-    relations(first: 250, after: $after) {
+    relations(first: 250, after: $after, includeArchived: true) {
       nodes {
         id type archivedAt
         issue { id identifier parent { id } team { id organization { id } } project { id } }
@@ -89,7 +97,7 @@ query WorkstreamChildInverseRelations($issueId: String!, $after: String) {
     id identifier parent { id identifier }
     team { id organization { id } }
     project { id }
-    inverseRelations(first: 250, after: $after) {
+    inverseRelations(first: 250, after: $after, includeArchived: true) {
       nodes {
         id type archivedAt
         issue { id identifier parent { id } team { id organization { id } } project { id } }
@@ -97,6 +105,19 @@ query WorkstreamChildInverseRelations($issueId: String!, $after: String) {
       }
       pageInfo { hasNextPage endCursor }
     }
+  }
+}
+"""
+
+ALL_RELATION_SLOTS_QUERY = """
+query WorkstreamChildDependencySlots($after: String) {
+  issueRelations(first: 250, after: $after, includeArchived: true) {
+    nodes {
+      id type archivedAt
+      issue { id identifier }
+      relatedIssue { id identifier }
+    }
+    pageInfo { hasNextPage endCursor }
   }
 }
 """
@@ -196,11 +217,11 @@ def reduce_dependency_readback(
             for raw in records:
                 if not isinstance(raw, dict):
                     raise ChildDependencyError("invalid_dependency_relation")
-                if raw.get("archivedAt") is not None:
-                    raise ChildDependencyError("archived_dependency_in_active_readback")
                 if raw.get("type") != "blocks":
                     ignored += 1
                     continue
+                if raw.get("archivedAt") is not None:
+                    raise ChildDependencyError("archived_dependency_in_active_readback")
                 relation_id = raw.get("id")
                 if not isinstance(relation_id, str) or not UUID.fullmatch(relation_id):
                     raise ChildDependencyError("invalid_dependency_relation_id")
@@ -306,7 +327,7 @@ class LinearChildDependencyAdapter:
     """Create native Linear child dependencies with deterministic relation IDs."""
 
     supports_native_linear_relations = True
-    supports_append_only_dependency_projection = False
+    supports_append_only_dependency_projection = True
 
     def __init__(
         self, client: GraphQLClient, *, workspace_id: str, team_id: str,
@@ -340,6 +361,7 @@ class LinearChildDependencyAdapter:
         input_fields = ((result.get("relationInput") or {}).get("inputFields") or [])
         enum_values = ((result.get("relationType") or {}).get("enumValues") or [])
         issue_fields = ((result.get("issueType") or {}).get("fields") or [])
+        query_fields = ((result.get("queryType") or {}).get("fields") or [])
         if not {"id", "issueId", "relatedIssueId", "type"}.issubset({
             field.get("name") for field in input_fields if isinstance(field, dict)
         }):
@@ -352,7 +374,81 @@ class LinearChildDependencyAdapter:
             field.get("name") for field in issue_fields if isinstance(field, dict)
         }):
             raise ChildDependencyError("linear_relation_readback_capability_unavailable")
+        issue_relations = next(
+            (field for field in query_fields
+             if isinstance(field, dict) and field.get("name") == "issueRelations"),
+            None,
+        )
+        if not isinstance(issue_relations, dict) or "includeArchived" not in {
+            item.get("name") for item in issue_relations.get("args", [])
+            if isinstance(item, dict)
+        }:
+            raise ChildDependencyError("linear_relation_slot_preflight_unavailable")
         self._capability_verified = True
+
+    def _all_relation_slots(self) -> dict[str, dict[str, Any]]:
+        slots: dict[str, dict[str, Any]] = {}
+        after: str | None = None
+        seen: set[str] = set()
+        while True:
+            response = self.client.execute(
+                ALL_RELATION_SLOTS_QUERY, {"after": after},
+            )
+            connection = response.get("issueRelations") if isinstance(response, dict) else None
+            if not isinstance(connection, dict):
+                raise ChildDependencyError("invalid_dependency_slot_preflight")
+            nodes = connection.get("nodes")
+            page_info = connection.get("pageInfo")
+            if not isinstance(nodes, list) or not isinstance(page_info, dict):
+                raise ChildDependencyError("invalid_dependency_slot_preflight")
+            for relation in nodes:
+                relation_id = relation.get("id") if isinstance(relation, dict) else None
+                if not isinstance(relation_id, str) or not UUID.fullmatch(relation_id):
+                    raise ChildDependencyError("invalid_dependency_slot_preflight")
+                if relation_id in slots:
+                    raise ChildDependencyError("duplicate_dependency_relation_slot")
+                slots[relation_id] = relation
+            if not page_info.get("hasNextPage"):
+                return slots
+            after = page_info.get("endCursor")
+            if not isinstance(after, str) or not after or after in seen:
+                raise ChildDependencyError("invalid_dependency_slot_pagination_cursor")
+            seen.add(after)
+
+    def _assert_relation_slots(
+        self, desired_by_id: dict[str, dict[str, Any]],
+        existing_by_id: dict[str, dict[str, Any]],
+    ) -> None:
+        slots = self._all_relation_slots()
+        for relation_id, desired in desired_by_id.items():
+            occupied = slots.get(relation_id)
+            if occupied is None:
+                if relation_id in existing_by_id:
+                    raise ChildDependencyError("dependency_slot_readback_inconsistent")
+                continue
+            if relation_id not in existing_by_id:
+                raise ChildDependencyError(
+                    f"dependency_relation_slot_occupied:{relation_id}"
+                )
+            if (
+                occupied.get("archivedAt") is not None
+                or occupied.get("type") != "blocks"
+                or (occupied.get("issue") or {}).get("id")
+                != desired["blocker"]["issue_id"]
+                or (occupied.get("relatedIssue") or {}).get("id")
+                != desired["blocked"]["issue_id"]
+            ):
+                raise ChildDependencyError(
+                    f"dependency_relation_slot_occupied:{relation_id}"
+                )
+
+    def _assert_authorization(self, event: dict[str, Any]) -> None:
+        try:
+            self.authorization.assert_child_dependencies_authorized(event)
+        except LinearTransportError as error:
+            raise ChildDependencyError(
+                "dependency_frontier_changed_reload_required"
+            ) from error
 
     def _root_comments(self) -> list[dict[str, Any]]:
         return LinearCommentEventAdapter(
@@ -626,16 +722,14 @@ class LinearChildDependencyAdapter:
             if reverse in existing_pairs:
                 raise ChildDependencyError("conflicting_dependency_direction")
         if (
-            initial_frontier["material_revision"] != expected_frontier["material_revision"]
+            initial_frontier["material_revision"] < expected_frontier["material_revision"]
             or initial_frontier["graph_revision"]
             != expected_frontier["graph_revision"] + len(present)
             or _sha256([
                 baseline_by_id[item] for item in sorted(baseline_by_id)
             ]) != expected_frontier["graph_sha256"]
-            or initial_frontier["projection_revision"] not in {
-                expected_frontier["projection_revision"],
-                expected_frontier["projection_revision"] + 1,
-            }
+            or initial_frontier["projection_revision"]
+            < expected_frontier["projection_revision"]
         ):
             raise ChildDependencyError("dependency_frontier_changed_reload_required")
 
@@ -649,6 +743,7 @@ class LinearChildDependencyAdapter:
         ):
             raise ChildDependencyError("dependency_relation_precedes_authorization")
         self._assert_native_capability()
+        self._assert_relation_slots(desired_by_id, existing_by_id)
         authorization = self.authorization.reserve_child_dependencies(
             batch_id=batch_id,
             relation_ids=sorted(desired_by_id),
@@ -675,11 +770,17 @@ class LinearChildDependencyAdapter:
             expected_now["graph_sha256"] = _sha256([
                 known_by_id[item] for item in sorted(known_by_id)
             ])
-            if frontier != expected_now or observed != known_by_id:
+            if (
+                frontier["material_revision"] < expected_now["material_revision"]
+                or frontier["projection_revision"]
+                < expected_now["projection_revision"]
+                or frontier["graph_revision"] != expected_now["graph_revision"]
+                or frontier["graph_sha256"] != expected_now["graph_sha256"]
+                or observed != known_by_id
+            ):
                 raise ChildDependencyError("dependency_frontier_changed_reload_required")
-            self.authorization.assert_child_dependencies_authorized(
-                authorization_event
-            )
+            self._assert_relation_slots(desired_by_id, observed)
+            self._assert_authorization(authorization_event)
             try:
                 response = self.client.execute(RELATION_CREATE_MUTATION, {"input": {
                     "id": relation["id"],
@@ -694,9 +795,10 @@ class LinearChildDependencyAdapter:
                 if after != expected_after:
                     raise ChildDependencyError("dependency_create_unconfirmed") from error
                 if (
-                    after_frontier["material_revision"] != expected_frontier["material_revision"]
+                    after_frontier["material_revision"]
+                    < expected_frontier["material_revision"]
                     or after_frontier["projection_revision"]
-                    != authorized_frontier["projection_revision"]
+                    < authorized_frontier["projection_revision"]
                     or after_frontier["graph_revision"] != len(expected_after)
                     or after_frontier["graph_sha256"] != _sha256([
                         expected_after[item] for item in sorted(expected_after)
@@ -722,11 +824,16 @@ class LinearChildDependencyAdapter:
         expected_final["graph_sha256"] = _sha256([
             known_by_id[item] for item in sorted(known_by_id)
         ])
-        if final_frontier != expected_final:
+        if (
+            final_frontier["material_revision"]
+            < expected_final["material_revision"]
+            or final_frontier["projection_revision"]
+            < expected_final["projection_revision"]
+            or final_frontier["graph_revision"] != expected_final["graph_revision"]
+            or final_frontier["graph_sha256"] != expected_final["graph_sha256"]
+        ):
             raise ChildDependencyError("dependency_final_frontier_changed")
-        self.authorization.assert_child_dependencies_authorized(
-            authorization_event
-        )
+        self._assert_authorization(authorization_event)
         final_by_id = {relation["id"]: relation for relation in final_graph.relations}
         if any(final_by_id.get(relation_id) != relation
                for relation_id, relation in desired_by_id.items()):
@@ -739,8 +846,74 @@ class LinearChildDependencyAdapter:
             "authorization": authorization,
             "relations": [deepcopy(final_by_id[item["id"]]) for item in desired],
             "native_linear_relations": {
-                "written": bool(writes), "authority": "dependency_graph",
+                "written": bool(writes), "authority": "derived_cache",
                 "idempotency": "client_supplied_deterministic_uuid_v4",
                 "readback": "relations_and_inverseRelations",
             },
+            "dependency_authority": "child_dependency_authorization",
         }
+
+
+def apply_dependency_request(
+    client: GraphQLClient, request: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply one exact, self-contained dependency request without route inference."""
+    required = {
+        "schema_version", "authority", "plan_revision", "owned_children",
+        "relations", "expected_frontier",
+    }
+    if not isinstance(request, dict) or set(request) != required:
+        raise ChildDependencyError("invalid_dependency_request_fields")
+    if request.get("schema_version") != 1:
+        raise ChildDependencyError("invalid_dependency_request_schema")
+    authority = _validate_authority(request.get("authority"))
+    adapter = LinearChildDependencyAdapter(
+        client,
+        workspace_id=authority["workspace_id"],
+        team_id=authority["team_id"],
+        project_id=authority["project_id"],
+        root_issue_id=authority["root_issue_id"],
+        root_identifier=authority["root_identifier"],
+        plan_revision=request.get("plan_revision"),
+    )
+    return adapter.apply_batch(
+        owned_children=request.get("owned_children"),
+        relations=request.get("relations"),
+        expected_frontier=request.get("expected_frontier"),
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Apply one fenced dependency batch to existing Linear children.",
+    )
+    parser.add_argument(
+        "--request", required=True,
+        help="Exact JSON request path, or '-' to read stdin.",
+    )
+    parser.add_argument(
+        "--apply", action="store_true", required=True,
+        help="Required acknowledgement that this invocation may create relations.",
+    )
+    parser.add_argument(
+        "--linear-endpoint", default="https://api.linear.app/graphql",
+    )
+    args = parser.parse_args(argv)
+    if args.request == "-":
+        request = json.load(sys.stdin)
+    else:
+        with open(args.request, encoding="utf-8") as stream:
+            request = json.load(stream)
+    token = load_linear_api_key()
+    if not token:
+        raise ChildDependencyError("linear_api_key_required")
+    receipt = apply_dependency_request(
+        HttpGraphQLClient(token, args.linear_endpoint), request,
+    )
+    json.dump(receipt, sys.stdout, ensure_ascii=False, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

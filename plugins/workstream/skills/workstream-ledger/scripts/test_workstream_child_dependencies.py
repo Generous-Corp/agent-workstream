@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import hashlib
+import io
 import json
 import unittest
 import uuid
+from unittest import mock
 
+import workstream_child_dependencies as dependency_module
 from workstream_child_dependencies import (
     ChildDependencyError, LinearChildDependencyAdapter,
     dependency_relation_id, reduce_dependency_readback,
@@ -49,6 +52,8 @@ class FakeLinear:
         self.children = [self.child(A), self.child(B), self.child(C)]
         self.root_reads = 0
         self.before_root_read = None
+        self.comment_reads = 0
+        self.before_comment_read = None
         self.lose_next_create_response = False
         self.page_size = 250
 
@@ -99,7 +104,8 @@ class FakeLinear:
         )
         self.comments["GEN-37"].append({
             "id": str(uuid.uuid4()), "body": encode_event_comment(delta),
-            "createdAt": "now", "updatedAt": "now",
+            "createdAt": "2026-08-29T00:00:01Z",
+            "updatedAt": "2026-08-29T00:00:01Z",
         })
 
     def add_projection(self):
@@ -146,6 +152,9 @@ class FakeLinear:
                              "pageInfo": {"hasNextPage": False, "endCursor": None}},
             }}
         if "query WorkstreamDeltaComments" in query:
+            self.comment_reads += 1
+            if self.before_comment_read:
+                self.before_comment_read(self)
             return {"issue": {
                 "id": ROOT_ID, "identifier": "GEN-37", "team": self.team(),
                 "project": {"id": "project"},
@@ -175,7 +184,23 @@ class FakeLinear:
                 "issueType": {"fields": [
                     {"name": "relations"}, {"name": "inverseRelations"},
                 ]},
+                "queryType": {"fields": [{
+                    "name": "issueRelations",
+                    "args": [{"name": "includeArchived"}],
+                }]},
             }
+        if "query WorkstreamChildDependencySlots" in query:
+            start = int(variables.get("after") or 0)
+            nodes = self.relations[start:start + self.page_size]
+            end = start + len(nodes)
+            more = end < len(self.relations)
+            return {"issueRelations": {
+                "nodes": nodes,
+                "pageInfo": {
+                    "hasNextPage": more,
+                    "endCursor": str(end) if more else None,
+                },
+            }}
         if "query WorkstreamProjectionCommentCreateCapability" in query:
             return {"__type": {"inputFields": [
                 {"name": "id"}, {"name": "issueId"}, {"name": "body"},
@@ -271,6 +296,71 @@ class ChildDependencyTests(unittest.TestCase):
         self.assertEqual(len(fake.relations), 1)
         fake.calls.clear()
         self.assertEqual(self.apply(fake)["writes"], 0)
+        self.assertFalse(any(
+            "issueRelationCreate" in query or "commentCreate" in query
+            for query, _ in fake.calls
+        ))
+
+    def test_material_after_authorization_does_not_strand_derived_cache(self):
+        fake = FakeLinear()
+        injected = False
+
+        def inject(client):
+            nonlocal injected
+            if client.comment_reads == 7 and not injected:
+                injected = True
+                client.add_material()
+
+        fake.before_comment_read = inject
+        first = self.apply(fake)
+        self.assertTrue(injected)
+        self.assertEqual(first["writes"], 1)
+        self.assertEqual(first["frontier_after"]["material_revision"], 1)
+        self.assertEqual(len(fake.relations), 1)
+        fake.calls.clear()
+        replay = self.apply(fake)
+        self.assertEqual(replay["writes"], 0)
+        self.assertEqual(replay["batch_id"], first["batch_id"])
+        self.assertFalse(any(
+            "issueRelationCreate" in query or "commentCreate" in query
+            for query, _ in fake.calls
+        ))
+
+    def test_archived_deterministic_slot_is_visible_and_refuses(self):
+        fake = FakeLinear()
+        archived = fake.native_relation(A, B)
+        archived["archivedAt"] = "2026-08-28T00:00:00Z"
+        fake.relations.append(archived)
+        with self.assertRaisesRegex(
+            ChildDependencyError, "archived_dependency_in_active_readback",
+        ):
+            self.apply(fake)
+        relation_queries = [
+            query for query, _ in fake.calls
+            if "WorkstreamChildRelations" in query
+            or "WorkstreamChildInverseRelations" in query
+        ]
+        self.assertTrue(relation_queries)
+        self.assertTrue(all("includeArchived: true" in query for query in relation_queries))
+        self.assertFalse(any(
+            "issueRelationCreate" in query or "commentCreate" in query
+            for query, _ in fake.calls
+        ))
+
+    def test_occupied_deterministic_slot_refuses_before_authorization(self):
+        fake = FakeLinear()
+        occupied = fake.native_relation(
+            A, C,
+            relation_id=dependency_relation_id(
+                authority=AUTHORITY, blocker=A, blocked=B,
+            ),
+            relation_type="related",
+        )
+        fake.relations.append(occupied)
+        with self.assertRaisesRegex(
+            ChildDependencyError, "dependency_relation_slot_occupied",
+        ):
+            self.apply(fake)
         self.assertFalse(any(
             "issueRelationCreate" in query or "commentCreate" in query
             for query, _ in fake.calls
@@ -431,6 +521,40 @@ class ChildDependencyTests(unittest.TestCase):
                 expected_frontier=FRONTIER,
             )
         self.assertFalse(any("issueRelationCreate" in query for query, _ in fake.calls))
+
+    def test_supported_json_cli_requires_exact_request_and_emits_receipt(self):
+        fake = FakeLinear()
+        request = {
+            "schema_version": 1,
+            "authority": AUTHORITY,
+            "plan_revision": PLAN,
+            "owned_children": [A, B, C],
+            "relations": [self.relation()],
+            "expected_frontier": FRONTIER,
+        }
+        stdin = io.StringIO(json.dumps(request))
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(dependency_module, "load_linear_api_key", return_value="secret"),
+            mock.patch.object(dependency_module, "HttpGraphQLClient", return_value=fake),
+            mock.patch.object(dependency_module.sys, "stdin", stdin),
+            mock.patch.object(dependency_module.sys, "stdout", stdout),
+        ):
+            self.assertEqual(
+                dependency_module.main(["--request", "-", "--apply"]), 0,
+            )
+        receipt = json.loads(stdout.getvalue())
+        self.assertEqual(receipt["writes"], 1)
+        self.assertEqual(receipt["authority"], AUTHORITY)
+        self.assertFalse(any(
+            "issueCreate" in query or "projectCreate" in query
+            for query, _ in fake.calls
+        ))
+
+        with self.assertRaisesRegex(
+            ChildDependencyError, "invalid_dependency_request_fields",
+        ):
+            dependency_module.apply_dependency_request(fake, {"schema_version": 1})
 
 
 if __name__ == "__main__":

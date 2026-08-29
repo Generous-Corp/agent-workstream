@@ -52,20 +52,35 @@ Dependencies between already-owned children use the separately bounded
 declared route, immutable root, and both direct-child identities, fences the
 root material/projection frontier plus the child dependency graph, reserves a
 deterministic append-only `child_dependency_authorization` projection slot,
-then writes a native `blocks` relation with one deterministic client-supplied
-UUIDv4. Every native write re-reads the exact durable authorization and all
-three frontiers before mutation; the graph frontier includes a canonical
-SHA-256 so a same-count edge replacement cannot pass as an unchanged graph.
+then projects that immutable authority into a native `blocks` cache relation
+with one deterministic client-supplied UUIDv4. The authorization is ordered
+after the exact pre-grant material/projection/graph state; the graph frontier
+includes a canonical SHA-256 so a same-count edge replacement cannot pass as
+unchanged. Root comments observed beyond the reviewed material frontier must
+have a strictly later server creation time than the grant. Projection CAS
+orders later projection events after it. Events ordered after the grant do not
+retroactively invalidate it: contradictions or scope changes require an
+append-only superseding event and reconciliation of the derived native cache.
 Runtime schema introspection must confirm that `IssueRelationCreateInput.id`,
-the `blocks` enum, and both `relations` and `inverseRelations` readback remain
-available. Complete pagination must recover the exact `blocks` view on the
-blocker and inverse `blocked_by` view on the blocked child, so a lost response
-converges and an exact batch replay performs no write. Ambiguous, duplicate,
-conflicting, self, cross-root, stale-frontier, partial-inverse, and mismatched
-readbacks fail closed. The transport never creates or updates an issue,
-project, or workstream root. If the native deterministic-ID capability is
-absent, it refuses before mutation; an append-only typed projection would need
-a separately reviewed fallback rather than an unsafe native create.
+the `blocks` enum, archived-inclusive relation connections, and global relation
+slot enumeration remain available. Complete pagination must recover the exact
+active `blocks` view on the blocker, inverse `blocked_by` view on the blocked
+child, and any occupied or archived deterministic slot before mutation. A lost
+response converges and an exact batch replay performs no comment or relation
+write. Ambiguous, duplicate, conflicting, self, cross-root, stale-frontier,
+archived-slot, partial-inverse, and mismatched readbacks fail closed. A truly
+never-seen UUID cannot be reserved or dry-run through Linear, so availability
+cannot be proven beyond complete occupied-slot preflight; deterministic create
+and authoritative readback bound that API limitation safely. The transport
+never creates or updates an issue, project, or workstream root.
+
+The supported invocation is
+`python3 scripts/workstream_child_dependencies.py --request REQUEST.json --apply`.
+The JSON object must contain exactly `schema_version`, `authority` (including
+the explicit workspace/team/project/root UUID and root identifier),
+`plan_revision`, the complete `owned_children` identity set, `relations`, and
+the reviewed `expected_frontier`. The command does not infer a route or child
+set and emits the complete JSON receipt on stdout.
 
 The live Linear graph transport verifies the declared workspace/team/project
 relationship, fences reads to that project, and assigns the project on creates.

@@ -1292,7 +1292,28 @@ class LinearProjectionAdapter:
                     "child_dependency_authorization_superseded_or_conflicting"
                 )
             after_comments = before_comments
-        return self._assert_child_dependency_authorization(event, after_comments)
+        receipt = self._assert_child_dependency_authorization(event, after_comments)
+        authorization_comment = next(
+            item for item in after_comments
+            if item.get("id") == receipt["remote_id"]
+        )
+        authorization_time = self._remote_time(authorization_comment)
+        material_after = reduce_event_comments(
+            after_comments, workstream_id=self.workstream_id,
+        )
+        for delta in material_after.events[expected_material_revision:]:
+            remote_id = material_after.remote_ids.get(delta.event_id)
+            comment = next(
+                (item for item in after_comments if item.get("id") == remote_id), None
+            )
+            if (
+                not isinstance(comment, dict)
+                or self._remote_time(comment) <= authorization_time
+            ):
+                raise LinearProjectionError(
+                    "child_dependency_material_preceded_authorization_reload_required"
+                )
+        return receipt
 
     def assert_child_dependencies_authorized(
         self, event: dict[str, Any],
