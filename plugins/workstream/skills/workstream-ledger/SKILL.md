@@ -42,7 +42,10 @@ separate roots connected by typed `blocks`, `blocked_by`, or `related` links to
 immutable Linear workspace + issue IDs (with the `<TEAM>-*` token retained only as
 a route/display value). `scripts/workstream_scope.py` validates this logical
 contract and rejects missing destinations, unowned children, self-links,
-duplicates, and unknown relation types.
+duplicates, unknown relation types, dangling immutable targets, contradictory
+directed edges, and missing `blocks`/`blocked_by` inverse views. `related`
+remains informational. Closure consumes authenticated peer-edge readback and
+refuses while the current root has an active `blocked_by` relation.
 
 The live Linear graph transport verifies the declared workspace/team/project
 relationship, fences reads to that project, and assigns the project on creates.
@@ -116,6 +119,11 @@ An exact repeat is a zero-write no-op, and the same plan revision may add a
 newly reviewed missing child. Changed-plan and other existing-graph mutations
 still fail `remote_cas_unavailable` until a remote CAS authority exists. Never
 infer a repository, worktree, or Linear project from the Markdown's cwd.
+
+After intake returns the canonical root token, invoke
+`scripts/workstream_tab.py GEN-123`. In cmux it preserves the existing tab
+title and appends exactly one token; the same token is a no-op and a different
+token refuses without mutation. Outside cmux it reports an optional no-op.
 
 ### Material-delta journal
 
@@ -217,10 +225,15 @@ these errors away. Deterministic closure evidence without an explicitly passed
 semantic review remains `Landed — acceptance review required`; invocation alone
 cannot emit `Done`.
 
-`workstreamctl reconcile` is the bounded live landing/closure path. It reads an
-authenticated GitHub repository identity, PR head, and merge SHA; invokes one
+`workstreamctl reconcile` is the bounded live landing/closure path. It reads
+every participating authenticated GitHub repository identity,
+repository-qualified PR head, and merge SHA; invokes one
 explicit fixed-argv Shipyard receipt adapter without a shell; and persists the
-result as the singleton lifecycle projection. Projection revisions use
+aggregate result as the singleton lifecycle projection. Repeatable
+`--repository-binding` JSON groups are the multi-repository interface; the
+original single-repository flags remain compatibility sugar for one group.
+Drift invalidates evidence only for that repository but blocks aggregate
+closure. Projection revisions use
 route-scoped deterministic client-supplied Linear comment IDs as exclusive
 remote slots. Runtime schema introspection must confirm that Linear still
 supports `CommentCreateInput.id`; an identical collision is replay, while a
@@ -229,10 +242,10 @@ history is fenced by one v2 activation event; later v1 writes are quarantined
 and surfaced by count/digest (or exact events in history mode) rather than
 silently admitted. Lifecycle reconciliation refuses while any quarantine is
 unresolved; retiring one requires a reviewed projection disposition naming the
-exact event IDs and event digest. A merged exact head can emit only `Landed —
+exact event IDs and event digest. A merged exact head set can emit only `Landed —
 acceptance review required`. `Done` additionally requires a durably projected
 fresh-session review receipt bound to the exact snapshot, closure input,
-repository key, and head. The receipt names and digests the durable review
+repository-qualified head set, and aggregate landing truth. The receipt names and digests the durable review
 artifact and declares procedural independence under a shared Linear credential;
 it does not claim cryptographic agent identity.
 Resume derives lifecycle status and the closure receipt digest from that durable
@@ -313,6 +326,11 @@ their reviewed event and value digest. It never retires an omitted key. A late
 key or changed head requires reload and review before any append. The command
 computes the concrete attach/successor disposition against a verified remote
 head and rereads the complete comment stream before reporting success.
+If a historical relation points to a peer created before the relation-readback
+contract, only this reconcile command may load that incomplete head, and only
+when the reviewed manifest exactly retires or replaces every incomplete
+relation. Those relation migrations are appended before unrelated changes;
+normal resume and final readback remain strict.
 
 This remains a validated bounded snapshot, not complete physical cross-machine
 recovery proof. Resume does not itself fetch owner, live source-control truth,
@@ -458,6 +476,22 @@ Before continuing in another agent session:
 7. Require the new session to reread the durable graph and live PR state and
    acknowledge the restored objective, decisions, open items, head, and next
    action. Do not close the source beforehand.
+
+When a configured Shipyard handoff needs a native launch profile, create it
+only after step 4 with the bundled product helper resolved from this skill:
+
+```sh
+python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_shipyard_profile.py" ABC-123 \
+  --repo-path /absolute/worktree \
+  --model <canonical-model> --reasoning-effort <effort> \
+  --output /owner-only/private-directory/ABC-123.json
+```
+
+The command itself reruns authenticated full-authority resume, derives the
+provider/session from the current remote checkpoint, and refuses any stale,
+uncheckpointed, dirty, mismatched, or unlineaged authority. It emits no prompt
+or secret. Owner-only profile publication currently requires macOS. See [the
+exact bridge and digest contract](references/shipyard-launch-profile.md).
 
 ## Abrupt termination
 

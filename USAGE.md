@@ -53,6 +53,11 @@ cmux, paste the same token or Linear URL into any new agent or terminal. Durable
 state remains in Linear in either case. See the [cmux API](https://cmux.com/docs/api)
 for its tab and workspace automation surface.
 
+The agent runs `workstreamctl tab-title GEN-123` after intake or resume. It
+appends the token to an existing human-readable title, does nothing when that
+token is already present, and refuses to overwrite a different workstream
+token. Outside cmux, the command exits successfully without changing anything.
+
 Useful follow-ups are:
 
 ```text
@@ -123,10 +128,24 @@ plugins/workstream/bin/workstreamctl resume GEN-123 \
 
 # Inspect an older root without claiming authority to continue it.
 plugins/workstream/bin/workstreamctl resume GEN-123 --inspection-only
+
+# After a current remote checkpoint, create one private Shipyard launch profile.
+install -d -m 700 ~/.local/share/agent-workstream/launch-profiles
+plugins/workstream/bin/workstreamctl shipyard-profile GEN-123 \
+  --repo-path /absolute/path/to/worktree \
+  --model gpt-5.6-sol --reasoning-effort medium \
+  --output ~/.local/share/agent-workstream/launch-profiles/GEN-123.json
 ```
 
 Those are secondary repository-local CLI examples; installation does not add
 `workstreamctl` to global `PATH`.
+
+`shipyard-profile` derives provider and session from the latest acknowledged
+checkpoint, performs a fresh authenticated full-authority resume, validates the
+exact clean GitHub worktree and active Shipyard lineage, and writes a new
+owner-only file atomically on macOS. It refuses other platforms, stale or
+uncheckpointed state, and never puts Linear credentials in the profile. See the
+[launch-profile bridge contract](plugins/workstream/skills/workstream-ledger/references/shipyard-launch-profile.md).
 
 Token-only resume tries HTTPS first. If an immutable GitHub blob URL at an
 exact 40-hex commit returns 404, it can use existing noninteractive GitHub SSH
@@ -175,6 +194,20 @@ the only path to a durable `Done`; a stale writer or unchanged replay writes
 nothing. Use `--github-token-command` with a noninteractive file/keychain/App
 helper, or explicitly opt into `--github-token-env GITHUB_TOKEN`; helper output
 is bounded and never logged.
+
+For one repository, the existing `--repository`, `--repository-id`, `--pr`, and
+`--expected-head` flags remain supported. For a root spanning repositories,
+repeat one qualified group per repository. The repository portion of the
+command is:
+
+```sh
+--repository-binding '{"repository":"Generous-Corp/pulp","repository_id":"R_pulp","pr":123,"expected_head":"<40-hex>"}' \
+--repository-binding '{"repository":"Generous-Corp/vellum","repository_id":"R_vellum","pr":456,"expected_head":"<40-hex>"}'
+```
+
+The fixed-argv receipt adapter returns one schema-v2 aggregate containing a
+repository-qualified receipt for every group. Missing, duplicate, or drifted
+repository truth blocks the aggregate lifecycle write.
 
 Review receipts name and digest the reviewer’s durable artifact and declare the
 `shared_linear_credential` trust boundary. This enforces a separate procedural

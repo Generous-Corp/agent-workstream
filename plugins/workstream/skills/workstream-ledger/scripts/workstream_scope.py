@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import urlparse
 from datetime import datetime
@@ -285,3 +286,81 @@ def validate_relations(relations: list[dict[str, Any]], *, root_id: str,
         if key in observed:
             raise ScopeError(f"duplicate_relation:{relation_type}:{target_workspace}:{target_issue}")
         observed.add(key)
+    directed: dict[tuple[str, str], set[str]] = {}
+    for relation_type, target_workspace, target_issue in observed:
+        if relation_type in {"blocks", "blocked_by"}:
+            directed.setdefault((target_workspace, target_issue), set()).add(relation_type)
+    for (target_workspace, target_issue), relation_types in directed.items():
+        if relation_types == {"blocks", "blocked_by"}:
+            raise ScopeError(
+                f"contradictory_relation:{target_workspace}:{target_issue}"
+            )
+
+
+def relation_target_key(target: dict[str, Any]) -> str:
+    """Return the immutable lookup key for one already syntax-checked target."""
+    return f"{target.get('workspace_id')}:{target.get('issue_id')}"
+
+
+def validate_relation_graph(
+    relations: list[dict[str, Any]], *, root_id: str, workspace_id: str,
+    root_issue_id: str,
+    resolve_target: Callable[[dict[str, Any]], dict[str, Any] | None]
+    | Mapping[str, dict[str, Any]],
+) -> None:
+    """Validate target existence and directed inverse edges from live readback.
+
+    ``validate_relations`` remains the transport-neutral syntax check.  This
+    stronger boundary consumes authenticated target readback supplied by the
+    caller; target display tokens are never treated as routing authority.
+    """
+    validate_relations(
+        relations, root_id=root_id, workspace_id=workspace_id,
+        root_issue_id=root_issue_id,
+    )
+    root_target = {
+        "workspace_id": workspace_id,
+        "issue_id": root_issue_id,
+        "identifier": root_id,
+    }
+    for relation in relations:
+        target = relation["target"]
+        resolved = (
+            resolve_target(target)
+            if callable(resolve_target)
+            else resolve_target.get(relation_target_key(target))
+        )
+        if not isinstance(resolved, dict):
+            raise ScopeError(f"dangling_relation_target:{target['identifier']}")
+        for field in ("workspace_id", "issue_id", "identifier"):
+            if resolved.get(field) != target[field]:
+                raise ScopeError(
+                    f"relation_target_identity_mismatch:{target['identifier']}:{field}"
+                )
+        peer_relations = resolved.get("relations")
+        if not isinstance(peer_relations, list):
+            raise ScopeError(f"relation_target_readback_incomplete:{target['identifier']}")
+        validate_relations(
+            peer_relations, root_id=target["identifier"],
+            workspace_id=target["workspace_id"], root_issue_id=target["issue_id"],
+        )
+        relation_type = relation["type"]
+        if relation_type == "related":
+            continue
+        expected_inverse = "blocked_by" if relation_type == "blocks" else "blocks"
+        peer_edges = [
+            item["type"] for item in peer_relations
+            if isinstance(item.get("target"), dict)
+            and all(item["target"].get(field) == value
+                    for field, value in root_target.items())
+            and item.get("type") in {"blocks", "blocked_by"}
+        ]
+        if expected_inverse in peer_edges:
+            continue
+        if peer_edges:
+            raise ScopeError(
+                f"contradictory_relation_inverse:{relation_type}:{target['identifier']}"
+            )
+        raise ScopeError(
+            f"missing_relation_inverse:{relation_type}:{target['identifier']}"
+        )

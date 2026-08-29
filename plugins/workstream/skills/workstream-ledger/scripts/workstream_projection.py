@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
@@ -23,7 +24,9 @@ from workstream_linear_projection import (
     build_projection_event, LinearProjectionAdapter, LinearProjectionError, TOMBSTONE,
 )
 from workstream_plan import plan_payload
+from workstream_relation_readback import RelationReadbackError, read_relation_targets
 from workstream_resume import add_material_history, compact_context, extract_token, ResumeError
+from workstream_scope import ScopeError, validate_relation_graph
 from workstream_successor import choose_disposition, SuccessorError
 
 
@@ -198,6 +201,97 @@ def stable_live_readback(
     return graph_fence, comments_after
 
 
+def load_material_history_for_projection_reconcile(
+    snapshot: dict[str, Any], comments: list[dict[str, Any]], token: str,
+    manifest: dict[str, Any], adapter: LinearProjectionAdapter, *,
+    authenticated_route: dict[str, str], authenticated_source: dict[str, Any],
+    relation_target_resolver: Callable[
+        [list[dict[str, Any]]], dict[str, dict[str, Any]]
+    ],
+) -> tuple[dict[str, Any], frozenset[tuple[str, str]]]:
+    """Load strict history, except for an exactly reviewed relation migration.
+
+    Historical relation heads can predate the peer projection contract.  They
+    may be inspected only by this reconcile boundary, and only when every head
+    whose authenticated peer readback is incomplete is exactly retired or
+    replaced by the reviewed manifest.  Ordinary resume never calls this
+    helper and remains strict.
+    """
+    try:
+        return add_material_history(
+            snapshot, comments, token, authenticated_route=authenticated_route,
+            authenticated_source=authenticated_source,
+            relation_target_resolver=relation_target_resolver,
+        ), frozenset()
+    except RelationReadbackError:
+        desired, reviewed_retirements = _reviewed_manifest(manifest)
+        initial = adapter.state()
+        if projection_review_contract(initial) != {
+            "expected_projection_revision": manifest["expected_projection_revision"],
+            "expected_active_heads": sorted(
+                manifest["expected_active_heads"],
+                key=lambda item: (item["kind"], item["key"]),
+            ),
+            "expected_legacy_v1_event_ids": manifest[
+                "expected_legacy_v1_event_ids"
+            ],
+            "expected_legacy_v1_events_sha256": manifest[
+                "expected_legacy_v1_events_sha256"
+            ],
+            "expected_projection_quarantine_count": manifest[
+                "expected_projection_quarantine_count"
+            ],
+            "expected_projection_quarantine_sha256": manifest[
+                "expected_projection_quarantine_sha256"
+            ],
+        }:
+            raise LinearProjectionError("projection_review_stale_reload_required")
+
+        active = _active_heads(initial)
+        unresolved: set[tuple[str, str]] = set()
+        for identity, event in active.items():
+            if identity[0] != "relation":
+                continue
+            try:
+                relation_target_resolver([deepcopy(event["value"])])
+            except RelationReadbackError:
+                unresolved.add(identity)
+        if not unresolved:
+            # Do not turn an unexpected batched-read failure into a bypass.
+            raise
+
+        desired_by_identity = {
+            (item["kind"], item["key"]): item["value"] for item in desired
+        }
+        retirements_by_identity = {
+            (item["kind"], item["key"]): item for item in reviewed_retirements
+        }
+        uncovered: list[str] = []
+        for identity in sorted(unresolved):
+            current = active[identity]
+            replacement = desired_by_identity.get(identity)
+            retirement = retirements_by_identity.get(identity)
+            replaced = replacement is not None and replacement != current["value"]
+            retired = retirement is not None and (
+                retirement["expected_event_id"] == current["event_id"]
+                and retirement["expected_value_sha256"]
+                == _value_digest(current["value"])
+            )
+            if not replaced and not retired:
+                uncovered.append(f"{identity[0]}:{identity[1]}")
+        if uncovered:
+            raise LinearProjectionError(
+                "legacy_unresolved_relation_migration_required:"
+                + ",".join(uncovered)
+            )
+
+        return add_material_history(
+            snapshot, comments, token, authenticated_route=authenticated_route,
+            authenticated_source=authenticated_source,
+            permit_stale_lifecycle_for_reconcile=True,
+        ), frozenset(unresolved)
+
+
 def _desired_items(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     items = manifest.get("projection")
     if not isinstance(items, list):
@@ -234,6 +328,10 @@ def reconcile_required_projection(
     adapter: LinearProjectionAdapter, snapshot: dict[str, Any],
     manifest: dict[str, Any], *, remote_head: str, created_at: str,
     authenticated_source: dict[str, Any],
+    relation_target_resolver: (
+        Callable[[list[dict[str, Any]]], dict[str, dict[str, Any]]] | None
+    ) = None,
+    legacy_unresolved_relation_heads: frozenset[tuple[str, str]] = frozenset(),
 ) -> dict[str, Any]:
     """Append only missing/changed values and verify the complete current view."""
     if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", remote_head):
@@ -321,7 +419,59 @@ def reconcile_required_projection(
             "kind": identity[0], "key": identity[1], "value": TOMBSTONE,
         })
 
-    for item in [*desired, *retirements]:
+    for identity in legacy_unresolved_relation_heads:
+        current = active_heads.get(identity)
+        replacement = desired_by_identity.get(identity)
+        retired = any(
+            (item["kind"], item["key"]) == identity for item in retirements
+        )
+        if (
+            current is None
+            or identity[0] != "relation"
+            or (not retired and (replacement is None or replacement == current["value"]))
+        ):
+            raise LinearProjectionError(
+                f"legacy_unresolved_relation_migration_required:{identity[0]}:{identity[1]}"
+            )
+
+    effective_relations = {
+        key: deepcopy(event["value"])
+        for (kind, key), event in active_heads.items()
+        if kind == "relation"
+    }
+    effective_relations.update({
+        key: deepcopy(value)
+        for (kind, key), value in desired_by_identity.items()
+        if kind == "relation"
+    })
+    for retirement in retirements:
+        if retirement["kind"] == "relation":
+            effective_relations.pop(retirement["key"], None)
+    if effective_relations:
+        if relation_target_resolver is None:
+            raise LinearProjectionError("relation_target_readback_required")
+        relations = [effective_relations[key] for key in sorted(effective_relations)]
+        try:
+            validate_relation_graph(
+                relations, root_id=adapter.workstream_id,
+                workspace_id=adapter.workspace_id,
+                root_issue_id=adapter.root_issue_id,
+                resolve_target=relation_target_resolver(relations),
+            )
+        except ScopeError as error:
+            raise LinearProjectionError(str(error)) from error
+
+    migration_items = [
+        item for item in [*desired, *retirements]
+        if (item["kind"], item["key"]) in legacy_unresolved_relation_heads
+    ]
+    remaining_items = [
+        item for item in [*desired, *retirements]
+        if (item["kind"], item["key"]) not in legacy_unresolved_relation_heads
+    ]
+    write_items = [*migration_items, *remaining_items]
+
+    for item in write_items:
         build_projection_event(
             workstream_id=adapter.workstream_id,
             kind=item["kind"], key=item["key"], value=item["value"],
@@ -372,7 +522,7 @@ def reconcile_required_projection(
     expected_revision = initial.revision
     expected_active_heads = dict(active_heads)
     expected_latest_heads = dict(latest_heads)
-    for item in [*desired, *retirements]:
+    for item in write_items:
         state = adapter.state()
         if projection_review_contract(state) != _contract_from_heads(
             expected_revision, expected_active_heads,
@@ -515,20 +665,27 @@ def main() -> int:
             client, issue_id=token, workspace_id=route["workspace_id"],
             team_id=route["team_id"], project_id=route["project_id"],
         ).comments()
-        snapshot = add_material_history(
-            graph, comments, token, authenticated_route=route,
-            authenticated_source=authenticated_source,
-        )
         adapter = LinearProjectionAdapter(
             client, issue_id=token, workstream_id=token,
             plan_revision=plan_revision, workspace_id=route["workspace_id"],
             team_id=route["team_id"], project_id=route["project_id"],
             root_issue_id=route["root_issue_id"],
         )
+        resolver = lambda relations: read_relation_targets(client, relations)
+        snapshot, legacy_unresolved_relation_heads = (
+            load_material_history_for_projection_reconcile(
+                graph, comments, token, manifest, adapter,
+                authenticated_route=route,
+                authenticated_source=authenticated_source,
+                relation_target_resolver=resolver,
+            )
+        )
         result = reconcile_required_projection(
             adapter, snapshot, manifest, remote_head=args.remote_head,
             created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             authenticated_source=authenticated_source,
+            relation_target_resolver=resolver,
+            legacy_unresolved_relation_heads=legacy_unresolved_relation_heads,
         )
         # Double-collect graph and comments so a concurrent root/child/checkpoint
         # mutation cannot be certified from a mixed pre/post-write snapshot.
@@ -542,6 +699,9 @@ def main() -> int:
         verified = add_material_history(
             graph_after, comments_after, token, authenticated_route=route,
             authenticated_source=authenticated_source,
+            relation_target_resolver=lambda relations: read_relation_targets(
+                client, relations,
+            ),
         )
         context = compact_context(
             verified, token, max_bytes=args.max_bytes, max_items=args.max_items,

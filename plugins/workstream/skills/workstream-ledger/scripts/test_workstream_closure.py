@@ -223,6 +223,104 @@ class ClosureTests(unittest.TestCase):
         self.assertIn("repository_head_keyset_mismatch", result["errors"])
         self.assertIn("missing_evidence_contract:GEN-38", result["errors"])
 
+    def test_blocked_by_inverse_is_valid_graph_state_but_blocks_closure(self):
+        snapshot = self.factory_snapshot({
+            "root": {"identifier": "GEN-37", "url": "https://linear/GEN-37",
+                     "plan_revision": "sha", "revision": 2, "status": "In Progress"},
+            "children": [{"identifier": "GEN-38", "status": "Done", "owner": "agent"}],
+        })
+        root_target = {"workspace_id": "ws",
+                       "issue_id": "33333333-3333-4333-8333-333333333333",
+                       "identifier": "GEN-37"}
+        peer = {"workspace_id": "ws-other",
+                "issue_id": "22222222-2222-4222-8222-222222222222",
+                "identifier": "GEN-50"}
+        snapshot["relations"] = [{"type": "blocked_by", "target": peer}]
+        snapshot["relation_targets"] = {
+            "ws-other:22222222-2222-4222-8222-222222222222": {
+                **peer, "relations": [{"type": "blocks", "target": root_target}],
+            },
+        }
+        result = review(
+            snapshot, expected_plan_revision="sha", criteria=["a"], evidence=self.evidence(),
+            repository_heads={"github.com:id:R_pulp": "a" * 40},
+            semantic_review_invoked=True, semantic_review_passed=True,
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("blocked_by:GEN-50", result["errors"])
+
+        snapshot["relations"] = [{"type": "related", "target": peer}]
+        result = review(
+            snapshot, expected_plan_revision="sha", criteria=["a"], evidence=self.evidence(),
+            repository_heads={"github.com:id:R_pulp": "a" * 40},
+            semantic_review_invoked=True, semantic_review_passed=True,
+        )
+        self.assertTrue(result["ok"])
+
+    def test_dangling_relation_target_is_a_closure_negative_control(self):
+        snapshot = self.factory_snapshot({
+            "root": {"identifier": "GEN-37", "url": "https://linear/GEN-37",
+                     "plan_revision": "sha", "revision": 2, "status": "In Progress"},
+            "children": [{"identifier": "GEN-38", "status": "Done", "owner": "agent"}],
+        })
+        snapshot["relations"] = [{"type": "related", "target": {
+            "workspace_id": "ws-other",
+            "issue_id": "22222222-2222-4222-8222-222222222222",
+            "identifier": "GEN-404",
+        }}]
+        result = review(
+            snapshot, expected_plan_revision="sha", criteria=["a"], evidence=self.evidence(),
+            repository_heads={"github.com:id:R_pulp": "a" * 40},
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn(
+            "invalid_scope_or_relations:dangling_relation_target:GEN-404",
+            result["errors"],
+        )
+
+    def test_one_repository_drift_invalidates_only_its_child_evidence_but_blocks_aggregate(self):
+        snapshot = self.factory_snapshot({
+            "root": {"identifier": "GEN-37", "url": "https://linear/GEN-37",
+                     "plan_revision": "sha", "revision": 2, "status": "In Progress"},
+            "children": [
+                {"identifier": "GEN-38", "status": "Done", "owner": "agent"},
+                {"identifier": "GEN-39", "status": "Done", "owner": "agent"},
+            ],
+        })
+        second_key = "github.com:id:R_vellum"
+        second_head = "b" * 40
+        snapshot["scope"]["repositories"].append({
+            "slug": "github.com/generous-corp/vellum", "provider_repository_id": "R_vellum",
+            "aliases": [], "identity_resolution": {
+                "provider_repository_id": "R_vellum",
+                "resolved_slug": "github.com/generous-corp/vellum",
+                "observed_at": "2026-08-21T11:00:00Z",
+                "evidence": [{"kind": "authenticated_provider_readback", "authenticated": True,
+                              "provider_repository_id": "R_vellum",
+                              "resolved_slug": "github.com/generous-corp/vellum"}],
+            }, "identity_updates": [], "exact_head": second_head, "evidence": [],
+        })
+        snapshot["scope"]["child_ownership"]["GEN-39"] = second_key
+        contract = snapshot["evidence_contracts"][1]
+        contract.update({
+            "repository": "github.com/generous-corp/vellum",
+            "repository_key": second_key, "exact_head": second_head,
+        })
+        for layer in contract["layers"].values():
+            for receipt in layer.get("receipts", []):
+                receipt.update({"repository_key": second_key, "exact_head": second_head})
+        result = review(
+            snapshot, expected_plan_revision="sha", criteria=["a"], evidence=self.evidence(),
+            repository_heads={
+                "github.com:id:R_pulp": "a" * 40,
+                second_key: "c" * 40,
+            },
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn(f"scope_repository_head_mismatch:{second_key}", result["errors"])
+        self.assertIn("evidence_head_mismatch:GEN-39", result["errors"])
+        self.assertNotIn("evidence_head_mismatch:GEN-38", result["errors"])
+
     def test_malformed_present_scope_never_skips_validation_or_emits_done(self):
         snapshot = {
             "root": {"identifier": "GEN-37", "url": "https://linear/GEN-37",

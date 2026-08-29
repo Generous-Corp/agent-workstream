@@ -8,7 +8,8 @@ from typing import Any
 from workstream_choices import ChoiceError, closure_blockers
 from workstream_evidence import evidence_errors
 from workstream_scope import (
-    is_full_oid, repository_key, ScopeError, validate_relations, validate_scope,
+    is_full_oid, repository_key, ScopeError, validate_relation_graph,
+    validate_relations, validate_scope,
 )
 
 
@@ -121,6 +122,18 @@ def review(snapshot: dict[str, Any], *, expected_plan_revision: str,
                 workspace_id=scope["linear"]["workspace_id"],
                 root_issue_id=scope["linear"]["root_issue_id"],
             )
+            if relations:
+                validate_relation_graph(
+                    relations, root_id=str(root.get("identifier", "")),
+                    workspace_id=scope["linear"]["workspace_id"],
+                    root_issue_id=scope["linear"]["root_issue_id"],
+                    resolve_target=snapshot.get("relation_targets") or {},
+                )
+                errors.extend(
+                    f"blocked_by:{relation['target']['identifier']}"
+                    for relation in relations
+                    if relation["type"] == "blocked_by"
+                )
             scoped_repositories = {repository_key(item): item for item in scope["repositories"]}
             if repository_heads is None:
                 if len(scoped_repositories) == 1 and exact_head:

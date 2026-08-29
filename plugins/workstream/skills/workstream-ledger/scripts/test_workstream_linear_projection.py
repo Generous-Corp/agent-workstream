@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from copy import deepcopy
 import hashlib
 import io
 import json
@@ -24,10 +25,12 @@ from workstream_linear_projection import (
     LinearProjectionError, projection_slot_id, reduce_projection_comments, TOMBSTONE,
 )
 from workstream_resume import add_material_history, compact_context, ResumeError
+from workstream_relation_readback import RelationReadbackError
 import workstream_projection
 import workstream_linear_projection as projection_module
 from workstream_projection import (
-    projection_review_contract, reconcile_required_projection, stable_live_readback,
+    load_material_history_for_projection_reconcile, projection_review_contract,
+    reconcile_required_projection, stable_live_readback,
 )
 from workstream_successor import choose_disposition
 
@@ -35,6 +38,8 @@ from workstream_successor import choose_disposition
 PLAN = "f38baae4441485b14e5b16ea0255e3a07e42aa94a4fb0e6e04e7aa513693719d"
 HEAD = "a" * 40
 ROOT_UUID = "33333333-3333-4333-8333-333333333333"
+TARGET_UUID = "22222222-2222-4222-8222-222222222222"
+CHANGED_TARGET_UUID = "44444444-4444-4444-8444-444444444444"
 
 # Literal read-only capture of GEN-37's 0.4.0 activation comment. The compressed
 # predecessor JSON is the exact ordered event array named by that marker; it is
@@ -296,6 +301,242 @@ def evidence_contract() -> dict:
 
 
 class ProjectionTests(unittest.TestCase):
+    @staticmethod
+    def relation_target_resolver(relations):
+        root = {
+            "workspace_id": "workspace", "issue_id": ROOT_UUID,
+            "identifier": "GEN-37",
+        }
+        resolved = {}
+        for relation in relations:
+            target = relation["target"]
+            inverse = (
+                "blocked_by" if relation["type"] == "blocks"
+                else "blocks" if relation["type"] == "blocked_by"
+                else None
+            )
+            resolved[f"{target['workspace_id']}:{target['issue_id']}"] = {
+                **target,
+                "relations": ([{"type": inverse, "target": root}] if inverse else []),
+            }
+        return resolved
+
+    @staticmethod
+    def incomplete_relation_target_resolver(relations):
+        target = relations[0]["target"]
+        raise RelationReadbackError(
+            f"relation_target_readback_incomplete:{target['identifier']}"
+        )
+
+    @staticmethod
+    def graph_snapshot():
+        return {
+            "root": {
+                "id": ROOT_UUID, "identifier": "GEN-37",
+                "url": "https://linear.app/acme/issue/GEN-37/root",
+                "plan_revision": PLAN, "revision": 0,
+                "status": "In Progress", "next_action": "Reconcile.",
+            },
+            "children": [],
+        }
+
+    def legacy_relation_fixture(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, workspace_id="workspace", team_id="team",
+            project_id="project", root_issue_id=ROOT_UUID,
+        )
+        relation = {"type": "blocks", "target": {
+            "workspace_id": "workspace", "issue_id": TARGET_UUID,
+            "identifier": "GEN-14",
+        }}
+        base = [
+            {"kind": "scope", "key": "root", "value": scope()},
+            {"kind": "source", "key": "root", "value": {
+                "sha256": PLAN, "identity": "https://example.test/plan",
+            }},
+            {"kind": "provenance", "key": "old", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "old",
+                "worktree": {"state": "safe", "head": HEAD},
+            }},
+            {"kind": "relation", "key": "blocks:GEN-14", "value": relation},
+        ]
+        source = {"identity": "https://example.test/plan", "sha256": PLAN}
+        reconcile_required_projection(
+            adapter, {"root": {"identifier": "GEN-37"}},
+            reviewed_manifest(adapter, base), remote_head=HEAD,
+            created_at="2026-08-27T18:00:00Z", authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        return client, adapter, base, source
+
+    def test_legacy_unresolved_relation_cannot_bypass_reviewed_migration(self):
+        client, adapter, base, source = self.legacy_relation_fixture()
+        manifest = reviewed_manifest(adapter, base)
+        writes_before = len(client.comments)
+        with self.assertRaisesRegex(
+            LinearProjectionError, "legacy_unresolved_relation_migration_required",
+        ):
+            load_material_history_for_projection_reconcile(
+                self.graph_snapshot(), client.comments, "GEN-37", manifest, adapter,
+                authenticated_route=AUTHORITY, authenticated_source=source,
+                relation_target_resolver=self.incomplete_relation_target_resolver,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+
+    def test_legacy_unresolved_relation_migration_refuses_stale_review_zero_writes(self):
+        client, adapter, base, source = self.legacy_relation_fixture()
+        retirement = reviewed_retirement(adapter, "relation", "blocks:GEN-14")
+        manifest = reviewed_manifest(adapter, base[:-1], [retirement])
+        late = build_projection_event(
+            workstream_id="GEN-37", kind="provenance", key="late",
+            value={"agent": "codex", "machine": "M3", "session_id": "late"},
+            plan_revision=PLAN, expected_revision=adapter.state().revision,
+            created_at="2026-08-27T18:30:00Z", authority=AUTHORITY,
+        )
+        adapter.append(late)
+        writes_before = len(client.comments)
+        with self.assertRaisesRegex(LinearProjectionError, "stale_reload_required"):
+            load_material_history_for_projection_reconcile(
+                self.graph_snapshot(), client.comments, "GEN-37", manifest, adapter,
+                authenticated_route=AUTHORITY, authenticated_source=source,
+                relation_target_resolver=self.incomplete_relation_target_resolver,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+
+    def test_invalid_legacy_relation_replacement_has_zero_partial_writes(self):
+        client, adapter, base, source = self.legacy_relation_fixture()
+        replacement = deepcopy(base[-1])
+        replacement["value"]["target"] = {
+            **replacement["value"]["target"], "issue_id": CHANGED_TARGET_UUID,
+        }
+        manifest = reviewed_manifest(adapter, [*base[:-1], replacement])
+        snapshot, unresolved = load_material_history_for_projection_reconcile(
+            self.graph_snapshot(), client.comments, "GEN-37", manifest, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            relation_target_resolver=self.incomplete_relation_target_resolver,
+        )
+        writes_before = len(client.comments)
+        with self.assertRaisesRegex(
+            RelationReadbackError, "relation_target_readback_incomplete",
+        ):
+            reconcile_required_projection(
+                adapter, snapshot, manifest, remote_head=HEAD,
+                created_at="2026-08-27T19:00:00Z", authenticated_source=source,
+                relation_target_resolver=self.incomplete_relation_target_resolver,
+                legacy_unresolved_relation_heads=unresolved,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+
+    def test_legacy_unresolved_relation_retirement_precedes_unrelated_writes(self):
+        client, adapter, base, source = self.legacy_relation_fixture()
+        retirement = reviewed_retirement(adapter, "relation", "blocks:GEN-14")
+        desired = [*base[:-2], {
+            "kind": "provenance", "key": "new", "value": {
+                "agent": "claude", "machine": "M3", "session_id": "new",
+                "worktree": {"state": "safe", "head": HEAD},
+            },
+        }]
+        manifest = reviewed_manifest(adapter, desired, [retirement])
+        snapshot, unresolved = load_material_history_for_projection_reconcile(
+            self.graph_snapshot(), client.comments, "GEN-37", manifest, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            relation_target_resolver=self.incomplete_relation_target_resolver,
+        )
+        revision_before = adapter.state().revision
+        result = reconcile_required_projection(
+            adapter, snapshot, manifest, remote_head=HEAD,
+            created_at="2026-08-27T19:00:00Z", authenticated_source=source,
+            legacy_unresolved_relation_heads=unresolved,
+        )
+        appended = adapter.state().events[revision_before:]
+        self.assertEqual(
+            (appended[0]["kind"], appended[0]["key"], appended[0]["value"]),
+            ("relation", "blocks:GEN-14", TOMBSTONE),
+        )
+        self.assertEqual(adapter.state().snapshot["relations"], [])
+        self.assertTrue(result["readback_verified"])
+
+    def test_concurrent_same_logical_relation_converges_without_duplicate_or_loss(self):
+        client = FakeProjectionClient()
+        first = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        second = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        relation = {"type": "related", "target": {
+            "workspace_id": "workspace",
+            "issue_id": "22222222-2222-4222-8222-222222222222",
+            "identifier": "GEN-50",
+        }}
+        event_a = build_projection_event(
+            workstream_id="GEN-37", kind="relation", key="related:GEN-50",
+            value=relation, plan_revision=PLAN, expected_revision=0,
+            created_at="2026-08-28T12:00:00Z", authority=AUTHORITY,
+        )
+        event_b = build_projection_event(
+            workstream_id="GEN-37", kind="relation", key="related:GEN-50",
+            value=relation, plan_revision=PLAN, expected_revision=0,
+            created_at="2026-08-28T12:00:00Z", authority=AUTHORITY,
+        )
+        receipt_a = first.append(event_a)
+        receipt_b = second.append(event_b)
+        self.assertEqual(receipt_a["event_id"], receipt_b["event_id"])
+        self.assertEqual(len(client.comments), 1)
+        self.assertEqual(first.state().snapshot["relations"], [relation])
+
+    def test_projection_refuses_unresolved_or_invalid_inverse_before_append(self):
+        relation = {"type": "blocks", "target": {
+            "workspace_id": "workspace", "issue_id": TARGET_UUID,
+            "identifier": "GEN-50",
+        }}
+        root = {"workspace_id": "workspace", "issue_id": ROOT_UUID,
+                "identifier": "GEN-37"}
+        target_key = f"workspace:{TARGET_UUID}"
+        cases = {
+            "dangling_relation_target": {},
+            "missing_relation_inverse": {
+                target_key: {**relation["target"], "relations": []},
+            },
+            "contradictory_relation_inverse": {
+                target_key: {**relation["target"], "relations": [
+                    {"type": "blocks", "target": root},
+                ]},
+            },
+        }
+        for expected_error, targets in cases.items():
+            with self.subTest(expected_error=expected_error):
+                client = FakeProjectionClient()
+                adapter = LinearProjectionAdapter(
+                    client, issue_id="GEN-37", workstream_id="GEN-37",
+                    plan_revision=PLAN, **AUTHORITY,
+                )
+                projected = [
+                    {"kind": "scope", "key": "root", "value": scope()},
+                    {"kind": "source", "key": "root", "value": {
+                        "sha256": PLAN, "identity": "https://example.test/plan",
+                    }},
+                    {"kind": "provenance", "key": "session", "value": {
+                        "agent": "codex", "machine": "M5", "session_id": "session",
+                    }},
+                    {"kind": "relation", "key": "blocks:GEN-50", "value": relation},
+                ]
+                with self.assertRaisesRegex(LinearProjectionError, expected_error):
+                    reconcile_required_projection(
+                        adapter, {"root": {"identifier": "GEN-37"}},
+                        reviewed_manifest(adapter, projected), remote_head=HEAD,
+                        created_at="2026-08-28T12:00:00Z",
+                        authenticated_source={
+                            "identity": "https://example.test/plan", "sha256": PLAN,
+                        },
+                        relation_target_resolver=lambda _relations, value=targets: value,
+                    )
+                self.assertEqual(client.comments, [])
+
     def _single_legacy_activation_comments(self, value):
         legacy = legacy_event(
             "scope", "root", scope(), 0, "2026-08-27T17:00:00Z",
@@ -1224,7 +1465,7 @@ class ProjectionTests(unittest.TestCase):
         old_provenance = {"agent": "codex", "machine": "M5", "session_id": "old",
                           "worktree": {"state": "safe", "head": HEAD}}
         relation = {"type": "blocks", "target": {
-            "workspace_id": "workspace", "issue_id": "target-uuid",
+            "workspace_id": "workspace", "issue_id": TARGET_UUID,
             "identifier": "GEN-14",
         }}
         first_manifest = reviewed_manifest(adapter, [*base,
@@ -1238,6 +1479,7 @@ class ProjectionTests(unittest.TestCase):
         reconcile_required_projection(
             adapter, snapshot, first_manifest, remote_head=HEAD,
             created_at="2026-08-27T18:00:00Z", authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
         )
         new_provenance = {"agent": "claude", "machine": "M3", "session_id": "new",
                           "worktree": {"state": "safe", "head": HEAD}}
@@ -1326,7 +1568,7 @@ class ProjectionTests(unittest.TestCase):
             }},
         ]
         relation = {"type": "blocks", "target": {
-            "workspace_id": "workspace", "issue_id": "target-uuid",
+            "workspace_id": "workspace", "issue_id": TARGET_UUID,
             "identifier": "GEN-14",
         }}
         source = {"identity": "https://example.test/plan", "sha256": PLAN}
@@ -1336,11 +1578,13 @@ class ProjectionTests(unittest.TestCase):
                 "kind": "relation", "key": "blocks:GEN-14", "value": relation,
             }]), remote_head=HEAD, created_at="2026-08-27T18:00:00Z",
             authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
         )
         reconcile_required_projection(
             adapter, {"root": {"identifier": "GEN-37"}},
             reviewed_manifest(adapter, base), remote_head=HEAD,
             created_at="2026-08-27T19:00:00Z", authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
         )
         state = adapter.state().snapshot
         self.assertEqual(state["relations"], [relation])
@@ -1366,7 +1610,7 @@ class ProjectionTests(unittest.TestCase):
             }},
             {"kind": "relation", "key": "blocks:GEN-14", "value": {
                 "type": "blocks", "target": {
-                    "workspace_id": "workspace", "issue_id": "target-uuid",
+                    "workspace_id": "workspace", "issue_id": TARGET_UUID,
                     "identifier": "GEN-14",
                 },
             }},
@@ -1376,6 +1620,7 @@ class ProjectionTests(unittest.TestCase):
             adapter, {"root": {"identifier": "GEN-37"}},
             reviewed_manifest(adapter, base), remote_head=HEAD,
             created_at="2026-08-27T18:00:00Z", authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
         )
         retirement = reviewed_retirement(adapter, "relation", "blocks:GEN-14")
         manifest = reviewed_manifest(adapter, base[:-1], [retirement])
@@ -1386,7 +1631,7 @@ class ProjectionTests(unittest.TestCase):
         changed = build_projection_event(
             workstream_id="GEN-37", kind="relation", key="blocks:GEN-14",
             value={"type": "blocks", "target": {
-                "workspace_id": "workspace", "issue_id": "changed-uuid",
+                "workspace_id": "workspace", "issue_id": CHANGED_TARGET_UUID,
                 "identifier": "GEN-14",
             }},
             plan_revision=PLAN, expected_revision=adapter.state().revision,
@@ -1412,7 +1657,7 @@ class ProjectionTests(unittest.TestCase):
             project_id="project", root_issue_id=ROOT_UUID,
         )
         relation = {"type": "blocks", "target": {
-            "workspace_id": "workspace", "issue_id": "target-uuid",
+            "workspace_id": "workspace", "issue_id": TARGET_UUID,
             "identifier": "GEN-14",
         }}
         base = [
@@ -1431,6 +1676,7 @@ class ProjectionTests(unittest.TestCase):
                 "kind": "relation", "key": "blocks:GEN-14", "value": relation,
             }]), remote_head=HEAD, created_at="2026-08-27T18:00:00Z",
             authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
         )
         retirement = reviewed_retirement(adapter, "relation", "blocks:GEN-14")
         retirement["expected_event_id"] = "wsp_stale"
@@ -1461,7 +1707,7 @@ class ProjectionTests(unittest.TestCase):
             }},
         ]
         relation = {"type": "blocks", "target": {
-            "workspace_id": "workspace", "issue_id": "target-uuid",
+            "workspace_id": "workspace", "issue_id": TARGET_UUID,
             "identifier": "GEN-14",
         }}
         projected = [
@@ -1476,6 +1722,7 @@ class ProjectionTests(unittest.TestCase):
             adapter, snapshot, reviewed_manifest(adapter, projected),
             remote_head=HEAD, created_at="2026-08-27T18:00:00Z",
             authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
         )
         retirements = [
             reviewed_retirement(adapter, "relation", "blocks:GEN-14"),
@@ -1495,6 +1742,7 @@ class ProjectionTests(unittest.TestCase):
             adapter, snapshot, reviewed_manifest(adapter, projected),
             remote_head=HEAD, created_at="2026-08-27T20:00:00Z",
             authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
         )
         state = adapter.state()
         self.assertEqual(state.snapshot["relations"], [relation])
@@ -1527,7 +1775,7 @@ class ProjectionTests(unittest.TestCase):
             }},
         ]
         relation = {"type": "blocks", "target": {
-            "workspace_id": "workspace", "issue_id": "target-uuid",
+            "workspace_id": "workspace", "issue_id": TARGET_UUID,
             "identifier": "GEN-14",
         }}
         projected = [*base, {
@@ -1539,6 +1787,7 @@ class ProjectionTests(unittest.TestCase):
             adapter, snapshot, reviewed_manifest(adapter, projected),
             remote_head=HEAD, created_at="2026-08-27T18:00:00Z",
             authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
         )
         reconcile_required_projection(
             adapter, snapshot, reviewed_manifest(adapter, base, [

@@ -690,6 +690,83 @@ class ResumeTests(unittest.TestCase):
                 authenticated_source=authenticated_source,
             )
 
+    def test_relation_target_readback_reconstructs_exact_lifecycle_digest(self):
+        graph = self.snapshot()
+        graph["root"]["plan_revision"] = "a" * 64
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project",
+            "root_issue_id": "33333333-3333-4333-8333-333333333333",
+        }
+        target = {
+            "workspace_id": "workspace",
+            "issue_id": "22222222-2222-4222-8222-222222222222",
+            "identifier": "GEN-50",
+        }
+        relation = {"type": "related", "target": target}
+        relation_event = build_projection_event(
+            workstream_id="GEN-37", kind="relation", key="related:GEN-50",
+            value=relation, plan_revision="a" * 64, expected_revision=0,
+            created_at="2026-08-28T11:59:00Z", authority=route,
+        )
+        relation_comment = {
+            "id": projection_slot_id("GEN-37", "a" * 64, 0, route),
+            "body": encode_projection_comment(relation_event),
+        }
+        target_readback = {
+            f"workspace:{target['issue_id']}": {**target, "relations": []},
+        }
+        before = MODULE.add_material_history(
+            graph, [relation_comment], "GEN-37", authenticated_route=route,
+            relation_target_resolver=lambda _relations: target_readback,
+        )
+        github = {
+            "repository": "generous-corp/agent-workstream",
+            "provider_repository_id": "R_agent_workstream", "pr_number": 41,
+            "pr_head": "c" * 40, "merged": True, "merge_sha": "d" * 40,
+        }
+        shipyard_body = {
+            "schema_version": 1, "repository": github["repository"],
+            "repository_key": "github.com:id:R_agent_workstream",
+            "pr_number": 41, "head": github["pr_head"],
+            "disposition": "merged", "receipt_id": "receipt-41",
+        }
+        shipyard = {**shipyard_body, "receipt_sha256": hashlib.sha256(json.dumps(
+            shipyard_body, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()}
+        lifecycle = build_projection_event(
+            workstream_id="GEN-37", kind="lifecycle", key="root", value={
+                "status": "Landed — acceptance review required",
+                "github": github, "shipyard_receipt": shipyard,
+                "closure_input_sha256": "b" * 64,
+                "snapshot_sha256": MODULE.closure_snapshot_digest(before),
+                "independent_review": None, "closure_receipt_sha256": None,
+            }, plan_revision="a" * 64, expected_revision=1,
+            created_at="2026-08-28T12:00:00Z", authority=route,
+        )
+        comments = [relation_comment, {
+            "id": projection_slot_id("GEN-37", "a" * 64, 1, route),
+            "body": encode_projection_comment(lifecycle),
+        }]
+        with self.assertRaisesRegex(
+            MODULE.ResumeError, "lifecycle_snapshot_stale_reconcile_required",
+        ):
+            MODULE.add_material_history(
+                graph, comments, "GEN-37", authenticated_route=route,
+            )
+        resumed = MODULE.add_material_history(
+            graph, comments, "GEN-37", authenticated_route=route,
+            relation_target_resolver=lambda _relations: target_readback,
+        )
+        self.assertEqual(
+            resumed["root"]["status"], "Landed — acceptance review required",
+        )
+        self.assertNotIn("lifecycle_recovery", resumed)
+        self.assertEqual(
+            MODULE.closure_snapshot_digest(resumed),
+            lifecycle["value"]["snapshot_sha256"],
+        )
+
     def test_snapshot_cli_is_inspection_only_even_when_forged_as_authenticated(self):
         snapshot = self.snapshot()
         snapshot["authenticated_source"] = {

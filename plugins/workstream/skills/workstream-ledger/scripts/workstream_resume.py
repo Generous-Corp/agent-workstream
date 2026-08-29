@@ -10,6 +10,7 @@ before an agent edits anything.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from copy import deepcopy
 import hashlib
 import json
@@ -39,6 +40,7 @@ from workstream_linear_projection import (
     validate_projection_event,
 )
 from workstream_plan import plan_payload
+from workstream_relation_readback import read_relation_targets
 from workstream_choices import ChoiceError, reduce_choices
 from workstream_evidence import evidence_errors
 from workstream_scope import repository_key, ScopeError, validate_relations, validate_scope
@@ -247,6 +249,9 @@ def add_material_history(
     *, authenticated_route: dict[str, str] | None = None,
     authenticated_source: dict[str, Any] | None = None,
     permit_stale_lifecycle_for_reconcile: bool = False,
+    relation_target_resolver: (
+        Callable[[list[dict[str, Any]]], dict[str, dict[str, Any]]] | None
+    ) = None,
 ) -> dict[str, Any]:
     """Join one complete Linear comment read to the issue-graph snapshot."""
     result = dict(snapshot)
@@ -264,6 +269,9 @@ def add_material_history(
     result["material_events"] = events
     result["material_event_revision"] = event_log.revision
     result.update(projection_log.snapshot)
+    relations = result.get("relations") or []
+    if relations and relation_target_resolver is not None:
+        result["relation_targets"] = relation_target_resolver(relations)
     result["authenticated_route"] = dict(authenticated_route) if authenticated_route else None
     result["authenticated_source"] = (
         dict(authenticated_source) if authenticated_source else None
@@ -927,6 +935,9 @@ def main() -> int:
             snapshot = add_material_history(
                 live_graph_snapshot, comments, token, authenticated_route=route,
                 permit_stale_lifecycle_for_reconcile=not args.inspection_only,
+                relation_target_resolver=lambda relations: read_relation_targets(
+                    client, relations,
+                ),
             )
         else:
             raw = (
@@ -947,6 +958,9 @@ def main() -> int:
                 snapshot = add_material_history(
                     live_graph_snapshot, comments, token, authenticated_route=route,
                     authenticated_source=authenticated_source,
+                    relation_target_resolver=lambda relations: read_relation_targets(
+                        client, relations,
+                    ),
                 )
             else:
                 snapshot["authenticated_source"] = authenticated_source
