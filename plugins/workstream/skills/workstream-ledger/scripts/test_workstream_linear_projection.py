@@ -1212,7 +1212,8 @@ class ProjectionTests(unittest.TestCase):
         )
         writes_before = len(client.comments)
         with self.assertRaisesRegex(
-            ResumeError, "completed_owned_child_closure_missing:GEN-72",
+            LinearProjectionError,
+            "terminal_child_closure_retirement_forbidden:GEN-72",
         ):
             load_material_history_for_projection_reconcile(
                 graph, client.comments, "GEN-37", retirement_manifest, adapter,
@@ -1239,13 +1240,24 @@ class ProjectionTests(unittest.TestCase):
             adapter, paired_desired, [retirement, evidence_retirement],
         )
         with self.assertRaisesRegex(
-            ResumeError, "completed_owned_child_closure_missing:GEN-72",
+            LinearProjectionError,
+            "terminal_child_closure_retirement_forbidden:GEN-72",
         ):
             load_material_history_for_projection_reconcile(
                 graph, client.comments, "GEN-37", paired_manifest, adapter,
                 authenticated_route=AUTHORITY,
                 authenticated_source=source, remote_head=HEAD,
                 relation_target_resolver=self.relation_target_resolver,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_closure_retirement_forbidden:GEN-72",
+        ):
+            reconcile_required_projection(
+                adapter, graph, paired_manifest, remote_head=HEAD,
+                created_at="2026-08-27T20:10:00Z",
+                authenticated_source=source,
             )
         self.assertEqual(len(client.comments), writes_before)
 
@@ -1264,13 +1276,24 @@ class ProjectionTests(unittest.TestCase):
             adapter, reassigned_desired, [retirement],
         )
         with self.assertRaisesRegex(
-            ResumeError, "completed_owned_child_closure_missing:GEN-72",
+            LinearProjectionError,
+            "terminal_child_closure_retirement_forbidden:GEN-72",
         ):
             load_material_history_for_projection_reconcile(
                 graph, client.comments, "GEN-37", reassigned_manifest, adapter,
                 authenticated_route=AUTHORITY,
                 authenticated_source=source, remote_head=HEAD,
                 relation_target_resolver=self.relation_target_resolver,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_closure_retirement_forbidden:GEN-72",
+        ):
+            reconcile_required_projection(
+                adapter, graph, reassigned_manifest, remote_head=HEAD,
+                created_at="2026-08-27T20:20:00Z",
+                authenticated_source=source,
             )
         self.assertEqual(len(client.comments), writes_before)
 

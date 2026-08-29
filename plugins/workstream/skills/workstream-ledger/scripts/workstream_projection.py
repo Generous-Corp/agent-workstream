@@ -304,6 +304,10 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         identity = (retirement.get("kind"), retirement.get("key"))
         if not all(isinstance(value, str) and value for value in identity):
             raise LinearProjectionError(f"invalid_manifest_retirement_identity:{index}")
+        if identity[0] == "child_closure":
+            raise LinearProjectionError(
+                f"terminal_child_closure_retirement_forbidden:{identity[1]}"
+            )
         if identity in retired:
             raise LinearProjectionError(
                 f"duplicate_manifest_retirement:{identity[0]}:{identity[1]}"
