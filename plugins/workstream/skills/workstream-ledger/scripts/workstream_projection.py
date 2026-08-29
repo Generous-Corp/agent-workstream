@@ -32,7 +32,7 @@ from workstream_successor import choose_disposition, SuccessorError
 from workstream_evidence import evidence_errors
 from workstream_child_closure import (
     canonical_digest, evidence_receipts_sha256, terminal_child_readback,
-    ChildClosureError,
+    CHILD_READBACK_FIELDS, ChildClosureError,
 )
 
 
@@ -614,6 +614,9 @@ def _require_repairs_for_changed_child_closures(
     repairs_by_child = {
         repair["child_identifier"].upper(): repair for repair in repairs
     }
+    desired_scope = next(
+        (item["value"] for item in desired if item["kind"] == "scope"), None,
+    )
     for item in desired:
         if item["kind"] != "child_closure":
             continue
@@ -637,6 +640,76 @@ def _require_repairs_for_changed_child_closures(
         ):
             raise LinearProjectionError(
                 f"terminal_child_closure_repair_mismatch:{child_id}"
+            )
+        readback = {
+            field: closure.get(field) for field in CHILD_READBACK_FIELDS
+        }
+        if canonical_digest(readback) != closure.get("child_readback_sha256"):
+            raise LinearProjectionError(
+                f"terminal_child_closure_readback_digest_mismatch:{child_id}"
+            )
+        if not isinstance(desired_scope, dict):
+            raise LinearProjectionError(
+                f"terminal_child_closure_scope_missing:{child_id}"
+            )
+        linear = desired_scope.get("linear") or {}
+        if any(
+            closure.get(field) != linear.get(field)
+            for field in ("workspace_id", "team_id", "project_id")
+        ) or closure.get("parent_issue_id") != linear.get("root_issue_id"):
+            raise LinearProjectionError(
+                f"terminal_child_closure_route_mismatch:{child_id}"
+            )
+        if desired_scope.get("child_ownership", {}).get(child_id) != closure.get(
+            "repository_key"
+        ):
+            raise LinearProjectionError(
+                f"terminal_child_closure_ownership_mismatch:{child_id}"
+            )
+        repository = next((
+            item for item in desired_scope.get("repositories", [])
+            if repository_key(item) == closure.get("repository_key")
+        ), None)
+        if repository is None or repository.get("exact_head") != closure.get(
+            "exact_head"
+        ):
+            raise LinearProjectionError(
+                f"terminal_child_closure_repository_mismatch:{child_id}"
+            )
+        active_evidence_heads = [
+            {
+                "key": key,
+                "event_id": event["event_id"],
+                "value_sha256": canonical_digest(event["value"]),
+            }
+            for (kind, key), event in active.items()
+            if kind == "evidence_contract"
+            and event["value"].get("owning_child") == child_id
+        ]
+        active_evidence_heads.sort(
+            key=lambda head: (head["key"], head["event_id"]),
+        )
+        if active_evidence_heads != repair["approved_evidence_heads"]:
+            raise LinearProjectionError(
+                f"terminal_child_closure_evidence_set_mismatch:{child_id}"
+            )
+        contracts: list[dict[str, Any]] = []
+        for head in active_evidence_heads:
+            contract = active[("evidence_contract", head["key"])]["value"]
+            if (
+                evidence_errors(contract)
+                or contract.get("repository_key") != closure.get("repository_key")
+                or contract.get("exact_head") != closure.get("exact_head")
+            ):
+                raise LinearProjectionError(
+                    f"terminal_child_closure_evidence_invalid:{child_id}"
+                )
+            contracts.append(contract)
+        if evidence_receipts_sha256(contracts) != closure.get(
+            "evidence_receipts_sha256"
+        ):
+            raise LinearProjectionError(
+                f"terminal_child_closure_receipts_mismatch:{child_id}"
             )
 
 

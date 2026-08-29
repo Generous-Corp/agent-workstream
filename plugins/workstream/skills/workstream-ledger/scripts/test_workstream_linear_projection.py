@@ -1374,6 +1374,23 @@ class ProjectionTests(unittest.TestCase):
                 authenticated_source=source,
             )
         self.assertEqual(len(client.comments), writes_before)
+        forged_with_repair = {
+            **replacement_manifest,
+            "terminal_child_repairs": deepcopy(
+                stale_manifest["terminal_child_repairs"]
+            ),
+        }
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_closure_readback_digest_mismatch:GEN-72",
+        ):
+            reconcile_required_projection(
+                adapter, graph, forged_with_repair, remote_head=HEAD,
+                created_at="2026-08-27T20:16:00Z",
+                authenticated_source=source,
+                terminal_child_fence=lambda _identifier: expected,
+            )
+        self.assertEqual(len(client.comments), writes_before)
 
         closure_head = next(
             event for event in reversed(adapter.state().events)
