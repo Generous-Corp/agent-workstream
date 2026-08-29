@@ -29,8 +29,17 @@ def canonical_digest(value: Any) -> str:
 def terminal_child_readback(child: dict[str, Any]) -> dict[str, Any]:
     """Return the exact live identity/state surface eligible for repair."""
     state_type = str(child.get("status_type") or "").lower()
-    assignee = child.get("assignee")
-    assignee_id = assignee.get("id") if isinstance(assignee, dict) else None
+    if "assignee" not in child:
+        raise ChildClosureError("terminal_child_readback_missing:assignee")
+    assignee = child["assignee"]
+    if assignee is None:
+        assignee_id = None
+    elif isinstance(assignee, dict):
+        assignee_id = assignee.get("id")
+        if not isinstance(assignee_id, str) or not assignee_id:
+            raise ChildClosureError("terminal_child_readback_invalid:assignee_id")
+    else:
+        raise ChildClosureError("terminal_child_readback_invalid:assignee")
     value = {
         "child_identifier": str(child.get("identifier") or "").upper(),
         "child_issue_id": child.get("id"),
@@ -48,9 +57,9 @@ def terminal_child_readback(child: dict[str, Any]) -> dict[str, Any]:
     for field in CHILD_READBACK_FIELDS - {"assignee_id"}:
         if not isinstance(value[field], str) or not value[field]:
             raise ChildClosureError(f"terminal_child_readback_missing:{field}")
-    if value["assignee_id"] is None:
-        raise ChildClosureError("terminal_child_readback_missing:assignee_id")
-    if not isinstance(value["assignee_id"], str) or not value["assignee_id"]:
+    if value["assignee_id"] is not None and (
+        not isinstance(value["assignee_id"], str) or not value["assignee_id"]
+    ):
         raise ChildClosureError("terminal_child_readback_invalid:assignee_id")
     if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", value["child_identifier"]):
         raise ChildClosureError("terminal_child_readback_invalid:child_identifier")

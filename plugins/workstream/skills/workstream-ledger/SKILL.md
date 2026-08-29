@@ -223,12 +223,16 @@ After a material child transition to Linear's `completed` state, run the
 model-free projection reconciliation before treating resume as authoritative.
 A reviewed `terminal_child_repairs` batch must fence every exact child issue
 from one authenticated root snapshot, including each
-parent/workspace/team/project route, assignee, state ID/name/type, and canonical
+parent/workspace/team/project route, exact assignee state (including explicitly
+unassigned), state ID/name/type, and canonical
 readback digest. The repository owner and head are derived only from named,
 active, valid evidence-contract heads and must already exist unchanged in the
 current scope. Closures are appended in canonical child order before any
 required scope replacement. A crash may resume only from that exact prefix.
 The writer never creates, reopens, or updates an issue.
+New closures use schema v2 so explicit unassignment is representable; readers
+continue to accept schema-v1 closures only with their original nonempty
+assignee identity.
 
 For a legacy completed, already-owned child whose receipts are still present
 but were never projected as evidence contracts, use a separately reviewed
