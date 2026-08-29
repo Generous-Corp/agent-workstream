@@ -217,6 +217,26 @@ either attach receipts or explain why it is not applicable:
 Do not call a system test with mocked providers live end-to-end proof. A head
 change invalidates head-bound receipts until reconciled.
 
+### Terminal-child projection repair
+
+After a material child transition to Linear's `completed` state, run the
+model-free projection reconciliation before treating resume as authoritative.
+A reviewed `terminal_child_repairs` entry must fence the exact child issue,
+parent/workspace/team/project route, assignee, state ID/name/type, and canonical
+readback digest. The repository owner and head are derived only from named,
+active, valid evidence-contract heads and must already exist unchanged in the
+current scope. The writer appends a typed `child_closure` before replacing the
+scope ownership map; it never creates, reopens, or updates an issue.
+
+An exact replay is a no-op. Missing/failed receipts, multiple owners or heads,
+non-completed state, missing assignee, route/readback drift, unrelated scope or
+source changes, and stale evidence refuse without mutation. Resume validates
+the closure against current Linear state, scope, repository head, and receipts
+before returning full authority. Once a completed child is present in the
+structured ownership map, full resume requires its active closure even if its
+evidence is later retired. Every closure creation or replacement requires the
+matching reviewed repair and live readback fence.
+
 ### Truth and closure reducer
 
 `scripts/workstream_state.py` supplies the deterministic adapter boundary for

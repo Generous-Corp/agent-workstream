@@ -85,7 +85,8 @@ query WorkstreamIssues($teamId: String!, $after: String) {
         parent { id identifier }
         project { id }
         team { id organization { id } }
-        state { name type }
+        assignee { id }
+        state { id name type }
       }
       pageInfo { hasNextPage endCursor }
     }
@@ -99,14 +100,16 @@ query WorkstreamResumeRoot($issueId: String!, $after: String) {
     id identifier title description url updatedAt
     project { id }
     team { id organization { id } }
-    state { name type }
+    assignee { id }
+    state { id name type }
     children(first: 250, after: $after) {
       nodes {
         id identifier title description url updatedAt
         parent { id identifier }
         project { id }
         team { id organization { id } }
-        state { name type }
+        assignee { id }
+        state { id name type }
         comments(first: 250) {
           nodes { id body createdAt updatedAt }
           pageInfo { hasNextPage endCursor }
@@ -507,6 +510,7 @@ class LinearGraphQLTransport:
                 continue
             child = dict(issue)
             state = child.pop("state", None) or {}
+            child["state_id"] = state.get("id")
             child["status"] = state.get("name") or state.get("type") or "Todo"
             child["status_type"] = state.get("type")
             child["next_action"] = parse_next_action(child.get("description"))

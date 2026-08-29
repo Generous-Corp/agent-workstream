@@ -529,7 +529,8 @@ class LinearTransportTests(unittest.TestCase):
             "id": "child-id", "identifier": "GEN-43", "title": "Child",
             "description": "completed without a next action",
             "url": "https://linear/GEN-43", "updatedAt": "now",
-            "state": {"name": "QA Accepted", "type": "completed"},
+            "state": {"id": "state-done", "name": "QA Accepted", "type": "completed"},
+            "assignee": {"id": "assignee-daniel"},
             "parent": {"id": "root-id", "identifier": "GEN-37"},
             "team": {"id": "team", "organization": {"id": "workspace"}},
             "project": {"id": "project"},
@@ -554,6 +555,8 @@ class LinearTransportTests(unittest.TestCase):
 
         self.assertEqual(snapshot["children"][0]["status"], "QA Accepted")
         self.assertEqual(snapshot["children"][0]["status_type"], "completed")
+        self.assertEqual(snapshot["children"][0]["state_id"], "state-done")
+        self.assertEqual(snapshot["children"][0]["assignee"]["id"], "assignee-daniel")
         self.assertEqual(snapshot["child_comments"], {})
 
     def test_repeated_intake_preserves_existing_mutable_next_action(self):

@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -30,9 +31,11 @@ import workstream_projection
 import workstream_linear_projection as projection_module
 from workstream_projection import (
     load_material_history_for_projection_reconcile, projection_review_contract,
-    reconcile_required_projection, stable_live_readback,
+    prepare_terminal_child_repairs, reconcile_required_projection,
+    stable_live_readback,
 )
 from workstream_successor import choose_disposition
+from workstream_child_closure import canonical_digest, terminal_child_readback
 
 
 PLAN = "f38baae4441485b14e5b16ea0255e3a07e42aa94a4fb0e6e04e7aa513693719d"
@@ -371,6 +374,72 @@ class ProjectionTests(unittest.TestCase):
         )
         return client, adapter, base, source
 
+    def terminal_repair_fixture(self, *, contract_mutator=None):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        source = {"identity": "https://example.test/plan", "sha256": PLAN}
+        contract = evidence_contract()
+        contract["slice_id"] = "gen72-terminal"
+        contract["owning_child"] = "GEN-72"
+        if contract_mutator is not None:
+            contract_mutator(contract)
+        base = [
+            {"kind": "scope", "key": "root", "value": scope()},
+            {"kind": "source", "key": "root", "value": source},
+            {"kind": "provenance", "key": "session", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "session",
+                "worktree": {"state": "safe", "head": HEAD},
+            }},
+            {"kind": "evidence_contract", "key": contract["slice_id"],
+             "value": contract},
+        ]
+        reconcile_required_projection(
+            adapter, {"root": {"identifier": "GEN-37"}},
+            reviewed_manifest(adapter, base), remote_head=HEAD,
+            created_at="2026-08-27T18:00:00Z", authenticated_source=source,
+        )
+        child = {
+            "id": "77777777-7777-4777-8777-777777777777",
+            "identifier": "GEN-72", "title": "terminal child",
+            "parent": {"id": ROOT_UUID, "identifier": "GEN-37"},
+            "team": {"id": "team", "organization": {"id": "workspace"}},
+            "project": {"id": "project"},
+            "assignee": {"id": "88888888-8888-4888-8888-888888888888"},
+            "state_id": "99999999-9999-4999-8999-999999999999",
+            "status": "Done", "status_type": "completed",
+        }
+        graph = self.graph_snapshot()
+        graph["children"] = [
+            {"identifier": "GEN-38", "title": "existing",
+             "status": "In Progress", "next_action": "continue"},
+            child,
+        ]
+        evidence_event = next(
+            event for event in adapter.state().events
+            if event["kind"] == "evidence_contract"
+        )
+        repair = {
+            "child_identifier": "GEN-72",
+            "child_issue_id": child["id"],
+            "expected_child_readback_sha256": canonical_digest(
+                terminal_child_readback(child)
+            ),
+            "expected_assignee_id": child["assignee"]["id"],
+            "approved_evidence_heads": [{
+                "key": evidence_event["key"],
+                "event_id": evidence_event["event_id"],
+                "value_sha256": canonical_digest(evidence_event["value"]),
+            }],
+        }
+        manifest = {
+            **reviewed_manifest(adapter, deepcopy(base)),
+            "terminal_child_repairs": [repair],
+        }
+        return client, adapter, source, graph, child, manifest
+
     def test_legacy_unresolved_relation_cannot_bypass_reviewed_migration(self):
         client, adapter, base, source = self.legacy_relation_fixture()
         manifest = reviewed_manifest(adapter, base)
@@ -428,6 +497,1010 @@ class ProjectionTests(unittest.TestCase):
                 legacy_unresolved_relation_heads=unresolved,
             )
         self.assertEqual(len(client.comments), writes_before)
+
+    def test_reviewed_scope_and_source_repair_previews_strict_final_state(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        current_scope = scope()
+        current = [
+            {"kind": "scope", "key": "root", "value": current_scope},
+            {"kind": "source", "key": "root", "value": {
+                "identity": "https://github.com/acme/plans/blob/main/PLAN.md",
+                "sha256": PLAN,
+            }},
+            {"kind": "provenance", "key": "session", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "session",
+                "worktree": {"state": "safe", "head": HEAD},
+            }},
+        ]
+        current_source = current[1]["value"]
+        reconcile_required_projection(
+            adapter, {"root": {"identifier": "GEN-37"}},
+            reviewed_manifest(adapter, current), remote_head=HEAD,
+            created_at="2026-08-27T18:00:00Z",
+            authenticated_source=current_source,
+        )
+        exact_source = {
+            "identity": "https://github.com/acme/plans/blob/" + "a" * 40 + "/PLAN.md",
+            "sha256": PLAN,
+        }
+        desired_scope = deepcopy(current_scope)
+        desired_scope["child_ownership"]["GEN-72"] = (
+            "github.com:id:R_agent_workstream"
+        )
+        desired = [
+            {"kind": "scope", "key": "root", "value": desired_scope},
+            {"kind": "source", "key": "root", "value": exact_source},
+            current[2],
+        ]
+        graph = {
+            "root": {
+                "id": ROOT_UUID, "identifier": "GEN-37",
+                "url": "https://linear.app/acme/issue/GEN-37/root",
+                "plan_revision": PLAN, "revision": 0,
+                "status": "In Progress", "next_action": "Reconcile.",
+            },
+            "children": [
+                {"identifier": "GEN-38", "title": "existing",
+                 "status": "In Progress", "next_action": "continue"},
+                {"identifier": "GEN-72", "title": "new child",
+                 "status": "In Progress", "next_action": "implement"},
+            ],
+        }
+        manifest = reviewed_manifest(adapter, desired)
+        writes_before = len(client.comments)
+
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", manifest, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=exact_source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+
+        self.assertEqual(unresolved, frozenset())
+        self.assertEqual(len(client.comments), writes_before)
+        self.assertEqual(preview["scope"], desired_scope)
+        self.assertEqual(preview["source"], exact_source)
+        result = reconcile_required_projection(
+            adapter, preview, manifest, remote_head=HEAD,
+            created_at="2026-08-27T19:00:00Z",
+            authenticated_source=exact_source,
+        )
+        self.assertTrue(result["readback_verified"])
+        strict = add_material_history(
+            graph, client.comments, "GEN-37",
+            authenticated_route=AUTHORITY, authenticated_source=exact_source,
+        )
+        self.assertEqual(strict["scope"], desired_scope)
+        self.assertEqual(strict["source"], exact_source)
+
+    def test_source_repair_that_leaves_scope_invalid_has_zero_writes(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        current = [
+            {"kind": "scope", "key": "root", "value": scope()},
+            {"kind": "source", "key": "root", "value": {
+                "identity": "https://example.test/plan", "sha256": PLAN,
+            }},
+            {"kind": "provenance", "key": "session", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "session",
+                "worktree": {"state": "safe", "head": HEAD},
+            }},
+        ]
+        current[1]["value"] = {
+            "identity": "https://github.com/acme/plans/blob/main/PLAN.md",
+            "sha256": PLAN,
+        }
+        source = current[1]["value"]
+        reconcile_required_projection(
+            adapter, {"root": {"identifier": "GEN-37"}},
+            reviewed_manifest(adapter, current), remote_head=HEAD,
+            created_at="2026-08-27T18:00:00Z", authenticated_source=source,
+        )
+        desired = deepcopy(current)
+        desired[1]["value"] = {
+            "identity": "https://github.com/acme/plans/blob/" + "a" * 40 + "/PLAN.md",
+            "sha256": PLAN,
+        }
+        graph = {
+            "root": {
+                "id": ROOT_UUID, "identifier": "GEN-37",
+                "url": "https://linear.app/acme/issue/GEN-37/root",
+                "plan_revision": PLAN, "revision": 0,
+                "status": "In Progress", "next_action": "Reconcile.",
+            },
+            "children": [
+                {"identifier": "GEN-38", "title": "existing",
+                 "status": "In Progress", "next_action": "continue"},
+                {"identifier": "GEN-72", "title": "new child", "status": "Done"},
+            ],
+        }
+        writes_before = len(client.comments)
+        with self.assertRaisesRegex(ResumeError, "unowned_children:GEN-72"):
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37",
+                reviewed_manifest(adapter, desired), adapter,
+                authenticated_route=AUTHORITY,
+                authenticated_source=desired[1]["value"],
+                remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+
+    def test_reviewed_scope_repair_over_resume_budget_has_zero_writes(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        current_scope = scope()
+        source = {
+            "identity": "https://example.test/plan", "sha256": PLAN,
+        }
+        current = [
+            {"kind": "scope", "key": "root", "value": current_scope},
+            {"kind": "source", "key": "root", "value": source},
+            {"kind": "provenance", "key": "session", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "session",
+                "worktree": {"state": "safe", "head": HEAD},
+            }},
+        ]
+        reconcile_required_projection(
+            adapter, {"root": {"identifier": "GEN-37"}},
+            reviewed_manifest(adapter, current), remote_head=HEAD,
+            created_at="2026-08-27T18:00:00Z", authenticated_source=source,
+        )
+        desired_scope = deepcopy(current_scope)
+        desired_scope["child_ownership"]["GEN-72"] = (
+            "github.com:id:R_agent_workstream"
+        )
+        desired = deepcopy(current)
+        desired[0]["value"] = desired_scope
+        graph = self.graph_snapshot()
+        graph["children"] = [
+            {"identifier": "GEN-38", "title": "existing",
+             "status": "In Progress", "next_action": "continue"},
+            {"identifier": "GEN-72", "title": "active", "status": "In Progress",
+             "next_action": "continue"},
+        ]
+        writes_before = len(client.comments)
+
+        with self.assertRaisesRegex(ResumeError, "resume_context_over_budget"):
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37",
+                reviewed_manifest(adapter, desired), adapter,
+                authenticated_route=AUTHORITY, authenticated_source=source,
+                remote_head=HEAD, max_bytes=1,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+
+        self.assertEqual(len(client.comments), writes_before)
+        with self.assertRaisesRegex(
+            ResumeError, "resume_context_over_item_budget",
+        ):
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37",
+                reviewed_manifest(adapter, desired), adapter,
+                authenticated_route=AUTHORITY, authenticated_source=source,
+                remote_head=HEAD, max_bytes=1_000_000, max_items=0,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+
+    def test_scope_source_repair_migrates_unreadable_relation_first(self):
+        client, adapter, base, _source = self.legacy_relation_fixture()
+        retirement = reviewed_retirement(adapter, "relation", "blocks:GEN-14")
+        exact_source = {
+            "identity": "https://github.com/acme/plans/blob/" + "a" * 40 + "/PLAN.md",
+            "sha256": PLAN,
+        }
+        desired = deepcopy(base[:-1])
+        desired[1]["value"] = exact_source
+        manifest = reviewed_manifest(adapter, desired, [retirement])
+        graph = self.graph_snapshot()
+        graph["children"] = [
+            {"identifier": "GEN-38", "title": "existing",
+             "status": "In Progress", "next_action": "continue"},
+        ]
+        snapshot, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", manifest, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=exact_source,
+            remote_head=HEAD,
+            relation_target_resolver=self.incomplete_relation_target_resolver,
+        )
+        revision_before = adapter.state().revision
+
+        result = reconcile_required_projection(
+            adapter, snapshot, manifest, remote_head=HEAD,
+            created_at="2026-08-27T19:00:00Z",
+            authenticated_source=exact_source,
+            relation_target_resolver=self.relation_target_resolver,
+            legacy_unresolved_relation_heads=unresolved,
+        )
+
+        appended = adapter.state().events[revision_before:]
+        self.assertEqual(
+            (appended[0]["kind"], appended[0]["key"], appended[0]["value"]),
+            ("relation", "blocks:GEN-14", TOMBSTONE),
+        )
+        self.assertEqual(adapter.state().snapshot["source"], exact_source)
+        self.assertTrue(result["readback_verified"])
+
+    def test_terminal_child_repair_is_evidence_derived_full_and_idempotent(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        source = {"identity": "https://example.test/plan", "sha256": PLAN}
+        contract = evidence_contract()
+        contract["slice_id"] = "gen72-terminal"
+        contract["owning_child"] = "GEN-72"
+        base = [
+            {"kind": "scope", "key": "root", "value": scope()},
+            {"kind": "source", "key": "root", "value": source},
+            {"kind": "provenance", "key": "session", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "session",
+                "worktree": {"state": "safe", "head": HEAD},
+            }},
+            {"kind": "evidence_contract", "key": contract["slice_id"],
+             "value": contract},
+        ]
+        reconcile_required_projection(
+            adapter, {"root": {"identifier": "GEN-37"}},
+            reviewed_manifest(adapter, base), remote_head=HEAD,
+            created_at="2026-08-27T18:00:00Z", authenticated_source=source,
+        )
+        child = {
+            "id": "77777777-7777-4777-8777-777777777777",
+            "identifier": "GEN-72", "title": "terminal child",
+            "parent": {"id": ROOT_UUID, "identifier": "GEN-37"},
+            "team": {"id": "team", "organization": {"id": "workspace"}},
+            "project": {"id": "project"},
+            "assignee": {"id": "88888888-8888-4888-8888-888888888888"},
+            "state_id": "99999999-9999-4999-8999-999999999999",
+            "status": "Done", "status_type": "completed",
+        }
+        graph = self.graph_snapshot()
+        graph["children"] = [
+            {"identifier": "GEN-38", "title": "existing",
+             "status": "In Progress", "next_action": "continue"},
+            child,
+        ]
+        evidence_event = next(
+            event for event in adapter.state().events
+            if event["kind"] == "evidence_contract"
+        )
+        repair = {
+            "child_identifier": "GEN-72",
+            "child_issue_id": child["id"],
+            "expected_child_readback_sha256": canonical_digest(
+                terminal_child_readback(child)
+            ),
+            "expected_assignee_id": child["assignee"]["id"],
+            "approved_evidence_heads": [{
+                "key": evidence_event["key"],
+                "event_id": evidence_event["event_id"],
+                "value_sha256": canonical_digest(evidence_event["value"]),
+            }],
+        }
+        stale_manifest = {
+            **reviewed_manifest(adapter, deepcopy(base)),
+            "terminal_child_repairs": [repair],
+        }
+        prepared = prepare_terminal_child_repairs(
+            stale_manifest, graph, adapter.state(),
+        )
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", prepared, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        before_revision = adapter.state().revision
+        result = reconcile_required_projection(
+            adapter, preview, prepared, remote_head=HEAD,
+            created_at="2026-08-27T19:00:00Z", authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda _identifier: repair[
+                "expected_child_readback_sha256"
+            ],
+            legacy_unresolved_relation_heads=unresolved,
+        )
+        appended = adapter.state().events[before_revision:]
+        self.assertEqual(
+            [(event["kind"], event["key"]) for event in appended[:2]],
+            [("child_closure", "GEN-72"), ("scope", "root")],
+        )
+        strict = add_material_history(
+            graph, client.comments, "GEN-37",
+            authenticated_route=AUTHORITY, authenticated_source=source,
+        )
+        context = compact_context(
+            strict, "GEN-37", require_projection_authority=True,
+        )
+        self.assertEqual(context["resume_authority"], "full")
+        self.assertEqual(context["scope"]["child_ownership"]["GEN-72"],
+                         "github.com:id:R_agent_workstream")
+        self.assertEqual(len(context["child_closures"]), 1)
+        self.assertEqual(context["source"], source)
+        self.assertEqual(context["disposition"]["remote_head"], HEAD)
+        self.assertTrue(result["readback_verified"])
+
+        replay = prepare_terminal_child_repairs(
+            stale_manifest, graph, adapter.state(),
+        )
+        replay_preview, replay_unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", replay, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        comments_before_replay = len(client.comments)
+        replay_result = reconcile_required_projection(
+            adapter, replay_preview, replay, remote_head=HEAD,
+            created_at="2026-08-27T20:00:00Z", authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda _identifier: repair[
+                "expected_child_readback_sha256"
+            ],
+            legacy_unresolved_relation_heads=replay_unresolved,
+        )
+        self.assertEqual(replay_result["writes"], [])
+        self.assertEqual(len(client.comments), comments_before_replay)
+        self.assertFalse(any(
+            "issueCreate" in query or "issueUpdate" in query
+            for query, _variables in client.calls
+        ))
+
+    def test_generic_scope_repair_cannot_bypass_terminal_child_protocol(self):
+        client, adapter, source, graph, _child, manifest = (
+            self.terminal_repair_fixture()
+        )
+        manifest.pop("terminal_child_repairs")
+        scope_item = next(
+            item for item in manifest["projection"] if item["kind"] == "scope"
+        )
+        scope_item["value"]["child_ownership"]["GEN-72"] = (
+            "github.com:id:R_agent_workstream"
+        )
+        writes_before = len(client.comments)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_ownership_repair_required:GEN-72",
+        ):
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37", manifest, adapter,
+                authenticated_route=AUTHORITY, authenticated_source=source,
+                remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+
+    def test_terminal_child_repair_contradictions_refuse_without_writes(self):
+        cases = {
+            "terminal_child_readback_missing:assignee_id": lambda graph, manifest: (
+                graph["children"][1].__setitem__("assignee", None)
+            ),
+            "terminal_child_not_completed": lambda graph, manifest: (
+                graph["children"][1].__setitem__("status_type", "canceled")
+            ),
+            "terminal_child_repair_route_mismatch:project_id": lambda graph, manifest: (
+                graph["children"][1].__setitem__("project", {"id": "other-project"}),
+                manifest["terminal_child_repairs"][0].__setitem__(
+                    "expected_child_readback_sha256",
+                    canonical_digest(terminal_child_readback(graph["children"][1])),
+                ),
+            ),
+            "terminal_child_readback_changed_reload_required": lambda graph, manifest: (
+                manifest["terminal_child_repairs"][0].__setitem__(
+                    "expected_assignee_id", "other-assignee"
+                )
+            ),
+            "terminal_child_repair_evidence_set_changed_reload_required": lambda graph, manifest: (
+                manifest["terminal_child_repairs"][0]["approved_evidence_heads"][0].__setitem__(
+                    "value_sha256", "0" * 64
+                )
+            ),
+        }
+        for expected, mutate in cases.items():
+            with self.subTest(expected=expected):
+                client, adapter, _source, graph, _child, manifest = (
+                    self.terminal_repair_fixture()
+                )
+                writes_before = len(client.comments)
+                mutate(graph, manifest)
+                with self.assertRaisesRegex(
+                    LinearProjectionError, re.escape(expected),
+                ):
+                    prepare_terminal_child_repairs(
+                        manifest, graph, adapter.state(),
+                    )
+                self.assertEqual(len(client.comments), writes_before)
+                self.assertFalse(any(
+                    "issueCreate" in query or "issueUpdate" in query
+                    for query, _variables in client.calls
+                ))
+
+        def remove_receipts(contract):
+            contract["layers"]["logic"]["receipts"] = []
+
+        client, adapter, _source, graph, _child, manifest = (
+            self.terminal_repair_fixture(contract_mutator=remove_receipts)
+        )
+        writes_before = len(client.comments)
+        with self.assertRaisesRegex(
+            LinearProjectionError, "terminal_child_repair_evidence_invalid",
+        ):
+            prepare_terminal_child_repairs(manifest, graph, adapter.state())
+        self.assertEqual(len(client.comments), writes_before)
+
+        client, adapter, _source, graph, _child, manifest = (
+            self.terminal_repair_fixture()
+        )
+        second_contract = deepcopy(evidence_contract())
+        second_contract["slice_id"] = "gen72-other-owner"
+        second_contract["owning_child"] = "GEN-72"
+        second_contract["repository"] = "github.com/acme/other"
+        second_contract["repository_key"] = "github.com:id:R_other"
+        second_contract["exact_head"] = "b" * 40
+        for layer in second_contract["layers"].values():
+            for receipt in layer.get("receipts") or []:
+                receipt["repository_key"] = second_contract["repository_key"]
+                receipt["exact_head"] = second_contract["exact_head"]
+        second_event = build_projection_event(
+            workstream_id="GEN-37", kind="evidence_contract",
+            key=second_contract["slice_id"], value=second_contract,
+            plan_revision=PLAN, expected_revision=adapter.state().revision,
+            created_at="2026-08-27T18:30:00Z", authority=AUTHORITY,
+        )
+        adapter.append(second_event)
+        state = adapter.state()
+        manifest.update(projection_review_contract(state))
+        manifest["terminal_child_repairs"][0]["approved_evidence_heads"] = sorted([
+            {
+                "key": event["key"], "event_id": event["event_id"],
+                "value_sha256": canonical_digest(event["value"]),
+            }
+            for event in state.events
+            if event["kind"] == "evidence_contract"
+        ], key=lambda item: (item["key"], item["event_id"]))
+        writes_before = len(client.comments)
+        with self.assertRaisesRegex(
+            LinearProjectionError, "terminal_child_repair_owner_ambiguous",
+        ):
+            prepare_terminal_child_repairs(manifest, graph, state)
+        self.assertEqual(len(client.comments), writes_before)
+
+    def test_terminal_child_repair_resumes_after_closure_only_partial_write(self):
+        client, adapter, source, graph, _child, stale_manifest = (
+            self.terminal_repair_fixture()
+        )
+        prepared = prepare_terminal_child_repairs(
+            stale_manifest, graph, adapter.state(),
+        )
+        closure_item = next(
+            item for item in prepared["projection"]
+            if item["kind"] == "child_closure"
+        )
+        closure_event = build_projection_event(
+            workstream_id="GEN-37", kind="child_closure", key="GEN-72",
+            value=closure_item["value"], plan_revision=PLAN,
+            expected_revision=adapter.state().revision,
+            created_at="2026-08-27T19:00:00Z", authority=AUTHORITY,
+        )
+        adapter.append(closure_event)
+        partial_revision = adapter.state().revision
+
+        resumed_manifest = prepare_terminal_child_repairs(
+            stale_manifest, graph, adapter.state(),
+        )
+        self.assertEqual(
+            resumed_manifest["expected_projection_revision"], partial_revision,
+        )
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", resumed_manifest, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        result = reconcile_required_projection(
+            adapter, preview, resumed_manifest, remote_head=HEAD,
+            created_at="2026-08-27T20:00:00Z", authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda _identifier: stale_manifest[
+                "terminal_child_repairs"
+            ][0]["expected_child_readback_sha256"],
+            legacy_unresolved_relation_heads=unresolved,
+        )
+        appended = adapter.state().events[partial_revision:]
+        self.assertEqual(
+            [(event["kind"], event["key"]) for event in appended],
+            [("scope", "root")],
+        )
+        strict = add_material_history(
+            graph, client.comments, "GEN-37",
+            authenticated_route=AUTHORITY, authenticated_source=source,
+        )
+        self.assertEqual(
+            compact_context(strict, "GEN-37", require_projection_authority=True)[
+                "resume_authority"
+            ],
+            "full",
+        )
+        self.assertTrue(result["readback_verified"])
+
+    def test_terminal_child_repair_refuses_prewrite_issue_drift_with_zero_writes(self):
+        client, adapter, source, graph, _child, stale_manifest = (
+            self.terminal_repair_fixture()
+        )
+        prepared = prepare_terminal_child_repairs(
+            stale_manifest, graph, adapter.state(),
+        )
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", prepared, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        writes_before = len(client.comments)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_readback_changed_reload_required",
+        ):
+            reconcile_required_projection(
+                adapter, preview, prepared, remote_head=HEAD,
+                created_at="2026-08-27T20:00:00Z",
+                authenticated_source=source,
+                relation_target_resolver=self.relation_target_resolver,
+                terminal_child_fence=lambda _identifier: "0" * 64,
+                legacy_unresolved_relation_heads=unresolved,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+
+    def test_terminal_child_repair_refuses_midwrite_drift_before_ownership(self):
+        client, adapter, source, graph, _child, stale_manifest = (
+            self.terminal_repair_fixture()
+        )
+        prepared = prepare_terminal_child_repairs(
+            stale_manifest, graph, adapter.state(),
+        )
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", prepared, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        expected = stale_manifest["terminal_child_repairs"][0][
+            "expected_child_readback_sha256"
+        ]
+        reads = 0
+
+        def changing_fence(_identifier):
+            nonlocal reads
+            reads += 1
+            return expected if reads <= 2 else "0" * 64
+
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_readback_changed_reload_required",
+        ):
+            reconcile_required_projection(
+                adapter, preview, prepared, remote_head=HEAD,
+                created_at="2026-08-27T20:00:00Z",
+                authenticated_source=source,
+                relation_target_resolver=self.relation_target_resolver,
+                terminal_child_fence=changing_fence,
+                legacy_unresolved_relation_heads=unresolved,
+            )
+        appended = adapter.state().events[
+            prepared["expected_projection_revision"]:
+        ]
+        self.assertEqual(
+            [(event["kind"], event["key"]) for event in appended],
+            [("child_closure", "GEN-72")],
+        )
+        self.assertNotIn(
+            "GEN-72", adapter.state().snapshot["scope"]["child_ownership"],
+        )
+
+    def test_terminal_closure_refuses_evidence_add_retire_or_replace_drift(self):
+        for mutation in ("add", "retire", "replace"):
+            with self.subTest(mutation=mutation):
+                client, adapter, source, graph, _child, stale_manifest = (
+                    self.terminal_repair_fixture()
+                )
+                prepared = prepare_terminal_child_repairs(
+                    stale_manifest, graph, adapter.state(),
+                )
+                preview, unresolved = load_material_history_for_projection_reconcile(
+                    graph, client.comments, "GEN-37", prepared, adapter,
+                    authenticated_route=AUTHORITY,
+                    authenticated_source=source, remote_head=HEAD,
+                    relation_target_resolver=self.relation_target_resolver,
+                )
+                expected_digest = stale_manifest["terminal_child_repairs"][0][
+                    "expected_child_readback_sha256"
+                ]
+                reconcile_required_projection(
+                    adapter, preview, prepared, remote_head=HEAD,
+                    created_at="2026-08-27T20:00:00Z",
+                    authenticated_source=source,
+                    relation_target_resolver=self.relation_target_resolver,
+                    terminal_child_fence=lambda _identifier: expected_digest,
+                    legacy_unresolved_relation_heads=unresolved,
+                )
+                evidence_head = next(
+                    event for event in reversed(adapter.state().events)
+                    if event["kind"] == "evidence_contract"
+                )
+                key = evidence_head["key"]
+                value = deepcopy(evidence_head["value"])
+                supersedes = evidence_head["event_id"]
+                if mutation == "add":
+                    key = "gen72-late-evidence"
+                    value["slice_id"] = key
+                    supersedes = None
+                elif mutation == "retire":
+                    value = TOMBSTONE
+                else:
+                    value["layers"]["logic"]["receipts"][0]["id"] = (
+                        "late-replacement"
+                    )
+                adapter.append(build_projection_event(
+                    workstream_id="GEN-37", kind="evidence_contract", key=key,
+                    value=value, plan_revision=PLAN,
+                    expected_revision=adapter.state().revision,
+                    created_at="2026-08-27T20:30:00Z",
+                    supersedes_event_id=supersedes, authority=AUTHORITY,
+                ))
+                with self.assertRaisesRegex(
+                    ResumeError, "child_closure_evidence_set_mismatch",
+                ):
+                    compact_context(
+                        add_material_history(
+                            graph, client.comments, "GEN-37",
+                            authenticated_route=AUTHORITY,
+                            authenticated_source=source,
+                        ),
+                        "GEN-37", require_projection_authority=True,
+                    )
+
+    def test_terminal_closure_cannot_be_retired_while_ownership_and_evidence_remain(self):
+        client, adapter, source, graph, _child, stale_manifest = (
+            self.terminal_repair_fixture()
+        )
+        prepared = prepare_terminal_child_repairs(
+            stale_manifest, graph, adapter.state(),
+        )
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", prepared, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        expected = stale_manifest["terminal_child_repairs"][0][
+            "expected_child_readback_sha256"
+        ]
+        reconcile_required_projection(
+            adapter, preview, prepared, remote_head=HEAD,
+            created_at="2026-08-27T20:00:00Z",
+            authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda _identifier: expected,
+            legacy_unresolved_relation_heads=unresolved,
+        )
+        closure_head = next(
+            event for event in reversed(adapter.state().events)
+            if event["kind"] == "child_closure" and event["key"] == "GEN-72"
+        )
+        retirement = reviewed_retirement(
+            adapter, "child_closure", "GEN-72",
+        )
+        desired = [
+            item for item in prepared["projection"]
+            if (item["kind"], item["key"]) != ("child_closure", "GEN-72")
+        ]
+        retirement_manifest = reviewed_manifest(
+            adapter, desired, [retirement],
+        )
+        writes_before = len(client.comments)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_closure_retirement_forbidden:GEN-72",
+        ):
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37", retirement_manifest, adapter,
+                authenticated_route=AUTHORITY,
+                authenticated_source=source, remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+
+        evidence_head = next(
+            event for event in reversed(adapter.state().events)
+            if event["kind"] == "evidence_contract"
+            and event["value"].get("owning_child") == "GEN-72"
+        )
+        evidence_retirement = reviewed_retirement(
+            adapter, "evidence_contract", evidence_head["key"],
+        )
+        paired_desired = [
+            item for item in desired
+            if (item["kind"], item["key"])
+            != ("evidence_contract", evidence_head["key"])
+        ]
+        paired_manifest = reviewed_manifest(
+            adapter, paired_desired, [retirement, evidence_retirement],
+        )
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_closure_retirement_forbidden:GEN-72",
+        ):
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37", paired_manifest, adapter,
+                authenticated_route=AUTHORITY,
+                authenticated_source=source, remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_closure_retirement_forbidden:GEN-72",
+        ):
+            reconcile_required_projection(
+                adapter, graph, paired_manifest, remote_head=HEAD,
+                created_at="2026-08-27T20:10:00Z",
+                authenticated_source=source,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+
+        reassigned = deepcopy(evidence_head["value"])
+        reassigned["owning_child"] = "GEN-38"
+        reassigned_desired = [
+            *[
+                item for item in desired
+                if (item["kind"], item["key"])
+                != ("evidence_contract", evidence_head["key"])
+            ],
+            {"kind": "evidence_contract", "key": evidence_head["key"],
+             "value": reassigned},
+        ]
+        reassigned_manifest = reviewed_manifest(
+            adapter, reassigned_desired, [retirement],
+        )
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_closure_retirement_forbidden:GEN-72",
+        ):
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37", reassigned_manifest, adapter,
+                authenticated_route=AUTHORITY,
+                authenticated_source=source, remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_closure_retirement_forbidden:GEN-72",
+        ):
+            reconcile_required_projection(
+                adapter, graph, reassigned_manifest, remote_head=HEAD,
+                created_at="2026-08-27T20:20:00Z",
+                authenticated_source=source,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+
+        adapter.append(build_projection_event(
+            workstream_id="GEN-37", kind="child_closure", key="GEN-72",
+            value=TOMBSTONE, plan_revision=PLAN,
+            expected_revision=adapter.state().revision,
+            created_at="2026-08-27T20:30:00Z",
+            supersedes_event_id=closure_head["event_id"], authority=AUTHORITY,
+        ))
+        with self.assertRaisesRegex(
+            ResumeError, "completed_owned_child_closure_missing:GEN-72",
+        ):
+            compact_context(
+                add_material_history(
+                    graph, client.comments, "GEN-37",
+                    authenticated_route=AUTHORITY,
+                    authenticated_source=source,
+                ),
+                "GEN-37", require_projection_authority=True,
+            )
+
+    def test_terminal_closure_add_or_replace_requires_matching_repair(self):
+        client, adapter, source, graph, _child, stale_manifest = (
+            self.terminal_repair_fixture()
+        )
+        prepared = prepare_terminal_child_repairs(
+            stale_manifest, graph, adapter.state(),
+        )
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", prepared, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        expected = stale_manifest["terminal_child_repairs"][0][
+            "expected_child_readback_sha256"
+        ]
+        reconcile_required_projection(
+            adapter, preview, prepared, remote_head=HEAD,
+            created_at="2026-08-27T20:00:00Z",
+            authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda _identifier: expected,
+            legacy_unresolved_relation_heads=unresolved,
+        )
+        closure_item = next(
+            item for item in prepared["projection"]
+            if (item["kind"], item["key"]) == ("child_closure", "GEN-72")
+        )
+        replacement = deepcopy(prepared["projection"])
+        next(
+            item for item in replacement
+            if (item["kind"], item["key"]) == ("child_closure", "GEN-72")
+        )["value"]["state_name"] = "Completed"
+        replacement_manifest = reviewed_manifest(adapter, replacement)
+        writes_before = len(client.comments)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_closure_repair_required:GEN-72",
+        ):
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37",
+                replacement_manifest, adapter,
+                authenticated_route=AUTHORITY,
+                authenticated_source=source, remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_closure_repair_required:GEN-72",
+        ):
+            reconcile_required_projection(
+                adapter, {"root": {"identifier": "GEN-37"}},
+                replacement_manifest, remote_head=HEAD,
+                created_at="2026-08-27T20:15:00Z",
+                authenticated_source=source,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+        forged_with_repair = {
+            **replacement_manifest,
+            "terminal_child_repairs": deepcopy(
+                stale_manifest["terminal_child_repairs"]
+            ),
+        }
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_closure_readback_digest_mismatch:GEN-72",
+        ):
+            reconcile_required_projection(
+                adapter, graph, forged_with_repair, remote_head=HEAD,
+                created_at="2026-08-27T20:16:00Z",
+                authenticated_source=source,
+                terminal_child_fence=lambda _identifier: expected,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+
+        closure_head = next(
+            event for event in reversed(adapter.state().events)
+            if event["kind"] == "child_closure" and event["key"] == "GEN-72"
+        )
+        adapter.append(build_projection_event(
+            workstream_id="GEN-37", kind="child_closure", key="GEN-72",
+            value=TOMBSTONE, plan_revision=PLAN,
+            expected_revision=adapter.state().revision,
+            created_at="2026-08-27T20:30:00Z",
+            supersedes_event_id=closure_head["event_id"], authority=AUTHORITY,
+        ))
+        addition_manifest = reviewed_manifest(adapter, prepared["projection"])
+        writes_before = len(client.comments)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_closure_repair_required:GEN-72",
+        ):
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37",
+                addition_manifest, adapter,
+                authenticated_route=AUTHORITY,
+                authenticated_source=source, remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_closure_repair_required:GEN-72",
+        ):
+            reconcile_required_projection(
+                adapter, {"root": {"identifier": "GEN-37"}},
+                addition_manifest, remote_head=HEAD,
+                created_at="2026-08-27T20:45:00Z",
+                authenticated_source=source,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+        combined_projection = deepcopy(prepared["projection"])
+        combined_evidence = next(
+            item for item in combined_projection
+            if item["kind"] == "evidence_contract"
+            and item["value"].get("owning_child") == "GEN-72"
+        )
+        combined_evidence["value"]["layers"]["logic"]["receipts"][0][
+            "id"
+        ] = "simultaneous-replacement"
+        combined_manifest = {
+            **reviewed_manifest(adapter, combined_projection),
+            "terminal_child_repairs": deepcopy(
+                stale_manifest["terminal_child_repairs"]
+            ),
+        }
+        with self.assertRaisesRegex(
+            ResumeError, "child_closure_evidence_set_mismatch",
+        ):
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37", combined_manifest, adapter,
+                authenticated_route=AUTHORITY,
+                authenticated_source=source, remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_repair_unrelated_change:evidence_contract:",
+        ):
+            reconcile_required_projection(
+                adapter, graph, combined_manifest, remote_head=HEAD,
+                created_at="2026-08-27T20:50:00Z",
+                authenticated_source=source,
+                terminal_child_fence=lambda _identifier: expected,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+        scope_mutations = {
+            "namespace": lambda value: value.__setitem__(
+                "namespace", "forged-namespace"
+            ),
+            "unrelated_owner": lambda value: value["child_ownership"].__setitem__(
+                "GEN-999", "github.com:id:R_agent_workstream"
+            ),
+            "repository_alias": lambda value: value["repositories"][0][
+                "aliases"
+            ].append("github.com/forged/alias"),
+        }
+        for name, mutate_scope in scope_mutations.items():
+            with self.subTest(scope_mutation=name):
+                widened_projection = deepcopy(prepared["projection"])
+                widened_scope = next(
+                    item["value"] for item in widened_projection
+                    if item["kind"] == "scope"
+                )
+                mutate_scope(widened_scope)
+                widened_manifest = {
+                    **reviewed_manifest(adapter, widened_projection),
+                    "terminal_child_repairs": deepcopy(
+                        stale_manifest["terminal_child_repairs"]
+                    ),
+                }
+                with self.assertRaisesRegex(
+                    LinearProjectionError,
+                    "terminal_child_repair_scope_widened",
+                ):
+                    reconcile_required_projection(
+                        adapter, graph, widened_manifest, remote_head=HEAD,
+                        created_at="2026-08-27T20:55:00Z",
+                        authenticated_source=source,
+                        terminal_child_fence=lambda _identifier: expected,
+                    )
+                self.assertEqual(len(client.comments), writes_before)
+        self.assertEqual(closure_item["value"]["child_identifier"], "GEN-72")
 
     def test_legacy_unresolved_relation_retirement_precedes_unrelated_writes(self):
         client, adapter, base, source = self.legacy_relation_fixture()
