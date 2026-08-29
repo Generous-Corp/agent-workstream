@@ -122,7 +122,10 @@ python3 scripts/workstream_plugin_manager.py doctor \
 The source checkout must be durable because the clients retain its local path.
 The updater uses a per-host lock and per-client recovery journal, skips clients
 that already verify exactly, and emits partial receipts when another client
-fails. Fleet controllers such as Shipyard should run this one-host command at
+fails. A changed Codex installation must also survive two delayed readbacks;
+if a live older Codex process rematerializes stale plugin cache state, the
+update refuses instead of publishing a false-success receipt. Fleet controllers
+such as Shipyard should run this one-host command at
 an exact approved commit, collect its JSON receipt, stage rollout, and retain
 explicit offline/failed hosts for catch-up. The updater does not schedule itself
 and does not hold fleet authority.

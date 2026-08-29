@@ -639,6 +639,61 @@ class PluginManagerTests(unittest.TestCase):
             self.assertEqual([command[2] for command in commands], ["add"])
             self.assertEqual(journal.phase, "plugin_installed")
 
+    def test_post_update_stability_catches_delayed_codex_cache_rollback(self):
+        exact_marketplace = {"root": "/durable/source"}
+        exact_plugin = {"version": "1.2.3", "installed": True, "enabled": True}
+        stale_plugin = {"version": "1.2.2", "installed": True, "enabled": True}
+        receipt = self.receipt("codex", Path("/codex"))
+        with mock.patch.object(
+                MODULE, "inventory",
+                side_effect=[(exact_marketplace, exact_plugin),
+                             (exact_marketplace, stale_plugin)]), \
+             mock.patch.object(
+                 MODULE, "verify_client",
+                 side_effect=[receipt,
+                              MODULE.InstallError(
+                                  "plugin_version_mismatch:codex:1.2.3:1.2.2:1.2.3")]), \
+             mock.patch.object(MODULE.time, "sleep") as sleep, \
+             self.assertRaisesRegex(
+                 MODULE.InstallError,
+                 "post_update_stability_failed:codex:plugin_version_mismatch"):
+            MODULE.verify_post_update_stability(
+                "codex", expected_commit="a" * 40,
+                expected_version="1.2.3",
+                expected_source=Path("/durable/source"),
+                expected_digest="d", host_id="M5", target=Path("/codex"),
+                env={},
+            )
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            list(MODULE.CODEX_POST_UPDATE_STABILITY_DELAYS_SECONDS),
+        )
+
+    def test_post_update_stability_requires_two_delayed_codex_readbacks(self):
+        marketplace = {"root": "/durable/source"}
+        plugin = {"version": "1.2.3", "installed": True, "enabled": True}
+        receipt = self.receipt("codex", Path("/codex"))
+        with mock.patch.object(
+                MODULE, "inventory",
+                return_value=(marketplace, plugin)) as inventory, \
+             mock.patch.object(
+                 MODULE, "verify_client", return_value=receipt) as verify, \
+             mock.patch.object(MODULE.time, "sleep") as sleep:
+            observed = MODULE.verify_post_update_stability(
+                "codex", expected_commit="a" * 40,
+                expected_version="1.2.3",
+                expected_source=Path("/durable/source"),
+                expected_digest="d", host_id="M5", target=Path("/codex"),
+                env={},
+            )
+        self.assertEqual(observed, receipt)
+        self.assertEqual(inventory.call_count, 2)
+        self.assertEqual(verify.call_count, 2)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            list(MODULE.CODEX_POST_UPDATE_STABILITY_DELAYS_SECONDS),
+        )
+
     def test_update_client_recovery_journal_survives_each_mutation_failure(self):
         expected_phases = [
             "removing_marketplace", "adding_marketplace", "installing_plugin"
@@ -972,6 +1027,42 @@ class PluginManagerTests(unittest.TestCase):
             self.assertEqual(payload["clients"][0]["recovery"], "repaired")
             self.assertFalse(journal.exists)
             update.assert_not_called()
+
+    def test_codex_recovery_repeats_stability_fence_before_clearing_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            target = root / "codex"
+            target.mkdir()
+            proof = {"path": "/durable/source", "commit": "a" * 40,
+                     "tree_sha256": "d"}
+            journal = MODULE.TransactionJournal(
+                state, host_id="M5", client="codex", target=target,
+                expected_commit="a" * 40, expected_version="1.2.3",
+            )
+            journal.set_phase("verifying_stability")
+            receipt = self.receipt("codex", target)
+            with mock.patch.object(MODULE, "verify_source", return_value=proof), \
+                 mock.patch.object(MODULE, "target_env", return_value=({}, target)), \
+                 mock.patch.object(MODULE, "inventory", return_value=({}, {})), \
+                 mock.patch.object(MODULE, "verify_client", return_value=receipt), \
+                 mock.patch.object(
+                     MODULE, "verify_post_update_stability",
+                     return_value=receipt) as stable, \
+                 mock.patch.object(MODULE, "update_client") as update, \
+                 mock.patch.object(MODULE, "STATE_ROOT", state), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                code = MODULE.main([
+                    "update", "--client", "codex",
+                    "--expected-commit", "a" * 40,
+                    "--expected-version", "1.2.3", "--host-id", "M5",
+                    "--source-root", "/durable/source",
+                    "--codex-home", str(target),
+                ])
+            self.assertEqual(code, 0)
+            stable.assert_called_once()
+            update.assert_not_called()
+            self.assertFalse(journal.exists)
 
     def test_identity_requires_full_commit_semver_and_host(self):
         with self.assertRaisesRegex(MODULE.InstallError, "full_sha"):
