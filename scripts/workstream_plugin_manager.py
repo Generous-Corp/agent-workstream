@@ -712,6 +712,14 @@ def update_client(client: str, *, source_root: Path, expected_version: str,
     if plugin_ready:
         journal.set_phase("plugin_present")
         return
+    if client == "codex" and plugin is not None:
+        # Codex intentionally has no plugin-update command. `plugin add` is an
+        # install operation and may leave an already-installed older version
+        # selected, so replace that registration through the supported CLI
+        # before installing the exact marketplace version.
+        journal.set_phase("removing_plugin")
+        run(["codex", "plugin", "remove", PLUGIN_ID, "--json"], env=env)
+        journal.set_phase("plugin_removed")
     journal.set_phase("installing_plugin")
     if client == "claude" and plugin is not None and plugin.get("version") == expected_version:
         run(["claude", "plugin", "enable", PLUGIN_ID, "--scope", "user"], env=env)

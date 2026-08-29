@@ -533,6 +533,112 @@ class PluginManagerTests(unittest.TestCase):
                                        "/durable/source", "--scope", "user"])
         self.assertEqual(commands[2][:3], ["claude", "plugin", "install"])
 
+    def test_update_client_replaces_stale_codex_plugin_before_add(self):
+        journal = mock.Mock()
+        marketplace = {"name": MODULE.MARKETPLACE, "root": "/durable/source"}
+        stale_plugin = {
+            "pluginId": MODULE.PLUGIN_ID,
+            "version": "1.2.2",
+            "installed": True,
+            "enabled": True,
+        }
+        with mock.patch.object(MODULE.shutil, "which", return_value="/bin/codex"), \
+             mock.patch.object(MODULE, "inventory",
+                               return_value=(marketplace, stale_plugin)), \
+             mock.patch.object(MODULE, "run") as run:
+            MODULE.update_client(
+                "codex", source_root=Path("/durable/source"), env={"PATH": "/bin"},
+                journal=journal, expected_version="1.2.3",
+            )
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands, [
+            ["codex", "plugin", "remove", MODULE.PLUGIN_ID, "--json"],
+            ["codex", "plugin", "add", MODULE.PLUGIN_ID, "--json"],
+        ])
+        self.assertEqual(
+            [call.args[0] for call in journal.set_phase.call_args_list[-4:]],
+            ["removing_plugin", "plugin_removed", "installing_plugin",
+             "plugin_installed"],
+        )
+
+    def test_update_client_codex_remove_failure_preserves_recovery_phase(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = MODULE.TransactionJournal(
+                Path(directory), host_id="M5", client="codex",
+                target=Path("/Users/example/.codex"), expected_commit="a" * 40,
+                expected_version="1.2.3",
+            )
+            journal.set_phase("preparing")
+            marketplace = {"name": MODULE.MARKETPLACE, "root": "/durable/source"}
+            stale_plugin = {
+                "pluginId": MODULE.PLUGIN_ID,
+                "version": "1.2.2",
+                "installed": True,
+                "enabled": True,
+            }
+            with mock.patch.object(MODULE.shutil, "which", return_value="/bin/codex"), \
+                 mock.patch.object(MODULE, "inventory",
+                                   return_value=(marketplace, stale_plugin)), \
+                 mock.patch.object(MODULE, "run",
+                                   side_effect=MODULE.InstallError("injected_failure")), \
+                 self.assertRaisesRegex(MODULE.InstallError, "injected_failure"):
+                MODULE.update_client(
+                    "codex", source_root=Path("/durable/source"),
+                    env={"PATH": "/bin"}, journal=journal,
+                    expected_version="1.2.3",
+                )
+            self.assertEqual(journal.phase, "removing_plugin")
+
+    def test_update_client_codex_add_failure_retries_without_second_remove(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = MODULE.TransactionJournal(
+                Path(directory), host_id="M5", client="codex",
+                target=Path("/Users/example/.codex"), expected_commit="a" * 40,
+                expected_version="1.2.3",
+            )
+            journal.set_phase("preparing")
+            marketplace = {"name": MODULE.MARKETPLACE, "root": "/durable/source"}
+            stale_plugin = {
+                "pluginId": MODULE.PLUGIN_ID,
+                "version": "1.2.2",
+                "installed": True,
+                "enabled": True,
+            }
+            commands = []
+
+            def fail_add(command, **_kwargs):
+                commands.append(command)
+                if command[2] == "add":
+                    raise MODULE.InstallError("injected_add_failure")
+
+            with mock.patch.object(MODULE.shutil, "which", return_value="/bin/codex"), \
+                 mock.patch.object(MODULE, "inventory",
+                                   return_value=(marketplace, stale_plugin)), \
+                 mock.patch.object(MODULE, "run", side_effect=fail_add), \
+                 self.assertRaisesRegex(MODULE.InstallError, "injected_add_failure"):
+                MODULE.update_client(
+                    "codex", source_root=Path("/durable/source"),
+                    env={"PATH": "/bin"}, journal=journal,
+                    expected_version="1.2.3",
+                )
+            self.assertEqual(journal.phase, "installing_plugin")
+            self.assertEqual([command[2] for command in commands], ["remove", "add"])
+
+            commands.clear()
+            with mock.patch.object(MODULE.shutil, "which", return_value="/bin/codex"), \
+                 mock.patch.object(MODULE, "inventory",
+                                   return_value=(marketplace, None)), \
+                 mock.patch.object(MODULE, "run",
+                                   side_effect=lambda command, **_kwargs: commands.append(command)):
+                MODULE.update_client(
+                    "codex", source_root=Path("/durable/source"),
+                    env={"PATH": "/bin"}, journal=journal,
+                    expected_version="1.2.3",
+                )
+            self.assertEqual([command[2] for command in commands], ["add"])
+            self.assertEqual(journal.phase, "plugin_installed")
+
     def test_update_client_recovery_journal_survives_each_mutation_failure(self):
         expected_phases = [
             "removing_marketplace", "adding_marketplace", "installing_plugin"
