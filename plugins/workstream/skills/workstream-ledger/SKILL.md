@@ -120,6 +120,28 @@ newly reviewed missing child. Changed-plan and other existing-graph mutations
 still fail `remote_cas_unavailable` until a remote CAS authority exists. Never
 infer a repository, worktree, or Linear project from the Markdown's cwd.
 
+For an existing legacy root that has no deterministic intake marker, never run
+initial intake again. After authenticated resume and graph review, add exactly
+one missing child through the separately fenced extension command:
+
+```sh
+python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_extend_child.py" ./PLAN.md \
+  --identity <canonical-immutable-plan-url> \
+  --plan-revision <authenticated-source-sha256> \
+  --workstream-id GEN-123 --root-issue-id <root-uuid> \
+  --candidate-key <reviewed-stable-key> \
+  --material-revision <live-material-revision> \
+  --projection-revision <live-projection-revision> \
+  --workspace-id <uuid> --team-id <uuid> --project-id <uuid> --apply
+```
+
+The command requires exact plan bytes, route, root identity, reviewed candidate,
+and both live frontiers. It can create only the deterministic child beneath the
+existing root, leaves it `planned_pending_projection`, and returns an
+authorization plus readback receipt. A replay converges; it never creates or
+updates a root or project. Project the child's ownership, status, evidence, and
+dependencies before treating it as executable.
+
 After intake returns the canonical root token, invoke
 `scripts/workstream_tab.py GEN-123`. In cmux or Herdr it preserves the existing
 tab title and appends exactly one token; the same token is a no-op and a
