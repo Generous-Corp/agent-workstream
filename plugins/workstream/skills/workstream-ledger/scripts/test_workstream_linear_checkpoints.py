@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
+import json
 import unittest
 from unittest import mock
 
@@ -157,16 +159,31 @@ class LinearCheckpointAdapterTests(unittest.TestCase):
 
     def test_checkpoint_refuses_while_shared_identity_reservation_is_pending(self):
         client = FakeCommentClient()
+        authority = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "issue-37",
+        }
+        from workstream_linear_projection import build_projection_event
+        intent = build_projection_event(
+            workstream_id="GEN-37", kind="scope", key="root",
+            value={"test": "intent"}, plan_revision="a" * 64,
+            expected_revision=0, created_at="2026-08-29T12:00:00Z",
+            authority=authority,
+        )
+        reservation = {
+            "schema_version": 1, "workstream_id": "GEN-37",
+            "material_revision": 0, "plan_revision": "a" * 64,
+            "projection_revision": 0, "projection_frontier_ids": [],
+            "frontier_ids": [], "authority": authority,
+            "intent_kind": "repository_identity_projection",
+            "intent_event": intent,
+            "intent_sha256": hashlib.sha256(json.dumps(
+                intent, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest(),
+        }
         client.comments.append({
-            "id": "reservation",
-            "body": encode_ledger_reservation({
-                "schema_version": 1, "workstream_id": "GEN-37",
-                "material_revision": 0, "plan_revision": "a" * 64,
-                "projection_revision": 0,
-                "intent_kind": "repository_identity_projection",
-                "intent_event_id": "wsp_" + ("1" * 32),
-                "intent_sha256": "2" * 64,
-            }),
+            "id": ledger_boundary_slot_id("GEN-37", 0, [], authority),
+            "body": encode_ledger_reservation(reservation),
             "createdAt": "now", "updatedAt": "now",
         })
         with self.assertRaisesRegex(LinearTransportError, "ledger_boundary_reserved"):

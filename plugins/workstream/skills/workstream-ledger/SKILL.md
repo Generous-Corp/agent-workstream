@@ -40,6 +40,11 @@ The identity writer and material/checkpoint writers serialize through one
 durable Linear boundary reservation. Material work cannot pass a pending
 identity intent; a competing material write that wins the boundary first
 causes the identity update to refuse with zero identity writes.
+Reservations carry the full immutable projection intent and both authenticated
+frontiers. Only an exact deterministic remote slot can block; malformed,
+oversized, arbitrary-ID, or stale-plan markers are quarantined into the next
+frontier. The exact projection event or a durable authenticated successor
+releases the reservation without a time-based lease.
 Chained coordinate history such as A to B to C is intentionally not supported;
 it requires reviewed manual consolidation before this single-hop writer runs.
 

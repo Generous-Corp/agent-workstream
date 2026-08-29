@@ -27,7 +27,7 @@ from workstream_config import load_linear_api_key, unique_object
 from workstream_http import default_ssl_context
 from workstream_linear import HttpGraphQLClient, LinearTransportError
 from workstream_linear_events import (
-    COMMENT_CREATE_MUTATION, encode_ledger_reservation,
+    COMMENT_CREATE_MUTATION, encode_ledger_reservation, MAX_WORKSTREAM_ID_BYTES,
     ledger_boundary_slot_id, ledger_serialization_frontier,
     reduce_event_comments, reduce_ledger_reservations,
 )
@@ -243,25 +243,21 @@ def _reserve_material_frontier(
     """Claim the shared material boundary before writing the projection event."""
     from workstream_linear_checkpoints import reduce_checkpoint_comments
 
-    reservation = {
-        "schema_version": 1,
-        "workstream_id": adapter.workstream_id,
-        "material_revision": material_revision,
-        "plan_revision": adapter.plan_revision,
-        "projection_revision": intent_event["expected_revision"],
-        "intent_kind": "repository_identity_projection",
-        "intent_event_id": intent_event["event_id"],
-        "intent_sha256": _value_digest(intent_event),
-    }
     reservations = reduce_ledger_reservations(
         comments, workstream_id=adapter.workstream_id,
     )
     same_intent = [
         (item, remote_id) for item, remote_id in reservations
-        if item["intent_event_id"] == intent_event["event_id"]
+        if item["intent_event"]["event_id"] == intent_event["event_id"]
     ]
     if same_intent:
-        if len(same_intent) != 1 or same_intent[0][0] != reservation:
+        existing = same_intent[0][0]
+        if (
+            len(same_intent) != 1
+            or existing["intent_event"] != intent_event
+            or existing["material_revision"] != material_revision
+            or existing["authority"] != adapter.authority
+        ):
             raise RepositoryIdentityError(
                 "repository_material_reservation_intent_conflict"
             )
@@ -275,7 +271,28 @@ def _reserve_material_frontier(
     frontier = ledger_serialization_frontier(
         sorted(item["event_id"] for item in checkpoints.checkpoints), comments,
         workstream_id=adapter.workstream_id,
+        authenticated_route=adapter.authority,
     )
+    projection = reduce_projection_comments(
+        comments, workstream_id=adapter.workstream_id,
+        expected_plan_revision=adapter.plan_revision,
+        authenticated_route=adapter.authority,
+    )
+    reservation = {
+        "schema_version": 1,
+        "workstream_id": adapter.workstream_id,
+        "material_revision": material_revision,
+        "plan_revision": adapter.plan_revision,
+        "projection_revision": intent_event["expected_revision"],
+        "projection_frontier_ids": [
+            projection.remote_ids[event["event_id"]] for event in projection.events
+        ],
+        "frontier_ids": frontier,
+        "authority": adapter.authority,
+        "intent_kind": "repository_identity_projection",
+        "intent_event": intent_event,
+        "intent_sha256": _value_digest(intent_event),
+    }
     slot_id = ledger_boundary_slot_id(
         adapter.workstream_id, material_revision, frontier, adapter.authority,
     )
@@ -628,7 +645,11 @@ def validate_request(request: dict[str, Any]) -> None:
         or request["schema_version"] != 1
     ):
         raise RepositoryIdentityError("unsupported_repository_identity_request")
-    if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", str(request.get("workstream_id", ""))):
+    if (
+        not isinstance(request.get("workstream_id"), str)
+        or len(request["workstream_id"].encode("utf-8")) > MAX_WORKSTREAM_ID_BYTES
+        or not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", request["workstream_id"])
+    ):
         raise RepositoryIdentityError("invalid_repository_identity_workstream")
     if not re.fullmatch(r"[0-9a-f]{64}", str(request.get("plan_revision", ""))):
         raise RepositoryIdentityError("invalid_repository_identity_plan_revision")

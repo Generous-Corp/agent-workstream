@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
 from copy import deepcopy
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -12,14 +14,16 @@ from unittest import mock
 from workstream_delta import Delta
 from workstream_linear import LinearTransportError
 from workstream_linear_events import (
-    encode_event_comment, encode_ledger_reservation, LinearCommentEventAdapter,
+    encode_event_comment, encode_ledger_reservation, ledger_boundary_slot_id,
+    LinearCommentEventAdapter, reduce_ledger_reservations,
 )
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
     projection_slot_id, reduce_projection_comments,
 )
 from workstream_repository_identity import (
-    MAX_REQUEST_BYTES, _MutationTrackingClient, _value_digest, GitHubRepositoryResolver,
+    MAX_REQUEST_BYTES, _MutationTrackingClient, _reserve_material_frontier,
+    _value_digest, GitHubRepositoryResolver,
     main, reconcile_repository_identity, RepositoryIdentityError,
 )
 
@@ -396,18 +400,26 @@ class RepositoryIdentityWriterTests(unittest.TestCase):
         self.assertEqual(len(client.comments), 2)  # initial scope plus material winner
 
     def test_material_writer_refuses_while_identity_reservation_is_pending(self):
-        _adapter, client, _event = adapter_with_scope()
+        _adapter, client, initial = adapter_with_scope()
+        intended = build_projection_event(
+            workstream_id="GEN-37", kind="scope", key="root", value=scope(),
+            plan_revision=PLAN, expected_revision=1,
+            created_at="2026-08-29T12:00:00Z",
+            supersedes_event_id=initial["event_id"], authority=AUTHORITY,
+        )
         reservation = {
             "schema_version": 1, "workstream_id": "GEN-37",
             "material_revision": 0,
             "plan_revision": PLAN,
             "projection_revision": 1,
+            "projection_frontier_ids": [client.comments[0]["id"]],
+            "frontier_ids": [], "authority": AUTHORITY,
             "intent_kind": "repository_identity_projection",
-            "intent_event_id": "wsp_" + ("1" * 32),
-            "intent_sha256": "2" * 64,
+            "intent_event": intended,
+            "intent_sha256": _value_digest(intended),
         }
         client.comments.append({
-            "id": "pending-reservation",
+            "id": ledger_boundary_slot_id("GEN-37", 0, [], AUTHORITY),
             "body": encode_ledger_reservation(reservation),
             "createdAt": "2026-08-29T12:00:00Z",
             "updatedAt": "2026-08-29T12:00:00Z",
@@ -437,6 +449,130 @@ class RepositoryIdentityWriterTests(unittest.TestCase):
         self.assertEqual(receipt.event_id, "wsd_waiting")
         self.assertEqual(client.write_count, 1)
 
+    def test_unproven_arbitrary_high_revision_and_old_plan_reservations_do_not_block(self):
+        def material_result(extra_comments):
+            _adapter, client, _initial = adapter_with_scope()
+            client.comments.extend(extra_comments(client))
+            material_adapter = LinearCommentEventAdapter(client, issue_id="GEN-37")
+            receipt = material_adapter.apply(Delta(
+                "wsd_safe", "GEN-37", "requirement", "agent",
+                {"text": "not poisoned"}, 0, "2026-08-29T12:02:00Z",
+            ))
+            self.assertEqual(receipt.event_id, "wsd_safe")
+            self.assertEqual(client.write_count, 1)
+
+        def arbitrary_id(client):
+            initial = reduce_projection_comments(
+                client.comments, workstream_id="GEN-37",
+                expected_plan_revision=PLAN, authenticated_route=AUTHORITY,
+            ).events[0]
+            intended = build_projection_event(
+                workstream_id="GEN-37", kind="scope", key="root", value=scope(),
+                plan_revision=PLAN, expected_revision=1,
+                created_at="2026-08-29T12:01:00Z",
+                supersedes_event_id=initial["event_id"], authority=AUTHORITY,
+            )
+            reservation = {
+                "schema_version": 1, "workstream_id": "GEN-37",
+                "material_revision": 0, "plan_revision": PLAN,
+                "projection_revision": 1,
+                "projection_frontier_ids": [client.comments[0]["id"]],
+                "frontier_ids": [], "authority": AUTHORITY,
+                "intent_kind": "repository_identity_projection",
+                "intent_event": intended, "intent_sha256": _value_digest(intended),
+            }
+            return [{
+                "id": "attacker-chosen-id", "body": encode_ledger_reservation(reservation),
+                "createdAt": "2026-08-29T12:01:00Z",
+                "updatedAt": "2026-08-29T12:01:00Z",
+            }]
+
+        def high_revision(_client):
+            intended = build_projection_event(
+                workstream_id="GEN-37", kind="scope", key="root", value=scope(),
+                plan_revision=PLAN, expected_revision=999999,
+                created_at="2026-08-29T12:01:00Z", authority=AUTHORITY,
+            )
+            malformed = {
+                "schema_version": 1, "workstream_id": "GEN-37",
+                "material_revision": 0, "plan_revision": PLAN,
+                "projection_revision": 999999, "projection_frontier_ids": [],
+                "frontier_ids": [], "authority": AUTHORITY,
+                "intent_kind": "repository_identity_projection",
+                "intent_event": intended, "intent_sha256": _value_digest(intended),
+            }
+            canonical = json.dumps(
+                malformed, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode()
+            envelope = {"reservation": malformed, "sha256": hashlib.sha256(canonical).hexdigest()}
+            encoded = base64.urlsafe_b64encode(json.dumps(
+                envelope, sort_keys=True, separators=(",", ":"),
+            ).encode()).decode().rstrip("=")
+            return [{
+                "id": ledger_boundary_slot_id("GEN-37", 0, [], AUTHORITY),
+                "body": f"<!-- workstream-ledger-reservation:v1:{encoded} -->",
+                "createdAt": "2026-08-29T12:01:00Z",
+                "updatedAt": "2026-08-29T12:01:00Z",
+            }]
+
+        def old_plan(client):
+            old_plan = "e" * 64
+            old = build_projection_event(
+                workstream_id="GEN-37", kind="scope", key="root", value=scope(),
+                plan_revision=old_plan, expected_revision=0,
+                created_at="2026-08-19T12:00:00Z", authority=AUTHORITY,
+            )
+            old_id = projection_slot_id("GEN-37", old_plan, 0, AUTHORITY)
+            intended = build_projection_event(
+                workstream_id="GEN-37", kind="scope", key="root", value=scope(),
+                plan_revision=old_plan, expected_revision=1,
+                created_at="2026-08-19T12:01:00Z",
+                supersedes_event_id=old["event_id"], authority=AUTHORITY,
+            )
+            reservation = {
+                "schema_version": 1, "workstream_id": "GEN-37",
+                "material_revision": 0, "plan_revision": old_plan,
+                "projection_revision": 1, "projection_frontier_ids": [old_id],
+                "frontier_ids": [], "authority": AUTHORITY,
+                "intent_kind": "repository_identity_projection",
+                "intent_event": intended, "intent_sha256": _value_digest(intended),
+            }
+            return [
+                {"id": old_id, "body": encode_projection_comment(old),
+                 "createdAt": "2026-08-19T12:00:00Z", "updatedAt": "2026-08-19T12:00:00Z"},
+                {"id": ledger_boundary_slot_id("GEN-37", 0, [], AUTHORITY),
+                 "body": encode_ledger_reservation(reservation),
+                 "createdAt": "2026-08-19T12:01:00Z", "updatedAt": "2026-08-19T12:01:00Z"},
+            ]
+
+        for name, factory in (
+            ("arbitrary_id", arbitrary_id),
+            ("high_revision", high_revision),
+            ("old_plan", old_plan),
+        ):
+            with self.subTest(name=name):
+                material_result(factory)
+
+    def test_oversized_reservation_intent_refuses_before_comment_create(self):
+        value = scope()
+        value["padding"] = "x" * (93 * 1024)
+        adapter, client, event = adapter_with_scope(value)
+        intent = build_projection_event(
+            workstream_id="GEN-37", kind="scope", key="root", value=value,
+            plan_revision=PLAN, expected_revision=1,
+            created_at="2026-08-29T12:00:00Z",
+            supersedes_event_id=event["event_id"], authority=AUTHORITY,
+        )
+        no_network = mock.Mock()
+        adapter.client = no_network
+        with self.assertRaisesRegex(LinearTransportError, "reservation_too_large"):
+            _reserve_material_frontier(
+                adapter, comments=client.comments, material_revision=0,
+                intent_event=intent,
+            )
+        self.assertEqual(client.comment_create_count, 0)
+        no_network.execute.assert_not_called()
+
     def test_lost_post_write_readback_is_unconfirmed_then_replay_converges(self):
         adapter, client, event = special_adapter_with_scope(
             LostPostWriteReadbackClient(),
@@ -459,6 +595,14 @@ class RepositoryIdentityWriterTests(unittest.TestCase):
         self.assertEqual(uncertain["disposition"], "landed_unconfirmed")
         self.assertEqual(client.reservation_count, 1)
         self.assertEqual(client.write_count, 0)
+        stored = reduce_ledger_reservations(
+            client.comments, workstream_id="GEN-37",
+        )
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(
+            stored[0][0]["intent_event"]["event_id"],
+            uncertain["scope_event_id"],
+        )
 
         completed = apply(adapter, event)
         self.assertEqual(completed["disposition"], "created")
@@ -664,6 +808,7 @@ class RepositoryIdentityCliTests(unittest.TestCase):
             ("root_uuid", lambda request: request["authority"].update(root_issue_id="GEN-37")),
             ("scope_id", lambda request: request["expected_frontier"].update(scope_event_id="wsp_bad")),
             ("authority_bound", lambda request: request["authority"].update(workspace_id="x" * 257)),
+            ("workstream_bound", lambda request: request.update(workstream_id=("G" * 65) + "-1")),
         )
         for name, mutate in cases:
             with self.subTest(name=name):
@@ -689,7 +834,7 @@ class RepositoryIdentityCliTests(unittest.TestCase):
         token.assert_not_called()
 
     def test_oversized_request_refuses_before_credentials_or_provider(self):
-        path = self.write_request("{" + (" " * (64 * 1024)) + "}")
+        path = self.write_request("{" + (" " * (93 * 1024)) + "}")
         with mock.patch("workstream_repository_identity.load_linear_api_key") as token, \
              mock.patch("workstream_repository_identity.GitHubRepositoryResolver") as provider, \
              mock.patch("workstream_repository_identity.sys.stderr", io.StringIO()):

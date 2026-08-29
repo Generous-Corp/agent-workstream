@@ -409,6 +409,7 @@ class LinearCheckpointAdapter:
         frontier = ledger_serialization_frontier(
             sorted(item["event_id"] for item in before.checkpoints), comments,
             workstream_id=self.workstream_id,
+            authenticated_route=self._observed_authority,
         )
         slot_id = ledger_boundary_slot_id(
             self.workstream_id, material.revision, frontier,
