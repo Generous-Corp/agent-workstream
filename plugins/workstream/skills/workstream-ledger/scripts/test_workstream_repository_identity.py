@@ -9,13 +9,17 @@ import tempfile
 import unittest
 from unittest import mock
 
+from workstream_delta import Delta
 from workstream_linear import LinearTransportError
+from workstream_linear_events import (
+    encode_event_comment, encode_ledger_reservation, LinearCommentEventAdapter,
+)
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
-    projection_slot_id,
+    projection_slot_id, reduce_projection_comments,
 )
 from workstream_repository_identity import (
-    _MutationTrackingClient, _value_digest, GitHubRepositoryResolver,
+    MAX_REQUEST_BYTES, _MutationTrackingClient, _value_digest, GitHubRepositoryResolver,
     main, reconcile_repository_identity, RepositoryIdentityError,
 )
 
@@ -87,9 +91,11 @@ class FakeProjectionClient:
     def __init__(self):
         self.comments = []
         self.write_count = 0
+        self.reservation_count = 0
+        self.comment_create_count = 0
 
     def execute(self, query, variables):
-        if "WorkstreamProjectionCommentCreateCapability" in query:
+        if "CommentCreateCapability" in query:
             return {"__type": {"inputFields": [{"name": "id"}, {"name": "body"}]}}
         if "query WorkstreamDeltaComments" in query:
             return {"issue": {
@@ -105,11 +111,15 @@ class FakeProjectionClient:
             comment_id = variables["input"]["id"]
             if any(item["id"] == comment_id for item in self.comments):
                 raise LinearTransportError("duplicate comment id")
-            self.write_count += 1
+            self.comment_create_count += 1
+            if "workstream-ledger-reservation:v1" in variables["input"]["body"]:
+                self.reservation_count += 1
+            else:
+                self.write_count += 1
             comment = {
                 "id": comment_id, "body": variables["input"]["body"],
-                "createdAt": f"2026-08-29T12:00:{self.write_count:02d}Z",
-                "updatedAt": f"2026-08-29T12:00:{self.write_count:02d}Z",
+                "createdAt": f"2026-08-29T12:00:{self.comment_create_count:02d}Z",
+                "updatedAt": f"2026-08-29T12:00:{self.comment_create_count:02d}Z",
             }
             self.comments.append(comment)
             return {"commentCreate": {"success": True, "comment": dict(comment)}}
@@ -175,6 +185,86 @@ class LostPostWriteReadbackClient(FakeProjectionClient):
             and self.write_count == 1 and self.fail_readback
         ):
             raise LinearTransportError("lost post-write readback")
+        return super().execute(query, variables)
+
+
+class SerializationEntryMaterialWinnerClient(FakeProjectionClient):
+    """Plant a material winner in the exact shared slot at reservation entry."""
+
+    def __init__(self):
+        super().__init__()
+        self.injected = False
+
+    def execute(self, query, variables):
+        body = ((variables.get("input") or {}).get("body") or "")
+        if (
+            "commentCreate" in query
+            and "workstream-ledger-reservation:v1" in body
+            and not self.injected
+        ):
+            self.injected = True
+            material = Delta(
+                "wsd_serialized_winner", "GEN-37", "requirement", "agent",
+                {"text": "wins shared slot"}, 0, "2026-08-29T12:00:00Z",
+            )
+            self.comments.append({
+                "id": variables["input"]["id"],
+                "body": encode_event_comment(material),
+                "createdAt": "2026-08-29T12:00:00Z",
+                "updatedAt": "2026-08-29T12:00:00Z",
+            })
+        return super().execute(query, variables)
+
+
+class SuccessorAfterIdentityReadbackClient(FakeProjectionClient):
+    def __init__(self):
+        super().__init__()
+        self.post_identity_reads = 0
+
+    def execute(self, query, variables):
+        if "query WorkstreamDeltaComments" in query and self.write_count == 1:
+            self.post_identity_reads += 1
+            if self.post_identity_reads == 2:
+                state = reduce_projection_comments(
+                    self.comments, workstream_id="GEN-37",
+                    expected_plan_revision=PLAN, authenticated_route=AUTHORITY,
+                )
+                head = next(item for item in reversed(state.events)
+                            if (item["kind"], item["key"]) == ("scope", "root"))
+                successor_value = deepcopy(head["value"])
+                successor_value["repositories"][0]["exact_head"] = "b" * 40
+                successor = build_projection_event(
+                    workstream_id="GEN-37", kind="scope", key="root",
+                    value=successor_value, plan_revision=PLAN,
+                    expected_revision=state.revision,
+                    created_at="2026-08-29T12:01:00Z",
+                    supersedes_event_id=head["event_id"], authority=AUTHORITY,
+                )
+                self.comments.append({
+                    "id": projection_slot_id(
+                        "GEN-37", PLAN, state.revision, AUTHORITY,
+                    ),
+                    "body": encode_projection_comment(successor),
+                    "createdAt": "2026-08-29T12:01:00Z",
+                    "updatedAt": "2026-08-29T12:01:00Z",
+                })
+        return super().execute(query, variables)
+
+
+class LostProjectionCreateAfterReservationClient(FakeProjectionClient):
+    def __init__(self):
+        super().__init__()
+        self.lose_projection_once = True
+
+    def execute(self, query, variables):
+        body = ((variables.get("input") or {}).get("body") or "")
+        if (
+            "commentCreate" in query
+            and "workstream-projection:v1" in body
+            and self.lose_projection_once
+        ):
+            self.lose_projection_once = False
+            raise LinearTransportError("projection outcome unknown")
         return super().execute(query, variables)
 
 
@@ -256,7 +346,7 @@ class RepositoryIdentityWriterTests(unittest.TestCase):
         cases = (
             {"expected_material_revision": 1},
             {"expected_projection_revision": 0},
-            {"expected_scope_event_id": "wsp_stale"},
+            {"expected_scope_event_id": "wsp_" + ("0" * 32)},
             {"expected_scope_sha256": "0" * 64},
         )
         for changes in cases:
@@ -292,7 +382,60 @@ class RepositoryIdentityWriterTests(unittest.TestCase):
         with self.assertRaisesRegex(LinearTransportError, "material_frontier_stale"):
             apply(adapter, event)
         self.assertEqual(client.write_count, 0)
-        self.assertEqual(len(client.comments), 2)  # initial scope plus planted material
+        self.assertEqual(len(client.comments), 3)  # scope, reservation, material
+
+    def test_material_writer_winning_shared_slot_at_create_entry_blocks_identity_write(self):
+        adapter, client, event = special_adapter_with_scope(
+            SerializationEntryMaterialWinnerClient(),
+        )
+        with self.assertRaisesRegex(RepositoryIdentityError, "serialization_slot_lost"):
+            apply(adapter, event)
+        self.assertTrue(client.injected)
+        self.assertEqual(client.write_count, 0)
+        self.assertEqual(client.reservation_count, 0)
+        self.assertEqual(len(client.comments), 2)  # initial scope plus material winner
+
+    def test_material_writer_refuses_while_identity_reservation_is_pending(self):
+        _adapter, client, _event = adapter_with_scope()
+        reservation = {
+            "schema_version": 1, "workstream_id": "GEN-37",
+            "material_revision": 0,
+            "plan_revision": PLAN,
+            "projection_revision": 1,
+            "intent_kind": "repository_identity_projection",
+            "intent_event_id": "wsp_" + ("1" * 32),
+            "intent_sha256": "2" * 64,
+        }
+        client.comments.append({
+            "id": "pending-reservation",
+            "body": encode_ledger_reservation(reservation),
+            "createdAt": "2026-08-29T12:00:00Z",
+            "updatedAt": "2026-08-29T12:00:00Z",
+        })
+        material_adapter = LinearCommentEventAdapter(client, issue_id="GEN-37")
+        delta = Delta(
+            "wsd_waiting", "GEN-37", "requirement", "agent",
+            {"text": "must wait"}, 0, "2026-08-29T12:00:00Z",
+        )
+        with self.assertRaisesRegex(LinearTransportError, "ledger_boundary_reserved"):
+            material_adapter.apply(delta)
+        self.assertEqual(client.write_count, 0)
+
+        successor = build_projection_event(
+            workstream_id="GEN-37", kind="provenance", key="successor",
+            value={"agent": "codex", "machine": "M5", "session_id": "next"},
+            plan_revision=PLAN, expected_revision=1,
+            created_at="2026-08-29T12:01:00Z", authority=AUTHORITY,
+        )
+        client.comments.append({
+            "id": projection_slot_id("GEN-37", PLAN, 1, AUTHORITY),
+            "body": encode_projection_comment(successor),
+            "createdAt": "2026-08-29T12:01:00Z",
+            "updatedAt": "2026-08-29T12:01:00Z",
+        })
+        receipt = material_adapter.apply(delta)
+        self.assertEqual(receipt.event_id, "wsd_waiting")
+        self.assertEqual(client.write_count, 1)
 
     def test_lost_post_write_readback_is_unconfirmed_then_replay_converges(self):
         adapter, client, event = special_adapter_with_scope(
@@ -308,13 +451,39 @@ class RepositoryIdentityWriterTests(unittest.TestCase):
         self.assertEqual(replay["disposition"], "existing")
         self.assertEqual(client.write_count, 1)
 
+    def test_replay_reuses_exact_pending_reservation_without_duplicate(self):
+        adapter, client, event = special_adapter_with_scope(
+            LostProjectionCreateAfterReservationClient(),
+        )
+        uncertain = apply(adapter, event)
+        self.assertEqual(uncertain["disposition"], "landed_unconfirmed")
+        self.assertEqual(client.reservation_count, 1)
+        self.assertEqual(client.write_count, 0)
+
+        completed = apply(adapter, event)
+        self.assertEqual(completed["disposition"], "created")
+        self.assertEqual(client.reservation_count, 1)
+        self.assertEqual(client.write_count, 1)
+
+    def test_successor_after_acknowledged_identity_readback_is_not_false_refusal(self):
+        adapter, client, event = special_adapter_with_scope(
+            SuccessorAfterIdentityReadbackClient(),
+        )
+        result = apply(adapter, event)
+        self.assertEqual(result["disposition"], "created_superseded")
+        self.assertEqual(result["write_count"], 1)
+        self.assertEqual(client.write_count, 1)
+        self.assertRegex(result["superseded_by_scope_event_id"], r"^wsp_[0-9a-f]{32}$")
+
     def test_later_scope_replacement_cannot_erase_or_alter_identity_history(self):
         adapter, client, event = adapter_with_scope()
         apply(adapter, event)
         state = adapter.state()
         current = next(item for item in reversed(state.events)
                        if (item["kind"], item["key"]) == ("scope", "root"))
-        for mutate in ("erase", "alter", "remove_repository"):
+        for mutate in (
+            "erase", "alter", "remove_repository", "resolution", "provider_id",
+        ):
             with self.subTest(mutate=mutate):
                 changed = deepcopy(current["value"])
                 repo = changed["repositories"][0]
@@ -325,8 +494,16 @@ class RepositoryIdentityWriterTests(unittest.TestCase):
                 elif mutate == "erase":
                     repo["aliases"] = []
                     repo["identity_updates"] = []
-                else:
+                elif mutate == "alter":
                     repo["identity_updates"][0]["effective_at"] = "2026-08-30T00:00:00Z"
+                elif mutate == "resolution":
+                    repo["identity_resolution"]["observed_at"] = "2026-08-30T00:00:00Z"
+                else:
+                    repo["provider_repository_id"] = "R_evil"
+                    repo["identity_resolution"]["provider_repository_id"] = "R_evil"
+                    repo["identity_resolution"]["evidence"][0][
+                        "provider_repository_id"
+                    ] = "R_evil"
                 replacement = build_projection_event(
                     workstream_id="GEN-37", kind="scope", key="root", value=changed,
                     plan_revision=PLAN, expected_revision=state.revision,
@@ -436,7 +613,8 @@ class RepositoryIdentityCliTests(unittest.TestCase):
     def request(self):
         _adapter, _client, event = adapter_with_scope()
         return {
-            "schema_version": 1, "workstream_id": "GEN-37", "authority": AUTHORITY,
+            "schema_version": 1, "workstream_id": "GEN-37",
+            "authority": deepcopy(AUTHORITY),
             "plan_revision": PLAN,
             "repository": {
                 "requested_slug": OLD, "provider_repository_id": "R_pulp",
@@ -480,6 +658,25 @@ class RepositoryIdentityCliTests(unittest.TestCase):
                 token.assert_not_called()
                 provider.assert_not_called()
 
+    def test_invalid_schema_authority_and_scope_id_refuse_before_external_access(self):
+        cases = (
+            ("schema_bool", lambda request: request.update(schema_version=True)),
+            ("root_uuid", lambda request: request["authority"].update(root_issue_id="GEN-37")),
+            ("scope_id", lambda request: request["expected_frontier"].update(scope_event_id="wsp_bad")),
+            ("authority_bound", lambda request: request["authority"].update(workspace_id="x" * 257)),
+        )
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                request = self.request()
+                mutate(request)
+                path = self.write_request(request)
+                with mock.patch("workstream_repository_identity.load_linear_api_key") as token, \
+                     mock.patch("workstream_repository_identity.GitHubRepositoryResolver") as provider, \
+                     mock.patch("workstream_repository_identity.sys.stderr", io.StringIO()):
+                    self.assertEqual(main(["--request", str(path), "--apply"]), 2)
+                token.assert_not_called()
+                provider.assert_not_called()
+
     def test_public_malicious_linear_endpoint_option_is_rejected_without_token_access(self):
         path = self.write_request(self.request())
         with mock.patch("workstream_repository_identity.load_linear_api_key") as token, \
@@ -499,6 +696,21 @@ class RepositoryIdentityCliTests(unittest.TestCase):
             self.assertEqual(main(["--request", str(path), "--apply"]), 2)
         token.assert_not_called()
         provider.assert_not_called()
+
+    def test_request_reader_physically_caps_read_and_deep_json_refuses_safely(self):
+        bounded = mock.mock_open(read_data=b"{}")
+        with mock.patch.object(Path, "open", bounded), \
+             mock.patch("workstream_repository_identity.load_linear_api_key") as token, \
+             mock.patch("workstream_repository_identity.sys.stderr", io.StringIO()):
+            self.assertEqual(main(["--request", "ignored", "--apply"]), 2)
+        bounded().read.assert_called_once_with(MAX_REQUEST_BYTES + 1)
+        token.assert_not_called()
+
+        path = self.write_request(("[" * 2000) + ("0") + ("]" * 2000))
+        with mock.patch("workstream_repository_identity.load_linear_api_key") as token, \
+             mock.patch("workstream_repository_identity.sys.stderr", io.StringIO()):
+            self.assertEqual(main(["--request", str(path), "--apply"]), 2)
+        token.assert_not_called()
 
     def test_linear_mutation_uses_immutable_root_issue_id_and_official_authority(self):
         path = self.write_request(self.request())

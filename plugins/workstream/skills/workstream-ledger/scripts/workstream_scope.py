@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -189,7 +191,11 @@ def validate_repository_identity_transition(
         key = repository_key(previous)
         current = next_by_key.get(key)
         if current is None:
-            if previous.get("aliases") or previous.get("identity_updates"):
+            if (
+                previous.get("provider_repository_id") is not None
+                or previous.get("aliases")
+                or previous.get("identity_updates")
+            ):
                 raise ScopeError(
                     f"repository_identity_history_regressed:{key}:repository_removed"
                 )
@@ -198,15 +204,98 @@ def validate_repository_identity_transition(
         current_aliases = current.get("aliases", [])
         previous_updates = previous.get("identity_updates", [])
         current_updates = current.get("identity_updates", [])
+        previous_evidence = previous.get("evidence", [])
+        current_evidence = current.get("evidence", [])
+        _repository_resolution(current)
+        _validate_identity_history(current, key)
         if (
-            not isinstance(previous_aliases, list)
+            current.get("provider_repository_id")
+            != previous.get("provider_repository_id")
+            or not isinstance(previous_aliases, list)
             or not isinstance(current_aliases, list)
             or not all(isinstance(alias, str) for alias in previous_aliases)
             or not all(isinstance(alias, str) for alias in current_aliases)
-            or not set(previous_aliases).issubset(set(current_aliases))
+            or current_aliases[:len(previous_aliases)] != previous_aliases
             or not isinstance(previous_updates, list)
             or not isinstance(current_updates, list)
             or current_updates[:len(previous_updates)] != previous_updates
+            or not isinstance(previous_evidence, list)
+            or not isinstance(current_evidence, list)
+            or current_evidence[:len(previous_evidence)] != previous_evidence
+        ):
+            raise ScopeError(f"repository_identity_history_regressed:{key}")
+        appended_updates = current_updates[len(previous_updates):]
+        if not appended_updates:
+            if (
+                current.get("identity_resolution")
+                != previous.get("identity_resolution")
+                or current.get("slug") != previous.get("slug")
+            ):
+                raise ScopeError(f"repository_identity_history_regressed:{key}")
+            continue
+        latest = appended_updates[-1]
+        resolution = current.get("identity_resolution")
+        previous_slug = latest.get("from") if isinstance(latest, dict) else None
+        current_slug = current.get("slug")
+        identity_material = json.dumps(
+            ["repository-identity-update-v1", key, previous_slug, current_slug],
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        expected_event_id = "wsri_" + hashlib.sha256(identity_material).hexdigest()[:32]
+        latest_evidence = (
+            latest.get("evidence") if isinstance(latest, dict) else None
+        )
+        evidence_head = (
+            latest_evidence[0]
+            if isinstance(latest_evidence, list)
+            and latest_evidence
+            and isinstance(latest_evidence[0], dict)
+            else {}
+        )
+        expected_update_evidence = [{
+            "kind": "authenticated_provider_readback",
+            "authenticated": True,
+            "repository_key": key,
+            "provider_repository_id": previous.get("provider_repository_id"),
+            "requested_slug": previous_slug,
+            "resolved_slug": current_slug,
+            "redirect_count": 1,
+            "requested_response_url": evidence_head.get("requested_response_url"),
+            "canonical_response_url": evidence_head.get("canonical_response_url"),
+        }]
+        if (
+            len(appended_updates) != 1
+            or not isinstance(latest, dict)
+            or not isinstance(resolution, dict)
+            or set(latest) != {
+                "event_id", "from", "to", "repository_key",
+                "provider_repository_id", "observed_at", "effective_at", "evidence",
+            }
+            or latest.get("event_id") != expected_event_id
+            or latest.get("provider_repository_id")
+            != previous.get("provider_repository_id")
+            or latest.get("repository_key") != key
+            or latest.get("to") != current.get("slug")
+            or latest.get("observed_at") != resolution.get("observed_at")
+            or latest.get("effective_at") != latest.get("observed_at")
+            or latest.get("evidence") != expected_update_evidence
+            or not all(
+                isinstance(expected_update_evidence[0].get(field), str)
+                and expected_update_evidence[0][field]
+                for field in ("requested_response_url", "canonical_response_url")
+            )
+            or resolution.get("provider_repository_id")
+            != previous.get("provider_repository_id")
+            or resolution.get("resolved_slug") != current.get("slug")
+            or set(resolution) != {
+                "provider_repository_id", "resolved_slug", "observed_at", "evidence",
+            }
+            or resolution.get("evidence") != [{
+                "kind": "authenticated_provider_readback",
+                "authenticated": True,
+                "provider_repository_id": previous.get("provider_repository_id"),
+                "resolved_slug": current_slug,
+            }]
         ):
             raise ScopeError(f"repository_identity_history_regressed:{key}")
 

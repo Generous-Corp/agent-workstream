@@ -36,6 +36,10 @@ projection revision, active scope event ID, and scope value digest. It appends
 one scope replacement containing the immutable identity-update event; exact
 replay is a zero-write no-op. A stale frontier, recycled alias, multi-hop
 redirect, or coordinate owned by another repository refuses before mutation.
+The identity writer and material/checkpoint writers serialize through one
+durable Linear boundary reservation. Material work cannot pass a pending
+identity intent; a competing material write that wins the boundary first
+causes the identity update to refuse with zero identity writes.
 Chained coordinate history such as A to B to C is intentionally not supported;
 it requires reviewed manual consolidation before this single-hop writer runs.
 

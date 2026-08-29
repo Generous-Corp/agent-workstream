@@ -26,18 +26,24 @@ import urllib.request
 from workstream_config import load_linear_api_key, unique_object
 from workstream_http import default_ssl_context
 from workstream_linear import HttpGraphQLClient, LinearTransportError
-from workstream_linear_events import reduce_event_comments
+from workstream_linear_events import (
+    COMMENT_CREATE_MUTATION, encode_ledger_reservation,
+    ledger_boundary_slot_id, ledger_serialization_frontier,
+    reduce_event_comments, reduce_ledger_reservations,
+)
 from workstream_linear_projection import (
     build_projection_event, LinearProjectionAdapter, LinearProjectionError,
     reduce_projection_comments,
 )
 from workstream_scope import (
-    canonical_repository, repository_key, ScopeError, validate_scope,
+    canonical_repository, repository_key, ScopeError, UUID, validate_scope,
 )
 
 
 MAX_PROVIDER_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 64 * 1024
+MAX_AUTHORITY_ID_BYTES = 256
+MAX_REPOSITORY_ID_BYTES = 512
 REQUEST_FIELDS = {
     "schema_version", "workstream_id", "authority", "plan_revision",
     "repository", "expected_frontier",
@@ -60,7 +66,11 @@ class _MutationTrackingClient:
         self.mutation_acknowledged = False
 
     def execute(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
-        is_create = "mutation WorkstreamDeltaCommentCreate" in query
+        body = ((variables.get("input") or {}).get("body") or "")
+        is_create = (
+            "mutation WorkstreamDeltaCommentCreate" in query
+            and "<!-- workstream-projection:v1:" in body
+        )
         if is_create:
             self.mutation_attempted = True
             self.mutation_transport_unknown = False
@@ -226,6 +236,80 @@ def _scope_head(state: Any) -> dict[str, Any]:
     return heads[-1]
 
 
+def _reserve_material_frontier(
+    adapter: LinearProjectionAdapter, *, comments: list[dict[str, Any]],
+    material_revision: int, intent_event: dict[str, Any],
+) -> dict[str, Any]:
+    """Claim the shared material boundary before writing the projection event."""
+    from workstream_linear_checkpoints import reduce_checkpoint_comments
+
+    reservation = {
+        "schema_version": 1,
+        "workstream_id": adapter.workstream_id,
+        "material_revision": material_revision,
+        "plan_revision": adapter.plan_revision,
+        "projection_revision": intent_event["expected_revision"],
+        "intent_kind": "repository_identity_projection",
+        "intent_event_id": intent_event["event_id"],
+        "intent_sha256": _value_digest(intent_event),
+    }
+    reservations = reduce_ledger_reservations(
+        comments, workstream_id=adapter.workstream_id,
+    )
+    same_intent = [
+        (item, remote_id) for item, remote_id in reservations
+        if item["intent_event_id"] == intent_event["event_id"]
+    ]
+    if same_intent:
+        if len(same_intent) != 1 or same_intent[0][0] != reservation:
+            raise RepositoryIdentityError(
+                "repository_material_reservation_intent_conflict"
+            )
+        return {
+            "event_id": intent_event["event_id"],
+            "remote_id": same_intent[0][1],
+        }
+    checkpoints = reduce_checkpoint_comments(
+        comments, workstream_id=adapter.workstream_id,
+    )
+    frontier = ledger_serialization_frontier(
+        sorted(item["event_id"] for item in checkpoints.checkpoints), comments,
+        workstream_id=adapter.workstream_id,
+    )
+    slot_id = ledger_boundary_slot_id(
+        adapter.workstream_id, material_revision, frontier, adapter.authority,
+    )
+    body = encode_ledger_reservation(reservation)
+    adapter._assert_comment_id_capability()
+    try:
+        response = adapter.client.execute(COMMENT_CREATE_MUTATION, {"input": {
+            "id": slot_id, "issueId": adapter.issue_id, "body": body,
+        }})
+    except (OSError, TimeoutError, LinearTransportError):
+        after = adapter._comments()
+        own = next((
+            item for item, remote_id in reduce_ledger_reservations(
+                after, workstream_id=adapter.workstream_id,
+            )
+            if remote_id == slot_id and item == reservation
+        ), None)
+        if own is not None:
+            return {"event_id": intent_event["event_id"], "remote_id": slot_id}
+        raise RepositoryIdentityError(
+            "repository_material_serialization_slot_lost_reload_required"
+        )
+    created = response.get("commentCreate") or {}
+    comment = created.get("comment")
+    if (
+        created.get("success") is not True
+        or not isinstance(comment, dict)
+        or comment.get("id") != slot_id
+        or comment.get("body") != body
+    ):
+        raise RepositoryIdentityError("repository_material_reservation_unconfirmed")
+    return {"event_id": intent_event["event_id"], "remote_id": slot_id}
+
+
 def _matching_update(
     repository: dict[str, Any], resolution: dict[str, Any],
 ) -> list[dict[str, Any]]:
@@ -383,7 +467,7 @@ def reconcile_repository_identity(
     ):
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise RepositoryIdentityError(f"invalid_repository_{name}_frontier")
-    if not isinstance(expected_scope_event_id, str) or not expected_scope_event_id:
+    if not re.fullmatch(r"wsp_[0-9a-f]{32}", str(expected_scope_event_id)):
         raise RepositoryIdentityError("invalid_repository_scope_event_frontier")
     if not re.fullmatch(r"[0-9a-f]{64}", str(expected_scope_sha256)):
         raise RepositoryIdentityError("invalid_repository_scope_digest_frontier")
@@ -453,6 +537,10 @@ def reconcile_repository_identity(
         created_at=resolution["observed_at"],
         supersedes_event_id=expected_scope_event_id, authority=adapter.authority,
     )
+    _reserve_material_frontier(
+        adapter, comments=fenced_comments,
+        material_revision=expected_material_revision, intent_event=event,
+    )
     try:
         receipt = adapter.append(
             event, expected_material_revision=expected_material_revision,
@@ -487,14 +575,42 @@ def reconcile_repository_identity(
             "scope_event_id": event["event_id"],
             "identity_update": update,
         }
-    after_head = _scope_head(after)
-    matching = _matching_update(
-        next(repo for repo in after_head["value"]["repositories"]
-             if repository_key(repo) == resolution["repository_key"]),
-        resolution,
+    applied = next(
+        (item for item in after.events if item["event_id"] == event["event_id"]),
+        None,
     )
-    if after_head["event_id"] != event["event_id"] or len(matching) != 1:
-        raise RepositoryIdentityError("repository_identity_update_not_observed")
+    if applied != event:
+        return {
+            "disposition": "landed_unconfirmed",
+            "reconcile_required": True,
+            "write_count": "unknown",
+            "expected_projection_revision": expected_projection_revision + 1,
+            "scope_event_id": event["event_id"],
+            "identity_update": update,
+        }
+    applied_repository = next(
+        repo for repo in applied["value"]["repositories"]
+        if repository_key(repo) == resolution["repository_key"]
+    )
+    matching = _matching_update(applied_repository, resolution)
+    if len(matching) != 1:
+        return {
+            "disposition": "landed_unconfirmed",
+            "reconcile_required": True,
+            "write_count": "unknown",
+            "expected_projection_revision": expected_projection_revision + 1,
+            "scope_event_id": event["event_id"],
+            "identity_update": update,
+        }
+    after_head = _scope_head(after)
+    if after_head["event_id"] != event["event_id"]:
+        return {
+            "disposition": "created_superseded", "write_count": 1,
+            "projection_revision": after.revision,
+            "scope_event_id": event["event_id"],
+            "superseded_by_scope_event_id": after_head["event_id"],
+            "identity_update": update, "receipt": receipt,
+        }
     return {
         "disposition": "created", "write_count": 1,
         "projection_revision": after.revision,
@@ -506,7 +622,11 @@ def reconcile_repository_identity(
 def validate_request(request: dict[str, Any]) -> None:
     if not isinstance(request, dict) or set(request) != REQUEST_FIELDS:
         raise RepositoryIdentityError("invalid_repository_identity_request_fields")
-    if request.get("schema_version") != 1:
+    if (
+        not isinstance(request.get("schema_version"), int)
+        or isinstance(request.get("schema_version"), bool)
+        or request["schema_version"] != 1
+    ):
         raise RepositoryIdentityError("unsupported_repository_identity_request")
     if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", str(request.get("workstream_id", ""))):
         raise RepositoryIdentityError("invalid_repository_identity_workstream")
@@ -516,9 +636,12 @@ def validate_request(request: dict[str, Any]) -> None:
     if not isinstance(authority, dict) or set(authority) != AUTHORITY_FIELDS:
         raise RepositoryIdentityError("invalid_repository_identity_authority")
     if not all(
-        isinstance(authority[field], str) and authority[field]
+        isinstance(authority[field], str)
+        and bool(authority[field])
+        and authority[field].strip() == authority[field]
+        and len(authority[field].encode("utf-8")) <= MAX_AUTHORITY_ID_BYTES
         for field in AUTHORITY_FIELDS
-    ):
+    ) or UUID.fullmatch(authority["root_issue_id"]) is None:
         raise RepositoryIdentityError("invalid_repository_identity_authority")
     repository = request.get("repository")
     if not isinstance(repository, dict) or set(repository) != {
@@ -531,7 +654,10 @@ def validate_request(request: dict[str, Any]) -> None:
         raise RepositoryIdentityError("invalid_repository_identity_target") from error
     if requested_slug != repository.get("requested_slug") or not isinstance(
         repository.get("provider_repository_id"), str
-    ) or not repository["provider_repository_id"]:
+    ) or not repository["provider_repository_id"] or any(
+        len(value.encode("utf-8")) > MAX_REPOSITORY_ID_BYTES
+        for value in (requested_slug, repository["provider_repository_id"])
+    ):
         raise RepositoryIdentityError("invalid_repository_identity_target")
     frontier = request.get("expected_frontier")
     required_frontier = {
@@ -545,7 +671,7 @@ def validate_request(request: dict[str, Any]) -> None:
             raise RepositoryIdentityError(
                 f"invalid_repository_{field.removesuffix('_revision')}_frontier"
             )
-    if not isinstance(frontier["scope_event_id"], str) or not frontier["scope_event_id"]:
+    if not re.fullmatch(r"wsp_[0-9a-f]{32}", str(frontier["scope_event_id"])):
         raise RepositoryIdentityError("invalid_repository_scope_event_frontier")
     if not re.fullmatch(r"[0-9a-f]{64}", str(frontier["scope_sha256"])):
         raise RepositoryIdentityError("invalid_repository_scope_digest_frontier")
@@ -557,7 +683,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
     try:
-        raw = Path(args.request).read_bytes()
+        with Path(args.request).open("rb") as request_file:
+            raw = request_file.read(MAX_REQUEST_BYTES + 1)
         if len(raw) > MAX_REQUEST_BYTES:
             raise RepositoryIdentityError("repository_identity_request_too_large")
         request = json.loads(
@@ -597,7 +724,8 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write("\n")
         return 3 if result.get("reconcile_required") is True else 0
     except (
-        OSError, json.JSONDecodeError, LinearProjectionError, LinearTransportError,
+        OSError, RecursionError, json.JSONDecodeError,
+        LinearProjectionError, LinearTransportError,
         RepositoryIdentityError, ScopeError, ValueError,
     ) as error:
         print(f"repository identity update refused: {error}", file=sys.stderr)

@@ -16,6 +16,7 @@ from workstream_linear_checkpoints import (
 )
 from workstream_linear_events import (
     LinearCommentEventAdapter,
+    encode_ledger_reservation,
     encode_event_comment,
     ledger_boundary_slot_id,
 )
@@ -153,6 +154,24 @@ class LinearCheckpointAdapterTests(unittest.TestCase):
             },
         )
         self.assertNotIn("remote_acknowledged", client.comments[0]["body"])
+
+    def test_checkpoint_refuses_while_shared_identity_reservation_is_pending(self):
+        client = FakeCommentClient()
+        client.comments.append({
+            "id": "reservation",
+            "body": encode_ledger_reservation({
+                "schema_version": 1, "workstream_id": "GEN-37",
+                "material_revision": 0, "plan_revision": "a" * 64,
+                "projection_revision": 0,
+                "intent_kind": "repository_identity_projection",
+                "intent_event_id": "wsp_" + ("1" * 32),
+                "intent_sha256": "2" * 64,
+            }),
+            "createdAt": "now", "updatedAt": "now",
+        })
+        with self.assertRaisesRegex(LinearTransportError, "ledger_boundary_reserved"):
+            self.adapter(client).persist(checkpoint(0))
+        self.assertFalse(any("commentCreate" in query for query, _ in client.calls))
 
     def test_crash_replay_returns_existing_ack_without_second_comment(self):
         client = FakeCommentClient()
