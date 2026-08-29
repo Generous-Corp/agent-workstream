@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import hashlib
 import io
@@ -977,7 +978,7 @@ class ResumeTests(unittest.TestCase):
             client, team_id="team", workspace_id="workspace", project_id="project"
         )
 
-    def test_live_full_resume_authenticates_source_before_strict_lifecycle_check(self):
+    def test_repeated_live_full_resume_is_read_only_and_authenticates_source_first(self):
         graph = self.snapshot()
         graph["root"]["plan_revision"] = "a" * 64
         route = {
@@ -1039,10 +1040,10 @@ class ResumeTests(unittest.TestCase):
             preauthentication["lifecycle_recovery"]["state"], "stale_snapshot",
         )
         transport = mock.Mock()
-        transport.snapshot_for_root.return_value = {
+        transport.snapshot_for_root.side_effect = lambda *_args, **_kwargs: copy.deepcopy({
             **graph, "children": [dict(child) for child in graph["children"]],
             "child_comments": child_comments,
-        }
+        })
         comments = mock.Mock()
         comments.comments.return_value = comments_payload
         stdout = io.StringIO()
@@ -1073,10 +1074,15 @@ class ResumeTests(unittest.TestCase):
              ), \
              mock.patch.object(MODULE.sys, "stdout", stdout):
             self.assertEqual(MODULE.main(), 0)
-        self.assertEqual(
-            json.loads(stdout.getvalue())["status"],
-            "Landed — acceptance review required",
-        )
+            first = json.loads(stdout.getvalue())
+            stdout.seek(0)
+            stdout.truncate(0)
+            self.assertEqual(MODULE.main(), 0)
+            second = json.loads(stdout.getvalue())
+        self.assertEqual(first, second)
+        self.assertEqual(first["status"], "Landed — acceptance review required")
+        self.assertEqual(transport.snapshot_for_root.call_count, 2)
+        self.assertEqual(comments.comments.call_count, 2)
         graph["root"]["next_action"] = "new material state after reconciliation"
         with self.assertRaisesRegex(
             MODULE.ResumeError, "lifecycle_snapshot_stale_reconcile_required",

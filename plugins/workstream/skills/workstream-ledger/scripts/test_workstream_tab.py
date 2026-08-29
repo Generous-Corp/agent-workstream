@@ -139,7 +139,7 @@ class WorkstreamTabTests(unittest.TestCase):
         self.assertEqual(result["status"], "unavailable")
         self.assertEqual(result["reason"], "cmux_unavailable")
 
-    def test_reachable_cmux_with_unresolved_target_fails_closed(self):
+    def test_reachable_cmux_with_unresolved_target_is_optional_noop(self):
         fake = FakeCmux()
 
         def runner(argv, **kwargs):
@@ -147,11 +147,12 @@ class WorkstreamTabTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 1, "", "unknown surface")
             return fake(argv, **kwargs)
 
-        with self.assertRaisesRegex(tab.TabTitleError, "cmux_command_failed"):
-            tab.apply_title(
-                "GEN-37", target="surface:404", runner=runner,
-                which=lambda _: "/opt/cmux",
-            )
+        result = tab.apply_title(
+            "GEN-37", target="surface:404", runner=runner,
+            which=lambda _: "/opt/cmux",
+        )
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["reason"], "cmux_target_unresolved")
         self.assertNotIn("rename-tab", [call[1] for call in fake.calls])
 
     def test_reachable_cmux_without_caller_binding_is_optional_noop(self):

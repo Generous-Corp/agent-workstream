@@ -110,7 +110,12 @@ def _json_result(result: subprocess.CompletedProcess[str] | None, error: str) ->
 def _surface_context(cmux: str, target: str, runner: Runner) -> SurfaceContext | None:
     if _run(runner, [cmux, "ping"], allow_unavailable=True) is None:
         return None
-    result = _run(runner, [cmux, "identify", "--surface", target, "--json"])
+    result = _run(
+        runner, [cmux, "identify", "--surface", target, "--json"],
+        allow_unavailable=True,
+    )
+    if result is None:
+        raise TabTitleError("cmux_target_unresolved")
     value = _json_result(result, "invalid_cmux_identify_response")
     caller = value.get("caller")
     if not isinstance(caller, dict):
