@@ -17,15 +17,18 @@ from workstream_linear_checkpoints import (
 from workstream_linear_events import (
     LinearCommentEventAdapter,
     encode_event_comment,
+    ledger_boundary_slot_id,
 )
 
 
-def checkpoint(revision: int, predecessor: str | None = None) -> dict:
+def checkpoint(
+    revision: int, predecessor: str | None = None, *, plan: str = "plan-sha",
+) -> dict:
     return build_checkpoint(
         workstream_id="GEN-37",
         boundary_id=f"boundary-{revision}",
         root_revision=revision,
-        plan_revision="plan-sha",
+        plan_revision=plan,
         before_status="In Progress",
         after_status="In Progress",
         execution={
@@ -286,6 +289,146 @@ class LinearCheckpointAdapterTests(unittest.TestCase):
         )
         self.assertEqual(second["root_revision"], 2)
         self.assertEqual(len(client.comments), 4)
+
+    def test_multi_generation_persist_recover_replay_uses_current_chain(self):
+        client = FakeCommentClient()
+        client.seed_material(1)
+        adapter = self.adapter(client)
+        old = adapter.persist(checkpoint(1, plan="old-plan"))
+        client.comments.append(material_comment(2))
+        current = adapter.persist(checkpoint(2, plan="current-plan"))
+        client.comments.append(material_comment(3))
+        successor = checkpoint(
+            3, current["event_id"], plan="current-plan",
+        )
+
+        result = adapter.persist(successor)
+        replay = adapter.persist(successor)
+        recovered = adapter.recover(expected_plan_revision="current-plan")
+
+        self.assertEqual(result, replay)
+        self.assertEqual(recovered["checkpoint_event_id"], result["event_id"])
+        self.assertEqual(
+            [item["session_id"] for item in recovered["provenance_chain"]],
+            ["session-2", "session-3"],
+        )
+        self.assertEqual(len(client.comments), 6)
+        expected_slot = ledger_boundary_slot_id(
+            "GEN-37", 3, sorted([old["event_id"], current["event_id"]]),
+            {
+                "workspace_id": "workspace", "team_id": "team",
+                "project_id": "project", "root_issue_id": "issue-37",
+            },
+        )
+        self.assertEqual(result["acknowledgement"]["remote_id"], expected_slot)
+
+    def test_arbitrary_remote_ids_preserve_multi_generation_current_chain(self):
+        client = FakeCommentClient()
+        client.seed_material(3)
+        old = checkpoint(1, plan="old-plan")
+        current = checkpoint(2, plan="current-plan")
+        successor = checkpoint(
+            3, current["event_id"], plan="current-plan",
+        )
+        client.comments.extend([
+            {
+                "id": "arbitrary-old-id",
+                "body": encode_checkpoint_comment(old),
+                "createdAt": "then", "updatedAt": "then",
+            },
+            {
+                "id": "arbitrary-current-id",
+                "body": encode_checkpoint_comment(current),
+                "createdAt": "then", "updatedAt": "then",
+            },
+        ])
+        adapter = self.adapter(client)
+
+        replay = adapter.persist(current)
+        persisted = adapter.persist(successor)
+        recovered = adapter.recover(expected_plan_revision="current-plan")
+
+        self.assertEqual(
+            replay["acknowledgement"]["remote_id"], "arbitrary-current-id",
+        )
+        self.assertEqual(recovered["checkpoint_event_id"], persisted["event_id"])
+        self.assertEqual(
+            [item["session_id"] for item in recovered["provenance_chain"]],
+            ["session-2", "session-3"],
+        )
+
+    def test_public_recover_distinguishes_empty_from_stale_plan(self):
+        empty = self.adapter(FakeCommentClient())
+        with self.assertRaisesRegex(Exception, "checkpoint_not_found"):
+            empty.recover(expected_plan_revision="current-plan")
+
+        client = FakeCommentClient()
+        client.seed_material(1)
+        self.adapter(client).persist(checkpoint(1, plan="old-plan"))
+        with self.assertRaisesRegex(Exception, "plan_sync_required"):
+            self.adapter(client).recover(expected_plan_revision="current-plan")
+
+    def test_broken_stale_generation_refuses_recover_persist_and_event(self):
+        client = FakeCommentClient()
+        client.seed_material(2)
+        broken = checkpoint(1, "wsc_missing", plan="old-plan")
+        current = checkpoint(2, plan="current-plan")
+        client.comments.extend([
+            {
+                "id": "arbitrary-old-generation-id",
+                "body": encode_checkpoint_comment(broken),
+                "createdAt": "then", "updatedAt": "then",
+            },
+            {
+                "id": "arbitrary-current-generation-id",
+                "body": encode_checkpoint_comment(current),
+                "createdAt": "then", "updatedAt": "then",
+            },
+        ])
+        adapter = self.adapter(client)
+        writes_before = len([
+            query for query, _ in client.calls if "commentCreate" in query
+        ])
+
+        with self.assertRaisesRegex(Exception, "checkpoint_chain_truncated"):
+            adapter.recover(expected_plan_revision="current-plan")
+        with self.assertRaisesRegex(Exception, "checkpoint_chain_truncated"):
+            adapter.persist(current)
+        with self.assertRaisesRegex(Exception, "checkpoint_chain_truncated"):
+            LinearCommentEventAdapter(client, issue_id="GEN-37").apply(
+                Delta(
+                    "event-3", "GEN-37", "material_boundary", "system",
+                    {"revision": 3}, 2, "2026-08-20T00:00:03Z",
+                )
+            )
+        writes_after = len([
+            query for query, _ in client.calls if "commentCreate" in query
+        ])
+        self.assertEqual(writes_before, writes_after)
+
+    def test_cross_type_cas_uses_full_multi_generation_frontier(self):
+        client = FakeCommentClient()
+        client.seed_material(1)
+        adapter = self.adapter(client)
+        old = adapter.persist(checkpoint(1, plan="old-plan"))
+        client.comments.append(material_comment(2))
+        current = adapter.persist(checkpoint(2, plan="current-plan"))
+
+        receipt = LinearCommentEventAdapter(client, issue_id="GEN-37").apply(
+            Delta(
+                "event-3", "GEN-37", "material_boundary", "system",
+                {"revision": 3}, 2, "2026-08-20T00:00:03Z",
+            )
+        )
+
+        expected_slot = ledger_boundary_slot_id(
+            "GEN-37", 2, sorted([old["event_id"], current["event_id"]]),
+            {
+                "workspace_id": "workspace", "team_id": "team",
+                "project_id": "project", "root_issue_id": "issue-37",
+            },
+        )
+        self.assertEqual(receipt.remote_id, expected_slot)
 
     def test_legacy_checkpoint_ahead_requires_quarantine_remediation(self):
         client = FakeCommentClient()

@@ -11,12 +11,12 @@ from workstream_checkpoint import (
 
 
 class CheckpointTests(unittest.TestCase):
-    def checkpoint(self, *, session, revision, predecessor=None, machine="M5", state="safe", workstream="GEN-37"):
+    def checkpoint(self, *, session, revision, predecessor=None, machine="M5", state="safe", workstream="GEN-37", plan="plan-sha"):
         return build_checkpoint(
             workstream_id=workstream,
             boundary_id=f"boundary-{revision}",
             root_revision=revision,
-            plan_revision="plan-sha",
+            plan_revision=plan,
             before_status="In Progress",
             after_status="Blocked" if revision == 2 else "In Progress",
             execution={
@@ -124,6 +124,51 @@ class CheckpointTests(unittest.TestCase):
         acknowledged = acknowledge_checkpoint(checkpoint, "r1", 1)
         with self.assertRaisesRegex(CheckpointError, "plan_sync_required"):
             recover_latest([acknowledged], "GEN-37", expected_plan_revision="other")
+
+    def test_recovery_validates_all_generations_and_selects_exact_plan(self):
+        old = acknowledge_checkpoint(
+            self.checkpoint(session="old", revision=1, plan="old-plan"), "old-id", 1,
+        )
+        current = acknowledge_checkpoint(
+            self.checkpoint(session="current", revision=2, plan="current-plan"),
+            "current-id", 2,
+        )
+        successor = acknowledge_checkpoint(
+            self.checkpoint(
+                session="current-2", revision=3, plan="current-plan",
+                predecessor=current["event_id"],
+            ),
+            "current-id-2", 3,
+        )
+
+        recovered = recover_latest(
+            [successor, old, current], "GEN-37",
+            expected_plan_revision="current-plan",
+        )
+
+        self.assertEqual(recovered["checkpoint_event_id"], successor["event_id"])
+        self.assertEqual(
+            [item["session_id"] for item in recovered["provenance_chain"]],
+            ["current", "current-2"],
+        )
+
+    def test_broken_stale_generation_refuses_current_recovery(self):
+        stale = acknowledge_checkpoint(
+            self.checkpoint(
+                session="stale", revision=1, plan="old-plan",
+                predecessor="wsc_missing",
+            ),
+            "stale-id", 1,
+        )
+        current = acknowledge_checkpoint(
+            self.checkpoint(session="current", revision=2, plan="current-plan"),
+            "current-id", 2,
+        )
+        with self.assertRaisesRegex(CheckpointError, "checkpoint_chain_truncated"):
+            recover_latest(
+                [stale, current], "GEN-37",
+                expected_plan_revision="current-plan",
+            )
 
     def test_same_event_id_with_different_bytes_is_corruption(self):
         checkpoint = acknowledge_checkpoint(self.checkpoint(session="session-a", revision=1), "r1", 1)

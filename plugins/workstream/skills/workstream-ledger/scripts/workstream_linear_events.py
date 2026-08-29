@@ -20,6 +20,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from workstream_checkpoint import CheckpointError, recover_generations
 from workstream_delta import Delta, MutationReceipt, RevisionConflict
 from workstream_linear import (
     GraphQLClient, HttpGraphQLClient, LinearTransportError, validate_issue_route,
@@ -379,15 +380,10 @@ class LinearCommentEventAdapter:
             raise LinearEventError("checkpoint_material_history_incomplete")
         if not records:
             return
-        if records[0].get("predecessor_event_id") is not None:
-            raise LinearEventError("checkpoint_chain_truncated")
-        previous = records[0]
-        for item in records[1:]:
-            if item["root_revision"] <= previous["root_revision"]:
-                raise LinearEventError("checkpoint_revision_not_monotonic")
-            if item.get("predecessor_event_id") != previous["event_id"]:
-                raise LinearEventError("checkpoint_chain_broken")
-            previous = item
+        try:
+            recover_generations(records, checkpoints.workstream_id)
+        except CheckpointError as error:
+            raise LinearEventError(str(error)) from error
 
     def current_revision(self, workstream_id: str) -> int:
         if workstream_id != self.issue_id:
@@ -410,6 +406,7 @@ class LinearCommentEventAdapter:
             raise LinearEventError("workstream_id_mismatch")
         for _attempt in range(8):
             before, checkpoints, _comments = self._combined_state()
+            self._validate_checkpoint_prefix(before, checkpoints)
             existing_id = before.remote_ids.get(delta.event_id)
             if existing_id:
                 existing = next(
@@ -423,7 +420,6 @@ class LinearCommentEventAdapter:
                     _event_applied_revision(before, delta.event_id),
                     existing_id,
                 )
-            self._validate_checkpoint_prefix(before, checkpoints)
             if delta.expected_revision != before.revision:
                 raise RevisionConflict(
                     f"expected revision {delta.expected_revision}, "
@@ -448,6 +444,7 @@ class LinearCommentEventAdapter:
                 )
             except LinearTransportError:
                 after_events, after_checkpoints, _ = self._combined_state()
+                self._validate_checkpoint_prefix(after_events, after_checkpoints)
                 winner = next(
                     (
                         event for event in after_events.events
@@ -475,9 +472,6 @@ class LinearCommentEventAdapter:
                     None,
                 )
                 if checkpoint_winner is not None:
-                    self._validate_checkpoint_prefix(
-                        after_events, after_checkpoints
-                    )
                     if after_events.revision != delta.expected_revision:
                         raise RevisionConflict(
                             f"expected revision {delta.expected_revision}, "
