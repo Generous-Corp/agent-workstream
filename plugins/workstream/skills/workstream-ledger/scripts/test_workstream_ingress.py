@@ -109,16 +109,17 @@ class WorkstreamIngressTests(unittest.TestCase):
 
     def test_remote_recovery_deduplicates_and_hides_processed(self):
         capture = {"event_id": "e1", "captured_at": "2026-08-14T01:00:00Z", "workstream_id": "ABC-12"}
-        processed = {
-            "schema_version": 1, "event_id": "e1",
-            "processed_at": "2026-08-14T02:00:00Z",
-            "disposition": "no-material-delta", "promoted_issue": None,
-        }
+        route = MODULE.canonical_ingress_route("o/r", 7)
+        processed = MODULE.build_classification_payload(
+            capture=capture, disposition="no-material-delta", route=route, actor="trusted-bot",
+        )
         comments = [
-            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture), "html_url": "u1"},
-            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture), "html_url": "u2"},
-            {"body": MODULE.comment_body(MODULE.PROCESSED_MARKER, processed), "html_url": "u3"},
+            {"id": 1, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture), "html_url": "u1"},
+            {"id": 2, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture), "html_url": "u2"},
+            {"id": 3, "body": MODULE.comment_body(MODULE.PROCESSED_MARKER, processed),
+             "html_url": "u3", "user": {"login": "trusted-bot"}},
         ]
+        MODULE.save_config({"repo": "o/r", "issue": 7, "classification_actor": "trusted-bot"})
         with mock.patch.object(MODULE, "gh", side_effect=[
             [{"number": 7, "url": "i", "title": "ingress"}], [comments]
         ]):
@@ -232,6 +233,27 @@ class WorkstreamIngressTests(unittest.TestCase):
             issue = MODULE.ensure_remote_issue("o/r", "m5")
         self.assertEqual(issue["number"], 4)
         self.assertNotIn("--search", gh.call_args.args[0])
+
+    def test_configure_records_authenticated_classification_actor_before_remote_mutation(self):
+        args = argparse.Namespace(
+            repo="o/r", machine="m5", local_retention_days=30,
+            remote_retention_days=90, max_local_bytes=1024,
+        )
+        issue = {"number": 7, "url": "https://example/issues/7"}
+        with mock.patch.object(MODULE, "authenticated_github_actor", return_value="trusted-bot"), \
+             mock.patch.object(MODULE, "ensure_remote_issue", return_value=issue), \
+             mock.patch.object(MODULE.sys, "stdout", io.StringIO()):
+            self.assertEqual(MODULE.command_configure(args), 0)
+        self.assertEqual(MODULE.load_config()["classification_actor"], "trusted-bot")
+
+    def test_configure_auth_failure_precedes_remote_issue_mutation(self):
+        args = argparse.Namespace(repo="o/r", machine="m5")
+        with mock.patch.object(
+            MODULE, "authenticated_github_actor", side_effect=ValueError("actor unavailable")
+        ), mock.patch.object(MODULE, "ensure_remote_issue") as ensure:
+            with self.assertRaisesRegex(ValueError, "actor unavailable"):
+                MODULE.command_configure(args)
+        ensure.assert_not_called()
 
     def test_prune_keeps_unuploaded_events(self):
         conn = MODULE.connect()
@@ -828,6 +850,178 @@ class RatchetTests(unittest.TestCase):
         self.assertEqual(mode, 0o600)
 
 
+class ClassificationAuthorityTests(unittest.TestCase):
+    """A body-shaped GitHub comment is not an authoritative classification."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.env = mock.patch.dict(os.environ, {
+            "WORKSTREAM_INGRESS_STATE_DIR": str(self.root / "state"),
+            "WORKSTREAM_INGRESS_CONFIG": str(self.root / "config.json"),
+        }, clear=False)
+        self.env.start()
+        self.repo = "private/ingress"
+        self.issue = 7
+        self.actor = "trusted-bot"
+        self.capture = {
+            "schema_version": 1, "event_id": "wsi_classify",
+            "captured_at": "2026-08-29T01:00:00Z", "provider": "codex",
+            "session_id": "expired", "workstream_id": "GEN-37",
+            "prompt": "No longer material", "prompt_sha256": "a" * 64,
+        }
+        MODULE.save_config({
+            "repo": self.repo, "issue": self.issue, "classification_actor": self.actor,
+        })
+
+    def tearDown(self):
+        self.env.stop()
+        self.temp.cleanup()
+
+    def payload(self, disposition, *, capture=None, route=None, actor=None):
+        payload = MODULE.build_classification_payload(
+            capture=capture or self.capture,
+            disposition=disposition,
+            route=route or MODULE.canonical_ingress_route(self.repo, self.issue),
+            actor=actor or self.actor,
+        )
+        payload["processed_at"] = "2026-08-29T01:01:00Z"
+        return payload
+
+    def recover(self, payload, *, comment_actor=None, capture=None, repo=None, issue=None):
+        capture = capture or self.capture
+        repo = repo or self.repo
+        issue = issue or self.issue
+        comments = [
+            {"id": 1, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture)},
+            {"id": 2, "body": MODULE.comment_body(MODULE.PROCESSED_MARKER, payload),
+             "user": {"login": comment_actor or self.actor}},
+        ]
+        with mock.patch.object(MODULE, "gh", side_effect=[
+            [{"number": issue, "url": "i", "title": "ingress"}], [comments],
+        ]):
+            return MODULE.remote_events(repo, "GEN-37")
+
+    def test_valid_authenticated_classification_hides_capture_for_both_dispositions(self):
+        for disposition in ("no-material-delta", "superseded"):
+            with self.subTest(disposition=disposition):
+                self.assertEqual(self.recover(self.payload(disposition)), [])
+
+    def test_process_uses_authenticated_actor_and_verifies_remote_readback(self):
+        comments = [{
+            "id": 1, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, self.capture),
+        }]
+
+        def gh(args, *, stdin=None, timeout=4):
+            if args == ["api", "user"]:
+                return {"login": self.actor}
+            if "--paginate" in args:
+                return [list(comments)]
+            if args[-2:] == ["--input", "-"]:
+                item = {
+                    "id": 2, "html_url": "https://example/comment/2",
+                    "body": json.loads(stdin)["body"], "user": {"login": self.actor},
+                }
+                comments.append(item)
+                return item
+            raise AssertionError(args)
+
+        args = argparse.Namespace(
+            disposition="no-material-delta", event="wsi_classify", issue=None,
+            repo=self.repo, remote_issue=self.issue,
+        )
+        output = io.StringIO()
+        with mock.patch.object(MODULE, "gh", side_effect=gh), \
+             mock.patch.object(MODULE.sys, "stdout", output):
+            self.assertEqual(MODULE.command_process(args), 0)
+        self.assertEqual(json.loads(output.getvalue())["event_id"], "wsi_classify")
+        payload = MODULE.parse_comment(comments[-1]["body"], MODULE.PROCESSED_MARKER)
+        self.assertEqual(payload["classification_actor"]["login"], self.actor)
+        replay = io.StringIO()
+        with mock.patch.object(MODULE, "gh", side_effect=gh), \
+             mock.patch.object(MODULE.sys, "stdout", replay):
+            self.assertEqual(MODULE.command_process(args), 0)
+        self.assertTrue(json.loads(replay.getvalue())["replay"])
+        self.assertEqual(len(comments), 2, "classification replay appended a duplicate comment")
+
+    def test_legacy_schema_is_rejected_for_both_dispositions(self):
+        for disposition in ("no-material-delta", "superseded"):
+            with self.subTest(disposition=disposition):
+                payload = self.payload(disposition)
+                payload["schema_version"] = 999
+                with self.assertRaisesRegex(ValueError, "classification_schema_invalid"):
+                    self.recover(payload)
+
+    def test_false_timestamp_is_rejected_for_both_dispositions(self):
+        for disposition in ("no-material-delta", "superseded"):
+            with self.subTest(disposition=disposition):
+                payload = self.payload(disposition)
+                payload["processed_at"] = False
+                with self.assertRaisesRegex(ValueError, "classification_timestamp_invalid"):
+                    self.recover(payload)
+
+    def test_object_promoted_issue_is_rejected_for_both_dispositions(self):
+        for disposition in ("no-material-delta", "superseded"):
+            with self.subTest(disposition=disposition):
+                payload = self.payload(disposition)
+                payload["promoted_issue"] = {"identifier": "GEN-37"}
+                with self.assertRaisesRegex(ValueError, "classification_promoted_issue_invalid"):
+                    self.recover(payload)
+
+    def test_wrong_declared_actor_is_rejected_for_both_dispositions(self):
+        for disposition in ("no-material-delta", "superseded"):
+            with self.subTest(disposition=disposition):
+                payload = self.payload(disposition, actor="attacker")
+                with self.assertRaisesRegex(ValueError, "classification_actor_mismatch"):
+                    self.recover(payload, comment_actor="attacker")
+
+    def test_wrong_route_is_rejected_for_both_dispositions(self):
+        wrong = MODULE.canonical_ingress_route("public/other", 999)
+        for disposition in ("no-material-delta", "superseded"):
+            with self.subTest(disposition=disposition):
+                payload = self.payload(disposition, route=wrong)
+                with self.assertRaisesRegex(ValueError, "classification_route_mismatch"):
+                    self.recover(payload)
+
+    def test_well_formed_marker_by_wrong_github_actor_is_rejected_for_both_dispositions(self):
+        for disposition in ("no-material-delta", "superseded"):
+            with self.subTest(disposition=disposition):
+                with self.assertRaisesRegex(ValueError, "classification_actor_mismatch"):
+                    self.recover(self.payload(disposition), comment_actor="attacker")
+
+    def test_event_predecessor_source_and_envelope_are_strict(self):
+        payload = self.payload("no-material-delta")
+        for field, value, error in (
+            ("event_id", "another", "processed_without_capture"),
+            ("capture_sha256", "0" * 64, "classification_predecessor_mismatch"),
+            ("classification_source", "user-comment", "classification_source_invalid"),
+        ):
+            with self.subTest(field=field):
+                forged = dict(payload)
+                forged[field] = value
+                with self.assertRaisesRegex(ValueError, error):
+                    self.recover(forged)
+        huge_capture = dict(self.capture, event_id="e" * MODULE.MAX_PROMOTION_BYTES)
+        huge = self.payload("superseded", capture=huge_capture)
+        comment = {"id": 2, "user": {"login": self.actor}}
+        with self.assertRaisesRegex(ValueError, "output_envelope_over_budget"):
+            MODULE.validate_classification_payload(
+                huge, capture=huge_capture,
+                route=MODULE.canonical_ingress_route(self.repo, self.issue),
+                trusted_actor=self.actor, comment=comment,
+            )
+        comment = {
+            "id": 2, "user": {"login": self.actor},
+            "body": MODULE.comment_body(MODULE.PROCESSED_MARKER, payload) + "\nforged suffix",
+        }
+        with self.assertRaisesRegex(ValueError, "classification_envelope_invalid"):
+            MODULE.validate_classification_payload(
+                payload, capture=self.capture,
+                route=MODULE.canonical_ingress_route(self.repo, self.issue),
+                trusted_actor=self.actor, comment=comment,
+            )
+
+
 class ManagedPromotionTests(unittest.TestCase):
     """Raw capture must survive every boundary through processed successor proof."""
 
@@ -1074,6 +1268,18 @@ class ManagedPromotionTests(unittest.TestCase):
         second = MODULE.promotion_payload(other, self.capture)
         self.assertNotEqual(first["promotion_id"], second["promotion_id"])
         self.assertNotEqual(first["ingress_route"], second["ingress_route"])
+
+    def test_route_bearing_promotion_requires_exact_schema_two(self):
+        request = json.loads(self.request.read_text())
+        current = MODULE.promotion_payload(request, self.capture)
+        self.assertEqual(current["schema_version"], 2)
+        self.assertEqual(MODULE.validate_promotion_payload(current), current)
+        legacy = dict(current, schema_version=1)
+        legacy["promotion_id"] = MODULE.promotion_id_for({
+            key: value for key, value in legacy.items() if key != "promotion_id"
+        })
+        with self.assertRaisesRegex(ValueError, "promotion_marker_schema_unsupported"):
+            MODULE.validate_promotion_payload(legacy)
 
     def test_staged_intent_cannot_be_replayed_from_a_different_repo_issue(self):
         request = json.loads(self.request.read_text())

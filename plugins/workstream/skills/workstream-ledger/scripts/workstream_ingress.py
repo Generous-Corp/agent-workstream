@@ -43,10 +43,13 @@ OPPORTUNISTIC_DRAIN = 5
 CAPTURE_MARKER = "<!-- workstream-ingress:capture:v1 -->"
 PROCESSED_MARKER = "<!-- workstream-ingress:processed:v1 -->"
 BIND_MARKER = "<!-- workstream-ingress:bind:v1 -->"
-PROMOTION_MARKER = "<!-- workstream-ingress:promotion:v1 -->"
+PROMOTION_MARKER = "<!-- workstream-ingress:promotion:v2 -->"
+PROMOTION_SCHEMA_VERSION = 2
 MAX_PROMOTION_CHANGES = 32
 MAX_PROMOTION_BYTES = 16 * 1024
 MAX_PROMOTION_CONFLICTS = 8
+CLASSIFICATION_SCHEMA_VERSION = 2
+CLASSIFICATION_SOURCE = "reviewed_agent_classification"
 
 SECRET_PATTERNS = (
     re.compile(r"-----BEGIN [^-]*(?:PRIVATE KEY|CERTIFICATE)-----.*?-----END [^-]*-----", re.S),
@@ -453,10 +456,125 @@ def canonical_ingress_route(repo: Any, issue: Any) -> dict[str, Any]:
     return {"provider": "github", "repository": repo.lower(), "issue": issue}
 
 
+def canonical_github_actor(actor: Any) -> str:
+    if not isinstance(actor, str) or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", actor):
+        raise ValueError("classification_actor_invalid")
+    return actor.lower()
+
+
+def authenticated_github_actor() -> str:
+    value = gh(["api", "user"], timeout=10)
+    return canonical_github_actor((value or {}).get("login"))
+
+
 def validate_output_envelope(marker: str, payload: dict[str, Any]) -> None:
     size = len(comment_body(marker, payload).encode("utf-8"))
     if size > MAX_PROMOTION_BYTES:
         raise ValueError(f"ingress_output_envelope_over_budget:{size}>{MAX_PROMOTION_BYTES}")
+
+
+def capture_predecessor_digest(capture: dict[str, Any]) -> str:
+    transport_only = {"remote_issue", "remote_repo", "remote_url", "promotion", "promotion_state"}
+    material = {key: value for key, value in capture.items() if key not in transport_only}
+    return hashlib.sha256(canonical_json(material).encode("utf-8")).hexdigest()
+
+
+def classification_id_for(
+    *, event_id: str, disposition: str, route: dict[str, Any],
+    capture_sha256: str, actor: str,
+) -> str:
+    material = {
+        "event_id": event_id, "disposition": disposition, "ingress_route": route,
+        "capture_sha256": capture_sha256, "actor": actor,
+        "source": CLASSIFICATION_SOURCE,
+    }
+    return "wsc_" + hashlib.sha256(canonical_json(material).encode("utf-8")).hexdigest()[:32]
+
+
+def build_classification_payload(
+    *, capture: dict[str, Any], disposition: str, route: dict[str, Any], actor: str,
+) -> dict[str, Any]:
+    event_id = capture.get("event_id")
+    digest = capture_predecessor_digest(capture)
+    actor = canonical_github_actor(actor)
+    return {
+        "schema_version": CLASSIFICATION_SCHEMA_VERSION,
+        "event_id": event_id,
+        "processed_at": utc_now(),
+        "disposition": disposition,
+        "promoted_issue": None,
+        "ingress_route": route,
+        "capture_sha256": digest,
+        "classification_actor": {"provider": "github", "login": actor},
+        "classification_source": CLASSIFICATION_SOURCE,
+        "classification_id": classification_id_for(
+            event_id=event_id, disposition=disposition, route=route,
+            capture_sha256=digest, actor=actor,
+        ),
+    }
+
+
+def validate_classification_payload(
+    payload: Any, *, capture: dict[str, Any], route: dict[str, Any],
+    trusted_actor: str, comment: dict[str, Any],
+) -> dict[str, Any]:
+    required = {
+        "schema_version", "event_id", "processed_at", "disposition", "promoted_issue",
+        "ingress_route", "capture_sha256", "classification_actor",
+        "classification_source", "classification_id",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise ValueError(f"processed_classification_schema_invalid:{capture.get('event_id')}")
+    if payload["schema_version"] != CLASSIFICATION_SCHEMA_VERSION:
+        raise ValueError(f"processed_classification_schema_invalid:{capture.get('event_id')}")
+    timestamp = payload["processed_at"]
+    if (
+        not isinstance(timestamp, str)
+        or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", timestamp)
+    ):
+        raise ValueError(f"processed_classification_timestamp_invalid:{capture.get('event_id')}")
+    try:
+        datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(
+            f"processed_classification_timestamp_invalid:{capture.get('event_id')}"
+        ) from error
+    if payload["disposition"] not in {"no-material-delta", "superseded"}:
+        raise ValueError(f"processed_classification_disposition_invalid:{capture.get('event_id')}")
+    if payload["promoted_issue"] is not None:
+        raise ValueError(f"processed_classification_promoted_issue_invalid:{capture.get('event_id')}")
+    if payload["event_id"] != capture.get("event_id"):
+        raise ValueError(f"processed_classification_event_mismatch:{capture.get('event_id')}")
+    if payload["ingress_route"] != route:
+        raise ValueError(f"processed_classification_route_mismatch:{capture.get('event_id')}")
+    digest = capture_predecessor_digest(capture)
+    if payload["capture_sha256"] != digest:
+        raise ValueError(f"processed_classification_predecessor_mismatch:{capture.get('event_id')}")
+    actor_value = payload["classification_actor"]
+    if not isinstance(actor_value, dict) or set(actor_value) != {"provider", "login"}:
+        raise ValueError(f"processed_classification_actor_invalid:{capture.get('event_id')}")
+    trusted_actor = canonical_github_actor(trusted_actor)
+    if (
+        actor_value.get("provider") != "github"
+        or canonical_github_actor(actor_value.get("login")) != trusted_actor
+        or canonical_github_actor(((comment.get("user") or {}).get("login"))) != trusted_actor
+    ):
+        raise ValueError(f"processed_classification_actor_mismatch:{capture.get('event_id')}")
+    if payload["classification_source"] != CLASSIFICATION_SOURCE:
+        raise ValueError(f"processed_classification_source_invalid:{capture.get('event_id')}")
+    expected_id = classification_id_for(
+        event_id=payload["event_id"], disposition=payload["disposition"], route=route,
+        capture_sha256=digest, actor=trusted_actor,
+    )
+    if payload["classification_id"] != expected_id:
+        raise ValueError(f"processed_classification_receipt_invalid:{capture.get('event_id')}")
+    comment_id = comment.get("id")
+    if not isinstance(comment_id, (str, int)) or isinstance(comment_id, bool):
+        raise ValueError(f"processed_classification_comment_invalid:{capture.get('event_id')}")
+    validate_output_envelope(PROCESSED_MARKER, payload)
+    if comment.get("body") != comment_body(PROCESSED_MARKER, payload):
+        raise ValueError(f"processed_classification_envelope_invalid:{capture.get('event_id')}")
+    return payload
 
 
 def promotion_id_for(value: dict[str, Any]) -> str:
@@ -530,7 +648,7 @@ def load_promotion_request(path: str) -> dict[str, Any]:
 
 def promotion_payload(request: dict[str, Any], capture: dict[str, Any]) -> dict[str, Any]:
     immutable = {
-        "schema_version": 1,
+        "schema_version": PROMOTION_SCHEMA_VERSION,
         "event_id": request["ingress"]["event_id"],
         "prompt_sha256": request["ingress"]["prompt_sha256"],
         "workstream_id": request["workstream_id"],
@@ -572,7 +690,7 @@ def validate_promotion_payload(promotion: Any) -> dict[str, Any]:
     }
     # Validate the same shapes as a first-attempt request without reading a
     # file or trusting a successor's local state.
-    if request["schema_version"] != 1:
+    if request["schema_version"] != PROMOTION_SCHEMA_VERSION:
         raise ValueError("promotion_marker_schema_unsupported")
     if not isinstance(promotion["event_id"], str) or not promotion["event_id"]:
         raise ValueError("promotion_marker_event_id_invalid")
@@ -911,6 +1029,7 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
     ], timeout=15)
     captures: dict[str, dict[str, Any]] = {}
     processed: dict[str, dict[str, Any]] = {}
+    processed_comments: dict[str, list[dict[str, Any]]] = {}
     promotions: dict[str, dict[str, Any]] = {}
     bindings: dict[str, dict[str, Any]] = {}
     event_routes: dict[str, dict[str, Any]] = {}
@@ -948,6 +1067,7 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
                 if previous and _payload_without_time(previous) != _payload_without_time(item):
                     raise ValueError(f"conflicting_processed:{item['event_id']}")
                 processed[item["event_id"]] = item
+                processed_comments.setdefault(item["event_id"], []).append(comment)
                 continue
             item = parse_comment(comment.get("body", ""), PROMOTION_MARKER)
             if item:
@@ -968,6 +1088,9 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
         if event_id in captures:
             captures[event_id]["workstream_id"] = binding.get("workstream_id")
             captures[event_id]["context_url"] = binding.get("context_url")
+    for event_id in processed:
+        if event_id not in captures:
+            raise ValueError(f"processed_without_capture:{event_id}")
     for event_id, promotion in promotions.items():
         if event_id not in captures:
             raise ValueError(f"promotion_without_capture:{event_id}")
@@ -984,15 +1107,25 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
     if workstream:
         candidates = [item for item in candidates if item[1].get("workstream_id") == workstream]
     verified_processed: set[str] = set()
+    config = load_config()
     for event_id, event in candidates:
         disposition = processed.get(event_id)
         if not disposition:
             continue
         if disposition.get("disposition") in {"no-material-delta", "superseded"}:
-            if set(disposition) != {
-                "schema_version", "event_id", "processed_at", "disposition", "promoted_issue",
-            }:
-                raise ValueError(f"processed_classification_schema_invalid:{event_id}")
+            configured_repo = config.get("repo")
+            trusted_actor = config.get("classification_actor")
+            if not configured_repo or canonical_ingress_route(configured_repo, 1)["repository"] != (
+                canonical_ingress_route(repo, 1)["repository"]
+            ):
+                raise ValueError(f"classification_ingress_repository_not_configured:{event_id}")
+            route = event_routes[event_id]
+            for comment in processed_comments[event_id]:
+                item = parse_comment(comment.get("body", ""), PROCESSED_MARKER)
+                validate_classification_payload(
+                    item, capture=event, route=route,
+                    trusted_actor=trusted_actor, comment=comment,
+                )
             verified_processed.add(event_id)
             continue
         if disposition.get("disposition") != "promoted":
@@ -1233,6 +1366,7 @@ def command_capture(args: argparse.Namespace) -> int:
 
 
 def command_configure(args: argparse.Namespace) -> int:
+    classification_actor = authenticated_github_actor()
     issue = ensure_remote_issue(args.repo, args.machine)
     config = load_config()
     config.update({
@@ -1243,6 +1377,7 @@ def command_configure(args: argparse.Namespace) -> int:
         "remote_retention_days": args.remote_retention_days,
         "max_local_bytes": args.max_local_bytes,
         "machine": args.machine or socket.gethostname().split(".")[0],
+        "classification_actor": classification_actor,
     })
     save_config(config)
     print(json.dumps(config, indent=2, sort_keys=True))
@@ -1298,23 +1433,81 @@ def command_process(args: argparse.Namespace) -> int:
         raise ValueError(
             "material promotion requires the receipt-verifying promote command"
         )
-    payload = {
-        "schema_version": SCHEMA_VERSION,
-        "event_id": args.event,
-        "processed_at": utc_now(),
-        "disposition": args.disposition,
-        "promoted_issue": args.issue,
-    }
+    if args.issue is not None:
+        raise ValueError("non-material classification cannot name a promoted issue")
+    config = load_config()
+    configured_repo = config.get("repo")
+    trusted_actor = config.get("classification_actor")
+    if not configured_repo or canonical_ingress_route(configured_repo, 1)["repository"] != (
+        canonical_ingress_route(args.repo, args.remote_issue)["repository"]
+    ):
+        raise ValueError("classification_ingress_repository_not_configured")
+    trusted_actor = canonical_github_actor(trusted_actor)
+    if authenticated_github_actor() != trusted_actor:
+        raise ValueError("classification_authenticated_actor_mismatch")
+    comments = remote_issue_comments(args.repo, args.remote_issue)
+    state = reduce_ingress_comments(
+        comments, event_id=args.event, repo=args.repo, issue=args.remote_issue,
+    )
+    capture = state["capture"]
+    if not capture:
+        raise ValueError(f"classification_capture_not_found:{args.event}")
+    route = canonical_ingress_route(args.repo, args.remote_issue)
+    payload = build_classification_payload(
+        capture=capture, disposition=args.disposition, route=route, actor=trusted_actor,
+    )
+    existing = [
+        (parse_comment(comment.get("body", ""), PROCESSED_MARKER), comment)
+        for comment in comments
+    ]
+    existing = [
+        (item, comment) for item, comment in existing
+        if item and item.get("event_id") == args.event
+    ]
+    if existing:
+        for item, comment in existing:
+            validate_classification_payload(
+                item, capture=capture, route=route,
+                trusted_actor=trusted_actor, comment=comment,
+            )
+        observed = existing[0][0]
+        if observed["classification_id"] != payload["classification_id"]:
+            raise ValueError(f"conflicting_processed:{args.event}")
+        _record_local_processed(args.event, observed)
+        print(json.dumps({
+            "event_id": args.event, "processed_url": existing[0][1].get("html_url"),
+            "replay": True,
+        }, sort_keys=True))
+        return 0
     response = append_ingress_marker(
         args.repo, args.remote_issue, PROCESSED_MARKER, payload,
     )
+    if canonical_github_actor(((response.get("user") or {}).get("login"))) != trusted_actor:
+        raise ValueError("classification_write_actor_mismatch")
+    reread = remote_issue_comments(args.repo, args.remote_issue)
+    observed = [
+        (parse_comment(comment.get("body", ""), PROCESSED_MARKER), comment)
+        for comment in reread
+    ]
+    matches = [(item, comment) for item, comment in observed
+               if item and item.get("event_id") == args.event]
+    if not matches:
+        raise ValueError("classification_marker_not_observed")
+    for item, comment in matches:
+        validate_classification_payload(
+            item, capture=capture, route=route, trusted_actor=trusted_actor, comment=comment,
+        )
+        if item["classification_id"] != payload["classification_id"]:
+            raise ValueError(f"conflicting_processed:{args.event}")
     conn = connect()
     conn.execute(
         "UPDATE events SET processed_at=?,disposition=?,promoted_issue=? WHERE event_id=?",
         (payload["processed_at"], args.disposition, args.issue, args.event),
     )
     conn.commit()
-    print(json.dumps({"event_id": args.event, "processed_url": response["html_url"]}, sort_keys=True))
+    print(json.dumps({
+        "event_id": args.event, "processed_url": response["html_url"], "replay": False,
+    }, sort_keys=True))
     return 0
 
 

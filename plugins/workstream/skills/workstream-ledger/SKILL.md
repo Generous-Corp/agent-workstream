@@ -625,7 +625,11 @@ python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_ingress.py" \
 
 After triage, use `promote` for a material event. Use `process` only for
 `superseded` or `no-material-delta`. Never mark a material event processed
-before the promotion path verifies the corresponding Linear mutation.
+before the promotion path verifies the corresponding Linear mutation. A
+non-material classification is authoritative only when GitHub API metadata
+identifies the exact actor recorded by `configure` and the marker binds the
+capture digest plus physical repo/issue route; another actor's well-formed
+comment must leave recovery refused.
 
 Issue titles must be understandable outside the project view and use a
 plan/workstream-derived prefix. Every issue independently includes the stable

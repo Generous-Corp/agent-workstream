@@ -109,15 +109,23 @@ one logical marker and refuses conflicting copies.
 
 The promotion identity includes the canonical lowercase GitHub `owner/repo`
 and exact ingress issue number as well as the raw event and immutable Linear
-route. Replaying the same-looking event from another repository or issue
-refuses. Both the reviewed request and the final encoded promotion/processed
+route. Route-bearing promotion markers use schema version 2; version 1 markers
+are refused because they did not carry that identity. Replaying the same-looking
+event from another repository or issue refuses. Both the reviewed request and the final encoded promotion/processed
 comment envelopes are capped at 16 KiB; expansion during encoding is checked
 before any write. Recovery does not hide a promoted capture until read-only
 Linear validation proves the marker's exact event and receipt.
 
 Use the older `process` command only for reviewed `no-material-delta` or
 `superseded` dispositions. Material promotion must use `promote`, which proves
-the Linear receipt before acknowledging the raw event.
+the Linear receipt before acknowledging the raw event. `configure` records the
+currently authenticated GitHub actor as the non-material classification trust
+boundary. Recovery accepts a classification only when the authenticated API
+metadata says that exact actor posted it and its schema-2 payload binds the
+physical repo/issue route, raw capture digest, event, source, disposition, and
+deterministic classification receipt. A well-formed marker posted by any other
+actor remains open and causes recovery to refuse; body shape alone is never
+authority. Changing the trusted actor requires rerunning `configure` deliberately.
 
 ## Privacy and retention
 
