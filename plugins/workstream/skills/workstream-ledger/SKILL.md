@@ -221,14 +221,24 @@ change invalidates head-bound receipts until reconciled.
 
 After a material child transition to Linear's `completed` state, run the
 model-free projection reconciliation before treating resume as authoritative.
-A reviewed `terminal_child_repairs` entry must fence the exact child issue,
+A reviewed `terminal_child_repairs` batch must fence every exact child issue
+from one authenticated root snapshot, including each
 parent/workspace/team/project route, assignee, state ID/name/type, and canonical
 readback digest. The repository owner and head are derived only from named,
 active, valid evidence-contract heads and must already exist unchanged in the
-current scope. The writer appends a typed `child_closure` before replacing the
-scope ownership map; it never creates, reopens, or updates an issue.
+current scope. Closures are appended in canonical child order before any
+required scope replacement. A crash may resume only from that exact prefix.
+The writer never creates, reopens, or updates an issue.
 
-An exact replay is a no-op. Missing/failed receipts, multiple owners or heads,
+For a legacy completed, already-owned child whose receipts are still present
+but were never projected as evidence contracts, use a separately reviewed
+`terminal_child_evidence_seeds` phase first. It may only append the named,
+valid contracts whose repository and exact head already match scope. It remains
+non-authoritative until the subsequent closure-repair batch succeeds; the two
+phases cannot be combined, and either phase is revision-checked and idempotent.
+
+An exact replay is a no-op. An incomplete multi-child batch, missing/failed
+receipts, multiple owners or heads,
 non-completed state, missing assignee, route/readback drift, unrelated scope or
 source changes, and stale evidence refuse without mutation. Resume validates
 the closure against current Linear state, scope, repository head, and receipts
