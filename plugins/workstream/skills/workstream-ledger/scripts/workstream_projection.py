@@ -21,7 +21,8 @@ from workstream_linear import (
 )
 from workstream_linear_events import LinearCommentEventAdapter
 from workstream_linear_projection import (
-    build_projection_event, LinearProjectionAdapter, LinearProjectionError, TOMBSTONE,
+    build_projection_event, encode_projection_comment, LinearProjectionAdapter,
+    LinearProjectionError, projection_slot_id, TOMBSTONE,
 )
 from workstream_plan import canonical_plan_url, plan_payload, same_plan_document
 from workstream_relation_readback import RelationReadbackError, read_relation_targets
@@ -337,18 +338,134 @@ def load_material_history_for_projection_reconcile(
     snapshot: dict[str, Any], comments: list[dict[str, Any]], token: str,
     manifest: dict[str, Any], adapter: LinearProjectionAdapter, *,
     authenticated_route: dict[str, str], authenticated_source: dict[str, Any],
+    remote_head: str | None = None,
     relation_target_resolver: Callable[
         [list[dict[str, Any]]], dict[str, dict[str, Any]]
     ],
 ) -> tuple[dict[str, Any], frozenset[tuple[str, str]]]:
-    """Load strict history, except for an exactly reviewed relation migration.
+    """Load strict history, except for an exactly reviewed projection repair.
 
     Historical relation heads can predate the peer projection contract.  They
     may be inspected only by this reconcile boundary, and only when every head
     whose authenticated peer readback is incomplete is exactly retired or
-    replaced by the reviewed manifest.  Ordinary resume never calls this
-    helper and remains strict.
+    replaced by the reviewed manifest. A newly added child or synchronized plan
+    URL can also make the current scope/source fail strict resume before the
+    reviewed replacement is appended. In that case, validate the exact
+    candidate projection entirely in memory first. Ordinary resume never calls
+    this helper and remains strict.
     """
+    desired, reviewed_retirements = _reviewed_manifest(manifest)
+    initial = adapter.state()
+    reviewed_contract = {
+        "expected_projection_revision": manifest["expected_projection_revision"],
+        "expected_active_heads": sorted(
+            manifest["expected_active_heads"],
+            key=lambda item: (item["kind"], item["key"]),
+        ),
+        "expected_legacy_v1_event_ids": manifest["expected_legacy_v1_event_ids"],
+        "expected_legacy_v1_events_sha256": manifest[
+            "expected_legacy_v1_events_sha256"
+        ],
+        "expected_projection_quarantine_count": manifest[
+            "expected_projection_quarantine_count"
+        ],
+        "expected_projection_quarantine_sha256": manifest[
+            "expected_projection_quarantine_sha256"
+        ],
+    }
+    active = _active_heads(initial)
+    desired_by_identity = {
+        (item["kind"], item["key"]): item["value"] for item in desired
+    }
+    scope_or_source_changes = any(
+        identity[0] in {"scope", "source"}
+        and (identity not in active or active[identity]["value"] != value)
+        for identity, value in desired_by_identity.items()
+    )
+    if scope_or_source_changes:
+        if remote_head is None:
+            raise LinearProjectionError("prospective_remote_head_required")
+        if projection_review_contract(initial) != reviewed_contract:
+            raise LinearProjectionError("projection_review_stale_reload_required")
+        latest = _latest_heads(initial)
+        retirement_items: list[dict[str, Any]] = []
+        for retirement in reviewed_retirements:
+            identity = (retirement["kind"], retirement["key"])
+            current = active.get(identity)
+            if (
+                current is None
+                or current["event_id"] != retirement["expected_event_id"]
+                or _value_digest(current["value"])
+                != retirement["expected_value_sha256"]
+            ):
+                raise LinearProjectionError(
+                    f"projection_retirement_stale:{identity[0]}:{identity[1]}"
+                )
+            retirement_items.append({
+                "kind": identity[0], "key": identity[1], "value": TOMBSTONE,
+            })
+
+        def prospective(items: list[dict[str, Any]]) -> dict[str, Any]:
+            candidate_comments = deepcopy(comments)
+            candidate_active = dict(active)
+            candidate_latest = dict(latest)
+            expected_revision = initial.revision
+            for item in items:
+                identity = (item["kind"], item["key"])
+                current = candidate_active.get(identity)
+                if current is not None and current["value"] == item["value"]:
+                    continue
+                previous = candidate_latest.get(identity)
+                event = build_projection_event(
+                    workstream_id=adapter.workstream_id,
+                    kind=item["kind"], key=item["key"], value=item["value"],
+                    plan_revision=adapter.plan_revision,
+                    expected_revision=expected_revision,
+                    created_at="1970-01-01T00:00:00Z",
+                    supersedes_event_id=(
+                        previous["event_id"] if previous else None
+                    ),
+                    authority=adapter.authority,
+                )
+                candidate_comments.append({
+                    "id": projection_slot_id(
+                        adapter.workstream_id, adapter.plan_revision,
+                        expected_revision, adapter.authority,
+                    ),
+                    "body": encode_projection_comment(event),
+                })
+                expected_revision += 1
+                candidate_latest[identity] = event
+                if item["value"] == TOMBSTONE:
+                    candidate_active.pop(identity, None)
+                else:
+                    candidate_active[identity] = event
+            return add_material_history(
+                snapshot, candidate_comments, token,
+                authenticated_route=authenticated_route,
+                authenticated_source=authenticated_source,
+                relation_target_resolver=relation_target_resolver,
+                permit_stale_lifecycle_for_reconcile=True,
+            )
+
+        provisional = prospective([*desired, *retirement_items])
+        decision = choose_disposition(provisional, remote_head=remote_head)
+        disposition = {
+            "kind": "disposition", "key": "root", "value": {
+                "disposition": decision["disposition"],
+                "remote_head": remote_head,
+                "recovered_from_checkpoint": decision.get(
+                    "recovered_from_checkpoint"
+                ),
+            },
+        }
+        candidate = prospective([*desired, disposition, *retirement_items])
+        compact_context(
+            candidate, token, max_bytes=100_000_000, max_items=1_000_000,
+            require_projection_authority=True,
+        )
+        return candidate, frozenset()
+
     try:
         return add_material_history(
             snapshot, comments, token, authenticated_route=authenticated_route,
@@ -356,27 +473,7 @@ def load_material_history_for_projection_reconcile(
             relation_target_resolver=relation_target_resolver,
         ), frozenset()
     except RelationReadbackError:
-        desired, reviewed_retirements = _reviewed_manifest(manifest)
-        initial = adapter.state()
-        if projection_review_contract(initial) != {
-            "expected_projection_revision": manifest["expected_projection_revision"],
-            "expected_active_heads": sorted(
-                manifest["expected_active_heads"],
-                key=lambda item: (item["kind"], item["key"]),
-            ),
-            "expected_legacy_v1_event_ids": manifest[
-                "expected_legacy_v1_event_ids"
-            ],
-            "expected_legacy_v1_events_sha256": manifest[
-                "expected_legacy_v1_events_sha256"
-            ],
-            "expected_projection_quarantine_count": manifest[
-                "expected_projection_quarantine_count"
-            ],
-            "expected_projection_quarantine_sha256": manifest[
-                "expected_projection_quarantine_sha256"
-            ],
-        }:
+        if projection_review_contract(initial) != reviewed_contract:
             raise LinearProjectionError("projection_review_stale_reload_required")
 
         active = _active_heads(initial)
@@ -818,6 +915,7 @@ def main() -> int:
                 graph, comments, token, manifest, adapter,
                 authenticated_route=route,
                 authenticated_source=authenticated_source,
+                remote_head=args.remote_head,
                 relation_target_resolver=resolver,
             )
         )

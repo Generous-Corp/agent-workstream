@@ -429,6 +429,141 @@ class ProjectionTests(unittest.TestCase):
             )
         self.assertEqual(len(client.comments), writes_before)
 
+    def test_reviewed_scope_and_source_repair_previews_strict_final_state(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        current_scope = scope()
+        current = [
+            {"kind": "scope", "key": "root", "value": current_scope},
+            {"kind": "source", "key": "root", "value": {
+                "identity": "https://github.com/acme/plans/blob/main/PLAN.md",
+                "sha256": PLAN,
+            }},
+            {"kind": "provenance", "key": "session", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "session",
+                "worktree": {"state": "safe", "head": HEAD},
+            }},
+        ]
+        current_source = current[1]["value"]
+        reconcile_required_projection(
+            adapter, {"root": {"identifier": "GEN-37"}},
+            reviewed_manifest(adapter, current), remote_head=HEAD,
+            created_at="2026-08-27T18:00:00Z",
+            authenticated_source=current_source,
+        )
+        exact_source = {
+            "identity": "https://github.com/acme/plans/blob/" + "a" * 40 + "/PLAN.md",
+            "sha256": PLAN,
+        }
+        desired_scope = deepcopy(current_scope)
+        desired_scope["child_ownership"]["GEN-72"] = (
+            "github.com:id:R_agent_workstream"
+        )
+        desired = [
+            {"kind": "scope", "key": "root", "value": desired_scope},
+            {"kind": "source", "key": "root", "value": exact_source},
+            current[2],
+        ]
+        graph = {
+            "root": {
+                "id": ROOT_UUID, "identifier": "GEN-37",
+                "url": "https://linear.app/acme/issue/GEN-37/root",
+                "plan_revision": PLAN, "revision": 0,
+                "status": "In Progress", "next_action": "Reconcile.",
+            },
+            "children": [
+                {"identifier": "GEN-38", "title": "existing",
+                 "status": "In Progress", "next_action": "continue"},
+                {"identifier": "GEN-72", "title": "new child",
+                 "status": "Done"},
+            ],
+        }
+        manifest = reviewed_manifest(adapter, desired)
+        writes_before = len(client.comments)
+
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", manifest, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=exact_source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+
+        self.assertEqual(unresolved, frozenset())
+        self.assertEqual(len(client.comments), writes_before)
+        self.assertEqual(preview["scope"], desired_scope)
+        self.assertEqual(preview["source"], exact_source)
+        result = reconcile_required_projection(
+            adapter, preview, manifest, remote_head=HEAD,
+            created_at="2026-08-27T19:00:00Z",
+            authenticated_source=exact_source,
+        )
+        self.assertTrue(result["readback_verified"])
+        strict = add_material_history(
+            graph, client.comments, "GEN-37",
+            authenticated_route=AUTHORITY, authenticated_source=exact_source,
+        )
+        self.assertEqual(strict["scope"], desired_scope)
+        self.assertEqual(strict["source"], exact_source)
+
+    def test_source_repair_that_leaves_scope_invalid_has_zero_writes(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        current = [
+            {"kind": "scope", "key": "root", "value": scope()},
+            {"kind": "source", "key": "root", "value": {
+                "identity": "https://example.test/plan", "sha256": PLAN,
+            }},
+            {"kind": "provenance", "key": "session", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "session",
+                "worktree": {"state": "safe", "head": HEAD},
+            }},
+        ]
+        current[1]["value"] = {
+            "identity": "https://github.com/acme/plans/blob/main/PLAN.md",
+            "sha256": PLAN,
+        }
+        source = current[1]["value"]
+        reconcile_required_projection(
+            adapter, {"root": {"identifier": "GEN-37"}},
+            reviewed_manifest(adapter, current), remote_head=HEAD,
+            created_at="2026-08-27T18:00:00Z", authenticated_source=source,
+        )
+        desired = deepcopy(current)
+        desired[1]["value"] = {
+            "identity": "https://github.com/acme/plans/blob/" + "a" * 40 + "/PLAN.md",
+            "sha256": PLAN,
+        }
+        graph = {
+            "root": {
+                "id": ROOT_UUID, "identifier": "GEN-37",
+                "url": "https://linear.app/acme/issue/GEN-37/root",
+                "plan_revision": PLAN, "revision": 0,
+                "status": "In Progress", "next_action": "Reconcile.",
+            },
+            "children": [
+                {"identifier": "GEN-38", "title": "existing",
+                 "status": "In Progress", "next_action": "continue"},
+                {"identifier": "GEN-72", "title": "new child", "status": "Done"},
+            ],
+        }
+        writes_before = len(client.comments)
+        with self.assertRaisesRegex(ResumeError, "unowned_children:GEN-72"):
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37",
+                reviewed_manifest(adapter, desired), adapter,
+                authenticated_route=AUTHORITY,
+                authenticated_source=desired[1]["value"],
+                remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+
     def test_legacy_unresolved_relation_retirement_precedes_unrelated_writes(self):
         client, adapter, base, source = self.legacy_relation_fixture()
         retirement = reviewed_retirement(adapter, "relation", "blocks:GEN-14")
