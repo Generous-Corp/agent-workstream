@@ -154,9 +154,10 @@ and retries a stable event ID after `RevisionConflict`.
 Linear `MutationAdapter`. It stores one immutable material delta per issue
 comment using Linear's documented `commentCreate` API, paginates the complete
 comment set, and derives the ledger revision from the valid event set. It does
-not use or claim conditional `issueUpdate`. Concurrent writers observed at the
-same revision append independent comments, so neither replaces the other.
-Replay returns the existing receipt; duplicate or conflicting event IDs,
+not use or claim conditional `issueUpdate`. A route-scoped deterministic
+client-supplied comment ID is the exclusive slot for each root revision, so
+concurrent writers cannot both advance the same revision. Replay returns the
+existing receipt; duplicate or conflicting event IDs,
 malformed markers, causal revision gaps, incomplete pagination, missing auth,
 and unobserved writes fail closed. Configure it with `LINEAR_API_KEY` and the
 exact root issue identifier. `from_env` also consumes the validated
@@ -439,7 +440,9 @@ and complete predecessor-chain recovery. `scripts/workstream_linear_checkpoints.
 persists that schema as a distinct immutable marker over the same authenticated,
 fully paginated Linear comment boundary as material-delta events. It derives an
 acknowledgement only after readback, replays an already observed event without a
-second write, and fails closed on ambiguous or malformed remote state. This is
+second write, and fences the exact live material revision and checkpoint
+predecessor through a deterministic successor slot before appending. It fails
+closed on ambiguous or malformed remote state. This is
 logical transport proof. Its `from_env` constructor consumes the same validated
 repository-root route and refuses a root outside it. Do not call the
 deterministic fake-client tests a live Linear, second-machine, process-death, or

@@ -6,6 +6,8 @@ import unittest
 from unittest import mock
 
 from workstream_delta import Delta, DeltaJournal
+from workstream_delta import RevisionConflict
+from workstream_linear import LinearTransportError
 from workstream_linear_events import (
     LinearCommentEventAdapter,
     LinearEventError,
@@ -57,10 +59,15 @@ class FakeCommentClient:
                     },
                 }
             }
+        if "WorkstreamEventCommentCreateCapability" in query:
+            return {"__type": {"inputFields": [{"name": "id"}, {"name": "body"}]}}
         if "commentCreate" in query:
             with self.lock:
+                comment_id = variables["input"]["id"]
+                if any(item["id"] == comment_id for item in self.comments):
+                    raise LinearTransportError("duplicate comment id")
                 comment = {
-                    "id": f"comment-{len(self.comments) + 1}",
+                    "id": comment_id,
                     "body": variables["input"]["body"],
                     "createdAt": "now", "updatedAt": "now",
                 }
@@ -70,7 +77,7 @@ class FakeCommentClient:
 
 
 class LinearCommentEventAdapterTests(unittest.TestCase):
-    def test_concurrent_same_revision_appends_preserve_both_deltas(self):
+    def test_concurrent_same_revision_has_one_durable_winner(self):
         client = FakeCommentClient(initial_readers=2)
         adapters = [
             LinearCommentEventAdapter(client, issue_id="GEN-37"),
@@ -92,13 +99,20 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
         for thread in threads:
             thread.join(timeout=3)
 
-        self.assertFalse(failures)
-        self.assertEqual({receipt.event_id for receipt in receipts}, {"event-a", "event-b"})
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(len(failures), 1)
+        self.assertTrue(
+            isinstance(failures[0], RevisionConflict)
+            or "expected revision 0, live revision 1" in str(failures[0])
+            or "event_slot_lost_reload_required" in str(failures[0])
+        )
         state = reduce_event_comments(client.comments, workstream_id="GEN-37")
-        self.assertEqual(state.revision, 2)
-        self.assertEqual({event.event_id for event in state.events}, {"event-a", "event-b"})
+        self.assertEqual(state.revision, 1)
+        self.assertEqual({event.event_id for event in state.events}, {
+            receipts[0].event_id
+        })
 
-    def test_delta_journals_use_append_capability_without_claiming_cas(self):
+    def test_stale_revision_refuses_before_a_second_comment(self):
         client = FakeCommentClient()
         adapter = LinearCommentEventAdapter(client, issue_id="GEN-37")
         self.assertFalse(adapter.supports_atomic_cas)
@@ -111,11 +125,12 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
         second.append("GEN-37", "decision", {"text": "B"}, 0, event_id="event-b")
 
         first.apply(adapter)
-        second.apply(adapter)
+        with self.assertRaisesRegex(RuntimeError, "expected revision 0, live revision 1"):
+            second.apply(adapter)
 
-        self.assertEqual(adapter.current_revision("GEN-37"), 2)
+        self.assertEqual(adapter.current_revision("GEN-37"), 1)
         self.assertEqual(first.pending(), [])
-        self.assertEqual(second.pending(), [])
+        self.assertEqual(len(second.pending()), 1)
 
     def test_crash_replay_returns_existing_event_without_second_comment(self):
         client = FakeCommentClient()
@@ -125,6 +140,47 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
         replay = adapter.apply(event)
         self.assertEqual(first, replay)
         self.assertEqual(len(client.comments), 1)
+
+    def test_lost_create_response_reloads_exact_slot_as_replay(self):
+        class LostResponseClient(FakeCommentClient):
+            lost = False
+
+            def execute(self, query, variables):
+                if "commentCreate" in query and not self.lost:
+                    self.lost = True
+                    super().execute(query, variables)
+                    raise LinearTransportError("response lost")
+                return super().execute(query, variables)
+
+        client = LostResponseClient()
+        receipt = LinearCommentEventAdapter(client, issue_id="GEN-37").apply(
+            delta("event-a", {"order": 1})
+        )
+        self.assertEqual(receipt.event_id, "event-a")
+        self.assertEqual(receipt.remote_id, client.comments[0]["id"])
+        self.assertEqual(len(client.comments), 1)
+
+    def test_foreign_winner_at_same_revision_refuses(self):
+        class ForeignWinnerClient(FakeCommentClient):
+            injected = False
+
+            def execute(self, query, variables):
+                if "commentCreate" in query and not self.injected:
+                    self.injected = True
+                    self.comments.append({
+                        "id": variables["input"]["id"],
+                        "body": encode_event_comment(delta("foreign", {"order": 9})),
+                        "createdAt": "now", "updatedAt": "now",
+                    })
+                    raise LinearTransportError("duplicate comment id")
+                return super().execute(query, variables)
+
+        with self.assertRaisesRegex(
+            LinearEventError, "event_slot_lost_reload_required"
+        ):
+            LinearCommentEventAdapter(
+                ForeignWinnerClient(), issue_id="GEN-37"
+            ).apply(delta("event-a", {"order": 1}))
 
     def test_duplicate_and_conflicting_event_ids_fail_closed(self):
         original = delta("event-a", {"order": 1})

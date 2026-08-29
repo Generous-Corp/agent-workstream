@@ -3,8 +3,8 @@
 
 Linear issue updates are not conditional. This adapter therefore never
 rewrites issue state: each delta is one issue comment and the live revision is
-the number of unique, valid event comments. Concurrent appends from the same
-revision commute and are retained by the reducer.
+the number of unique, valid event comments. A route-scoped deterministic
+comment ID is the exclusive remote slot for each revision.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import hmac
 import json
 import os
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,6 +54,12 @@ mutation WorkstreamDeltaCommentCreate($input: CommentCreateInput!) {
 }
 """
 
+COMMENT_CREATE_CAPABILITY_QUERY = """
+query WorkstreamEventCommentCreateCapability {
+  __type(name: "CommentCreateInput") { inputFields { name } }
+}
+"""
+
 
 class LinearEventError(LinearTransportError):
     """The remote event journal cannot be reduced without guessing."""
@@ -64,6 +71,34 @@ class ReducedEventLog:
     revision: int
     events: tuple[Delta, ...]
     remote_ids: dict[str, str]
+
+
+def deterministic_comment_slot_id(
+    slot_kind: str,
+    workstream_id: str,
+    fence: Any,
+    authority: dict[str, str],
+) -> str:
+    """Return one UUIDv4-shaped remote create slot for a fenced append."""
+    if slot_kind not in {"material-event", "checkpoint"}:
+        raise LinearEventError("invalid_comment_slot_kind")
+    if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", workstream_id.upper()):
+        raise LinearEventError("invalid_comment_slot_workstream")
+    required = {"workspace_id", "team_id", "project_id", "root_issue_id"}
+    if set(authority) != required or not all(
+        isinstance(authority[field], str) and authority[field] for field in required
+    ):
+        raise LinearEventError("comment_slot_authority_incomplete")
+    material = json.dumps(
+        [f"workstream-{slot_kind}-slot-v1", authority, workstream_id.upper(), fence],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    raw = bytearray(hashlib.sha256(material).digest()[:16])
+    raw[6] = (raw[6] & 0x0F) | 0x40
+    raw[8] = (raw[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(raw)))
 
 
 def _canonical_event(delta: Delta) -> dict[str, Any]:
@@ -203,6 +238,8 @@ class LinearCommentEventAdapter:
         self.workspace_id = workspace_id
         self.team_id = team_id
         self.project_id = project_id
+        self._observed_authority: dict[str, str] | None = None
+        self._comment_id_capability_verified = False
         if any((workspace_id, team_id, project_id)) and not all((workspace_id, team_id, project_id)):
             raise ValueError("Linear workspace, team, and project IDs must be supplied together")
 
@@ -249,6 +286,19 @@ class LinearCommentEventAdapter:
                 )
             except LinearTransportError as error:
                 raise LinearEventError(str(error)) from error
+            team = issue.get("team") or {}
+            project = issue.get("project") or {}
+            authority = {
+                "workspace_id": (team.get("organization") or {}).get("id"),
+                "team_id": team.get("id"),
+                "project_id": project.get("id"),
+                "root_issue_id": issue.get("id"),
+            }
+            if not all(isinstance(value, str) and value for value in authority.values()):
+                raise LinearEventError("comment_slot_authority_incomplete")
+            if self._observed_authority is not None and self._observed_authority != authority:
+                raise LinearEventError("comment_slot_authority_changed")
+            self._observed_authority = authority  # type: ignore[assignment]
             connection = issue.get("comments") or {}
             comments.extend(connection.get("nodes") or [])
             page_info = connection.get("pageInfo") or {}
@@ -271,6 +321,17 @@ class LinearCommentEventAdapter:
             raise LinearEventError("workstream_id_mismatch")
         return self._state(workstream_id).revision
 
+    def _assert_comment_id_capability(self) -> None:
+        if self._comment_id_capability_verified:
+            return
+        result = self.client.execute(COMMENT_CREATE_CAPABILITY_QUERY, {})
+        fields = ((result.get("__type") or {}).get("inputFields") or [])
+        if not isinstance(fields, list) or "id" not in {
+            field.get("name") for field in fields if isinstance(field, dict)
+        }:
+            raise LinearEventError("linear_comment_create_id_capability_unavailable")
+        self._comment_id_capability_verified = True
+
     def apply(self, delta: Delta) -> MutationReceipt:
         if delta.workstream_id != self.issue_id:
             raise LinearEventError("workstream_id_mismatch")
@@ -281,18 +342,49 @@ class LinearCommentEventAdapter:
             if _canonical_event(existing) != _canonical_event(delta):
                 raise LinearEventError(f"conflicting_event_id:{delta.event_id}")
             return MutationReceipt(delta.event_id, before.revision, existing_id)
-        if delta.expected_revision > before.revision:
+        if delta.expected_revision != before.revision:
             raise RevisionConflict(
                 f"expected revision {delta.expected_revision}, live revision {before.revision}"
             )
 
-        response = self.client.execute(
-            COMMENT_CREATE_MUTATION,
-            {"input": {"issueId": self.issue_id, "body": encode_event_comment(delta)}},
+        if self._observed_authority is None:
+            raise LinearEventError("comment_slot_authority_incomplete")
+        slot_id = deterministic_comment_slot_id(
+            "material-event", delta.workstream_id, delta.expected_revision,
+            self._observed_authority,
         )
+        self._assert_comment_id_capability()
+
+        try:
+            response = self.client.execute(
+                COMMENT_CREATE_MUTATION,
+                {"input": {
+                    "id": slot_id,
+                    "issueId": self.issue_id,
+                    "body": encode_event_comment(delta),
+                }},
+            )
+        except LinearTransportError:
+            after_error = self._state(delta.workstream_id)
+            winner = next(
+                (
+                    event for event in after_error.events
+                    if after_error.remote_ids.get(event.event_id) == slot_id
+                ),
+                None,
+            )
+            if winner is not None and _canonical_event(winner) == _canonical_event(delta):
+                return MutationReceipt(delta.event_id, after_error.revision, slot_id)
+            if winner is not None:
+                raise LinearEventError("event_slot_lost_reload_required")
+            raise
         created = response.get("commentCreate") or {}
         comment = created.get("comment")
-        if created.get("success") is not True or not comment or not comment.get("id"):
+        if (
+            created.get("success") is not True
+            or not comment
+            or comment.get("id") != slot_id
+        ):
             raise LinearEventError("Linear comment creation returned no durable receipt")
 
         after = self._state(delta.workstream_id)
