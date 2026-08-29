@@ -46,8 +46,13 @@ os.execvp("ssh", ["ssh", "-oBatchMode=yes", *sys.argv[1:]])
 """
 
 
-def _immutable_github_blob(source: str) -> tuple[str, str, str, str] | None:
-    """Parse a strict immutable github.com blob identity for SSH fallback."""
+def _github_ssh_blob(source: str) -> tuple[str, str, str, str] | None:
+    """Parse a strict GitHub blob identity supported by the SSH fallback.
+
+    Exact commits remain preferred. The canonical ``main`` ref is also allowed
+    for a synchronized living plan: Git snapshots one FETCH_HEAD and the caller
+    still verifies its bytes against the root's recorded SHA-256 revision.
+    """
     parsed = urlparse(source)
     if parsed.scheme != "https" or parsed.netloc.lower() != "github.com":
         return None
@@ -63,7 +68,7 @@ def _immutable_github_blob(source: str) -> tuple[str, str, str, str] | None:
     if (
         not GITHUB_OWNER.fullmatch(owner)
         or not GITHUB_REPOSITORY.fullmatch(repository)
-        or not EXACT_GIT_COMMIT.fullmatch(commit)
+        or (not EXACT_GIT_COMMIT.fullmatch(commit) and commit != "main")
         or len(path) > 4096
         or any(
             not segment
@@ -149,9 +154,9 @@ def _write_ssh_wrapper(directory: str) -> str:
 
 
 def _github_ssh_blob_bytes(
-    owner: str, repository: str, commit: str, path: str,
+    owner: str, repository: str, revision: str, path: str,
 ) -> bytes:
-    """Fetch one exact GitHub object over SSH in a disposable bare repo."""
+    """Fetch one bounded GitHub snapshot over SSH in a disposable bare repo."""
     remote = f"git@github.com:{owner}/{repository}.git"
     with tempfile.TemporaryDirectory(prefix="workstream-plan-") as directory:
         repository_path = str(Path(directory) / "repository.git")
@@ -167,14 +172,17 @@ def _github_ssh_blob_bytes(
         _run_bounded(
             [
                 "git", "-C", repository_path, "fetch", "--quiet", "--no-tags",
-                "--depth=1", remote, commit,
+                "--depth=1", remote,
+                revision if EXACT_GIT_COMMIT.fullmatch(revision)
+                else "refs/heads/main",
             ],
             environment=environment, timeout=GIT_FETCH_TIMEOUT_SECONDS,
         )
         return _run_bounded(
             [
                 "git", "-C", repository_path, "show", "--no-ext-diff",
-                "--no-textconv", f"{commit}:{path}",
+                "--no-textconv",
+                f"{revision if EXACT_GIT_COMMIT.fullmatch(revision) else 'FETCH_HEAD'}:{path}",
             ],
             environment=environment, timeout=GIT_SHOW_TIMEOUT_SECONDS,
         )
@@ -208,10 +216,10 @@ def source_bytes(source: str, identity: str | None = None) -> tuple[bytes, str]:
             ) as response:
                 return response.read(), identity or source
         except HTTPError as error:
-            immutable = _immutable_github_blob(source)
-            if error.code != 404 or immutable is None:
+            ssh_blob = _github_ssh_blob(source)
+            if error.code != 404 or ssh_blob is None:
                 raise
-            return _github_ssh_blob_bytes(*immutable), identity or source
+            return _github_ssh_blob_bytes(*ssh_blob), identity or source
     path = Path(source).expanduser().resolve()
     return path.read_bytes(), identity or str(path)
 

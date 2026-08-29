@@ -119,9 +119,35 @@ class PlanIntakeTests(unittest.TestCase):
         self.assertEqual(show[2], MODULE.GIT_SHOW_TIMEOUT_SECONDS)
         self.assertIn('"-oBatchMode=yes"', MODULE.SSH_WRAPPER)
 
+    def test_private_main_plan_404_falls_back_to_one_bounded_git_snapshot(self):
+        source = "https://github.com/acme/plans/blob/main/PLAN.md"
+        missing = self.http_error(source, 404, "Not Found")
+        calls = []
+
+        def run(arguments, *, environment, timeout):
+            calls.append(arguments)
+            return b"# Current private plan\n" if len(calls) == 3 else b""
+
+        with mock.patch.object(MODULE, "urlopen", side_effect=missing), \
+             mock.patch.object(MODULE, "_run_bounded", side_effect=run):
+            raw, identity = MODULE.source_bytes(source)
+
+        isolated = calls[0][-1]
+        self.assertEqual(raw, b"# Current private plan\n")
+        self.assertEqual(identity, source)
+        self.assertEqual(calls[1], [
+            "git", "-C", isolated, "fetch", "--quiet", "--no-tags",
+            "--depth=1", "git@github.com:acme/plans.git", "refs/heads/main",
+        ])
+        self.assertEqual(calls[2], [
+            "git", "-C", isolated, "show", "--no-ext-diff", "--no-textconv",
+            "FETCH_HEAD:PLAN.md",
+        ])
+
     def test_github_ssh_fallback_refuses_mutable_or_malformed_blob_urls(self):
         invalid = [
-            "https://github.com/acme/plans/blob/main/PLAN.md",
+            "https://github.com/acme/plans/blob/master/PLAN.md",
+            "https://github.com/acme/plans/blob/feature/PLAN.md",
             f"https://github.com/acme/plans/blob/{'a' * 39}/PLAN.md",
             f"https://github.com/bad_owner/plans/blob/{'a' * 40}/PLAN.md",
             f"https://github.com/acme/plans/blob/{'a' * 40}/../PLAN.md",

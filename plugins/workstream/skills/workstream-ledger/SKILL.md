@@ -314,8 +314,11 @@ caps when that complete history is known to exceed the normal resume budget;
 required current state is never truncated.
 For an immutable `github.com/.../blob/<40-hex-commit>/<path>` source, HTTPS is
 tried first; a 404 may fall back to existing noninteractive GitHub SSH access
-in a temporary isolated repository. Mutable refs, malformed paths, prompts,
-timeouts, and Git failures refuse resume rather than weakening source proof.
+in a temporary isolated repository. A synchronized living plan may use the
+canonical `blob/main` identity: the fallback snapshots one `FETCH_HEAD`, and
+resume still refuses unless those bytes match the root's recorded SHA-256.
+Other mutable refs, malformed paths, prompts, timeouts, and Git failures refuse
+resume rather than weakening source proof.
 Any positional JSON snapshot requires `--inspection-only`, labels its output
 `inspection_only`, and is not authority to continue work; JSON fields that
 claim authentication do not change that boundary. Full authority comes only
