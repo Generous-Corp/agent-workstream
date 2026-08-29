@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import threading
+import tempfile
 import unittest
+from dataclasses import replace
+from pathlib import Path
 from unittest import mock
 
 import workstream_linear_events as linear_events_module
@@ -162,6 +165,83 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
         self.assertEqual(replay.revision, 1)
         self.assertEqual(replay.remote_id, client.comments[0]["id"])
         self.assertEqual(len(client.comments), 2)
+
+    def test_crash_after_rebased_remote_accept_replays_from_fresh_journal(self):
+        client = FakeCommentClient()
+        adapter = LinearCommentEventAdapter(client, issue_id="GEN-37")
+        adapter.apply(delta("event-a", {"order": 1}))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.sqlite3"
+            journal = DeltaJournal(path)
+            event_id = journal.append(
+                "GEN-37", "requirement", {"order": 2}, 0,
+                event_id="event-b", source="agent_discovery",
+            )
+            crashed = False
+
+            def crash_after_remote_accept():
+                nonlocal crashed
+                if not crashed:
+                    crashed = True
+                    raise RuntimeError("crash after rebased remote accept")
+
+            journal.commit_hook = crash_after_remote_accept
+            with mock.patch.object(
+                linear_events_module, "RevisionConflict", RevisionConflict
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "crash after rebased remote accept"
+                ):
+                    journal.apply_with_rebase(adapter)
+            journal.commit_hook = None
+            journal.close()
+
+            remote = reduce_event_comments(
+                client.comments, workstream_id="GEN-37"
+            )
+            rebased = next(
+                event for event in remote.events if event.event_id == event_id
+            )
+            self.assertEqual(rebased.expected_revision, 1)
+
+            fresh = DeltaJournal(path)
+            self.addCleanup(fresh.close)
+            self.assertEqual(fresh.pending()[0].expected_revision, 0)
+            receipts = fresh.apply_with_rebase(adapter)
+
+            self.assertEqual(receipts[0].event_id, event_id)
+            self.assertEqual(receipts[0].revision, 2)
+            self.assertEqual(fresh.pending(), [])
+            self.assertEqual(len(client.comments), 2)
+
+    def test_rebased_replay_rejects_reverse_revision_and_material_mismatch(self):
+        client = FakeCommentClient()
+        first = delta("event-a", {"order": 1})
+        remote = delta("event-b", {"order": 2}, expected_revision=1)
+        client.comments.extend([
+            {"id": "legacy-1", "body": encode_event_comment(first)},
+            {"id": "legacy-2", "body": encode_event_comment(remote)},
+        ])
+        adapter = LinearCommentEventAdapter(client, issue_id="GEN-37")
+        original = replace(remote, expected_revision=0)
+        self.assertEqual(adapter.apply(original).revision, 2)
+
+        mismatches = [
+            replace(original, expected_revision=2),
+            replace(original, payload={"order": 99}),
+            replace(original, kind="decision"),
+            replace(original, source="user_turn"),
+            replace(original, created_at="2026-08-20T00:01:00Z"),
+        ]
+        for mismatch in mismatches:
+            with self.subTest(mismatch=mismatch):
+                with self.assertRaisesRegex(
+                    LinearEventError, "conflicting_event_id:event-b"
+                ):
+                    adapter.apply(mismatch)
+        with self.assertRaisesRegex(LinearEventError, "workstream_id_mismatch"):
+            adapter.apply(replace(original, workstream_id="OPS-9"))
 
     def test_legacy_arbitrary_comment_id_history_remains_compatible(self):
         client = FakeCommentClient()

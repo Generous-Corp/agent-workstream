@@ -138,6 +138,20 @@ def _canonical_event(delta: Delta) -> dict[str, Any]:
     }
 
 
+def _rebase_compatible_replay(existing: Delta, requested: Delta) -> bool:
+    """Accept only the same event durably rebased to a later revision."""
+    if existing.expected_revision < requested.expected_revision:
+        return False
+    return (
+        existing.event_id == requested.event_id
+        and existing.workstream_id == requested.workstream_id
+        and existing.kind == requested.kind
+        and existing.source == requested.source
+        and existing.payload == requested.payload
+        and existing.created_at == requested.created_at
+    )
+
+
 def encode_event_comment(delta: Delta) -> str:
     encoded = base64.urlsafe_b64encode(
         json.dumps(
@@ -402,7 +416,7 @@ class LinearCommentEventAdapter:
                     event for event in before.events
                     if event.event_id == delta.event_id
                 )
-                if _canonical_event(existing) != _canonical_event(delta):
+                if not _rebase_compatible_replay(existing, delta):
                     raise LinearEventError(f"conflicting_event_id:{delta.event_id}")
                 return MutationReceipt(
                     delta.event_id,

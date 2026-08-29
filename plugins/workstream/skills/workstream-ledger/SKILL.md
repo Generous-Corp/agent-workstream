@@ -160,7 +160,12 @@ workspace/root identity, current material revision, and checkpoint frontier.
 Team or project moves therefore cannot create a second slot. A checkpoint
 winner moves a concurrent event to the next frontier; an event winner forces a
 pending checkpoint to reload and rebuild. Replay returns the existing receipt;
-duplicate or conflicting event IDs,
+bounded rebase replay also accepts the same stable event ID when workstream,
+kind, source, payload, and creation time are identical and the remote expected
+revision moved only forward. Reverse revisions or any other material mismatch
+remain conflicts. This closes the crash window where remote acceptance occurs
+after rebase but before the local outbox acknowledgement. Duplicate or
+conflicting event IDs,
 malformed markers, causal revision gaps, incomplete pagination, missing auth,
 and unobserved writes fail closed. Configure it with `LINEAR_API_KEY` and the
 exact root issue identifier. `from_env` also consumes the validated
