@@ -1053,6 +1053,19 @@ def reconcile_required_projection(
     _require_repairs_for_changed_child_closures(
         desired, active_heads, manifest.get("terminal_child_repairs") or [],
     )
+    if manifest.get("terminal_child_repairs"):
+        if reviewed_retirements:
+            raise LinearProjectionError("terminal_child_repair_forbids_retirements")
+        for item in desired:
+            identity = (item["kind"], item["key"])
+            if item["kind"] in {"scope", "child_closure", "disposition"}:
+                continue
+            current = active_heads.get(identity)
+            if current is None or current["value"] != item["value"]:
+                raise LinearProjectionError(
+                    f"terminal_child_repair_unrelated_change:"
+                    f"{identity[0]}:{identity[1]}"
+                )
     latest_heads = _latest_heads(initial)
     retirements: list[dict[str, Any]] = []
     for retirement in reviewed_retirements:

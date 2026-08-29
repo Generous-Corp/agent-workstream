@@ -1428,6 +1428,42 @@ class ProjectionTests(unittest.TestCase):
                 authenticated_source=source,
             )
         self.assertEqual(len(client.comments), writes_before)
+        combined_projection = deepcopy(prepared["projection"])
+        combined_evidence = next(
+            item for item in combined_projection
+            if item["kind"] == "evidence_contract"
+            and item["value"].get("owning_child") == "GEN-72"
+        )
+        combined_evidence["value"]["layers"]["logic"]["receipts"][0][
+            "id"
+        ] = "simultaneous-replacement"
+        combined_manifest = {
+            **reviewed_manifest(adapter, combined_projection),
+            "terminal_child_repairs": deepcopy(
+                stale_manifest["terminal_child_repairs"]
+            ),
+        }
+        with self.assertRaisesRegex(
+            ResumeError, "child_closure_evidence_set_mismatch",
+        ):
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37", combined_manifest, adapter,
+                authenticated_route=AUTHORITY,
+                authenticated_source=source, remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        self.assertEqual(len(client.comments), writes_before)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_repair_unrelated_change:evidence_contract:",
+        ):
+            reconcile_required_projection(
+                adapter, graph, combined_manifest, remote_head=HEAD,
+                created_at="2026-08-27T20:50:00Z",
+                authenticated_source=source,
+                terminal_child_fence=lambda _identifier: expected,
+            )
+        self.assertEqual(len(client.comments), writes_before)
         self.assertEqual(closure_item["value"]["child_identifier"], "GEN-72")
 
     def test_legacy_unresolved_relation_retirement_precedes_unrelated_writes(self):
