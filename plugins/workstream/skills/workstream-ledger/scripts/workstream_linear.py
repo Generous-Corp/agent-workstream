@@ -16,7 +16,7 @@ import re
 import ssl
 import urllib.request
 import uuid
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from workstream_http import default_ssl_context
 from workstream_graph import GraphReviewRequired, build_operations
@@ -189,6 +189,27 @@ def deterministic_issue_id(
         raise ValueError("deterministic Linear child identity needs a stable key")
     material = json.dumps(
         ["workstream-issue-v1", *fields, child_stable_key],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    deterministic = uuid.uuid5(ISSUE_ID_NAMESPACE, material)
+    return str(uuid.UUID(bytes=deterministic.bytes, version=4))
+
+
+def deterministic_existing_root_child_id(
+    *, workspace_id: str, team_id: str, project_id: str,
+    root_issue_id: str, child_stable_key: str,
+) -> str:
+    """Return a deterministic child ID scoped to an immutable legacy root ID."""
+    fields = (
+        workspace_id, team_id, project_id, root_issue_id, child_stable_key,
+    )
+    if any(not isinstance(value, str) or not value.strip() for value in fields):
+        raise ValueError(
+            "existing-root child identity needs a complete route, root ID, and key"
+        )
+    material = json.dumps(
+        ["workstream-existing-root-child-v1", *fields],
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -848,6 +869,181 @@ class LinearGraphQLTransport:
             "root": final_root,
             "issues": applied,
             "receipts": {"root": root_receipt, "children": child_receipts},
+        }
+
+    def extend_existing_root_reviewed_child(
+        self,
+        plan: dict[str, Any],
+        *,
+        root_issue_id: str,
+        reviewed_candidate_key: str,
+        source_revision: str,
+        plan_revision: str,
+        expected_frontier: dict[str, int],
+        frontier_fence: Callable[[], dict[str, int]],
+    ) -> dict[str, Any]:
+        """Create or converge one reviewed child beneath an immutable legacy root.
+
+        This is deliberately separate from initial intake: a legacy root can lack
+        an intake stable-key marker, so treating it as a new plan would create a
+        second root. The caller supplies the authenticated route through this
+        transport and a live material/projection fence from the resume surface.
+        """
+        if plan.get("graph_review_required") is not True:
+            raise GraphReviewRequired("candidate graph review is required")
+        source = plan.get("source")
+        root_plan = plan.get("root")
+        children = plan.get("children")
+        if not isinstance(source, dict) or not isinstance(root_plan, dict):
+            raise GraphReviewRequired("reviewed plan source is incomplete")
+        if source.get("sha256") != source_revision:
+            raise GraphReviewRequired("reviewed source revision did not reproduce")
+        if root_plan.get("plan_revision") != plan_revision:
+            raise GraphReviewRequired("reviewed plan revision did not reproduce")
+        if source_revision != plan_revision:
+            raise GraphReviewRequired("source and plan revisions differ")
+        if not isinstance(children, list):
+            raise GraphReviewRequired("reviewed candidate list is incomplete")
+        candidates = [
+            child for child in children
+            if isinstance(child, dict)
+            and child.get("key") == reviewed_candidate_key
+        ]
+        if len(candidates) != 1:
+            raise GraphReviewRequired("reviewed candidate key did not reproduce uniquely")
+        candidate = candidates[0]
+        if not isinstance(candidate.get("title"), str) or not candidate["title"].strip():
+            raise GraphReviewRequired("reviewed candidate title is invalid")
+        required_frontier = {"material_revision", "projection_revision"}
+        if (
+            set(expected_frontier) != required_frontier
+            or any(
+                not isinstance(expected_frontier[field], int)
+                or expected_frontier[field] < 0
+                for field in required_frontier
+            )
+        ):
+            raise ValueError("expected material/projection frontier is invalid")
+        if not callable(frontier_fence):
+            raise ValueError("a live material/projection frontier fence is required")
+        if not isinstance(root_issue_id, str) or not root_issue_id.strip():
+            raise ValueError("existing root issue ID is required")
+
+        route = self._intake_route()
+        self._ensure_route()
+
+        def verify_frontier() -> None:
+            observed = frontier_fence()
+            if observed != expected_frontier:
+                raise LinearTransportError(
+                    "existing_root_frontier_changed_reload_required"
+                )
+
+        current = self.snapshot()["issues"]
+        root = next((item for item in current if item.get("id") == root_issue_id), None)
+        if not isinstance(root, dict):
+            raise LinearTransportError("existing_workstream_root_not_found")
+        if root.get("parent") is not None:
+            raise LinearTransportError("existing_workstream_root_is_child")
+        validate_issue_route(root, **route)
+        if parse_plan_revision(root.get("description")) != plan_revision:
+            raise LinearTransportError("existing_root_plan_revision_changed")
+
+        child_id = deterministic_existing_root_child_id(
+            **route,
+            root_issue_id=root_issue_id,
+            child_stable_key=reviewed_candidate_key,
+        )
+        root_children = [
+            item for item in current
+            if (item.get("parent") or {}).get("id") == root_issue_id
+        ]
+        matching = [
+            item for item in root_children
+            if issue_key(item) == reviewed_candidate_key
+        ]
+        if len(matching) > 1:
+            raise LinearTransportError("duplicate_workstream_child")
+        child = matching[0] if matching else None
+        disposition = "existing"
+        verify_frontier()
+        if child is not None:
+            self._validate_intake_issue(
+                child,
+                issue_id=child_id,
+                stable_key=reviewed_candidate_key,
+                title=candidate["title"],
+                plan_revision=plan_revision,
+                parent_id=root_issue_id,
+            )
+        else:
+            occupied = next((item for item in current if item.get("id") == child_id), None)
+            if occupied is not None:
+                self._validate_intake_issue(
+                    occupied,
+                    issue_id=child_id,
+                    stable_key=reviewed_candidate_key,
+                    title=candidate["title"],
+                    plan_revision=plan_revision,
+                    parent_id=root_issue_id,
+                )
+                child, disposition = occupied, "converged"
+            else:
+                # Re-fence immediately before the only mutation. A concurrent
+                # cooperative writer advances this frontier and forces reload.
+                verify_frontier()
+                child, disposition = self._create_or_converge(
+                    issue_id=child_id,
+                    stable_key=reviewed_candidate_key,
+                    title=candidate["title"],
+                    description=durable_description(
+                        reviewed_candidate_key,
+                        plan_revision,
+                        next_action=candidate.get("next_action"),
+                    ),
+                    plan_revision=plan_revision,
+                    parent_id=root_issue_id,
+                )
+
+        verify_frontier()
+        final = self.snapshot()["issues"]
+        final_root = next(
+            (item for item in final if item.get("id") == root_issue_id), None
+        )
+        if (
+            not isinstance(final_root, dict)
+            or final_root.get("parent") is not None
+            or parse_plan_revision(final_root.get("description")) != plan_revision
+        ):
+            raise LinearTransportError("existing_root_readback_changed")
+        validate_issue_route(final_root, **route)
+        final_child = next((item for item in final if item.get("id") == child_id), None)
+        if not isinstance(final_child, dict):
+            raise LinearTransportError(
+                f"intake_readback_missing_child:{reviewed_candidate_key}"
+            )
+        self._validate_intake_issue(
+            final_child,
+            issue_id=child_id,
+            stable_key=reviewed_candidate_key,
+            title=candidate["title"],
+            plan_revision=plan_revision,
+            parent_id=root_issue_id,
+        )
+        verify_frontier()
+        return {
+            "schema_version": 1,
+            "source": source,
+            "plan_revision": plan_revision,
+            "route": route,
+            "root": final_root,
+            "issues": [] if disposition == "existing" else [final_child],
+            "receipt": self._intake_receipt(
+                final_child,
+                stable_key=reviewed_candidate_key,
+                disposition=disposition,
+            ),
+            "frontier": dict(expected_frontier),
         }
 
     def apply_reviewed_plan(

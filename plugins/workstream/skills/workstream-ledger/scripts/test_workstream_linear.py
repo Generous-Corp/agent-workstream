@@ -14,6 +14,7 @@ from workstream_linear import (
     LinearGraphQLTransport,
     LinearTransportError,
     MARKER,
+    deterministic_existing_root_child_id,
     deterministic_issue_id,
     parse_next_action,
     parse_plan_revision,
@@ -140,6 +141,41 @@ class LinearTransportTests(unittest.TestCase):
             fake, team_id="team", workspace_id="workspace", project_id="project"
         )
 
+    def legacy_extension_plan(self):
+        plan = self.plan()
+        plan["source"] = {
+            "identity": "plan:legacy", "sha256": "sha-demo", "bytes": 10,
+        }
+        return plan
+
+    def legacy_root(self):
+        return {
+            "id": "409c1423-f949-4655-9f5f-d3213d7b434f",
+            "identifier": "GEN-37",
+            "title": "Legacy root",
+            "description": "Plan revision: sha-demo\nLedger revision: 3",
+            "url": "https://linear.test/37",
+            "updatedAt": "now",
+            "state": {"name": "In Progress", "type": "started"},
+            "parent": None,
+            "project": {"id": "project"},
+            "team": {
+                "id": "team", "organization": {"id": "workspace"},
+            },
+        }
+
+    def extend_legacy(self, transport, *, frontier_fence=None):
+        frontier = {"material_revision": 3, "projection_revision": 7}
+        return transport.extend_existing_root_reviewed_child(
+            self.legacy_extension_plan(),
+            root_issue_id="409c1423-f949-4655-9f5f-d3213d7b434f",
+            reviewed_candidate_key="a",
+            source_revision="sha-demo",
+            plan_revision="sha-demo",
+            expected_frontier=frontier,
+            frontier_fence=frontier_fence or (lambda: dict(frontier)),
+        )
+
     def test_reviewed_plan_creates_one_root_and_child(self):
         fake = FakeClient()
         result = LinearGraphQLTransport(fake, team_id="team").apply_reviewed_plan(self.plan(), accepted_keys={"a"})
@@ -214,6 +250,128 @@ class LinearTransportTests(unittest.TestCase):
         self.assertEqual(len(fake.issues), 2)
         self.assertTrue(all(uuid.UUID(issue["id"]).version == 4 for issue in fake.issues))
         self.assertEqual(result["receipts"]["root"]["id"], fake.issues[0]["id"])
+
+    def test_existing_legacy_root_extension_creates_only_scoped_child(self):
+        fake = UUIDv4ValidatingFakeClient()
+        fake.issues.append(self.legacy_root())
+
+        result = self.extend_legacy(self.routed_transport(fake))
+
+        child_id = deterministic_existing_root_child_id(
+            workspace_id="workspace", team_id="team", project_id="project",
+            root_issue_id="409c1423-f949-4655-9f5f-d3213d7b434f",
+            child_stable_key="a",
+        )
+        self.assertEqual(len(fake.issues), 2)
+        self.assertEqual(result["root"]["identifier"], "GEN-37")
+        self.assertEqual(result["receipt"]["id"], child_id)
+        self.assertEqual(result["receipt"]["parent_id"], self.legacy_root()["id"])
+        self.assertEqual(result["receipt"]["disposition"], "created")
+        self.assertEqual(sum("issueCreate" in query for query, _ in fake.calls), 1)
+
+    def test_existing_root_extension_replay_is_a_zero_write_no_op(self):
+        fake = FakeClient()
+        fake.issues.append(self.legacy_root())
+        transport = self.routed_transport(fake)
+        first = self.extend_legacy(transport)
+        fake.calls.clear()
+
+        second = self.extend_legacy(transport)
+
+        self.assertEqual(first["receipt"]["id"], second["receipt"]["id"])
+        self.assertEqual(second["receipt"]["disposition"], "existing")
+        self.assertEqual(second["issues"], [])
+        self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
+
+    def test_existing_root_extension_lost_response_converges(self):
+        class LostResponseFake(FakeClient):
+            def execute(self, query, variables):
+                result = super().execute(query, variables)
+                if "issueCreate" in query:
+                    raise TimeoutError("response lost after commit")
+                return result
+
+        fake = LostResponseFake()
+        fake.issues.append(self.legacy_root())
+
+        result = self.extend_legacy(self.routed_transport(fake))
+
+        self.assertEqual(len(fake.issues), 2)
+        self.assertEqual(result["receipt"]["disposition"], "converged")
+
+    def test_existing_root_extension_collision_fails_closed(self):
+        fake = FakeClient()
+        fake.issues.append(self.legacy_root())
+        child_id = deterministic_existing_root_child_id(
+            workspace_id="workspace", team_id="team", project_id="project",
+            root_issue_id=self.legacy_root()["id"], child_stable_key="a",
+        )
+        fake.issues.append({
+            **self.legacy_root(),
+            "id": child_id,
+            "identifier": "GEN-99",
+            "title": "Collision",
+            "description": "<!-- workstream-key:other -->\nPlan revision: sha-demo",
+        })
+
+        with self.assertRaisesRegex(LinearTransportError, "intake_identity_collision"):
+            self.extend_legacy(self.routed_transport(fake))
+        self.assertEqual(len(fake.issues), 2)
+
+    def test_existing_root_extension_stale_frontier_is_zero_write(self):
+        fake = FakeClient()
+        fake.issues.append(self.legacy_root())
+
+        with self.assertRaisesRegex(
+            LinearTransportError, "existing_root_frontier_changed_reload_required",
+        ):
+            self.extend_legacy(
+                self.routed_transport(fake),
+                frontier_fence=lambda: {
+                    "material_revision": 4, "projection_revision": 7,
+                },
+            )
+
+        self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
+
+    def test_existing_root_extension_concurrent_advance_before_create_is_zero_write(self):
+        fake = FakeClient()
+        fake.issues.append(self.legacy_root())
+        observed = iter([
+            {"material_revision": 3, "projection_revision": 7},
+            {"material_revision": 3, "projection_revision": 8},
+        ])
+
+        with self.assertRaisesRegex(
+            LinearTransportError, "existing_root_frontier_changed_reload_required",
+        ):
+            self.extend_legacy(
+                self.routed_transport(fake), frontier_fence=lambda: next(observed),
+            )
+
+        self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
+
+    def test_existing_root_extension_requires_exact_reviewed_source_before_network(self):
+        fake = FakeClient()
+        fake.issues.append(self.legacy_root())
+        transport = self.routed_transport(fake)
+
+        with self.assertRaisesRegex(GraphReviewRequired, "source revision"):
+            transport.extend_existing_root_reviewed_child(
+                self.legacy_extension_plan(),
+                root_issue_id=self.legacy_root()["id"],
+                reviewed_candidate_key="a",
+                source_revision="sha-other",
+                plan_revision="sha-demo",
+                expected_frontier={
+                    "material_revision": 3, "projection_revision": 7,
+                },
+                frontier_fence=lambda: {
+                    "material_revision": 3, "projection_revision": 7,
+                },
+            )
+
+        self.assertEqual(fake.calls, [])
 
     def test_live_uuid_contract_fake_rejects_legacy_uuid_v5(self):
         fake = UUIDv4ValidatingFakeClient()
