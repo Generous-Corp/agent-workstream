@@ -50,6 +50,9 @@ from workstream_child_closure import (
 from workstream_scope import (
     repository_key, ScopeError, validate_relations, validate_scope,
 )
+from workstream_projection_history import (
+    closure_bound_historical_evidence, ProjectionHistoryError,
+)
 
 
 TOKEN = re.compile(r"\b[A-Z][A-Z0-9]*-\d+\b", re.I)
@@ -1143,6 +1146,16 @@ def validate_snapshot(
         evidence_contracts = snapshot.get("evidence_contracts", [])
         if not isinstance(evidence_contracts, list):
             raise ResumeError("evidence_contracts must be a list")
+        historical_evidence_event_ids: frozenset[str] = frozenset()
+        if scope is not None and projection_events:
+            try:
+                historical_evidence_event_ids = (
+                    closure_bound_historical_evidence(
+                        projection_events, scope,
+                    )
+                )
+            except ProjectionHistoryError as error:
+                raise ResumeError(str(error)) from error
         for index, contract in enumerate(evidence_contracts):
             errors = evidence_errors(contract)
             if errors:
@@ -1160,7 +1173,17 @@ def validate_snapshot(
                 )
                 if contract.get("repository") not in [scoped_repository["slug"], *scoped_repository.get("aliases", [])]:
                     raise ResumeError(f"evidence_repository_route_unknown:{index}")
-                if contract.get("exact_head") != scoped_repository["exact_head"]:
+                evidence_event = active.get((
+                    "evidence_contract", str(contract.get("slice_id", "")),
+                ))
+                if (
+                    contract.get("exact_head") != scoped_repository["exact_head"]
+                    and (
+                        evidence_event is None
+                        or evidence_event.get("event_id")
+                        not in historical_evidence_event_ids
+                    )
+                ):
                     raise ResumeError(f"evidence_head_mismatch:{index}")
         child_closures = snapshot.get("child_closures", [])
         if not isinstance(child_closures, list):
@@ -1192,7 +1215,17 @@ def validate_snapshot(
                 repository for repository in scope["repositories"]
                 if repository_key(repository) == closure.get("repository_key")
             ), None)
-            if scoped_repository is None or scoped_repository.get("exact_head") != closure.get("exact_head"):
+            historical_closure = (
+                bool(closure.get("evidence_heads"))
+                and all(
+                    head.get("event_id") in historical_evidence_event_ids
+                    for head in closure.get("evidence_heads", [])
+                )
+            )
+            if scoped_repository is None or (
+                scoped_repository.get("exact_head") != closure.get("exact_head")
+                and not historical_closure
+            ):
                 raise ResumeError(f"child_closure_repository_mismatch:{index}")
             contracts: list[dict[str, Any]] = []
             current_evidence_heads = [

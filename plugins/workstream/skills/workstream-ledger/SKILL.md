@@ -259,12 +259,22 @@ but were never projected as evidence contracts, use a separately reviewed
 valid contracts whose repository and exact head already match scope. It remains
 non-authoritative until the subsequent closure-repair batch succeeds; the two
 phases cannot be combined, and either phase is revision-checked and idempotent.
+When the reviewed seed also advances the primary repository head, every seed
+must belong to that primary repository and bind the new head. The manifest
+records the exact predecessor/new heads, computed disposition, checkpoint
+identity, and issue/material/checkpoint frontier. The writer fences that
+frontier before every append and commits in evidence, disposition, scope order,
+with scope last. Existing closed-child evidence may retain an older head only
+when immutable projection order proves the complete evidence set and scope were
+valid when its closure was appended; open or unclosed evidence always remains
+bound to the current head.
 
 An exact replay is a no-op. An incomplete multi-child batch, missing/failed
 receipts, multiple owners or heads,
 non-completed state, missing assignee, route/readback drift, unrelated scope or
 source changes, and stale evidence refuse without mutation. Resume validates
-the closure against current Linear state, scope, repository head, and receipts
+the closure against current Linear state, current repository identity/ownership,
+its creation-time scope and evidence set, and receipts
 before returning full authority. Once a completed child is present in the
 structured ownership map, full resume requires its active closure even if its
 evidence is later retired. Every closure creation or replacement requires the
@@ -399,8 +409,12 @@ requires a reviewed manifest containing the exact current projection revision,
 the exact active key/event/value-digest set, and explicit retirements naming
 their reviewed event and value digest. It never retires an omitted key. A late
 key or changed head requires reload and review before any append. The command
-computes the concrete attach/successor disposition against a verified remote
-head and rereads the complete comment stream before reporting success.
+computes the concrete attach/successor disposition against the reviewed
+`--remote-head` and rereads the complete comment stream before reporting
+success. It does not itself authenticate Git hosting or refs: the caller must
+obtain that head through an authenticated repository read before reviewing the
+manifest, and must not describe the CLI argument alone as live remote
+verification.
 Projection synchronization treats a labeled `Canonical plan: <URL>` line on
 the existing root issue as the source identity. Exactly one distinct URL is
 required before any write; zero or multiple candidates refuse with a concrete
