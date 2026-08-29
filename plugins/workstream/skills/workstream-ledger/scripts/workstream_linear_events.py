@@ -160,7 +160,9 @@ def encode_ledger_reservation(reservation: dict[str, Any]) -> str:
         or not re.fullmatch(
             r"[A-Z][A-Z0-9]*-\d+", reservation["workstream_id"]
         )
-        or reservation["intent_kind"] != "repository_identity_projection"
+        or reservation["intent_kind"] not in {
+            "repository_identity_projection", "repository_identity_history_seal",
+        }
         or not re.fullmatch(
             r"wsp_[0-9a-f]{32}", str(
                 (reservation.get("intent_event") or {}).get("event_id", "")
@@ -194,8 +196,17 @@ def encode_ledger_reservation(reservation: dict[str, Any]) -> str:
         or intent["plan_revision"] != reservation["plan_revision"]
         or intent["expected_revision"] != reservation["projection_revision"]
         or intent["authority"] != reservation["authority"]
-        or intent["kind"] != "scope"
-        or intent["key"] != "root"
+        or (
+            reservation["intent_kind"] == "repository_identity_projection"
+            and (intent["kind"] != "scope" or intent["key"] != "root")
+        )
+        or (
+            reservation["intent_kind"] == "repository_identity_history_seal"
+            and (
+                intent["kind"] != "identity_history_seal"
+                or intent["key"] != intent["value"].get("sealed_scope_event_id")
+            )
+        )
         or hashlib.sha256(json.dumps(
             intent, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")).hexdigest() != reservation["intent_sha256"]

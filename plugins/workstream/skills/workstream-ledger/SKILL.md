@@ -48,6 +48,19 @@ releases the reservation without a time-based lease.
 Chained coordinate history such as A to B to C is intentionally not supported;
 it requires reviewed manual consolidation before this single-hop writer runs.
 
+Older projections that contain a legitimate first identity backfill are not
+silently trusted. Resume returns bounded `partial_reconcile_required` metadata
+with no scope, worktree, next action, or execution authority. Use
+`workstreamctl repository-identity-seal --request REQUEST.json` for a zero-write
+preview, review its exact frontier, then add `--apply`. The writer reauthenticates
+the canonical planning source plus the current GitHub identity of every stored
+coordinate, serializes at the shared material boundary, and appends one
+deterministic v2 seal over the exact legacy projection receipts. Repeating the
+same repair is a zero-write readback; altered history, ambiguous candidates,
+provider mismatch, stale frontiers, or a second seal refuse.
+The exact bounded request and preview/apply procedure are documented in
+[`references/identity-history-seal.md`](references/identity-history-seal.md).
+
 Neither a provider ID nor a Linear destination is trusted merely because it is
 nonempty. Repository identity includes a timestamped authenticated-provider
 readback binding the immutable ID to the resolved current coordinate; every

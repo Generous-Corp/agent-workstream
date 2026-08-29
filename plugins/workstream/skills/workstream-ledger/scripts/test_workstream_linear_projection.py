@@ -4022,6 +4022,308 @@ class ProjectionTests(unittest.TestCase):
                 workstream_id="GEN-37", expected_plan_revision=PLAN,
             )
 
+    def test_legacy_first_backfill_requires_exact_later_identity_seal(self):
+        initial_value = scope()
+        backfilled_value = deepcopy(initial_value)
+        repository = backfilled_value["repositories"][0]
+        old_slug = "github.com/danielraffel/agent-workstream"
+        observed_at = "2026-08-28T03:35:30Z"
+        repository["aliases"] = [old_slug]
+        repository["identity_resolution"]["observed_at"] = observed_at
+        repository["identity_updates"] = [{
+            "from": old_slug,
+            "to": repository["slug"],
+            "repository_key": "github.com:id:R_agent_workstream",
+            "provider_repository_id": "R_agent_workstream",
+            "observed_at": observed_at,
+            "evidence": [{
+                "kind": "authenticated_provider_readback", "authenticated": True,
+                "repository_key": "github.com:id:R_agent_workstream",
+                "provider_repository_id": "R_agent_workstream",
+                "requested_slug": old_slug,
+                "resolved_slug": repository["slug"],
+            }],
+        }]
+        first = self.event("scope", "root", initial_value, 0)
+        source = self.event(
+            "source", "root", {"identity": "plan:test", "sha256": PLAN}, 1,
+        )
+        second = self.event(
+            "scope", "root", backfilled_value, 2, supersedes=first["event_id"],
+        )
+        first_comment = {
+            **projection_comment(first),
+            "createdAt": "2026-08-28T03:34:00.000Z",
+            "updatedAt": "2026-08-28T03:34:00.000Z",
+        }
+        second_comment = {
+            **projection_comment(second),
+            "createdAt": "2026-08-28T03:36:53.292Z",
+            "updatedAt": "2026-08-28T03:36:53.273Z",
+        }
+        source_comment = {
+            **projection_comment(source),
+            "createdAt": "2026-08-28T03:35:00.000Z",
+            "updatedAt": "2026-08-28T03:35:00.000Z",
+        }
+        with self.assertRaisesRegex(
+            LinearProjectionError, "repository_identity_history_regressed",
+        ):
+            reduce_projection_comments(
+                [first_comment, source_comment, second_comment], workstream_id="GEN-37",
+                expected_plan_revision=PLAN,
+            )
+        inspection = projection_module.inspect_unsealed_identity_history(
+            [first_comment, source_comment, second_comment], workstream_id="GEN-37",
+            expected_plan_revision=PLAN, authenticated_route=AUTHORITY,
+            authenticated_source={"identity": "plan:test", "sha256": PLAN},
+            material_revision=0,
+        )
+        self.assertEqual(inspection["resume_authority"], "none")
+        self.assertNotIn("scope", inspection)
+        self.assertEqual(
+            inspection["candidate"]["sealed_scope_event_id"], second["event_id"],
+        )
+        proof = [{
+            "repository_key": "github.com:id:R_agent_workstream",
+            "provider_repository_id": "R_agent_workstream",
+            "canonical_slug": repository["slug"],
+            "routes": [
+                {
+                    "requested_slug": route,
+                    "resolved_slug": repository["slug"],
+                    "provider_repository_id": "R_agent_workstream",
+                    "requested_response_url": f"https://api.github.test/{route}",
+                    "canonical_response_url": "https://api.github.test/canonical",
+                    "redirect_count": 0 if route == repository["slug"] else 1,
+                    "authenticated": True,
+                }
+                for route in sorted([repository["slug"], old_slug])
+            ],
+        }]
+        receipt_comments = {
+            first["event_id"]: first_comment, source["event_id"]: source_comment,
+            second["event_id"]: second_comment,
+        }
+        seal_value = {
+            "schema_version": 1,
+            "root_issue_id": ROOT_UUID,
+            "plan_revision": PLAN,
+            "source_identity": "plan:test",
+            "source_sha256": PLAN,
+            "expected_material_revision": 0,
+            "expected_projection_revision": 3,
+            "sealed_scope_event_id": second["event_id"],
+            "sealed_scope_value_sha256": hashlib.sha256(
+                projection_module._canonical(backfilled_value)
+            ).hexdigest(),
+            "legacy_transitions": [{
+                "predecessor_scope_event_id": first["event_id"],
+                "predecessor_scope_value_sha256": hashlib.sha256(
+                    projection_module._canonical(initial_value)
+                ).hexdigest(),
+                "transition_scope_event_id": second["event_id"],
+                "transition_scope_value_sha256": hashlib.sha256(
+                    projection_module._canonical(backfilled_value)
+                ).hexdigest(),
+            }],
+            "sealed_projection_frontier_event_id": second["event_id"],
+            "sealed_projection_frontier_event_sha256": hashlib.sha256(
+                projection_module._canonical(second)
+            ).hexdigest(),
+            "legacy_projection_prefix_sha256": projection_module.projection_prefix_sha256(
+                [first, source, second], receipt_comments, second["event_id"],
+            ),
+            "repositories": proof,
+            "repositories_sha256": hashlib.sha256(
+                projection_module._canonical(proof)
+            ).hexdigest(),
+            "observed_at": "2026-08-29T12:00:00Z",
+        }
+        seal = self.event(
+            "identity_history_seal", second["event_id"], seal_value, 3,
+        )
+        seal_comment = {
+            **projection_comment(seal),
+            "createdAt": "2026-08-29T12:00:00.000Z",
+            "updatedAt": "2026-08-29T12:00:00.000Z",
+        }
+        reduced = reduce_projection_comments(
+            [first_comment, source_comment, second_comment, seal_comment], workstream_id="GEN-37",
+            expected_plan_revision=PLAN,
+        )
+        self.assertEqual(reduced.snapshot["scope"], backfilled_value)
+
+        twice_backfilled = deepcopy(backfilled_value)
+        second_old_slug = "github.com/example/agent-workstream"
+        twice_repository = twice_backfilled["repositories"][0]
+        twice_repository["aliases"].append(second_old_slug)
+        twice_repository["identity_resolution"]["observed_at"] = (
+            "2026-08-28T04:35:30Z"
+        )
+        twice_repository["identity_updates"].append({
+            "from": second_old_slug, "to": twice_repository["slug"],
+            "repository_key": "github.com:id:R_agent_workstream",
+            "provider_repository_id": "R_agent_workstream",
+            "observed_at": "2026-08-28T04:35:30Z",
+            "evidence": [{
+                "kind": "authenticated_provider_readback", "authenticated": True,
+                "repository_key": "github.com:id:R_agent_workstream",
+                "provider_repository_id": "R_agent_workstream",
+                "requested_slug": second_old_slug,
+                "resolved_slug": twice_repository["slug"],
+            }],
+        })
+        third = self.event(
+            "scope", "root", twice_backfilled, 3,
+            supersedes=second["event_id"],
+        )
+        third_comment = {
+            **projection_comment(third),
+            "createdAt": "2026-08-28T04:36:53.292Z",
+            "updatedAt": "2026-08-28T04:36:53.273Z",
+        }
+        twice_inspection = projection_module.inspect_unsealed_identity_history(
+            [first_comment, source_comment, second_comment, third_comment],
+            workstream_id="GEN-37", expected_plan_revision=PLAN,
+            authenticated_route=AUTHORITY,
+            authenticated_source={"identity": "plan:test", "sha256": PLAN},
+            material_revision=0,
+        )
+        self.assertEqual(
+            [item["transition_scope_event_id"] for item in
+             twice_inspection["candidate"]["legacy_transitions"]],
+            [second["event_id"], third["event_id"]],
+        )
+        twice_proof = deepcopy(proof)
+        twice_proof[0]["routes"].append({
+            "requested_slug": second_old_slug,
+            "resolved_slug": twice_repository["slug"],
+            "provider_repository_id": "R_agent_workstream",
+            "requested_response_url": f"https://api.github.test/{second_old_slug}",
+            "canonical_response_url": "https://api.github.test/canonical",
+            "redirect_count": 1, "authenticated": True,
+        })
+        twice_proof[0]["routes"].sort(key=lambda item: item["requested_slug"])
+        twice_seal_value = {
+            **seal_value,
+            **twice_inspection["candidate"],
+            "expected_projection_revision": 4,
+            "repositories": twice_proof,
+            "repositories_sha256": hashlib.sha256(
+                projection_module._canonical(twice_proof)
+            ).hexdigest(),
+        }
+        twice_seal = self.event(
+            "identity_history_seal", third["event_id"], twice_seal_value, 4,
+        )
+        twice_seal_comment = {
+            **projection_comment(twice_seal),
+            "createdAt": "2026-08-29T12:02:00.000Z",
+            "updatedAt": "2026-08-29T12:02:00.000Z",
+        }
+        twice_reduced = reduce_projection_comments(
+            [first_comment, source_comment, second_comment, third_comment,
+             twice_seal_comment],
+            workstream_id="GEN-37", expected_plan_revision=PLAN,
+            authenticated_route=AUTHORITY,
+            authenticated_source={"identity": "plan:test", "sha256": PLAN},
+        )
+        self.assertEqual(twice_reduced.snapshot["scope"], twice_backfilled)
+
+        forged_value = deepcopy(backfilled_value)
+        forged_repository = forged_value["repositories"][0]
+        forged_slug = "github.com/attacker/forged"
+        forged_repository["aliases"] = [forged_slug]
+        forged_repository["identity_updates"][0]["from"] = forged_slug
+        forged_repository["identity_updates"][0]["evidence"][0][
+            "requested_slug"
+        ] = forged_slug
+        forged = self.event(
+            "scope", "root", forged_value, 2, supersedes=first["event_id"],
+        )
+        forged_comment = {**second_comment, "body": encode_projection_comment(forged)}
+        with self.assertRaisesRegex(
+            LinearProjectionError, "identity_history_seal_frontier_mismatch",
+        ):
+            reduce_projection_comments(
+                [first_comment, source_comment, forged_comment, seal_comment], workstream_id="GEN-37",
+                expected_plan_revision=PLAN,
+            )
+
+        def changed_seal(**changes):
+            changed = deepcopy(seal_value)
+            changed.update(changes)
+            if "repositories" in changes:
+                changed["repositories_sha256"] = hashlib.sha256(
+                    projection_module._canonical(changed["repositories"])
+                ).hexdigest()
+            event = self.event(
+                "identity_history_seal", second["event_id"], changed, 3,
+            )
+            return {
+                **projection_comment(event),
+                "createdAt": seal_comment["createdAt"],
+                "updatedAt": seal_comment["updatedAt"],
+            }
+
+        with self.assertRaisesRegex(
+            LinearProjectionError, "identity_history_seal_frontier_mismatch",
+        ):
+            reduce_projection_comments(
+                [first_comment, source_comment, second_comment, changed_seal(
+                    legacy_projection_prefix_sha256="0" * 64,
+                )],
+                workstream_id="GEN-37", expected_plan_revision=PLAN,
+            )
+
+        wrong_proof = deepcopy(proof)
+        wrong_proof[0]["provider_repository_id"] = "R_attacker"
+        for route in wrong_proof[0]["routes"]:
+            route["provider_repository_id"] = "R_attacker"
+        with self.assertRaisesRegex(
+            LinearProjectionError, "identity_history_seal_repository_mismatch",
+        ):
+            reduce_projection_comments(
+                [first_comment, source_comment, second_comment,
+                 changed_seal(repositories=wrong_proof)],
+                workstream_id="GEN-37", expected_plan_revision=PLAN,
+            )
+
+        repeated_seal_value = deepcopy(seal_value)
+        repeated_seal_value["expected_projection_revision"] = 4
+        second_seal = self.event(
+            "identity_history_seal", second["event_id"], repeated_seal_value, 4,
+            supersedes=seal["event_id"],
+        )
+        second_seal_comment = {
+            **projection_comment(second_seal),
+            "createdAt": "2026-08-29T12:01:00.000Z",
+            "updatedAt": "2026-08-29T12:01:00.000Z",
+        }
+        with self.assertRaisesRegex(
+            LinearProjectionError, "identity_history_seal_frontier_mismatch",
+        ):
+            reduce_projection_comments(
+                [first_comment, source_comment, second_comment, seal_comment,
+                 second_seal_comment],
+                workstream_id="GEN-37", expected_plan_revision=PLAN,
+            )
+
+        seal_shaped_plain_comment = {
+            "id": "not-a-projection-slot", "body": json.dumps(seal_value),
+            "createdAt": seal_comment["createdAt"],
+            "updatedAt": seal_comment["updatedAt"],
+        }
+        with self.assertRaisesRegex(
+            LinearProjectionError, "repository_identity_history_regressed",
+        ):
+            reduce_projection_comments(
+                [first_comment, source_comment, second_comment,
+                 seal_shaped_plain_comment],
+                workstream_id="GEN-37", expected_plan_revision=PLAN,
+            )
+
     def test_v1_history_activation_quarantines_late_v1_writer(self):
         client = FakeProjectionClient()
         first = legacy_event(
