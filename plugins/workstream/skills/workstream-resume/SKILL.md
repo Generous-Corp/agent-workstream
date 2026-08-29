@@ -36,6 +36,16 @@ If recovery refuses, report its exact error and stop. Do not fall back to local
 context or load the lifecycle skill. Success requires `resume_authority` to be
 `full`; inspection-only or unavailable authority is not permission to continue.
 
+After successful recovery, carry the resolved canonical token in the existing
+tab without replacing its title:
+
+```sh
+python3 "<absolute directory of this SKILL.md>/scripts/workstream_tab.py" GEN-123
+```
+
+An unavailable cmux surface is an optional no-op. A conflicting workstream
+token is a hard refusal; do not rename the tab.
+
 Report and retain the authenticated route/source, open children, current next
 action, checkpoint, and attach-or-successor disposition. Do not claim live
 repository or landing truth from the resume snapshot alone. For a status-only

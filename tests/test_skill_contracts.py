@@ -70,6 +70,7 @@ class SkillContractTests(unittest.TestCase):
         target = plugin / "skills/workstream-ledger/scripts/workstream_resume.py"
         self.assertTrue(shim.is_file())
         self.assertTrue(target.is_file())
+        self.assertTrue((plugin / "skills/workstream-resume/scripts/workstream_tab.py").is_file())
 
     def test_resume_shim_forwards_exact_argv_and_missing_target_refuses(self):
         source = (

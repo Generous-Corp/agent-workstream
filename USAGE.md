@@ -53,6 +53,11 @@ cmux, paste the same token or Linear URL into any new agent or terminal. Durable
 state remains in Linear in either case. See the [cmux API](https://cmux.com/docs/api)
 for its tab and workspace automation surface.
 
+The agent runs `workstreamctl tab-title GEN-123` after intake or resume. It
+appends the token to an existing human-readable title, does nothing when that
+token is already present, and refuses to overwrite a different workstream
+token. Outside cmux, the command exits successfully without changing anything.
+
 Useful follow-ups are:
 
 ```text

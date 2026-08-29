@@ -120,6 +120,11 @@ newly reviewed missing child. Changed-plan and other existing-graph mutations
 still fail `remote_cas_unavailable` until a remote CAS authority exists. Never
 infer a repository, worktree, or Linear project from the Markdown's cwd.
 
+After intake returns the canonical root token, invoke
+`scripts/workstream_tab.py GEN-123`. In cmux it preserves the existing tab
+title and appends exactly one token; the same token is a no-op and a different
+token refuses without mutation. Outside cmux it reports an optional no-op.
+
 ### Material-delta journal
 
 User turns are not the only source of durable work. When an agent discovers a

@@ -128,6 +128,15 @@ class WorkstreamCtlTests(unittest.TestCase):
             [MODULE.sys.executable, str(script), "plan.md", "--identity", "plan:demo", "--plan-revision", "abc", "--root-stable-key", "source-abc", "--accept-none"],
         )
 
+    def test_tab_title_dispatches_safe_cmux_adapter(self):
+        with mock.patch.object(MODULE.os, "execv") as execute:
+            MODULE.main(["tab-title", "GEN-37"])
+        script = MODULE.SCRIPTS / "workstream_tab.py"
+        execute.assert_called_once_with(
+            MODULE.sys.executable,
+            [MODULE.sys.executable, str(script), "GEN-37"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
