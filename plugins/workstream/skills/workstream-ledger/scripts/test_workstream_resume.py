@@ -68,7 +68,14 @@ class ResumeTests(unittest.TestCase):
         context = MODULE.compact_context(snapshot, "GEN-37")
         self.assertEqual(context["workstream_id"], "GEN-37")
         self.assertEqual([c["identifier"] for c in context["children"]], ["GEN-38"])
-        self.assertEqual(context["children"][0]["description"], "large redundant prose")
+        self.assertNotIn("description", context["children"][0])
+        self.assertEqual(
+            context["children"][0]["description_summary"],
+            {
+                "bytes": len("large redundant prose"),
+                "sha256": hashlib.sha256(b"large redundant prose").hexdigest(),
+            },
+        )
         self.assertEqual(context["children"][0]["owner"], "agent")
         self.assertEqual(context["children"][0]["blocker"], {"text": "waiting"})
 
@@ -156,7 +163,7 @@ class ResumeTests(unittest.TestCase):
         context = MODULE.compact_context(enriched, "GEN-37")
         resumed = context["children"][0]
 
-        self.assertEqual(resumed["issue_next_action"], "stale issue-description action")
+        self.assertNotIn("issue_next_action", resumed)
         self.assertEqual(resumed["next_action"], "resume current child state")
         self.assertEqual(resumed["blocker"], {"text": "await review"})
         self.assertEqual(resumed["material_event_revision"], 4)
@@ -221,10 +228,8 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(bounded["history"]["checkpoints"]["count"], 2)
         self.assertRegex(bounded["history"]["checkpoints"]["sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(bounded["next_action"], "current child action")
-        self.assertEqual(
-            bounded["latest_checkpoint"]["evidence"]["items"],
-            [{"kind": "current-test", "id": "focused"}],
-        )
+        self.assertEqual(bounded["latest_checkpoint"]["evidence"]["count"], 1)
+        self.assertNotIn("items", bounded["latest_checkpoint"]["evidence"])
 
         full = MODULE.compact_context(
             enriched, "GEN-37", include_history=True, max_items=100,
@@ -539,9 +544,8 @@ class ResumeTests(unittest.TestCase):
 
         self.assertEqual(context["latest_checkpoint"]["worktree"]["path"], "/repo/worktree")
         self.assertEqual(context["latest_checkpoint"]["provenance"]["latest"]["machine"], "M5")
-        self.assertEqual(context["latest_checkpoint"]["evidence"]["items"], [
-            {"kind": "test", "id": "unit"},
-        ])
+        self.assertEqual(context["latest_checkpoint"]["evidence"]["count"], 1)
+        self.assertNotIn("items", context["latest_checkpoint"]["evidence"])
         self.assertRegex(context["latest_checkpoint"]["provenance"]["sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(context["surface_availability"]["latest_checkpoint"], "available")
         self.assertEqual(context["next_action"], "validate live resume")

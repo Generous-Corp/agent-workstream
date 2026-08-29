@@ -26,7 +26,9 @@ from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
     LinearProjectionError, projection_slot_id, reduce_projection_comments, TOMBSTONE,
 )
-from workstream_resume import add_material_history, compact_context, ResumeError
+from workstream_resume import (
+    add_child_material_history, add_material_history, compact_context, ResumeError,
+)
 from workstream_relation_readback import RelationReadbackError
 import workstream_projection
 import workstream_linear_projection as projection_module
@@ -568,8 +570,8 @@ class ProjectionTests(unittest.TestCase):
         }
         return client, adapter, source, graph, children, manifest
 
-    def five_terminal_verbose_evidence_fixture(self):
-        """Build a GEN-37-shaped strict snapshot with receipt-heavy evidence."""
+    def gen37_production_shaped_fixture(self):
+        """Build five closures plus two verbose open children and checkpoints."""
         client = FakeProjectionClient()
         adapter = LinearProjectionAdapter(
             client, issue_id="GEN-37", workstream_id="GEN-37",
@@ -577,10 +579,11 @@ class ProjectionTests(unittest.TestCase):
         )
         source = {"identity": "https://example.test/plan", "sha256": PLAN}
         identifiers = [f"GEN-{number}" for number in range(38, 43)]
+        open_identifiers = ["GEN-43", "GEN-85"]
         owned_scope = scope()
         owned_scope["child_ownership"] = {
             identifier: "github.com:id:R_agent_workstream"
-            for identifier in identifiers
+            for identifier in [*identifiers, *open_identifiers]
         }
         children = []
         contracts = []
@@ -605,10 +608,18 @@ class ProjectionTests(unittest.TestCase):
         base = [
             {"kind": "scope", "key": "root", "value": owned_scope},
             {"kind": "source", "key": "root", "value": source},
-            {"kind": "provenance", "key": "session", "value": {
-                "agent": "codex", "machine": "M5", "session_id": "session",
-                "worktree": {"state": "safe", "head": HEAD},
-            }},
+            *[
+                {"kind": "provenance", "key": f"session-{index}", "value": {
+                    "agent": "codex", "machine": machine,
+                    "session_id": f"session-{index}",
+                    **({"worktree": {
+                        "state": "safe", "head": HEAD,
+                        "path": f"/worktrees/gen37-session-{index}",
+                        "branch": f"fix/gen37-session-{index}",
+                    }} if index == 4 else {}),
+                }}
+                for index, machine in enumerate(("M1", "M3", "M5", "M3", "M5"))
+            ],
             *[
                 {"kind": "evidence_contract", "key": contract["slice_id"],
                  "value": contract}
@@ -621,7 +632,86 @@ class ProjectionTests(unittest.TestCase):
             created_at="2026-08-29T18:00:00Z", authenticated_source=source,
         )
         graph = self.graph_snapshot()
-        graph["children"] = children
+        open_children = [
+            {
+                "id": "open-child-43", "identifier": "GEN-43",
+                "title": "Durable launch continuation", "url": "https://linear/GEN-43",
+                "description": "Verbose launch history. " * 90,
+                "parent": {"id": ROOT_UUID, "identifier": "GEN-37"},
+                "team": {"id": "team", "organization": {"id": "workspace"}},
+                "project": {"id": "project"}, "assignee": {"id": "owner-43"},
+                "state_id": "started", "status": "In Progress",
+                "status_type": "started", "next_action": "stale issue action",
+                "updatedAt": "2026-08-29T18:00:00Z",
+            },
+            {
+                "id": "open-child-85", "identifier": "GEN-85",
+                "title": "Aggregate child recovery", "url": "https://linear/GEN-85",
+                "description": "Verbose aggregation requirements. " * 30,
+                "parent": {"id": ROOT_UUID, "identifier": "GEN-37"},
+                "team": {"id": "team", "organization": {"id": "workspace"}},
+                "project": {"id": "project"}, "assignee": {"id": "owner-85"},
+                "state_id": "started", "status": "In Progress",
+                "status_type": "started", "next_action": "Implement aggregation.",
+                "updatedAt": "2026-08-29T18:00:00Z",
+            },
+        ]
+        graph["children"] = [*open_children, *children]
+        child_event = Delta(
+            "gen43-progress", "GEN-43", "progress", "agent",
+            {"next_action": "Land the M3 adapter, then rerun the continuation canary."},
+            0, "2026-08-29T18:10:00Z",
+        )
+        child_checkpoint = build_checkpoint(
+            workstream_id="GEN-43", boundary_id="gen43-current", root_revision=1,
+            plan_revision=PLAN, before_status="In Progress",
+            after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai", "session_id": "session-child",
+                "machine": "M5", "worktree": {"state": "unavailable"},
+            },
+            exact_head=None,
+            evidence=[{"kind": "focused", "proof": "e" * 500} for _ in range(3)],
+            blocker={"owner_machine": "M3", "reason": "M3 is the sole writer."},
+            next_action="Land the M3 adapter, then rerun the continuation canary.",
+        )
+        graph = add_child_material_history(
+            graph,
+            {
+                "GEN-43": [
+                    {"id": "gen43-event", "body": encode_event_comment(child_event)},
+                    {"id": "gen43-checkpoint",
+                     "body": encode_checkpoint_comment(child_checkpoint)},
+                ],
+                "GEN-85": [],
+            },
+            authenticated_route=AUTHORITY,
+        )
+        root_event = Delta(
+            "gen37-progress", "GEN-37", "progress", "agent",
+            {"next_action": "Finish both open children, then run physical acceptance."},
+            0, "2026-08-29T18:20:00Z",
+        )
+        root_checkpoint = build_checkpoint(
+            workstream_id="GEN-37", boundary_id="gen37-current", root_revision=1,
+            plan_revision=PLAN, before_status="In Progress",
+            after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai", "session_id": "session-root",
+                "machine": "M5", "worktree": {
+                    "state": "safe", "path": "/worktrees/gen37", "branch": "fix/gen37",
+                    "head": HEAD,
+                },
+            },
+            exact_head=HEAD,
+            evidence=[{"kind": "focused", "proof": "r" * 500} for _ in range(5)],
+            blocker={"conditions": ["GEN-43 remains open", "GEN-85 remains open"]},
+            next_action="Finish both open children, then run physical acceptance.",
+        )
+        client.comments.extend([
+            {"id": "gen37-event", "body": encode_event_comment(root_event)},
+            {"id": "gen37-checkpoint", "body": encode_checkpoint_comment(root_checkpoint)},
+        ])
         evidence_events = {
             event["value"]["owning_child"]: event
             for event in adapter.state().events
@@ -674,8 +764,8 @@ class ProjectionTests(unittest.TestCase):
         )
         return strict, contracts
 
-    def test_five_terminal_contracts_fit_compact_resume_budget(self):
-        strict, contracts = self.five_terminal_verbose_evidence_fixture()
+    def test_gen37_production_shaped_resume_has_meaningful_budget_headroom(self):
+        strict, contracts = self.gen37_production_shaped_fixture()
         context = compact_context(
             strict, "GEN-37", max_bytes=16 * 1024, max_items=100,
             require_projection_authority=True,
@@ -683,10 +773,36 @@ class ProjectionTests(unittest.TestCase):
         encoded = json.dumps(
             context, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ).encode()
-        self.assertLessEqual(len(encoded), 16 * 1024)
+        self.assertLessEqual(len(encoded), int(14.5 * 1024))
         self.assertEqual(context["resume_authority"], "full")
+        self.assertEqual(
+            [child["identifier"] for child in context["children"]],
+            ["GEN-43", "GEN-85"],
+        )
+        self.assertEqual(
+            context["children"][0]["next_action"],
+            "Land the M3 adapter, then rerun the continuation canary.",
+        )
+        self.assertEqual(
+            context["children"][0]["blocker"],
+            {"owner_machine": "M3", "reason": "M3 is the sole writer."},
+        )
+        self.assertNotIn("description", context["children"][0])
+        self.assertRegex(
+            context["children"][0]["description_summary"]["sha256"],
+            r"^[0-9a-f]{64}$",
+        )
         self.assertEqual(len(context["child_closures"]), 5)
         self.assertEqual(len(context["evidence_contracts"]), 5)
+        for closure in context["child_closures"]:
+            self.assertEqual(closure["representation"], "compact_validated")
+            self.assertNotIn("child_issue_id", closure)
+            self.assertNotIn("evidence_heads", closure)
+            self.assertEqual(closure["evidence_head_count"], 1)
+            self.assertRegex(closure["evidence_heads_sha256"], r"^[0-9a-f]{64}$")
+            self.assertRegex(
+                closure["projection_head"]["value_sha256"], r"^[0-9a-f]{64}$",
+            )
         for compact, complete in zip(context["evidence_contracts"], contracts):
             self.assertNotIn("layers", compact)
             self.assertEqual(compact["representation"], "compact_validated")
@@ -707,7 +823,7 @@ class ProjectionTests(unittest.TestCase):
             )
 
     def test_explicit_history_retains_full_verbose_evidence_contracts(self):
-        strict, contracts = self.five_terminal_verbose_evidence_fixture()
+        strict, contracts = self.gen37_production_shaped_fixture()
         with self.assertRaisesRegex(ResumeError, "resume_context_over_budget"):
             compact_context(
                 strict, "GEN-37", max_bytes=16 * 1024, max_items=500,
@@ -719,9 +835,14 @@ class ProjectionTests(unittest.TestCase):
         )
         self.assertEqual(full["evidence_contracts"], contracts)
         self.assertIn("layers", full["evidence_contracts"][0])
+        self.assertIsInstance(full["provenance"], list)
+        self.assertIn("description", full["children"][0])
+        self.assertEqual(len(full["children"][0]["latest_checkpoint"]["evidence"]), 3)
+        self.assertIn("child_issue_id", full["child_closures"][0])
+        self.assertIn("evidence_heads", full["child_closures"][0])
 
     def test_compaction_does_not_weaken_contract_tamper_validation(self):
-        strict, _contracts = self.five_terminal_verbose_evidence_fixture()
+        strict, _contracts = self.gen37_production_shaped_fixture()
         tampered = deepcopy(strict)
         tampered["evidence_contracts"][0]["layers"]["logic"]["receipts"][0][
             "proof"
@@ -2999,7 +3120,9 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(context["choice_events"][0]["choice_id"], "choice-comment-authority")
         self.assertEqual(context["evidence_contracts"][0]["owning_child"], "GEN-38")
         self.assertEqual(context["source"]["sha256"], PLAN)
-        self.assertEqual(context["provenance"][0]["machine"], "M5")
+        self.assertEqual(context["provenance"]["latest"]["machine"], "M5")
+        self.assertEqual(context["provenance"]["count"], 1)
+        self.assertRegex(context["provenance"]["sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(context["projection_revision"], 7)
         self.assertEqual(context["resume_authority"], "full")
         disposition = choose_disposition(context, remote_head=HEAD)
