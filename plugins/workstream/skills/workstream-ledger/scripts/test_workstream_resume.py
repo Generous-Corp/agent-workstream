@@ -107,6 +107,25 @@ class ResumeTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ResumeError, "over_item_budget"):
             MODULE.compact_context(self.snapshot(), "GEN-37", max_items=2)
 
+    def test_raw_transcripts_are_excluded_before_resume_budgeting(self):
+        secret = "transcript-only-secret-" + "x" * 100_000
+        snapshot = self.snapshot()
+        snapshot["decisions"].append({
+            "id": "D2", "status": "rejected", "rationale": "keep this",
+            "raw_transcript": secret,
+            "nested": {"transcript": secret, "summary": "keep summary"},
+        })
+        context = MODULE.compact_context(snapshot, "GEN-37", max_bytes=16 * 1024)
+        encoded = json.dumps(context, sort_keys=True)
+        self.assertNotIn("transcript-only-secret", encoded)
+        self.assertNotIn("raw_transcript", encoded)
+        self.assertEqual(context["decisions"][-1]["rationale"], "keep this")
+        self.assertEqual(context["decisions"][-1]["nested"], {"summary": "keep summary"})
+
+        snapshot["decisions"][-1]["rationale"] = secret
+        with self.assertRaisesRegex(MODULE.ResumeError, "over_budget"):
+            MODULE.compact_context(snapshot, "GEN-37", max_bytes=16 * 1024)
+
     def test_material_events_override_stale_issue_next_action(self):
         snapshot = self.snapshot()
         snapshot["root"]["revision"] = 91

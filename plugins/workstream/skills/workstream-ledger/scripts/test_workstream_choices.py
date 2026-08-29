@@ -3,8 +3,9 @@ import unittest
 
 from workstream_choices import (
     ChoiceError, audit_choice, closure_blockers, record_choice, reduce_choices,
-    supersede_choice,
+    retired_acceptance_criteria, supersede_choice,
 )
+from workstream_resume import compact_context
 
 
 HEAD_A = "a" * 40
@@ -101,6 +102,124 @@ class ChoiceEventTests(unittest.TestCase):
         view = reduce_choices([record, audit, retired, successor])[record["choice_id"]]
         self.assertFalse(view["active"])
         self.assertEqual(len(view["audits"]), 1)
+
+    def test_accepted_criterion_rejection_survives_token_resume_as_history(self):
+        record = self.record(
+            domains=[], reach="local", acceptance_criteria=["legacy-mode-required"],
+        )
+        audit = audit_choice(
+            choice_id=record["choice_id"], workstream_id="GEN-37",
+            owning_child="GEN-38", namespace="pulp-playback",
+            repository="github.com/generous-corp/pulp",
+            repository_key="github.com:id:R_pulp", plan_revision="plan-a",
+            git_head=HEAD_A, created_at="2026-08-21T13:00:00Z",
+            recorded_event_id=record["event_id"], verdict="accepted",
+            rationale="Initially required", auditor="fresh-agent",
+        )
+        rejected = supersede_choice(
+            choice_id=record["choice_id"], workstream_id="GEN-37",
+            owning_child="GEN-38", namespace="pulp-playback",
+            repository="github.com/generous-corp/pulp",
+            repository_key="github.com:id:R_pulp", plan_revision="plan-a",
+            git_head=HEAD_A, created_at="2026-08-21T14:00:00Z",
+            target_event_id=record["event_id"],
+            reason="Human rejected the requirement", successor_choice_id=None,
+        )
+        events = [record, audit, rejected]
+        snapshot = {
+            "root": {"identifier": "GEN-37", "url": "https://linear/GEN-37",
+                     "plan_revision": "plan-a", "revision": 2, "status": "In Progress",
+                     "next_action": "continue without legacy mode"},
+            "children": [{"identifier": "GEN-38", "title": "Implement",
+                          "status": "Done"}],
+            "decisions": [], "provenance": [], "choice_events": events,
+        }
+        resumed = compact_context(snapshot, "GEN-37")
+        self.assertEqual(resumed["choice_events"], events)
+        view = reduce_choices(resumed["choice_events"])[record["choice_id"]]
+        self.assertEqual(view["verdict"], "accepted")
+        self.assertFalse(view["active"])
+        self.assertEqual(view["retired_acceptance_criteria"], ["legacy-mode-required"])
+
+    def test_successor_differentially_retires_criteria_and_survives_resume(self):
+        predecessor = self.record(
+            choice_id="choice-old", decision="Use old behavior",
+            acceptance_criteria=["shared-behavior", "old-only-behavior"],
+            domains=[], reach="local",
+        )
+        predecessor_audit = audit_choice(
+            choice_id="choice-old", workstream_id="GEN-37", owning_child="GEN-38",
+            namespace="pulp-playback", repository="github.com/generous-corp/pulp",
+            repository_key="github.com:id:R_pulp", plan_revision="plan-a",
+            git_head=HEAD_A, created_at="2026-08-21T13:00:00Z",
+            recorded_event_id=predecessor["event_id"], verdict="accepted",
+            rationale="Accepted old behavior", auditor="fresh-agent",
+        )
+        successor = self.record(
+            choice_id="choice-new", decision="Use new behavior",
+            acceptance_criteria=["shared-behavior", "new-only-behavior"],
+            domains=[], reach="local", created_at="2026-08-21T13:30:00Z",
+        )
+        supersession = supersede_choice(
+            choice_id="choice-old", workstream_id="GEN-37", owning_child="GEN-38",
+            namespace="pulp-playback", repository="github.com/generous-corp/pulp",
+            repository_key="github.com:id:R_pulp", plan_revision="plan-a",
+            git_head=HEAD_A, created_at="2026-08-21T14:00:00Z",
+            target_event_id=predecessor["event_id"], reason="Adopt new behavior",
+            successor_choice_id="choice-new",
+        )
+        successor_audit = audit_choice(
+            choice_id="choice-new", workstream_id="GEN-37", owning_child="GEN-38",
+            namespace="pulp-playback", repository="github.com/generous-corp/pulp",
+            repository_key="github.com:id:R_pulp", plan_revision="plan-a",
+            git_head=HEAD_A, created_at="2026-08-21T15:00:00Z",
+            recorded_event_id=successor["event_id"], verdict="accepted",
+            rationale="Accepted replacement behavior", auditor="fresh-agent",
+        )
+        events = [predecessor, predecessor_audit, successor, supersession, successor_audit]
+        snapshot = {
+            "root": {"identifier": "GEN-37", "url": "https://linear/GEN-37",
+                     "plan_revision": "plan-a", "revision": 2, "status": "In Progress",
+                     "next_action": "implement new behavior"},
+            "children": [{"identifier": "GEN-38", "title": "Implement",
+                          "status": "Done"}],
+            "decisions": [], "provenance": [], "choice_events": events,
+        }
+        resumed = compact_context(snapshot, "GEN-37")
+        view = reduce_choices(resumed["choice_events"])
+        self.assertEqual(
+            view["choice-old"]["retired_acceptance_criteria"],
+            ["old-only-behavior"],
+        )
+        self.assertTrue(view["choice-new"]["active"])
+        self.assertEqual(
+            view["choice-new"]["record"]["payload"]["acceptance_criteria"],
+            ["shared-behavior", "new-only-behavior"],
+        )
+        self.assertEqual(
+            retired_acceptance_criteria(resumed["choice_events"]),
+            {"old-only-behavior": "choice-old"},
+        )
+
+    def test_successor_choice_cannot_change_immutable_ownership(self):
+        predecessor = self.record(
+            choice_id="choice-old", acceptance_criteria=["old-only"],
+            domains=[], reach="local",
+        )
+        successor = self.record(
+            choice_id="choice-new", owning_child="GEN-99",
+            acceptance_criteria=["new-only"], domains=[], reach="local",
+        )
+        supersession = supersede_choice(
+            choice_id="choice-old", workstream_id="GEN-37", owning_child="GEN-38",
+            namespace="pulp-playback", repository="github.com/generous-corp/pulp",
+            repository_key="github.com:id:R_pulp", plan_revision="plan-a",
+            git_head=HEAD_A, created_at="2026-08-21T14:00:00Z",
+            target_event_id=predecessor["event_id"], reason="Invalid move",
+            successor_choice_id="choice-new",
+        )
+        with self.assertRaisesRegex(ChoiceError, "successor_choice_ownership_changed"):
+            reduce_choices([predecessor, successor, supersession])
 
     def test_audit_cannot_silently_move_choice_to_another_child(self):
         record = self.record()

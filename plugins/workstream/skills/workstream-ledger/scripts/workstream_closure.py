@@ -5,7 +5,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from workstream_choices import ChoiceError, closure_blockers
+from workstream_choices import (
+    ChoiceError, closure_blockers, retired_acceptance_criteria,
+)
 from workstream_evidence import evidence_errors
 from workstream_scope import (
     is_full_oid, repository_key, ScopeError, validate_relation_graph,
@@ -108,6 +110,14 @@ def review(snapshot: dict[str, Any], *, expected_plan_revision: str,
                 ))
             except ChoiceError as error:
                 errors.append(f"invalid_choice_history:{error}")
+        try:
+            retired_criteria = retired_acceptance_criteria(choice_events)
+            errors.extend(
+                f"retired_choice_criterion:{retired_criteria[criterion]}:{criterion}"
+                for criterion in criteria if criterion in retired_criteria
+            )
+        except ChoiceError as error:
+            errors.append(f"invalid_choice_history:{error}")
     for index, contract in enumerate(evidence_contracts if isinstance(evidence_contracts, list) else []):
         errors.extend(
             f"evidence_contract:{index}:{error}"

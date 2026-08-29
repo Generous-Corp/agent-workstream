@@ -692,6 +692,32 @@ class ReconcileTests(unittest.TestCase):
         with self.assertRaisesRegex(ReconcileError, "aggregate_keyset_mismatch"):
             ShipyardTruthReader(command, timeout=2).read_many(bindings)
 
+    def test_identical_pr_numbers_remain_repository_qualified(self):
+        second_github = {**github_truth_2(), "pr_number": 41}
+        second_receipt_value = {
+            "schema_version": 1, "repository": "generous-corp/vellum",
+            "repository_key": KEY_2, "pr_number": 41, "head": HEAD_2,
+            "disposition": "merged", "receipt_id": "shipyard-receipt-vellum-41",
+        }
+        second_shipyard = {
+            **second_receipt_value,
+            "receipt_sha256": canonical_digest(second_receipt_value),
+        }
+        material = closure_input()
+        material["required_child_ids"] = ["GEN-38", "GEN-39"]
+        landed = reconcile_lifecycle(
+            snapshot=multi_repository_snapshot(),
+            adapter=self.adapter(FakeProjectionClient()),
+            github=[github_truth(), second_github],
+            shipyard=[shipyard_truth(), second_shipyard], closure_input=material,
+            independent_review=None, created_at="2026-08-28T12:00:00Z",
+        )
+        repositories = landed["lifecycle"]["repositories"]
+        self.assertEqual(
+            [(item["repository_key"], item["github"]["pr_number"]) for item in repositories],
+            [(KEY, 41), (KEY_2, 41)],
+        )
+
     def test_relation_target_reader_binds_immutable_route_and_peer_edges(self):
         target_uuid = "22222222-2222-4222-8222-222222222222"
         target_authority = {
