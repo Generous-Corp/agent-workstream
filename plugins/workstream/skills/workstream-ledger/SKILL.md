@@ -47,6 +47,26 @@ directed edges, and missing `blocks`/`blocked_by` inverse views. `related`
 remains informational. Closure consumes authenticated peer-edge readback and
 refuses while the current root has an active `blocked_by` relation.
 
+Dependencies between already-owned children use the separately bounded
+`scripts/workstream_child_dependencies.py` transport. It authenticates the
+declared route, immutable root, and both direct-child identities, fences the
+root material/projection frontier plus the child dependency graph, reserves a
+deterministic append-only `child_dependency_authorization` projection slot,
+then writes a native `blocks` relation with one deterministic client-supplied
+UUIDv4. Every native write re-reads the exact durable authorization and all
+three frontiers before mutation; the graph frontier includes a canonical
+SHA-256 so a same-count edge replacement cannot pass as an unchanged graph.
+Runtime schema introspection must confirm that `IssueRelationCreateInput.id`,
+the `blocks` enum, and both `relations` and `inverseRelations` readback remain
+available. Complete pagination must recover the exact `blocks` view on the
+blocker and inverse `blocked_by` view on the blocked child, so a lost response
+converges and an exact batch replay performs no write. Ambiguous, duplicate,
+conflicting, self, cross-root, stale-frontier, partial-inverse, and mismatched
+readbacks fail closed. The transport never creates or updates an issue,
+project, or workstream root. If the native deterministic-ID capability is
+absent, it refuses before mutation; an append-only typed projection would need
+a separately reviewed fallback rather than an unsafe native create.
+
 The live Linear graph transport verifies the declared workspace/team/project
 relationship, fences reads to that project, and assigns the project on creates.
 The append-only projection transport persists scope and typed cross-workstream

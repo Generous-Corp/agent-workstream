@@ -43,7 +43,7 @@ KINDS = {
     "scope", "relation", "choice", "evidence_contract", "source",
     "provenance", "disposition", "closure_review", "lifecycle", "cas_activation",
     "quarantine_disposition", "child_closure",
-    "child_extension_authorization",
+    "child_extension_authorization", "child_dependency_authorization",
 }
 SINGLETON_KINDS = {
     "scope", "source", "disposition", "lifecycle", "cas_activation",
@@ -249,6 +249,46 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             or value.get("initial_state") != "planned_pending_projection"
         ):
             raise LinearProjectionError("invalid_child_extension_authorization")
+    if event["kind"] == "child_dependency_authorization":
+        required_authorization = {
+            "root_issue_id", "route", "plan_revision", "batch_id",
+            "relation_ids", "relations_sha256", "expected_material_revision",
+            "expected_projection_revision", "expected_graph_revision",
+            "expected_graph_sha256",
+            "initial_state",
+        }
+        route = value.get("route") if isinstance(value, dict) else None
+        relation_ids = value.get("relation_ids") if isinstance(value, dict) else None
+        if (
+            schema_version != 2
+            or tombstone
+            or set(value) != required_authorization
+            or event["key"] != value.get("batch_id")
+            or not re.fullmatch(r"wsdb_[0-9a-f]{32}", str(value.get("batch_id", "")))
+            or value.get("root_issue_id") != event["authority"]["root_issue_id"]
+            or route != event["authority"]
+            or value.get("plan_revision") != event["plan_revision"]
+            or value.get("expected_projection_revision") != event["expected_revision"]
+            or not isinstance(relation_ids, list)
+            or not relation_ids
+            or relation_ids != sorted(set(relation_ids))
+            or not all(re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+                r"[89ab][0-9a-f]{3}-[0-9a-f]{12}", str(item), re.IGNORECASE,
+            ) for item in relation_ids)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("relations_sha256", "")))
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(value.get("expected_graph_sha256", "")),
+            )
+            or any(
+                not isinstance(value.get(field), int)
+                or isinstance(value.get(field), bool)
+                or value[field] < 0
+                for field in ("expected_material_revision", "expected_graph_revision")
+            )
+            or value.get("initial_state") != "owned_children_validated"
+        ):
+            raise LinearProjectionError("invalid_child_dependency_authorization")
     if event["kind"] == "source" and not tombstone:
         if not re.fullmatch(r"[0-9a-f]{64}", str(value.get("sha256", ""))):
             raise LinearProjectionError("invalid_projection_source_digest")
@@ -1169,3 +1209,93 @@ class LinearProjectionAdapter:
     ) -> dict[str, Any]:
         """Re-read the exact durable grant; later unrelated events stay valid."""
         return self._assert_child_extension_authorization(event, self._comments())
+
+    def _assert_child_dependency_authorization(
+        self, event: dict[str, Any], comments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        state = reduce_projection_comments(
+            comments, workstream_id=self.workstream_id,
+            expected_plan_revision=self.plan_revision,
+            authenticated_route=self.authority,
+        )
+        matching = [
+            item for item in state.events
+            if item["kind"] == "child_dependency_authorization"
+            and item["key"] == event["key"]
+        ]
+        if not matching or matching[-1] != event:
+            raise LinearProjectionError(
+                "child_dependency_authorization_superseded_or_conflicting"
+            )
+        remote_id = state.remote_ids.get(event["event_id"])
+        if not any(item.get("id") == remote_id for item in comments):
+            raise LinearProjectionError(
+                "child_dependency_authorization_readback_missing"
+            )
+        return {"event": event, "remote_id": remote_id, "revision": state.revision}
+
+    def reserve_child_dependencies(
+        self, *, batch_id: str, relation_ids: list[str], relations_sha256: str,
+        expected_material_revision: int, expected_projection_revision: int,
+        expected_graph_revision: int, expected_graph_sha256: str,
+    ) -> dict[str, Any]:
+        """Win a durable projection-CAS grant before native relation creation."""
+        before_comments = self._comments()
+        from workstream_linear_events import reduce_event_comments
+
+        material = reduce_event_comments(
+            before_comments, workstream_id=self.workstream_id,
+        )
+        before = reduce_projection_comments(
+            before_comments, workstream_id=self.workstream_id,
+            expected_plan_revision=self.plan_revision,
+            authenticated_route=self.authority,
+        )
+        value = {
+            "root_issue_id": self.root_issue_id,
+            "route": self.authority,
+            "plan_revision": self.plan_revision,
+            "batch_id": batch_id,
+            "relation_ids": sorted(relation_ids),
+            "relations_sha256": relations_sha256,
+            "expected_material_revision": expected_material_revision,
+            "expected_projection_revision": expected_projection_revision,
+            "expected_graph_revision": expected_graph_revision,
+            "expected_graph_sha256": expected_graph_sha256,
+            "initial_state": "owned_children_validated",
+        }
+        event = build_projection_event(
+            workstream_id=self.workstream_id,
+            kind="child_dependency_authorization", key=batch_id,
+            value=value, plan_revision=self.plan_revision,
+            expected_revision=expected_projection_revision,
+            created_at="1970-01-01T00:00:00Z", authority=self.authority,
+        )
+        existing = next(
+            (item for item in before.events if item["event_id"] == event["event_id"]),
+            None,
+        )
+        if existing is None:
+            if material.revision != expected_material_revision:
+                raise LinearProjectionError(
+                    "child_dependency_material_frontier_stale_reload_required"
+                )
+            if before.revision != expected_projection_revision:
+                raise LinearProjectionError(
+                    "child_dependency_projection_frontier_stale_reload_required"
+                )
+            self.append(event)
+            after_comments = self._comments()
+        else:
+            if existing != event:
+                raise LinearProjectionError(
+                    "child_dependency_authorization_superseded_or_conflicting"
+                )
+            after_comments = before_comments
+        return self._assert_child_dependency_authorization(event, after_comments)
+
+    def assert_child_dependencies_authorized(
+        self, event: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Re-read the exact durable native-dependency grant."""
+        return self._assert_child_dependency_authorization(event, self._comments())
