@@ -571,7 +571,12 @@ def extract_token(value: str) -> str:
 def validate_snapshot(
     snapshot: dict[str, Any], token: str | None = None, *,
     require_projection_authority: bool = False,
+    expected_missing_terminal_closures: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
+    if expected_missing_terminal_closures and not require_projection_authority:
+        raise ResumeError(
+            "expected_missing_terminal_closures_requires_projection_authority"
+        )
     source_root = snapshot.get("root")
     if not isinstance(source_root, dict):
         raise ResumeError("missing root")
@@ -1047,6 +1052,7 @@ def validate_snapshot(
                 contracts.append(contract)
             if evidence_receipts_sha256(contracts) != closure.get("evidence_receipts_sha256"):
                 raise ResumeError(f"child_closure_receipts_mismatch:{index}")
+        missing_terminal_closures: set[str] = set()
         if projection_events and scope is not None:
             for child_id, child in child_by_identifier.items():
                 status_type = str(
@@ -1057,9 +1063,20 @@ def validate_snapshot(
                     and child_id in scope["child_ownership"]
                     and child_id not in closure_ids
                 ):
-                    raise ResumeError(
-                        f"completed_owned_child_closure_missing:{child_id}"
-                    )
+                    missing_terminal_closures.add(child_id)
+        if missing_terminal_closures != set(expected_missing_terminal_closures):
+            if not expected_missing_terminal_closures and missing_terminal_closures:
+                raise ResumeError(
+                    "completed_owned_child_closure_missing:"
+                    + sorted(missing_terminal_closures)[0]
+                )
+            raise ResumeError(
+                "completed_owned_child_closure_set_mismatch:"
+                + ",".join(sorted(
+                    missing_terminal_closures
+                    ^ set(expected_missing_terminal_closures)
+                ))
+            )
         for choice_id, view in choice_view.items():
             event = view["record"]
             if event["workstream_id"] != identifier.upper():
@@ -1125,11 +1142,13 @@ def compact_context(
     snapshot: dict[str, Any], token: str, max_bytes: int = 16 * 1024,
     max_items: int = 100, *, require_projection_authority: bool = False,
     include_history: bool = False,
+    expected_missing_terminal_closures: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     normalized_token = extract_token(token)
     clean = validate_snapshot(
         snapshot, normalized_token,
         require_projection_authority=require_projection_authority,
+        expected_missing_terminal_closures=expected_missing_terminal_closures,
     )
     root = clean["root"]
 
@@ -1251,7 +1270,9 @@ def compact_context(
         "authenticated_source": clean["authenticated_source"],
         "history": history,
         "resume_authority": (
-            "full" if require_projection_authority else "inspection_only"
+            "partial_terminal_closure_required"
+            if expected_missing_terminal_closures
+            else ("full" if require_projection_authority else "inspection_only")
         ),
     }
     if include_history:

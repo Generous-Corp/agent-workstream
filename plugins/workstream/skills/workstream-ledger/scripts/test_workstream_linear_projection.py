@@ -3788,8 +3788,7 @@ class ProjectionTests(unittest.TestCase):
 
         synced, source = workstream_projection.synchronize_manifest_source(
             manifest, f"Canonical plan: {exact}",
-            {"identity": "https://github.com/acme/plans/blob/main/PLAN.md",
-             "sha256": "new", "bytes": 10},
+            {"identity": exact, "sha256": "new", "bytes": 10},
         )
 
         self.assertEqual(synced["projection"][0]["value"], {
@@ -3797,6 +3796,263 @@ class ProjectionTests(unittest.TestCase):
         })
         self.assertEqual(source, {"identity": exact, "sha256": "new", "bytes": 10})
         self.assertEqual(manifest["projection"][0]["value"]["sha256"], "old")
+
+    def test_manifest_source_sync_updates_equivalent_ref_to_exact_canonical(self):
+        main = "https://github.com/acme/plans/blob/main/PLAN.md"
+        exact = "https://github.com/acme/plans/blob/" + "a" * 40 + "/PLAN.md"
+        manifest = {"projection": [{
+            "kind": "source", "key": "root",
+            "value": {"identity": main, "sha256": PLAN},
+        }]}
+
+        synced, source = workstream_projection.synchronize_manifest_source(
+            manifest, f"Canonical plan: {exact}",
+            {"identity": exact, "sha256": PLAN, "bytes": 10},
+        )
+
+        self.assertEqual(synced["projection"][0]["value"], {
+            "identity": exact, "sha256": PLAN,
+        })
+        self.assertEqual(source, {
+            "identity": exact, "sha256": PLAN, "bytes": 10,
+        })
+
+    def test_terminal_source_transition_is_partial_replayable_and_narrow(self):
+        client, adapter, _source, graph, children, _manifest = (
+            self.multi_terminal_repair_fixture(evidence_active=False)
+        )
+        main = "https://github.com/acme/plans/blob/main/PLAN.md"
+        exact = "https://github.com/acme/plans/blob/" + "a" * 40 + "/PLAN.md"
+        current_source = next(
+            event for event in reversed(adapter.state().events)
+            if event["kind"] == "source"
+        )
+        adapter.append(build_projection_event(
+            workstream_id="GEN-37", kind="source", key="root",
+            value={"identity": main, "sha256": PLAN}, plan_revision=PLAN,
+            expected_revision=adapter.state().revision,
+            created_at="2026-08-29T01:00:00Z",
+            supersedes_event_id=current_source["event_id"], authority=AUTHORITY,
+        ))
+        active = adapter.state()
+        active_heads = workstream_projection._active_heads(active)
+        desired = [
+            {"kind": event["kind"], "key": event["key"],
+             "value": deepcopy(event["value"])}
+            for (kind, _key), event in active_heads.items()
+            if kind in {"scope", "source", "provenance"}
+        ]
+        pending = [{
+            "child_identifier": child["identifier"],
+            "child_issue_id": child["id"],
+            "expected_child_readback_sha256": canonical_digest(
+                terminal_child_readback(child)
+            ),
+            "expected_assignee_id": (child.get("assignee") or {}).get("id"),
+        } for child in children]
+        transition = {
+            "from_identity": main, "to_identity": exact, "sha256": PLAN,
+            "pending_children": pending,
+        }
+        manifest = {
+            **reviewed_manifest(adapter, desired),
+            "terminal_child_source_transition": transition,
+        }
+        graph = deepcopy(graph)
+        graph["root"]["description"] = f"Canonical plan: {exact}"
+        manifest, authenticated = workstream_projection.synchronize_manifest_source(
+            manifest, graph["root"]["description"],
+            {"identity": exact, "sha256": PLAN},
+        )
+        prepared = workstream_projection.prepare_terminal_child_source_transition(
+            manifest, graph, adapter.state(),
+        )
+        drifted_graph = deepcopy(graph)
+        drifted_graph["children"][1]["status_type"] = "started"
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_source_transition_pending_set_mismatch",
+        ):
+            workstream_projection.prepare_terminal_child_source_transition(
+                manifest, drifted_graph, adapter.state(),
+            )
+        bad_url = deepcopy(manifest)
+        bad_url["terminal_child_source_transition"]["to_identity"] = (
+            "https://github.com/acme/plans/blob/develop/PLAN.md"
+        )
+        with self.assertRaisesRegex(
+            LinearProjectionError, "terminal_child_source_transition_invalid_route",
+        ):
+            workstream_projection.prepare_terminal_child_source_transition(
+                bad_url, graph, adapter.state(),
+            )
+        bad_digest = deepcopy(manifest)
+        bad_digest["terminal_child_source_transition"]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(
+            LinearProjectionError, "terminal_child_source_transition_invalid_route",
+        ):
+            workstream_projection.prepare_terminal_child_source_transition(
+                bad_digest, graph, adapter.state(),
+            )
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", prepared, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=authenticated,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        expected = {item["child_identifier"]: item["expected_child_readback_sha256"]
+                    for item in pending}
+        legacy_state = deepcopy(adapter.state())
+        for event in legacy_state.events:
+            event["schema_version"] = 1
+        legacy_contract = projection_review_contract(legacy_state)
+        legacy_manifest = deepcopy(prepared)
+        for key, value in legacy_contract.items():
+            legacy_manifest[key] = deepcopy(value)
+        writes_before_legacy_refusal = len(client.comments)
+        with mock.patch.object(adapter, "state", return_value=legacy_state):
+            with self.assertRaisesRegex(
+                LinearProjectionError,
+                "terminal_child_source_transition_requires_v2_projection",
+            ):
+                reconcile_required_projection(
+                    adapter, preview, legacy_manifest, remote_head=HEAD,
+                    created_at="2026-08-29T01:00:30Z",
+                    authenticated_source=authenticated,
+                    relation_target_resolver=self.relation_target_resolver,
+                    terminal_child_fence=lambda ids: {
+                        item: expected[item] for item in ids
+                    },
+                    legacy_unresolved_relation_heads=unresolved,
+                )
+        self.assertEqual(len(client.comments), writes_before_legacy_refusal)
+        before = adapter.state().revision
+        result = reconcile_required_projection(
+            adapter, preview, prepared, remote_head=HEAD,
+            created_at="2026-08-29T01:01:00Z",
+            authenticated_source=authenticated,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda ids: {item: expected[item] for item in ids},
+            legacy_unresolved_relation_heads=unresolved,
+        )
+        self.assertFalse(result["resume_authority_verified"])
+        self.assertEqual(
+            [(event["kind"], event["key"])
+             for event in adapter.state().events[before:]],
+            [("source", "root")],
+        )
+        replay = workstream_projection.prepare_terminal_child_source_transition(
+            manifest, graph, adapter.state(),
+        )
+        self.assertEqual(
+            replay["expected_projection_revision"], adapter.state().revision,
+        )
+
+        comments = mock.Mock()
+        comments.comments.side_effect = lambda: [
+            dict(item) for item in client.comments
+        ]
+        transport = mock.Mock()
+        transport.snapshot_for_root.return_value = graph
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = Path(directory) / "source-transition.json"
+            manifest_path.write_text(json.dumps(manifest))
+            output = io.StringIO()
+            argv = [
+                "workstream_projection.py", "GEN-37", str(manifest_path),
+                "--remote-head", HEAD, "--plan-source", "ignored",
+                "--plan-identity", exact,
+                "--max-bytes", "65536", "--max-items", "500",
+            ]
+            with mock.patch.object(workstream_projection.sys, "argv", argv), \
+                 mock.patch.object(workstream_projection.sys, "stdout", output), \
+                 mock.patch.object(workstream_projection, "plan_payload", return_value={
+                     "source": {"identity": exact, "sha256": PLAN}
+                 }), \
+                 mock.patch.object(workstream_projection, "load_linear_api_key", return_value="secret"), \
+                 mock.patch.object(workstream_projection, "HttpGraphQLClient", return_value=client), \
+                 mock.patch.object(workstream_projection, "resolve_linear_route", return_value=(AUTHORITY, None)), \
+                 mock.patch.object(workstream_projection, "resolve_authenticated_issue_route", return_value=AUTHORITY), \
+                 mock.patch.object(workstream_projection, "LinearGraphQLTransport", return_value=transport), \
+                 mock.patch.object(workstream_projection, "LinearCommentEventAdapter", return_value=comments):
+                self.assertEqual(workstream_projection.main(), 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["operation_status"], "partial")
+            self.assertEqual(
+                payload["resume_authority"],
+                "partial_terminal_closure_required",
+            )
+            self.assertFalse(payload["resume_authority_verified"])
+            self.assertEqual(
+                payload["pending_terminal_closure"], ["GEN-70", "GEN-72"],
+            )
+            self.assertTrue(payload["source_transition"]["verified"])
+            self.assertEqual(payload["writes"], [])
+
+            changed_graph = deepcopy(graph)
+            changed_graph["children"][1]["assignee"] = {
+                "id": "81818181-8181-4181-8181-818181818181"
+            }
+            transport.snapshot_for_root.side_effect = [
+                graph, graph, graph,
+                changed_graph, changed_graph, changed_graph,
+            ]
+            error = io.StringIO()
+            with mock.patch.object(workstream_projection.sys, "argv", argv), \
+                 mock.patch.object(workstream_projection.sys, "stderr", error), \
+                 mock.patch.object(workstream_projection, "plan_payload", return_value={
+                     "source": {"identity": exact, "sha256": PLAN}
+                 }), \
+                 mock.patch.object(workstream_projection, "load_linear_api_key", return_value="secret"), \
+                 mock.patch.object(workstream_projection, "HttpGraphQLClient", return_value=client), \
+                 mock.patch.object(workstream_projection, "resolve_linear_route", return_value=(AUTHORITY, None)), \
+                 mock.patch.object(workstream_projection, "resolve_authenticated_issue_route", return_value=AUTHORITY), \
+                 mock.patch.object(workstream_projection, "LinearGraphQLTransport", return_value=transport), \
+                 mock.patch.object(workstream_projection, "LinearCommentEventAdapter", return_value=comments):
+                self.assertEqual(workstream_projection.main(), 2)
+            self.assertIn(
+                "terminal_child_readback_changed_reload_required:GEN-70",
+                error.getvalue(),
+            )
+
+        widened = deepcopy(manifest)
+        next(item for item in widened["projection"] if item["kind"] == "scope")[
+            "value"
+        ]["namespace"] = "forged"
+        with self.assertRaisesRegex(
+            LinearProjectionError, "terminal_child_source_transition_unrelated_change",
+        ):
+            workstream_projection.prepare_terminal_child_source_transition(
+                widened, graph, adapter.state(),
+            )
+
+    def test_manifest_source_sync_refuses_different_authenticated_exact_ref(self):
+        first = "https://github.com/acme/plans/blob/" + "a" * 40 + "/PLAN.md"
+        second = "https://github.com/acme/plans/blob/" + "b" * 40 + "/PLAN.md"
+        manifest = {"projection": [{
+            "kind": "source", "key": "root",
+            "value": {"identity": first, "sha256": PLAN},
+        }]}
+
+        with self.assertRaisesRegex(
+            LinearProjectionError, "plan_source_conflicts_canonical_issue_url",
+        ):
+            workstream_projection.synchronize_manifest_source(
+                manifest, f"Canonical plan: {second}",
+                {"identity": first, "sha256": PLAN, "bytes": 10},
+            )
+
+    def test_canonical_source_readback_refuses_equivalent_ref_change(self):
+        first = "https://github.com/acme/plans/blob/" + "a" * 40 + "/PLAN.md"
+        second = "https://github.com/acme/plans/blob/" + "b" * 40 + "/PLAN.md"
+
+        with self.assertRaisesRegex(
+            LinearProjectionError, "canonical_plan_changed_during_projection",
+        ):
+            workstream_projection.validate_canonical_source_readback(
+                f"Canonical plan: {second}",
+                {"identity": first, "sha256": PLAN},
+            )
 
     def test_manifest_source_sync_refuses_ambiguous_issue_without_mutation(self):
         manifest = {"projection": []}

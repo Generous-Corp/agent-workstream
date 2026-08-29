@@ -217,6 +217,16 @@ either attach receipts or explain why it is not applicable:
 Do not call a system test with mocked providers live end-to-end proof. A head
 change invalidates head-bound receipts until reconciled.
 
+The labeled canonical URL must be the exact authenticated source identity,
+including its Git ref, and its digest must match the structured projection.
+Changing a URL or revision is a synchronized source transition, never an
+implicit identity alias.
+When legacy completed ownership already blocks full authority, a reviewed
+`terminal_child_source_transition` may perform only the same-document
+`blob/main` to immutable 40-character commit transition at the same digest.
+It freezes every non-source head and disposition, fences the exact pending
+children, and returns partial authority until evidence seeding and closure.
+
 ### Terminal-child projection repair
 
 After a material child transition to Linear's `completed` state, run the
