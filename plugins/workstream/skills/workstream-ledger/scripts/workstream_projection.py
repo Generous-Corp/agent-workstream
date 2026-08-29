@@ -601,6 +601,41 @@ def _ordered_write_items(
     return [*migration, *closures, *ordinary, *disposition, *scopes]
 
 
+def _require_repairs_for_changed_child_closures(
+    desired: list[dict[str, Any]],
+    active: dict[tuple[str, str], dict[str, Any]],
+    repairs: list[dict[str, Any]],
+) -> None:
+    """Bind every closure creation/replacement to its reviewed live fence."""
+    repairs_by_child = {
+        repair["child_identifier"].upper(): repair for repair in repairs
+    }
+    for item in desired:
+        if item["kind"] != "child_closure":
+            continue
+        child_id = item["key"].upper()
+        current = active.get(("child_closure", child_id))
+        if current is not None and current["value"] == item["value"]:
+            continue
+        repair = repairs_by_child.get(child_id)
+        closure = item["value"]
+        if repair is None:
+            raise LinearProjectionError(
+                f"terminal_child_closure_repair_required:{child_id}"
+            )
+        if (
+            closure.get("child_identifier") != child_id
+            or closure.get("child_issue_id") != repair["child_issue_id"]
+            or closure.get("assignee_id") != repair["expected_assignee_id"]
+            or closure.get("child_readback_sha256")
+            != repair["expected_child_readback_sha256"]
+            or closure.get("evidence_heads") != repair["approved_evidence_heads"]
+        ):
+            raise LinearProjectionError(
+                f"terminal_child_closure_repair_mismatch:{child_id}"
+            )
+
+
 def load_material_history_for_projection_reconcile(
     snapshot: dict[str, Any], comments: list[dict[str, Any]], token: str,
     manifest: dict[str, Any], adapter: LinearProjectionAdapter, *,
@@ -642,6 +677,9 @@ def load_material_history_for_projection_reconcile(
         ],
     }
     active = _active_heads(initial)
+    _require_repairs_for_changed_child_closures(
+        desired, active, manifest.get("terminal_child_repairs") or [],
+    )
     desired_by_identity = {
         (item["kind"], item["key"]): item["value"] for item in desired
     }
@@ -935,6 +973,9 @@ def reconcile_required_projection(
     if observed_contract != reviewed_contract:
         raise LinearProjectionError("projection_review_stale_reload_required")
     active_heads = _active_heads(initial)
+    _require_repairs_for_changed_child_closures(
+        desired, active_heads, manifest.get("terminal_child_repairs") or [],
+    )
     latest_heads = _latest_heads(initial)
     retirements: list[dict[str, Any]] = []
     for retirement in reviewed_retirements:

@@ -1047,12 +1047,7 @@ def validate_snapshot(
                 contracts.append(contract)
             if evidence_receipts_sha256(contracts) != closure.get("evidence_receipts_sha256"):
                 raise ResumeError(f"child_closure_receipts_mismatch:{index}")
-        evidence_owned_children = {
-            str(event["value"].get("owning_child", "")).upper()
-            for (kind, _key), event in active.items()
-            if kind == "evidence_contract"
-        }
-        if scope is not None:
+        if projection_events and scope is not None:
             for child_id, child in child_by_identifier.items():
                 status_type = str(
                     child.get("status_type") or child.get("status") or ""
@@ -1060,7 +1055,6 @@ def validate_snapshot(
                 if (
                     status_type in {"completed", "done"}
                     and child_id in scope["child_ownership"]
-                    and child_id in evidence_owned_children
                     and child_id not in closure_ids
                 ):
                     raise ResumeError(

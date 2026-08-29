@@ -232,7 +232,10 @@ An exact replay is a no-op. Missing/failed receipts, multiple owners or heads,
 non-completed state, missing assignee, route/readback drift, unrelated scope or
 source changes, and stale evidence refuse without mutation. Resume validates
 the closure against current Linear state, scope, repository head, and receipts
-before returning full authority.
+before returning full authority. Once a completed child is present in the
+structured ownership map, full resume requires its active closure even if its
+evidence is later retired. Every closure creation or replacement requires the
+matching reviewed repair and live readback fence.
 
 ### Truth and closure reducer
 

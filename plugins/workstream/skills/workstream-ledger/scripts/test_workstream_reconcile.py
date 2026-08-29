@@ -503,6 +503,7 @@ class ReconcileTests(unittest.TestCase):
         graph["root"]["plan_revision"] = PLAN
         graph["root"]["next_action"] = "await exact landing review"
         graph["children"][0]["title"] = "Owned acceptance slice"
+        graph["children"][0]["status"] = "Canceled"
         before_lifecycle = add_material_history(
             graph, client.comments, "GEN-37", authenticated_route=AUTHORITY,
             authenticated_source={
