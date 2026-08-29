@@ -121,9 +121,14 @@ still fail `remote_cas_unavailable` until a remote CAS authority exists. Never
 infer a repository, worktree, or Linear project from the Markdown's cwd.
 
 After intake returns the canonical root token, invoke
-`scripts/workstream_tab.py GEN-123`. In cmux it preserves the existing tab
-title and appends exactly one token; the same token is a no-op and a different
-token refuses without mutation. Outside cmux it reports an optional no-op.
+`scripts/workstream_tab.py GEN-123`. In cmux or Herdr it preserves the existing
+tab title and appends exactly one token; the same token is a no-op and a
+different token refuses without mutation. Herdr resolution is allowed only
+inside `HERDR_ENV=1` with the inherited exact tab, workspace, and socket
+namespace; never query a focused/default session or treat a bare `w1:t1` as
+globally unique. Outside a supported manager, or when the exact target cannot
+be resolved, it reports an optional no-op without changing the preceding
+full-authority recovery result.
 
 ### Material-delta journal
 

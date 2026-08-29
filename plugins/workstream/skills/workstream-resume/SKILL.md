@@ -43,8 +43,11 @@ tab without replacing its title:
 python3 "<absolute directory of this SKILL.md>/scripts/workstream_tab.py" GEN-123
 ```
 
-An unavailable cmux surface is an optional no-op. A conflicting workstream
-token is a hard refusal; do not rename the tab.
+An unresolved cmux/Herdr surface is an optional no-op and never downgrades
+`resume_authority: full`. Use Herdr only when `HERDR_ENV=1` supplies the exact
+inherited tab/workspace/socket identity. A conflicting token is a hard refusal;
+do not rename the tab. Resume refusal denies execution authority; tab
+unavailability means only that optional display binding was skipped.
 
 Report and retain the authenticated route/source, open children, current next
 action, checkpoint, and attach-or-successor disposition. Do not claim live

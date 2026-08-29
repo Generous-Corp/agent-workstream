@@ -56,10 +56,10 @@ Resume ABC-123 and reconcile it with live repository state.
 Adversarially check whether ABC-123 can close.
 ```
 
-[cmux](https://cmux.com/) is optional. When available, Agent Workstream can
-carry the stable token in a tab title and help coordinate a successor session.
-Without cmux, resume from the same Linear token or URL in any agent or terminal;
-only the tab and session conveniences are skipped.
+[cmux](https://cmux.com/) and [Herdr](https://herdr.dev/docs/) are optional.
+When either manages the current tab, Agent Workstream can carry the stable token
+in its title. Without a supported session manager, resume from the same Linear
+token or URL; only the display convenience is skipped.
 
 ## Roadmap
 

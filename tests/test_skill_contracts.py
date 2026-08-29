@@ -44,6 +44,18 @@ class SkillContractTests(unittest.TestCase):
         self.assertLess(cwd_warning, path_warning)
         self.assertLess(path_warning, history_warning)
 
+    def test_optional_tab_binding_cannot_replace_resume_authority(self):
+        resume = " ".join(self.resume_skill().split())
+        recovery = resume.index("Success requires `resume_authority` to be `full`")
+        binding = resume.index("After successful recovery, carry the resolved canonical token")
+        unavailable = resume.index("An unresolved cmux/Herdr surface is an optional no-op")
+        no_downgrade = resume.index("never downgrades `resume_authority: full`")
+        refusal = resume.index("Resume refusal denies execution authority")
+        self.assertLess(recovery, binding)
+        self.assertLess(binding, unavailable)
+        self.assertLess(unavailable, no_downgrade)
+        self.assertLess(no_downgrade, refusal)
+
     def test_resume_entry_is_small_and_owns_fresh_handle_trigger(self):
         resume = self.resume_skill()
         ledger = self.skill()

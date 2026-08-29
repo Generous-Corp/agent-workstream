@@ -1,9 +1,11 @@
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("workstream_tab.py")
@@ -35,6 +37,40 @@ class FakeCmux:
             if self.accept_rename:
                 self.title = argv[-1]
             output = "{}"
+        else:
+            raise AssertionError(argv)
+        return subprocess.CompletedProcess(argv, 0, output, "")
+
+
+class FakeHerdr:
+    def __init__(self, label="Linear", *, workspace="w1", accept_rename=True):
+        self.label = label
+        self.workspace = workspace
+        self.accept_rename = accept_rename
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(argv)
+        if argv[1:3] == ["tab", "get"]:
+            output = json.dumps({
+                "id": "request-1", "result": {
+                    "type": "tab_info", "tab": {
+                        "tab_id": argv[3], "workspace_id": self.workspace,
+                        "number": 1, "label": self.label, "focused": True,
+                        "pane_count": 1, "agent_status": "idle",
+                    },
+                },
+            })
+        elif argv[1:3] == ["tab", "rename"]:
+            if self.accept_rename:
+                self.label = argv[4]
+            output = json.dumps({"id": "request-2", "result": {
+                "type": "tab_info", "tab": {
+                    "tab_id": argv[3], "workspace_id": self.workspace,
+                    "number": 1, "label": self.label, "focused": True,
+                    "pane_count": 1, "agent_status": "idle",
+                },
+            }})
         else:
             raise AssertionError(argv)
         return subprocess.CompletedProcess(argv, 0, output, "")
@@ -103,7 +139,7 @@ class WorkstreamTabTests(unittest.TestCase):
         self.assertEqual(result["status"], "unavailable")
         self.assertEqual(result["reason"], "cmux_unavailable")
 
-    def test_reachable_cmux_with_unresolved_target_fails_closed(self):
+    def test_reachable_cmux_with_unresolved_target_is_optional_noop(self):
         fake = FakeCmux()
 
         def runner(argv, **kwargs):
@@ -111,12 +147,50 @@ class WorkstreamTabTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 1, "", "unknown surface")
             return fake(argv, **kwargs)
 
-        with self.assertRaisesRegex(tab.TabTitleError, "cmux_command_failed"):
-            tab.apply_title(
-                "GEN-37", target="surface:404", runner=runner,
-                which=lambda _: "/opt/cmux",
-            )
+        result = tab.apply_title(
+            "GEN-37", target="surface:404", runner=runner,
+            which=lambda _: "/opt/cmux",
+        )
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["reason"], "cmux_target_unresolved")
         self.assertNotIn("rename-tab", [call[1] for call in fake.calls])
+
+    def test_reachable_cmux_without_caller_binding_is_optional_noop(self):
+        fake = FakeCmux()
+
+        def runner(argv, **kwargs):
+            if argv[1] == "identify":
+                return subprocess.CompletedProcess(argv, 0, "{}", "")
+            return fake(argv, **kwargs)
+
+        result = tab.apply_title(
+            "GEN-37", target="surface:404", runner=runner,
+            which=lambda _: "/opt/cmux",
+        )
+
+        self.assertEqual(result, {
+            "status": "unavailable", "reason": "cmux_target_unresolved",
+            "token": "GEN-37",
+        })
+        self.assertNotIn("rename-tab", [call[1] for call in fake.calls])
+
+    def test_cli_distinguishes_optional_unavailable_from_binding_error(self):
+        unavailable = {
+            "status": "unavailable", "reason": "cmux_target_unresolved",
+            "token": "GEN-37",
+        }
+        with mock.patch.object(tab, "apply_title", return_value=unavailable), \
+             mock.patch.object(sys, "stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(tab.main(["GEN-37"]), 0)
+        self.assertEqual(json.loads(stdout.getvalue()), unavailable)
+
+        with mock.patch.object(
+            tab, "apply_title", side_effect=tab.TabTitleError("cmux_command_failed"),
+        ), mock.patch.object(
+            sys, "stderr", new_callable=io.StringIO,
+        ) as stderr:
+            self.assertEqual(tab.main(["GEN-37"]), 2)
+        self.assertEqual(stderr.getvalue().strip(), "workstream-tab: cmux_command_failed")
 
     def test_malformed_title_read_fails_closed(self):
         fake = FakeCmux()
@@ -144,6 +218,107 @@ class WorkstreamTabTests(unittest.TestCase):
             tab.apply_title(
                 "GEN-37", target="surface:7", runner=fake,
                 which=lambda _: "/opt/cmux",
+            )
+
+    @staticmethod
+    def herdr_env(socket="/tmp/herdr-a.sock"):
+        return {
+            "HERDR_ENV": "1", "HERDR_BIN_PATH": "/opt/herdr",
+            "HERDR_SOCKET_PATH": socket, "HERDR_WORKSPACE_ID": "w1",
+            "HERDR_TAB_ID": "w1:t1", "HERDR_PANE_ID": "w1:p1",
+        }
+
+    def test_herdr_appends_token_and_verifies_exact_readback(self):
+        fake = FakeHerdr("Linear")
+        result = tab.apply_title(
+            "GEN-37", environ=self.herdr_env(), runner=fake,
+            which=lambda _: None,
+        )
+        self.assertEqual(result["status"], "updated")
+        self.assertEqual(result["manager"], "herdr")
+        self.assertEqual(result["title"], "Linear · GEN-37")
+        self.assertEqual([call[1:3] for call in fake.calls], [
+            ["tab", "get"], ["tab", "rename"], ["tab", "get"],
+        ])
+
+    def test_herdr_same_token_is_noop_and_conflict_refuses(self):
+        fake = FakeHerdr("Linear · GEN-37")
+        result = tab.apply_title(
+            "GEN-37", environ=self.herdr_env(), runner=fake,
+            which=lambda _: None,
+        )
+        self.assertEqual(result["status"], "unchanged")
+        self.assertNotIn(["tab", "rename"], [call[1:3] for call in fake.calls])
+
+        conflicting = FakeHerdr("Linear · GEN-38")
+        with self.assertRaisesRegex(tab.TabTitleError, "conflicting_workstream_token"):
+            tab.apply_title(
+                "GEN-37", environ=self.herdr_env(), runner=conflicting,
+                which=lambda _: None,
+            )
+        self.assertNotIn(
+            ["tab", "rename"], [call[1:3] for call in conflicting.calls],
+        )
+
+    def test_herdr_missing_identity_binary_or_target_is_optional_noop(self):
+        called = False
+
+        def runner(*args, **kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError("must not run")
+
+        missing = self.herdr_env()
+        missing.pop("HERDR_TAB_ID")
+        result = tab.apply_title(
+            "GEN-37", environ=missing, runner=runner, which=lambda _: None,
+        )
+        self.assertEqual(result["reason"], "herdr_identity_unavailable")
+        self.assertFalse(called)
+
+        no_binary = self.herdr_env()
+        no_binary.pop("HERDR_BIN_PATH")
+        result = tab.apply_title(
+            "GEN-37", environ=no_binary, runner=runner, which=lambda _: None,
+        )
+        self.assertEqual(result["reason"], "herdr_cli_unavailable")
+        self.assertFalse(called)
+
+        def unavailable(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 1, "", "stopped socket")
+
+        result = tab.apply_title(
+            "GEN-37", environ=self.herdr_env(), runner=unavailable,
+            which=lambda _: None,
+        )
+        self.assertEqual(result["reason"], "herdr_target_unresolved")
+
+    def test_herdr_named_session_namespace_prevents_public_id_collision(self):
+        first = tab.apply_title(
+            "GEN-37", environ=self.herdr_env("/tmp/herdr-a.sock"),
+            runner=FakeHerdr(), which=lambda _: None,
+        )
+        second = tab.apply_title(
+            "GEN-37", environ=self.herdr_env("/tmp/herdr-b.sock"),
+            runner=FakeHerdr(), which=lambda _: None,
+        )
+        self.assertEqual(first["tab"], second["tab"])
+        self.assertNotEqual(
+            first["session_namespace_sha256"],
+            second["session_namespace_sha256"],
+        )
+
+    def test_herdr_workspace_mismatch_is_unavailable_and_readback_mismatch_refuses(self):
+        unresolved = tab.apply_title(
+            "GEN-37", environ=self.herdr_env(),
+            runner=FakeHerdr(workspace="w2"), which=lambda _: None,
+        )
+        self.assertEqual(unresolved["reason"], "herdr_target_unresolved")
+
+        with self.assertRaisesRegex(tab.TabTitleError, "herdr_title_readback_mismatch"):
+            tab.apply_title(
+                "GEN-37", environ=self.herdr_env(),
+                runner=FakeHerdr(accept_rename=False), which=lambda _: None,
             )
 
 
