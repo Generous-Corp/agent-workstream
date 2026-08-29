@@ -376,7 +376,10 @@ class LinearCommentEventAdapter:
             if winner is not None and _canonical_event(winner) == _canonical_event(delta):
                 return MutationReceipt(delta.event_id, after_error.revision, slot_id)
             if winner is not None:
-                raise LinearEventError("event_slot_lost_reload_required")
+                raise RevisionConflict(
+                    f"expected revision {delta.expected_revision}, "
+                    f"live revision {after_error.revision}"
+                )
             raise
         created = response.get("commentCreate") or {}
         comment = created.get("comment")

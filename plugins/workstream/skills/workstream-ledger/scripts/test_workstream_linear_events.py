@@ -5,6 +5,7 @@ import threading
 import unittest
 from unittest import mock
 
+import workstream_linear_events as linear_events_module
 from workstream_delta import Delta, DeltaJournal
 from workstream_delta import RevisionConflict
 from workstream_linear import LinearTransportError
@@ -176,11 +177,55 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
                 return super().execute(query, variables)
 
         with self.assertRaisesRegex(
-            LinearEventError, "event_slot_lost_reload_required"
+            RuntimeError, "expected revision 0, live revision 1"
         ):
             LinearCommentEventAdapter(
                 ForeignWinnerClient(), issue_id="GEN-37"
             ).apply(delta("event-a", {"order": 1}))
+
+    def test_concurrent_apply_with_rebase_serializes_stable_event_ids(self):
+        client = FakeCommentClient(initial_readers=2)
+        receipts = []
+        failures = []
+
+        def apply(event_id, order):
+            journal = DeltaJournal(":memory:")
+            try:
+                journal.append(
+                    "GEN-37", "requirement", {"order": order}, 0,
+                    event_id=event_id, source="agent_discovery",
+                )
+                receipts.extend(journal.apply_with_rebase(
+                    LinearCommentEventAdapter(client, issue_id="GEN-37")
+                ))
+            except Exception as exc:  # captured so the main thread can assert it
+                failures.append(exc)
+            finally:
+                journal.close()
+
+        threads = [
+            threading.Thread(target=apply, args=("event-a", 1)),
+            threading.Thread(target=apply, args=("event-b", 2)),
+        ]
+        # Some full-suite tests deliberately reload workstream_delta to verify
+        # migrations. Keep the adapter's exception identity aligned with the
+        # journal class under test while these worker threads execute.
+        with mock.patch.object(
+            linear_events_module, "RevisionConflict", RevisionConflict
+        ):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=3)
+
+        self.assertFalse(failures)
+        self.assertEqual({receipt.event_id for receipt in receipts}, {"event-a", "event-b"})
+        state = reduce_event_comments(client.comments, workstream_id="GEN-37")
+        self.assertEqual(state.revision, 2)
+        self.assertEqual([event.expected_revision for event in state.events], [0, 1])
+        self.assertEqual({event.event_id for event in state.events}, {"event-a", "event-b"})
+        self.assertEqual(len(client.comments), 2)
+        self.assertEqual(len({comment["id"] for comment in client.comments}), 2)
 
     def test_duplicate_and_conflicting_event_ids_fail_closed(self):
         original = delta("event-a", {"order": 1})
