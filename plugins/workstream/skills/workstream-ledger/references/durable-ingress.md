@@ -122,7 +122,10 @@ and exact receipt before acknowledging the raw event. GitHub issue comments are
 editable and deletable, so `no-material-delta` and `superseded` comments are
 never durable processed authority—even when their body, author login, numeric
 user ID, and timestamps currently look valid. Recovery may expose such a
-comment as a nonauthoritative hint but keeps the capture open. The legacy
+comment as bounded nonauthoritative metadata only when it shares the capture's
+physical repo/issue route, but keeps the capture open. Conflicting, malformed,
+orphaned, and cross-route hints neither become routing evidence nor abort the
+remaining inventory. The legacy
 `process` command refuses to publish these classifications until an immutable
 or signed receipt design exists; no signing keys or key-management surface are
 part of the current implementation.

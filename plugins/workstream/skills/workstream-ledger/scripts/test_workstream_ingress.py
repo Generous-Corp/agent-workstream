@@ -887,9 +887,12 @@ class ClassificationAuthorityTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["event_id"], "wsi_classify")
         self.assertEqual(events[0]["classification_hint"], {
-            "disposition": payload["disposition"],
             "authoritative": False,
             "reason": "mutable_github_comment",
+            "observed_count": 1,
+            "additional_hints_omitted": 0,
+            "dispositions": [payload["disposition"]],
+            "ambiguous": False,
         })
 
     def test_every_mutable_classification_variant_remains_open_for_both_dispositions(self):
@@ -919,6 +922,59 @@ class ClassificationAuthorityTests(unittest.TestCase):
                     changes, metadata = mutate(payload)
                     payload.update(changes)
                     self.assert_visible_hint(payload, metadata=metadata or None)
+
+    def test_conflicting_orphan_and_cross_route_hints_never_block_inventory(self):
+        other_capture = {
+            **self.capture, "event_id": "wsi_other",
+            "captured_at": "2026-08-29T01:02:00Z", "prompt": "Still open",
+        }
+        first = self.payload("no-material-delta")
+        conflicting_actor = self.payload("no-material-delta")
+        conflicting_actor["classification_actor"] = {
+            "provider": "github", "login": "other", "id": 200,
+        }
+        conflicting_disposition = self.payload("superseded")
+        cross_route = self.payload("no-material-delta")
+        orphan = self.payload("superseded")
+        orphan["event_id"] = "wsi_orphan"
+        issue_seven = [
+            {"id": 1, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, self.capture)},
+            {"id": 2, "body": MODULE.comment_body(MODULE.PROCESSED_MARKER, first),
+             "user": {"login": "trusted-bot", "id": 100}},
+            {"id": 3, "body": MODULE.comment_body(
+                MODULE.PROCESSED_MARKER, conflicting_actor),
+             "user": {"login": "other", "id": 200}},
+            {"id": 4, "body": MODULE.comment_body(
+                MODULE.PROCESSED_MARKER, conflicting_disposition)},
+            {"id": 5, "body": MODULE.comment_body(
+                MODULE.PROCESSED_MARKER, ["malformed", "hint"])},
+        ]
+        issue_eight = [
+            {"id": 6, "body": MODULE.comment_body(
+                MODULE.CAPTURE_MARKER, other_capture)},
+            {"id": 7, "body": MODULE.comment_body(MODULE.PROCESSED_MARKER, cross_route)},
+            {"id": 8, "body": MODULE.comment_body(MODULE.PROCESSED_MARKER, orphan)},
+        ]
+        with mock.patch.object(MODULE, "gh", side_effect=[
+            [
+                {"number": 7, "url": "i7", "title": "ingress"},
+                {"number": 8, "url": "i8", "title": "ingress"},
+            ],
+            [issue_seven], [issue_eight],
+        ]):
+            events = MODULE.remote_events(self.repo, "GEN-37")
+        self.assertEqual([event["event_id"] for event in events], [
+            "wsi_classify", "wsi_other",
+        ])
+        self.assertEqual(events[0]["classification_hint"], {
+            "authoritative": False,
+            "reason": "mutable_github_comment",
+            "observed_count": 3,
+            "additional_hints_omitted": 0,
+            "dispositions": ["no-material-delta", "superseded"],
+            "ambiguous": True,
+        })
+        self.assertNotIn("classification_hint", events[1])
 
     def test_process_refuses_to_publish_nonauthoritative_classifications(self):
         for disposition in ("no-material-delta", "superseded"):

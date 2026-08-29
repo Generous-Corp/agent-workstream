@@ -48,6 +48,8 @@ PROMOTION_SCHEMA_VERSION = 2
 MAX_PROMOTION_CHANGES = 32
 MAX_PROMOTION_BYTES = 16 * 1024
 MAX_PROMOTION_CONFLICTS = 8
+MAX_CLASSIFICATION_HINT_GROUPS = 256
+MAX_CLASSIFICATION_HINTS_REPORTED = 8
 
 SECRET_PATTERNS = (
     re.compile(r"-----BEGIN [^-]*(?:PRIVATE KEY|CERTIFICATE)-----.*?-----END [^-]*-----", re.S),
@@ -916,6 +918,7 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
     ], timeout=15)
     captures: dict[str, dict[str, Any]] = {}
     processed: dict[str, dict[str, Any]] = {}
+    mutable_hints: dict[tuple[int, str], dict[str, Any]] = {}
     promotions: dict[str, dict[str, Any]] = {}
     bindings: dict[str, dict[str, Any]] = {}
     event_routes: dict[str, dict[str, Any]] = {}
@@ -927,6 +930,53 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
         if previous and previous != route:
             raise ValueError(f"ingress_event_route_collision:{event_id}")
         event_routes[event_id] = route
+
+    def record_mutable_hint(
+        item: Any, comment: dict[str, Any], issue_number: int,
+    ) -> None:
+        if not isinstance(item, dict):
+            return
+        disposition = item.get("disposition")
+        event_id = item.get("event_id")
+        if (
+            disposition not in {"no-material-delta", "superseded"}
+            or not isinstance(event_id, str)
+            or not event_id
+            or len(event_id.encode("utf-8")) > 256
+        ):
+            return
+        key = (issue_number, event_id)
+        if key not in mutable_hints:
+            if len(mutable_hints) >= MAX_CLASSIFICATION_HINT_GROUPS:
+                return
+            mutable_hints[key] = {
+                "count": 0, "dispositions": set(), "fingerprints": set(),
+                "ambiguous": False,
+            }
+        hint = mutable_hints[key]
+        hint["count"] += 1
+        hint["dispositions"].add(disposition)
+        user = comment.get("user")
+        user = user if isinstance(user, dict) else {}
+        fingerprint_material = canonical_json({
+            "body": comment.get("body") if isinstance(comment.get("body"), str) else "",
+            "user_login": user.get("login") if isinstance(user.get("login"), str) else None,
+            "user_id": user.get("id")
+            if isinstance(user.get("id"), (str, int)) and not isinstance(user.get("id"), bool)
+            else None,
+            "created_at": comment.get("created_at")
+            if isinstance(comment.get("created_at"), str) else None,
+            "updated_at": comment.get("updated_at")
+            if isinstance(comment.get("updated_at"), str) else None,
+        }).encode("utf-8")
+        fingerprint = hashlib.sha256(fingerprint_material).hexdigest()
+        if fingerprint not in hint["fingerprints"]:
+            if len(hint["fingerprints"]) < 2:
+                hint["fingerprints"].add(fingerprint)
+            else:
+                hint["ambiguous"] = True
+        if len(hint["fingerprints"]) > 1 or len(hint["dispositions"]) > 1:
+            hint["ambiguous"] = True
 
     for issue in issues:
         issue_number = issue.get("number")
@@ -948,11 +998,17 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
                 continue
             item = parse_comment(comment.get("body", ""), PROCESSED_MARKER)
             if item:
-                bind_route(item["event_id"], issue_number)
-                previous = processed.get(item["event_id"])
+                record_mutable_hint(item, comment, issue_number)
+                if not isinstance(item, dict) or item.get("disposition") != "promoted":
+                    continue
+                event_id = item.get("event_id")
+                if not isinstance(event_id, str) or not event_id:
+                    raise ValueError("processed_promotion_schema_invalid:unknown")
+                bind_route(event_id, issue_number)
+                previous = processed.get(event_id)
                 if previous and _payload_without_time(previous) != _payload_without_time(item):
-                    raise ValueError(f"conflicting_processed:{item['event_id']}")
-                processed[item["event_id"]] = item
+                    raise ValueError(f"conflicting_processed:{event_id}")
+                processed[event_id] = item
                 continue
             item = parse_comment(comment.get("body", ""), PROMOTION_MARKER)
             if item:
@@ -973,6 +1029,21 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
         if event_id in captures:
             captures[event_id]["workstream_id"] = binding.get("workstream_id")
             captures[event_id]["context_url"] = binding.get("context_url")
+    for event_id, event in captures.items():
+        route = event_routes[event_id]
+        hint = mutable_hints.get((route["issue"], event_id))
+        if hint:
+            count = hint["count"]
+            event["classification_hint"] = {
+                "authoritative": False,
+                "reason": "mutable_github_comment",
+                "observed_count": min(count, MAX_CLASSIFICATION_HINTS_REPORTED),
+                "additional_hints_omitted": max(
+                    0, count - MAX_CLASSIFICATION_HINTS_REPORTED,
+                ),
+                "dispositions": sorted(hint["dispositions"]),
+                "ambiguous": bool(hint["ambiguous"]),
+            }
     for event_id in processed:
         if event_id not in captures:
             raise ValueError(f"processed_without_capture:{event_id}")
@@ -995,18 +1066,6 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
     for event_id, event in candidates:
         disposition = processed.get(event_id)
         if not disposition:
-            continue
-        if disposition.get("disposition") in {"no-material-delta", "superseded"}:
-            # GitHub issue comments are editable and deletable. Even an exact
-            # current actor match is not an immutable receipt: logins can be
-            # recycled and old bodies can be rewritten. Preserve the marker as
-            # a triage hint, but keep the raw capture open until a durable
-            # authority exists.
-            event["classification_hint"] = {
-                "disposition": disposition.get("disposition"),
-                "authoritative": False,
-                "reason": "mutable_github_comment",
-            }
             continue
         if disposition.get("disposition") != "promoted":
             raise ValueError(f"processed_disposition_invalid:{event_id}")
