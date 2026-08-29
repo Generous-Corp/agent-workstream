@@ -84,6 +84,74 @@ class SuccessorTests(unittest.TestCase):
             ):
                 choose_disposition(snapshot, remote_head=head)
 
+    def test_compact_and_full_dirty_or_stale_worktree_create_same_successor(self):
+        remote_head = "a" * 40
+        for state in ("dirty", "stale"):
+            with self.subTest(state=state):
+                worktree = {
+                    "state": state, "path": f"/{state}", "head": "b" * 40,
+                }
+                compact = {
+                    "root": {"identifier": "GEN-37"},
+                    "context_schema": {
+                        "name": "agent-workstream.resume-context", "version": 2,
+                        "representation": "compact_validated",
+                    },
+                    "provenance": {
+                        "worktree_authority_count": 1,
+                        "worktree_authority_ambiguous": False,
+                        "latest": {"worktree": worktree},
+                        "latest_projection_head": {
+                            "key": state, "event_id": f"event-{state}",
+                            "value_sha256": "c" * 64,
+                        },
+                    },
+                }
+                full = {
+                    "root": {"identifier": "GEN-37"},
+                    "provenance": [{"worktree": worktree}],
+                }
+                compact_result = choose_disposition(
+                    compact, remote_head=remote_head,
+                )
+                full_result = choose_disposition(full, remote_head=remote_head)
+                self.assertEqual(
+                    compact_result["disposition"], full_result["disposition"],
+                )
+                self.assertEqual(
+                    compact_result["predecessor"], full_result["predecessor"],
+                )
+                self.assertEqual(compact_result["reason"], full_result["reason"])
+
+    def test_compact_and_full_safe_plus_dirty_refuse_identically(self):
+        head = "a" * 40
+        compact = {
+            "root": {"identifier": "GEN-37"},
+            "context_schema": {
+                "name": "agent-workstream.resume-context", "version": 2,
+                "representation": "compact_validated",
+            },
+            "provenance": {
+                "worktree_authority_count": 2,
+                "worktree_authority_ambiguous": True,
+                "latest": None, "latest_projection_head": None,
+            },
+        }
+        full = {
+            "root": {"identifier": "GEN-37"},
+            "provenance": [
+                {"worktree": {"state": "safe", "head": head}},
+                {"worktree": {
+                    "state": "dirty", "path": "/dirty", "head": "b" * 40,
+                }},
+            ],
+        }
+        for snapshot in (compact, full):
+            with self.assertRaisesRegex(
+                SuccessorError, "multiple projected worktree authorities",
+            ):
+                choose_disposition(snapshot, remote_head=head)
+
     def test_recovered_checkpoint_is_the_worktree_authority(self):
         snapshot = {
             "root": {"identifier": "GEN-37"},

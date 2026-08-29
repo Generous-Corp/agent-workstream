@@ -365,9 +365,10 @@ Its `context_schema` is `agent-workstream.resume-context` version 2 with
 checkpoint evidence, provenance, and terminal readbacks are represented by
 counts, digests, exact repository heads, and active projection-head bindings
 instead of being duplicated into every agent prompt.
-Compact provenance exposes a worktree authority only when exactly one active
-safe candidate matches a scoped exact head. Multiple candidates refuse just as
-full history does; projection order is not implicit supersession.
+Compact provenance uses the same candidate predicate as full history: every
+provenance item with a truthy worktree is a candidate. Exactly one is preserved,
+including a dirty or stale predecessor; multiple candidates refuse, and
+projection order is not implicit supersession.
 After initial bounded recovery, an explicitly requested audit or closure pass
 may use a second `--include-history` invocation and raise the explicit byte/item
 caps when that complete history is known to exceed the normal resume budget.

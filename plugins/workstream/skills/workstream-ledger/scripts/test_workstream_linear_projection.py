@@ -925,7 +925,9 @@ class ProjectionTests(unittest.TestCase):
         }
         later = {
             "agent": "alpha", "machine": "M3", "session_id": "later",
-            "worktree": {"state": "safe", "head": HEAD},
+            "worktree": {
+                "state": "dirty", "path": "/dirty", "head": "b" * 40,
+            },
         }
         items = sorted(
             [older, later],
@@ -939,12 +941,21 @@ class ProjectionTests(unittest.TestCase):
              "value": later},
         ]
         compact = resume_module._compact_provenance(
-            items, projection_events, scope(),
+            items, projection_events,
         )
         self.assertEqual(compact["worktree_authority_count"], 2)
         self.assertTrue(compact["worktree_authority_ambiguous"])
         self.assertIsNone(compact["latest"])
         self.assertIsNone(compact["latest_projection_head"])
+
+        sole_dirty = resume_module._compact_provenance(
+            [later], [projection_events[1]],
+        )
+        self.assertEqual(sole_dirty["worktree_authority_count"], 1)
+        self.assertEqual(sole_dirty["latest"]["worktree"], later["worktree"])
+        self.assertEqual(
+            sole_dirty["latest_projection_head"]["key"], "later",
+        )
 
     def test_multi_terminal_repair_is_ordered_full_and_idempotent(self):
         client, adapter, source, graph, _children, stale_manifest = (

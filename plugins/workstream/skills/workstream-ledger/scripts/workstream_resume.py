@@ -48,7 +48,7 @@ from workstream_child_closure import (
     ChildClosureError,
 )
 from workstream_scope import (
-    is_full_oid, repository_key, ScopeError, validate_relations, validate_scope,
+    repository_key, ScopeError, validate_relations, validate_scope,
 )
 
 
@@ -618,56 +618,33 @@ def _compact_child(child: dict[str, Any]) -> dict[str, Any]:
 
 def _compact_provenance(
     items: list[dict[str, Any]], projection_events: list[dict[str, Any]],
-    scope: dict[str, Any] | None,
 ) -> dict[str, Any]:
     encoded = json.dumps(
         items, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode()
-    active: dict[str, tuple[int, dict[str, Any]]] = {}
-    for index, event in enumerate(projection_events):
-        if event.get("kind") != "provenance":
-            continue
-        key = event.get("key")
-        if not isinstance(key, str):
-            continue
-        if event.get("value") == TOMBSTONE:
-            active.pop(key, None)
-        else:
-            active[key] = (index, event)
-    valid_heads = {
-        repository.get("exact_head")
-        for repository in (scope or {}).get("repositories", [])
-    }
-    item_digests = {canonical_digest(item) for item in items}
-    bound = []
-    for candidate in active.values():
-        value = candidate[1]["value"]
-        worktree = value.get("worktree") if isinstance(value, dict) else None
-        if (
-            isinstance(worktree, dict)
-            and str(worktree.get("state") or "").lower() == "safe"
-            and is_full_oid(str(worktree.get("head") or ""))
-            and worktree.get("head") in valid_heads
-            and canonical_digest(value) in item_digests
-        ):
-            bound.append(candidate)
-    latest_event = bound[0] if len(bound) == 1 else None
-    latest = latest_event[1]["value"] if latest_event is not None else None
+    candidates = [
+        item for item in items
+        if isinstance(item, dict) and item.get("worktree")
+    ]
+    latest = candidates[0] if len(candidates) == 1 else None
+    head = (
+        _projection_head_for_value(
+            latest, _active_projection_heads(projection_events, "provenance"),
+            "provenance_compaction",
+        )
+        if latest is not None else None
+    )
     return {
         "count": len(items),
         "sha256": hashlib.sha256(encoded).hexdigest(),
-        "worktree_authority_count": len(bound),
-        "worktree_authority_ambiguous": len(bound) > 1,
+        "worktree_authority_count": len(candidates),
+        "worktree_authority_ambiguous": len(candidates) > 1,
         "latest": ({
             key: latest[key]
             for key in ("agent", "machine", "session_id", "worktree")
             if latest.get(key) is not None
         } if latest is not None else None),
-        "latest_projection_head": ({
-            "key": latest_event[1]["key"],
-            "event_id": latest_event[1]["event_id"],
-            "value_sha256": canonical_digest(latest),
-        } if latest is not None else None),
+        "latest_projection_head": head,
     }
 
 
@@ -1466,7 +1443,7 @@ def compact_context(
         "provenance": (
             clean["provenance"] if include_history
             else _compact_provenance(
-                clean["provenance"], clean["projection_events"], clean["scope"],
+                clean["provenance"], clean["projection_events"],
             )
         ),
         "material_event_revision": clean["material_event_revision"],
