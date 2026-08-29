@@ -426,6 +426,136 @@ class LinearTransportTests(unittest.TestCase):
         self.assertEqual(snapshot["children"][0]["next_action"], "Run focused tests.")
         self.assertEqual(snapshot["root"]["revision"], 0)
 
+    def test_resume_collects_child_comments_in_one_graph_read_then_paginates(self):
+        root = {
+            "id": "root-id", "identifier": "GEN-37", "title": "Root",
+            "description": "Plan revision: sha\nLedger revision: 0\nNext action: root",
+            "url": "https://linear/GEN-37", "updatedAt": "now",
+            "state": {"name": "In Progress", "type": "started"},
+            "team": {"id": "team", "organization": {"id": "workspace"}},
+            "project": {"id": "project"},
+        }
+
+        def child(identifier, comment_id, *, has_next=False):
+            return {
+                "id": identifier.lower(), "identifier": identifier, "title": identifier,
+                "description": f"Next action: resume {identifier}",
+                "url": f"https://linear/{identifier}", "updatedAt": "now",
+                "state": {"name": "In Progress", "type": "started"},
+                "parent": {"id": "root-id", "identifier": "GEN-37"},
+                "team": {"id": "team", "organization": {"id": "workspace"}},
+                "project": {"id": "project"},
+                "comments": {
+                    "nodes": [{"id": comment_id, "body": "plain"}],
+                    "pageInfo": {
+                        "hasNextPage": has_next,
+                        "endCursor": "child-cursor" if has_next else None,
+                    },
+                },
+            }
+
+        client = mock.Mock()
+
+        def execute(query, variables):
+            if "WorkstreamResumeRoot" in query:
+                return {"issue": {
+                    **root,
+                    "children": {
+                        "nodes": [child("GEN-38", "comment-a"),
+                                  child("GEN-43", "comment-b", has_next=True)],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                }}
+            if "WorkstreamResumeComments" in query:
+                self.assertEqual(variables, {
+                    "issueId": "GEN-43", "after": "child-cursor",
+                })
+                continuation = child("GEN-43", "ignored")
+                return {"issue": {
+                    **continuation,
+                    "comments": {
+                        "nodes": [{"id": "comment-c", "body": "plain"}],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                }}
+            self.fail("unexpected query")
+
+        client.execute.side_effect = execute
+        snapshot = LinearGraphQLTransport(client, team_id="team").snapshot_for_root(
+            "GEN-37", include_child_comments=True,
+        )
+
+        self.assertEqual(
+            [comment["id"] for comment in snapshot["child_comments"]["GEN-38"]],
+            ["comment-a"],
+        )
+        self.assertEqual(
+            [comment["id"] for comment in snapshot["child_comments"]["GEN-43"]],
+            ["comment-b", "comment-c"],
+        )
+        self.assertEqual(client.execute.call_count, 2)
+
+    def test_resume_refuses_null_child_connection(self):
+        client = mock.Mock()
+        client.execute.return_value = {"issue": {
+            "id": "root-id", "identifier": "GEN-37", "title": "Root",
+            "description": "Plan revision: sha\nLedger revision: 0\nNext action: root",
+            "url": "https://linear/GEN-37", "updatedAt": "now",
+            "state": {"name": "In Progress", "type": "started"},
+            "team": {"id": "team", "organization": {"id": "workspace"}},
+            "project": {"id": "project"}, "children": None,
+        }}
+
+        with self.assertRaisesRegex(LinearTransportError, "child connection"):
+            LinearGraphQLTransport(client, team_id="team").snapshot_for_root(
+                "GEN-37", include_child_comments=True,
+            )
+
+    def test_resume_refuses_null_comment_continuation(self):
+        client = mock.Mock()
+        client.execute.return_value = {"issue": {
+            "id": "child-id", "identifier": "GEN-43", "comments": None,
+        }}
+        transport = LinearGraphQLTransport(client, team_id="team")
+
+        with self.assertRaisesRegex(LinearTransportError, "comment connection"):
+            transport._remaining_resume_comments(
+                {"id": "child-id", "identifier": "GEN-43"},
+                {"hasNextPage": True, "endCursor": "cursor"},
+            )
+
+    def test_completed_state_type_does_not_require_child_comment_log(self):
+        child = {
+            "id": "child-id", "identifier": "GEN-43", "title": "Child",
+            "description": "completed without a next action",
+            "url": "https://linear/GEN-43", "updatedAt": "now",
+            "state": {"name": "QA Accepted", "type": "completed"},
+            "parent": {"id": "root-id", "identifier": "GEN-37"},
+            "team": {"id": "team", "organization": {"id": "workspace"}},
+            "project": {"id": "project"},
+        }
+        client = mock.Mock()
+        client.execute.return_value = {"issue": {
+            "id": "root-id", "identifier": "GEN-37", "title": "Root",
+            "description": "Plan revision: sha\nLedger revision: 0\nNext action: root",
+            "url": "https://linear/GEN-37", "updatedAt": "now",
+            "state": {"name": "In Progress", "type": "started"},
+            "team": {"id": "team", "organization": {"id": "workspace"}},
+            "project": {"id": "project"},
+            "children": {
+                "nodes": [child],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            },
+        }}
+
+        snapshot = LinearGraphQLTransport(client, team_id="team").snapshot_for_root(
+            "GEN-37", include_child_comments=True,
+        )
+
+        self.assertEqual(snapshot["children"][0]["status"], "QA Accepted")
+        self.assertEqual(snapshot["children"][0]["status_type"], "completed")
+        self.assertEqual(snapshot["child_comments"], {})
+
     def test_repeated_intake_preserves_existing_mutable_next_action(self):
         fake = FakeClient()
         transport = LinearGraphQLTransport(fake, team_id="team")

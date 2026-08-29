@@ -33,6 +33,22 @@ class ResumeTests(unittest.TestCase):
                              {"identifier": "GEN-39", "title": "delta", "status": "Done"}],
                 "decisions": [{"id": "D1", "status": "accepted"}], "provenance": [{"machine": "M3"}]}
 
+    def live_snapshot(self, snapshot, route):
+        for index, child in enumerate(snapshot["children"]):
+            child.update({
+                "id": f"child-{index}",
+                "url": f"https://linear/{child['identifier']}",
+                "parent": {"id": route["root_issue_id"], "identifier": "GEN-37"},
+                "team": {"id": route["team_id"],
+                         "organization": {"id": route["workspace_id"]}},
+                "project": {"id": route["project_id"]},
+            })
+        snapshot["child_comments"] = {
+            child["identifier"]: [] for child in snapshot["children"]
+            if str(child.get("status", "")).lower() not in MODULE.TERMINAL
+        }
+        return snapshot
+
     def test_compact_context_keeps_root_and_only_nonterminal_children(self):
         snapshot = self.snapshot()
         snapshot["children"][0]["description"] = "large redundant prose"
@@ -84,6 +100,328 @@ class ResumeTests(unittest.TestCase):
         snapshot = self.snapshot(); snapshot["children"][0].pop("next_action")
         with self.assertRaises(MODULE.ResumeError):
             MODULE.validate_snapshot(snapshot, "GEN-37")
+
+    def test_child_material_log_and_checkpoint_override_stale_issue_prose(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        snapshot = self.live_snapshot(self.snapshot(), route)
+        child = snapshot["children"][0]
+        child["next_action"] = "stale issue-description action"
+        events = [
+            Delta(
+                f"child-event-{index}", "GEN-38", "progress", "agent",
+                {"next_action": f"event action {index}"} if index == 3 else {"step": index},
+                index, f"2026-08-29T00:00:0{index}Z",
+            )
+            for index in range(4)
+        ]
+        checkpoint = build_checkpoint(
+            workstream_id="GEN-38", boundary_id="child-current", root_revision=4,
+            plan_revision="sha", before_status="In Progress",
+            after_status="Blocked",
+            execution={
+                "agent": "codex", "provider": "openai", "session_id": "session",
+                "machine": "M5", "worktree": {
+                    "state": "safe", "path": "/repo/child", "branch": "fix/child",
+                    "head": "abc123",
+                },
+            },
+            exact_head="abc123", evidence=[{"kind": "test", "id": "focused"}],
+            blocker={"text": "await review"}, next_action="resume current child state",
+        )
+        snapshot["child_comments"]["GEN-38"] = [
+            *[
+                {"id": f"remote-{index}", "body": encode_event_comment(event)}
+                for index, event in enumerate(events)
+            ],
+            {"id": "remote-checkpoint", "body": encode_checkpoint_comment(checkpoint)},
+        ]
+
+        enriched = MODULE.add_child_material_history(
+            snapshot, snapshot["child_comments"], authenticated_route=route,
+        )
+        context = MODULE.compact_context(enriched, "GEN-37")
+        resumed = context["children"][0]
+
+        self.assertEqual(resumed["issue_next_action"], "stale issue-description action")
+        self.assertEqual(resumed["next_action"], "resume current child state")
+        self.assertEqual(resumed["blocker"], {"text": "await review"})
+        self.assertEqual(resumed["material_event_revision"], 4)
+        self.assertEqual(
+            resumed["latest_checkpoint"]["checkpoint_event_id"], checkpoint["event_id"],
+        )
+        self.assertEqual(resumed["history"]["material_events"]["count"], 4)
+
+    def test_child_full_history_retains_every_checkpoint_and_budgets_old_evidence(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        snapshot = self.live_snapshot(self.snapshot(), route)
+        events = [
+            Delta(
+                f"child-history-event-{index}", "GEN-38", "progress", "agent",
+                {"step": index}, index, f"2026-08-29T00:00:0{index}Z",
+            )
+            for index in range(2)
+        ]
+        execution = {
+            "agent": "codex", "provider": "openai", "session_id": "session",
+            "machine": "M5", "worktree": {
+                "state": "safe", "path": "/repo/child", "branch": "fix/child",
+                "head": "abc123",
+            },
+        }
+        first = build_checkpoint(
+            workstream_id="GEN-38", boundary_id="child-earlier", root_revision=1,
+            plan_revision="sha", before_status="In Progress",
+            after_status="In Progress", execution=execution, exact_head="abc123",
+            evidence=[
+                {"kind": "earlier-test", "id": str(index)} for index in range(20)
+            ],
+            blocker=None, next_action="older child action",
+        )
+        second = build_checkpoint(
+            workstream_id="GEN-38", boundary_id="child-current", root_revision=2,
+            plan_revision="sha", before_status="In Progress",
+            after_status="In Progress", execution=execution, exact_head="abc123",
+            evidence=[{"kind": "current-test", "id": "focused"}],
+            blocker=None, next_action="current child action",
+            predecessor_event_id=first["event_id"],
+        )
+        snapshot["child_comments"]["GEN-38"] = [
+            *[
+                {"id": f"child-event-{index}", "body": encode_event_comment(event)}
+                for index, event in enumerate(events)
+            ],
+            {"id": "child-checkpoint-earlier", "body": encode_checkpoint_comment(first)},
+            {"id": "child-checkpoint-current", "body": encode_checkpoint_comment(second)},
+        ]
+        enriched = MODULE.add_child_material_history(
+            snapshot, snapshot["child_comments"], authenticated_route=route,
+        )
+
+        bounded = MODULE.compact_context(
+            enriched, "GEN-37", max_items=10,
+        )["children"][0]
+        self.assertNotIn("checkpoint_history", bounded)
+        self.assertEqual(bounded["history"]["checkpoints"]["count"], 2)
+        self.assertRegex(bounded["history"]["checkpoints"]["sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(bounded["next_action"], "current child action")
+        self.assertEqual(
+            bounded["latest_checkpoint"]["evidence"]["items"],
+            [{"kind": "current-test", "id": "focused"}],
+        )
+
+        full = MODULE.compact_context(
+            enriched, "GEN-37", include_history=True, max_items=100,
+        )["children"][0]
+        self.assertEqual(
+            [checkpoint["event_id"] for checkpoint in full["checkpoint_history"]],
+            [first["event_id"], second["event_id"]],
+        )
+        self.assertEqual(full["checkpoint_history"][0]["evidence"], first["evidence"])
+        truncated = json.loads(json.dumps(enriched))
+        truncated["children"][0]["checkpoint_history"] = [
+            truncated["children"][0]["checkpoint_history"][-1]
+        ]
+        with self.assertRaisesRegex(
+            MODULE.ResumeError, "invalid_child_checkpoint_history:GEN-38"
+        ):
+            MODULE.compact_context(
+                truncated, "GEN-37", include_history=True, max_items=100,
+            )
+        with self.assertRaisesRegex(MODULE.ResumeError, "over_item_budget"):
+            MODULE.compact_context(
+                enriched, "GEN-37", include_history=True, max_items=10,
+            )
+
+    def test_child_stale_checkpoint_generation_must_be_a_complete_chain(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        snapshot = self.live_snapshot(self.snapshot(), route)
+        truncated = build_checkpoint(
+            workstream_id="GEN-38", boundary_id="stale-truncated",
+            root_revision=2, plan_revision="old-sha",
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai",
+                "session_id": "old-session", "machine": "M3",
+                "worktree": {"state": "unknown"},
+            },
+            exact_head=None, evidence=[], blocker=None,
+            next_action="obsolete action",
+            predecessor_event_id="missing-predecessor",
+        )
+        snapshot["child_comments"]["GEN-38"] = [{
+            "id": "stale-truncated", "body": encode_checkpoint_comment(truncated),
+        }]
+
+        with self.assertRaisesRegex(
+            MODULE.ResumeError,
+            "invalid_child_checkpoint_history:GEN-38:checkpoint_chain_truncated",
+        ):
+            MODULE.add_child_material_history(
+                snapshot, snapshot["child_comments"], authenticated_route=route,
+            )
+
+    def test_legacy_string_child_blocker_is_preserved_as_structured_state(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        snapshot = self.live_snapshot(self.snapshot(), route)
+        event = Delta(
+            "legacy-child-blocker", "GEN-38", "material_boundary", "agent",
+            {
+                "boundary_id": "legacy-boundary",
+                "changes": [{
+                    "kind": "blocker",
+                    "payload": {"blocker": "await exact-head checks"},
+                }],
+            },
+            0, "2026-08-29T00:00:00Z",
+        )
+        snapshot["child_comments"]["GEN-38"] = [{
+            "id": "legacy-child-blocker-comment",
+            "body": encode_event_comment(event),
+        }]
+
+        enriched = MODULE.add_child_material_history(
+            snapshot, snapshot["child_comments"], authenticated_route=route,
+        )
+
+        self.assertEqual(
+            enriched["children"][0]["blocker"],
+            {"text": "await exact-head checks"},
+        )
+
+    def test_malformed_child_material_log_refuses_resume(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        snapshot = self.live_snapshot(self.snapshot(), route)
+        snapshot["child_comments"]["GEN-38"] = [{
+            "id": "planted-malformed",
+            "body": "<!-- workstream-delta:v1:not-valid-base64 -->",
+        }]
+        with self.assertRaisesRegex(MODULE.LinearEventError, "malformed_event_marker"):
+            MODULE.add_child_material_history(
+                snapshot, snapshot["child_comments"], authenticated_route=route,
+            )
+
+    def test_child_route_mismatch_refuses_before_state_reduction(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        snapshot = self.live_snapshot(self.snapshot(), route)
+        snapshot["children"][0]["project"] = {"id": "attacker-project"}
+        with self.assertRaisesRegex(MODULE.ResumeError, "child_route_mismatch:GEN-38"):
+            MODULE.add_child_material_history(
+                snapshot, snapshot["child_comments"], authenticated_route=route,
+            )
+
+    def test_child_collection_must_cover_every_nonterminal_child(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        snapshot = self.live_snapshot(self.snapshot(), route)
+        with self.assertRaisesRegex(MODULE.ResumeError, "incomplete_child_comment_collection"):
+            MODULE.add_child_material_history(
+                snapshot, {}, authenticated_route=route,
+            )
+
+    def test_root_event_in_child_log_cannot_overwrite_child_state(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        snapshot = self.live_snapshot(self.snapshot(), route)
+        root_event = Delta(
+            "root-event", "GEN-37", "progress", "agent",
+            {"next_action": "must remain root-only"}, 0, "2026-08-29T00:00:00Z",
+        )
+        snapshot["child_comments"]["GEN-38"] = [{
+            "id": "misrouted-root-event", "body": encode_event_comment(root_event),
+        }]
+        with self.assertRaisesRegex(MODULE.LinearEventError, "workstream_id_mismatch"):
+            MODULE.add_child_material_history(
+                snapshot, snapshot["child_comments"], authenticated_route=route,
+            )
+
+    def test_child_material_obligations_count_toward_context_budget(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        snapshot = self.live_snapshot(self.snapshot(), route)
+        event = Delta(
+            "child-requirement", "GEN-38", "requirement", "agent",
+            {"requirement": "preserve this exact child obligation"},
+            0, "2026-08-29T00:00:00Z",
+        )
+        snapshot["child_comments"]["GEN-38"] = [{
+            "id": "child-requirement-comment", "body": encode_event_comment(event),
+        }]
+        enriched = MODULE.add_child_material_history(
+            snapshot, snapshot["child_comments"], authenticated_route=route,
+        )
+        with self.assertRaisesRegex(MODULE.ResumeError, "over_item_budget"):
+            MODULE.compact_context(enriched, "GEN-37", max_items=3)
+
+    def test_child_checkpoint_evidence_counts_toward_context_budget(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        snapshot = self.live_snapshot(self.snapshot(), route)
+        checkpoint = build_checkpoint(
+            workstream_id="GEN-38", boundary_id="child-evidence", root_revision=0,
+            plan_revision="sha", before_status="In Progress",
+            after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai", "session_id": "session",
+                "machine": "M5", "worktree": {
+                    "state": "safe", "path": "/repo/child", "branch": "fix/child",
+                    "head": "abc123",
+                },
+            },
+            exact_head="abc123",
+            evidence=[{"kind": "test", "id": str(index)} for index in range(20)],
+            blocker=None, next_action="resume child",
+        )
+        snapshot["child_comments"]["GEN-38"] = [{
+            "id": "child-checkpoint-comment",
+            "body": encode_checkpoint_comment(checkpoint),
+        }]
+        enriched = MODULE.add_child_material_history(
+            snapshot, snapshot["child_comments"], authenticated_route=route,
+        )
+
+        with self.assertRaisesRegex(MODULE.ResumeError, "over_item_budget"):
+            MODULE.compact_context(enriched, "GEN-37", max_items=10)
+
+    def test_child_without_comments_preserves_legacy_noop_surface(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        snapshot = self.live_snapshot(self.snapshot(), route)
+        expected_children = json.loads(json.dumps(snapshot["children"]))
+
+        enriched = MODULE.add_child_material_history(
+            snapshot, snapshot["child_comments"], authenticated_route=route,
+        )
+
+        self.assertEqual(enriched["children"], expected_children)
+        self.assertNotIn("material_event_revision", enriched["children"][0])
 
     def test_nonterminal_root_without_next_action_fails_closed(self):
         snapshot = self.snapshot(); snapshot["root"].pop("next_action")
@@ -298,6 +636,29 @@ class ResumeTests(unittest.TestCase):
             context["checkpoint_recovery"],
             {"state": "stale_plan", "stale_plan_count": 1},
         )
+
+    def test_stale_root_checkpoint_generation_must_be_a_complete_chain(self):
+        checkpoint = build_checkpoint(
+            workstream_id="GEN-37", boundary_id="old-plan-truncated",
+            root_revision=2, plan_revision="old-sha",
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai",
+                "session_id": "old-session", "machine": "M3",
+                "worktree": {"state": "unknown"},
+            },
+            exact_head=None, evidence=[], blocker=None, next_action="obsolete",
+            predecessor_event_id="missing-predecessor",
+        )
+        with self.assertRaisesRegex(
+            MODULE.ResumeError,
+            "invalid_checkpoint_history:GEN-37:checkpoint_chain_truncated",
+        ):
+            MODULE.add_material_history(
+                self.snapshot(), [{
+                    "id": "old-checkpoint", "body": encode_checkpoint_comment(checkpoint),
+                }], "GEN-37",
+            )
 
     def test_checkpoint_cannot_claim_unrecorded_material_revision(self):
         checkpoint = build_checkpoint(
@@ -538,13 +899,15 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(context["surface_availability"]["evidence_contracts"], "transport_unimplemented")
 
     def test_live_cli_normalizes_title_before_fetch(self):
+        authenticated_route = {"workspace_id": "workspace", "team_id": "team",
+                               "project_id": "project", "root_issue_id": "root-uuid"}
         transport = mock.Mock()
-        transport.snapshot_for_root.return_value = self.snapshot()
+        transport.snapshot_for_root.return_value = self.live_snapshot(
+            self.snapshot(), authenticated_route,
+        )
         client = mock.Mock()
         comments = mock.Mock()
         comments.comments.return_value = []
-        authenticated_route = {"workspace_id": "workspace", "team_id": "team",
-                               "project_id": "project", "root_issue_id": "root-uuid"}
         with mock.patch.object(MODULE, "HttpGraphQLClient", return_value=client), \
              mock.patch.object(MODULE, "resolve_authenticated_issue_route", return_value=authenticated_route), \
              mock.patch.object(MODULE, "LinearGraphQLTransport", return_value=transport), \
@@ -553,21 +916,26 @@ class ResumeTests(unittest.TestCase):
              mock.patch.object(MODULE.sys, "argv", ["workstream_resume.py", "pulp GEN-37 #3", "--linear-team-id", "team", "--inspection-only"]), \
              mock.patch.object(MODULE.sys, "stdout"):
             self.assertEqual(MODULE.main(), 0)
-        transport.snapshot_for_root.assert_called_once_with("GEN-37")
+        transport.snapshot_for_root.assert_called_once_with(
+            "GEN-37", include_child_comments=True,
+        )
         comments.comments.assert_called_once_with()
 
     def test_live_cli_automatically_uses_repository_config_route(self):
-        transport = mock.Mock()
-        transport.snapshot_for_root.return_value = self.snapshot()
-        client = mock.Mock()
         route = {
             "workspace_id": "workspace", "team_id": "team", "project_id": "project"
         }
+        authenticated_route = {**route, "root_issue_id": "root-uuid"}
+        transport = mock.Mock()
+        transport.snapshot_for_root.return_value = self.live_snapshot(
+            self.snapshot(), authenticated_route,
+        )
+        client = mock.Mock()
         constructor = mock.Mock(return_value=transport)
         comments = mock.Mock()
         comments.comments.return_value = []
         with mock.patch.object(MODULE, "resolve_linear_route", return_value=(route, Path(".workstream.json"))), \
-             mock.patch.object(MODULE, "resolve_authenticated_issue_route", return_value={**route, "root_issue_id": "root-uuid"}), \
+             mock.patch.object(MODULE, "resolve_authenticated_issue_route", return_value=authenticated_route), \
              mock.patch.object(MODULE, "HttpGraphQLClient", return_value=client), \
              mock.patch.object(MODULE, "LinearGraphQLTransport", constructor), \
              mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
@@ -579,17 +947,21 @@ class ResumeTests(unittest.TestCase):
         constructor.assert_called_once_with(
             client, team_id="team", workspace_id="workspace", project_id="project"
         )
-        transport.snapshot_for_root.assert_called_once_with("GEN-37")
+        transport.snapshot_for_root.assert_called_once_with(
+            "GEN-37", include_child_comments=True,
+        )
         comments.comments.assert_called_once_with()
 
     def test_live_cli_bootstraps_route_from_token_without_repo_config(self):
+        route = {"workspace_id": "workspace", "team_id": "team",
+                 "project_id": "project", "root_issue_id": "root-uuid"}
         transport = mock.Mock()
-        transport.snapshot_for_root.return_value = self.snapshot()
+        transport.snapshot_for_root.return_value = self.live_snapshot(
+            self.snapshot(), route,
+        )
         client = mock.Mock()
         comments = mock.Mock()
         comments.comments.return_value = []
-        route = {"workspace_id": "workspace", "team_id": "team",
-                 "project_id": "project", "root_issue_id": "root-uuid"}
         constructor = mock.Mock(return_value=transport)
         with mock.patch.object(MODULE, "resolve_linear_route", return_value=(None, None)), \
              mock.patch.object(MODULE, "resolve_authenticated_issue_route", return_value=route) as bootstrap, \
@@ -613,6 +985,8 @@ class ResumeTests(unittest.TestCase):
             "project_id": "project",
             "root_issue_id": "33333333-3333-4333-8333-333333333333",
         }
+        graph = self.live_snapshot(graph, route)
+        child_comments = graph.pop("child_comments")
         authenticated_source = {
             "identity": "https://example.test/immutable-plan",
             "sha256": "a" * 64, "bytes": 123,
@@ -665,7 +1039,10 @@ class ResumeTests(unittest.TestCase):
             preauthentication["lifecycle_recovery"]["state"], "stale_snapshot",
         )
         transport = mock.Mock()
-        transport.snapshot_for_root.return_value = graph
+        transport.snapshot_for_root.return_value = {
+            **graph, "children": [dict(child) for child in graph["children"]],
+            "child_comments": child_comments,
+        }
         comments = mock.Mock()
         comments.comments.return_value = comments_payload
         stdout = io.StringIO()

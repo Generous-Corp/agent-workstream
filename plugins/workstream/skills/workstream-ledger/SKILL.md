@@ -286,7 +286,12 @@ agent may resume from a cwd, stale transcript, or title metadata alone.
 
 The current paginated Linear transport obtains the issue graph and reads the
 root comment connection once to reduce append-only material events, remote
-checkpoints, and the complete projection history. A newer material-event
+checkpoints, and the complete projection history. The same bounded graph read
+collects the first comment page for every nonterminal child and paginates only
+continuations; each child is route/identity validated and independently reduces
+its own material events and checkpoints. Child state never inherits root events
+or another child's events, and malformed, conflicting, or incomplete child logs
+refuse the whole resume. A newer material-event
 `next_action` supersedes stale root description prose. The projection restores
 scope, relations, choices, evidence contracts, source, provenance, and the
 recorded attach/successor disposition. An acknowledged checkpoint restores its
