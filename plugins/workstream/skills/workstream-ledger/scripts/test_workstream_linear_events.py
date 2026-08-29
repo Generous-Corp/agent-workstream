@@ -9,10 +9,13 @@ import workstream_linear_events as linear_events_module
 from workstream_delta import Delta, DeltaJournal
 from workstream_delta import RevisionConflict
 from workstream_linear import LinearTransportError
+from workstream_checkpoint import build_checkpoint
+from workstream_linear_checkpoints import encode_checkpoint_comment
 from workstream_linear_events import (
     LinearCommentEventAdapter,
     LinearEventError,
     encode_event_comment,
+    ledger_boundary_slot_id,
     reduce_event_comments,
 )
 
@@ -35,6 +38,10 @@ class FakeCommentClient:
             threading.Barrier(initial_readers) if initial_readers else None
         )
         self.initial_reads = 0
+        self.workspace_id = "workspace"
+        self.team_id = "team"
+        self.project_id = "project"
+        self.root_issue_id = "issue-37"
 
     def execute(self, query, variables):
         with self.lock:
@@ -51,9 +58,10 @@ class FakeCommentClient:
                 nodes = [dict(comment) for comment in self.comments]
             return {
                 "issue": {
-                    "id": "issue-37", "identifier": "GEN-37",
-                    "team": {"id": "team", "organization": {"id": "workspace"}},
-                    "project": {"id": "project"},
+                    "id": self.root_issue_id, "identifier": "GEN-37",
+                    "team": {"id": self.team_id,
+                             "organization": {"id": self.workspace_id}},
+                    "project": {"id": self.project_id},
                     "comments": {
                         "nodes": nodes,
                         "pageInfo": {"hasNextPage": False, "endCursor": None},
@@ -142,6 +150,39 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
         self.assertEqual(first, replay)
         self.assertEqual(len(client.comments), 1)
 
+    def test_replay_after_later_event_returns_own_stable_revision(self):
+        client = FakeCommentClient()
+        adapter = LinearCommentEventAdapter(client, issue_id="GEN-37")
+        first = delta("event-a", {"order": 1})
+        adapter.apply(first)
+        adapter.apply(delta("event-b", {"order": 2}, expected_revision=1))
+
+        replay = adapter.apply(first)
+
+        self.assertEqual(replay.revision, 1)
+        self.assertEqual(replay.remote_id, client.comments[0]["id"])
+        self.assertEqual(len(client.comments), 2)
+
+    def test_legacy_arbitrary_comment_id_history_remains_compatible(self):
+        client = FakeCommentClient()
+        first = delta("event-a", {"order": 1})
+        client.comments.append({
+            "id": "legacy-arbitrary-comment-id",
+            "body": encode_event_comment(first),
+            "createdAt": "then", "updatedAt": "then",
+        })
+        adapter = LinearCommentEventAdapter(client, issue_id="GEN-37")
+
+        replay = adapter.apply(first)
+        second = adapter.apply(
+            delta("event-b", {"order": 2}, expected_revision=1)
+        )
+
+        self.assertEqual(replay.remote_id, "legacy-arbitrary-comment-id")
+        self.assertEqual(replay.revision, 1)
+        self.assertEqual(second.revision, 2)
+        self.assertEqual(len(client.comments), 2)
+
     def test_lost_create_response_reloads_exact_slot_as_replay(self):
         class LostResponseClient(FakeCommentClient):
             lost = False
@@ -182,6 +223,97 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
             LinearCommentEventAdapter(
                 ForeignWinnerClient(), issue_id="GEN-37"
             ).apply(delta("event-a", {"order": 1}))
+
+    def test_project_move_keeps_same_boundary_slot_and_collision(self):
+        old_authority = {
+            "workspace_id": "workspace", "team_id": "old-team",
+            "project_id": "old-project", "root_issue_id": "issue-37",
+        }
+        new_authority = {
+            "workspace_id": "workspace", "team_id": "new-team",
+            "project_id": "new-project", "root_issue_id": "issue-37",
+        }
+        old_slot = ledger_boundary_slot_id("GEN-37", 0, [], old_authority)
+        self.assertEqual(
+            old_slot,
+            ledger_boundary_slot_id("GEN-37", 0, [], new_authority),
+        )
+        self.assertEqual(
+            old_slot,
+            ledger_boundary_slot_id("OPS-9", 0, [], new_authority),
+        )
+
+        class MovedProjectClient(FakeCommentClient):
+            injected = False
+
+            def __init__(self):
+                super().__init__()
+                self.team_id = "new-team"
+                self.project_id = "new-project"
+
+            def execute(self, query, variables):
+                if "commentCreate" in query and not self.injected:
+                    self.injected = True
+                    self.asserted_slot = variables["input"]["id"]
+                    self.comments.append({
+                        "id": old_slot,
+                        "body": encode_event_comment(delta("old-winner", {"order": 9})),
+                        "createdAt": "now", "updatedAt": "now",
+                    })
+                    raise LinearTransportError("duplicate comment id")
+                return super().execute(query, variables)
+
+        client = MovedProjectClient()
+        with self.assertRaisesRegex(RuntimeError, "live revision 1"):
+            LinearCommentEventAdapter(
+                client, issue_id="GEN-37", workspace_id="workspace",
+                team_id="new-team", project_id="new-project",
+            ).apply(delta("new-writer", {"order": 1}))
+        self.assertEqual(client.asserted_slot, old_slot)
+
+    def test_checkpoint_winner_moves_event_to_new_shared_frontier(self):
+        client = FakeCommentClient()
+        client.comments.append({
+            "id": "legacy-material-1",
+            "body": encode_event_comment(delta("event-a", {"order": 1})),
+            "createdAt": "then", "updatedAt": "then",
+        })
+        checkpoint = build_checkpoint(
+            workstream_id="GEN-37", boundary_id="checkpoint-wins",
+            root_revision=1, plan_revision="plan-sha",
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai", "session_id": "s1",
+                "machine": "m1", "worktree": {
+                    "state": "safe", "path": "/repo", "branch": "main",
+                    "head": "head-1",
+                },
+            }, exact_head="head-1", evidence=[], blocker=None,
+            next_action="continue", predecessor_event_id=None,
+        )
+        original_execute = client.execute
+        injected = False
+
+        def checkpoint_wins(query, variables):
+            nonlocal injected
+            if "commentCreate" in query and not injected:
+                injected = True
+                client.comments.append({
+                    "id": variables["input"]["id"],
+                    "body": encode_checkpoint_comment(checkpoint),
+                    "createdAt": "now", "updatedAt": "now",
+                })
+                raise LinearTransportError("duplicate comment id")
+            return original_execute(query, variables)
+
+        client.execute = checkpoint_wins
+        receipt = LinearCommentEventAdapter(client, issue_id="GEN-37").apply(
+            delta("event-b", {"order": 2}, expected_revision=1)
+        )
+
+        self.assertEqual(receipt.revision, 2)
+        self.assertEqual(len(client.comments), 3)
+        self.assertEqual(len({comment["id"] for comment in client.comments}), 3)
 
     def test_concurrent_apply_with_rebase_serializes_stable_event_ids(self):
         client = FakeCommentClient(initial_readers=2)

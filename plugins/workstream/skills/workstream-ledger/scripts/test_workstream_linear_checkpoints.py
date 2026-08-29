@@ -14,7 +14,10 @@ from workstream_linear_checkpoints import (
     encode_checkpoint_comment,
     reduce_checkpoint_comments,
 )
-from workstream_linear_events import encode_event_comment
+from workstream_linear_events import (
+    LinearCommentEventAdapter,
+    encode_event_comment,
+)
 
 
 def checkpoint(revision: int, predecessor: str | None = None) -> dict:
@@ -223,6 +226,104 @@ class LinearCheckpointAdapterTests(unittest.TestCase):
         ).checkpoints
         self.assertEqual(len(checkpoints), 2)
 
+    def test_event_winner_forces_checkpoint_rebuild_at_new_revision(self):
+        client = FakeCommentClient()
+        client.seed_material(1)
+        adapter = self.adapter(client)
+        pending = checkpoint(1)
+        original_execute = client.execute
+        injected = False
+
+        def event_wins(query, variables):
+            nonlocal injected
+            if "commentCreate" in query and not injected:
+                injected = True
+                event = Delta(
+                    "event-2", "GEN-37", "material_boundary", "system",
+                    {"revision": 2}, 1, "2026-08-20T00:00:02Z",
+                )
+                client.comments.append({
+                    "id": variables["input"]["id"],
+                    "body": encode_event_comment(event),
+                    "createdAt": "now", "updatedAt": "now",
+                })
+                raise LinearTransportError("duplicate comment id")
+            return original_execute(query, variables)
+
+        client.execute = event_wins
+        with self.assertRaisesRegex(
+            LinearCheckpointError,
+            "checkpoint_material_revision_advanced_reload_and_rebuild_required",
+        ):
+            adapter.persist(pending)
+        self.assertFalse(any(
+            "workstream-checkpoint:v1" in comment["body"]
+            for comment in client.comments
+        ))
+
+        rebuilt = adapter.persist(checkpoint(2))
+        self.assertEqual(rebuilt["root_revision"], 2)
+        self.assertEqual(len(client.comments), 3)
+
+    def test_legacy_arbitrary_checkpoint_ids_remain_compatible(self):
+        client = FakeCommentClient()
+        client.seed_material(1)
+        first = checkpoint(1)
+        client.comments.append({
+            "id": "legacy-arbitrary-checkpoint-id",
+            "body": encode_checkpoint_comment(first),
+            "createdAt": "then", "updatedAt": "then",
+        })
+        adapter = self.adapter(client)
+
+        replay = adapter.persist(first)
+        client.comments.append(material_comment(2))
+        second = adapter.persist(checkpoint(2, first["event_id"]))
+
+        self.assertEqual(
+            replay["acknowledgement"]["remote_id"],
+            "legacy-arbitrary-checkpoint-id",
+        )
+        self.assertEqual(second["root_revision"], 2)
+        self.assertEqual(len(client.comments), 4)
+
+    def test_legacy_checkpoint_ahead_requires_quarantine_remediation(self):
+        client = FakeCommentClient()
+        client.seed_material(1)
+        ahead = checkpoint(2)
+        client.comments.append({
+            "id": "legacy-checkpoint-ahead",
+            "body": encode_checkpoint_comment(ahead),
+            "createdAt": "then", "updatedAt": "then",
+        })
+        adapter = self.adapter(client)
+
+        # Exact replay remains safe and does not mutate the malformed history.
+        replay = adapter.persist(ahead)
+        self.assertEqual(
+            replay["acknowledgement"]["remote_id"], "legacy-checkpoint-ahead"
+        )
+        writes_before = len([
+            query for query, _ in client.calls if "commentCreate" in query
+        ])
+        with self.assertRaisesRegex(
+            LinearCheckpointError, "checkpoint_material_history_incomplete"
+        ):
+            adapter.persist(checkpoint(3, ahead["event_id"]))
+        with self.assertRaisesRegex(
+            Exception, "checkpoint_material_history_incomplete"
+        ):
+            LinearCommentEventAdapter(client, issue_id="GEN-37").apply(
+                Delta(
+                    "event-2", "GEN-37", "material_boundary", "system",
+                    {"revision": 2}, 1, "2026-08-20T00:00:02Z",
+                )
+            )
+        writes_after = len([
+            query for query, _ in client.calls if "commentCreate" in query
+        ])
+        self.assertEqual(writes_before, writes_after)
+
     def test_stale_root_revision_and_predecessor_refuse_before_write(self):
         client = FakeCommentClient()
         client.seed_material(2)
@@ -236,13 +337,23 @@ class LinearCheckpointAdapterTests(unittest.TestCase):
         ):
             adapter.persist(checkpoint(2, "wsc_wrong"))
         with self.assertRaisesRegex(
-            LinearCheckpointError, "checkpoint_root_revision_stale_reload_required"
+            LinearCheckpointError, "checkpoint_material_history_incomplete"
         ):
             adapter.persist(checkpoint(3, first["event_id"]))
         writes_after = len([
             query for query, _ in client.calls if "commentCreate" in query
         ])
         self.assertEqual(writes_before, writes_after)
+
+    def test_successor_revision_must_advance_predecessor(self):
+        client = FakeCommentClient()
+        client.seed_material(2)
+        adapter = self.adapter(client)
+        first = adapter.persist(checkpoint(2))
+        with self.assertRaisesRegex(
+            LinearCheckpointError, "checkpoint_successor_revision_not_monotonic"
+        ):
+            adapter.persist(checkpoint(2, first["event_id"]))
 
     def test_complete_paginated_chain_recovers_latest_boundary(self):
         first = checkpoint(1)
