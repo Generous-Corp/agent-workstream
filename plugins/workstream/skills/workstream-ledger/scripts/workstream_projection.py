@@ -27,7 +27,10 @@ from workstream_linear_projection import (
 )
 from workstream_plan import canonical_plan_url, plan_payload, same_plan_document
 from workstream_relation_readback import RelationReadbackError, read_relation_targets
-from workstream_resume import add_material_history, compact_context, extract_token, ResumeError
+from workstream_resume import (
+    DEFAULT_RESUME_MAX_BYTES, ResumeError, add_material_history, compact_context,
+    extract_token,
+)
 from workstream_scope import repository_key, ScopeError, validate_relation_graph
 from workstream_successor import choose_disposition, SuccessorError
 from workstream_checkpoint import CheckpointError, recover_latest
@@ -1547,7 +1550,7 @@ def load_material_history_for_projection_reconcile(
     manifest: dict[str, Any], adapter: LinearProjectionAdapter, *,
     authenticated_route: dict[str, str], authenticated_source: dict[str, Any],
     remote_head: str | None = None,
-    max_bytes: int = 16 * 1024, max_items: int = 100,
+    max_bytes: int = DEFAULT_RESUME_MAX_BYTES, max_items: int = 100,
     relation_target_resolver: Callable[
         [list[dict[str, Any]]], dict[str, dict[str, Any]]
     ],
@@ -2390,7 +2393,7 @@ def main() -> int:
     parser.add_argument("--plan-source", required=True)
     parser.add_argument("--plan-identity")
     parser.add_argument(
-        "--max-bytes", type=int, default=16 * 1024,
+        "--max-bytes", type=int, default=DEFAULT_RESUME_MAX_BYTES,
         help="maximum encoded full-resume context accepted after projection",
     )
     parser.add_argument(

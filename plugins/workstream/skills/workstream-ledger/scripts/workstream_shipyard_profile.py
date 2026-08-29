@@ -21,11 +21,11 @@ from typing import Any, Callable
 import unicodedata
 from urllib.parse import urlparse
 
-from workstream_resume import ResumeError, extract_token
+from workstream_resume import DEFAULT_RESUME_MAX_BYTES, ResumeError, extract_token
 from workstream_scope import ScopeError, canonical_repository
 
 
-RESUME_MAX_BYTES = 16 * 1024
+RESUME_MAX_BYTES = DEFAULT_RESUME_MAX_BYTES
 RESUME_MAX_ITEMS = 100
 RESUME_OUTPUT_MAX_BYTES = 64 * 1024
 PROFILE_MAX_BYTES = 64 * 1024

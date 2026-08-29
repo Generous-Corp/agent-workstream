@@ -1366,8 +1366,11 @@ def validate_snapshot(
             "authenticated_source": snapshot.get("authenticated_source")}
 
 
+DEFAULT_RESUME_MAX_BYTES = 24 * 1024
+
+
 def compact_context(
-    snapshot: dict[str, Any], token: str, max_bytes: int = 16 * 1024,
+    snapshot: dict[str, Any], token: str, max_bytes: int = DEFAULT_RESUME_MAX_BYTES,
     max_items: int = 100, *, require_projection_authority: bool = False,
     include_history: bool = False,
     expected_missing_terminal_closures: frozenset[str] = frozenset(),
@@ -1564,7 +1567,7 @@ def main() -> int:
     parser.add_argument("--linear-team-id", help="explicit immutable Linear team ID")
     parser.add_argument("--linear-project-id", help="explicit immutable Linear project ID")
     parser.add_argument("--linear-endpoint", default="https://api.linear.app/graphql")
-    parser.add_argument("--max-bytes", type=int, default=16 * 1024)
+    parser.add_argument("--max-bytes", type=int, default=DEFAULT_RESUME_MAX_BYTES)
     parser.add_argument("--max-items", type=int, default=100)
     parser.add_argument(
         "--include-history", action="store_true",
