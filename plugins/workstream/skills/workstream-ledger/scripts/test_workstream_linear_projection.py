@@ -33,6 +33,7 @@ from workstream_relation_readback import RelationReadbackError
 import workstream_projection
 import workstream_linear_projection as projection_module
 import workstream_resume as resume_module
+import workstream_shipyard_profile as shipyard_profile
 from workstream_projection import (
     load_material_history_for_projection_reconcile, projection_review_contract,
     prepare_terminal_child_evidence_seeds, prepare_terminal_child_repairs,
@@ -124,6 +125,18 @@ def reviewed_manifest(adapter, projection, retirements=None):
 
 def fixed_terminal_fence(value):
     return lambda child_ids: {child_id: value for child_id in child_ids}
+
+
+def acknowledged_checkpoint(checkpoint_id, *, head=HEAD):
+    return {
+        "checkpoint_event_id": checkpoint_id,
+        "worktree": {"state": "safe", "head": head},
+        "acknowledgement": {
+            "state": "remote_acknowledged",
+            "remote_id": f"comment-{checkpoint_id}",
+            "applied_revision": 0,
+        },
+    }
 
 
 def reviewed_retirement(adapter, kind, key):
@@ -762,6 +775,9 @@ class ProjectionTests(unittest.TestCase):
             terminal_child_fence=lambda child_ids: {
                 child_id: expected[child_id] for child_id in child_ids
             },
+            checkpoint_fence=lambda: preview["latest_checkpoint"][
+                "checkpoint_event_id"
+            ],
             legacy_unresolved_relation_heads=unresolved,
         )
         strict = add_material_history(
@@ -834,6 +850,79 @@ class ProjectionTests(unittest.TestCase):
                 compact["projection_head"]["event_id"],
                 r"^wsp_[0-9a-f]{32}$",
             )
+
+    def test_compact_resume_builds_launch_profile_without_authority_rehydration(self):
+        strict, _contracts = self.gen37_production_shaped_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            worktree = strict["latest_checkpoint"]["worktree"]
+            worktree["path"] = str(root)
+            strict["latest_checkpoint"]["provenance_chain"][-1][
+                "worktree"
+            ] = deepcopy(worktree)
+            context = compact_context(
+                strict, "GEN-37", max_bytes=16 * 1024, max_items=100,
+                require_projection_authority=True,
+            )
+            checkpoint = context["latest_checkpoint"]
+            self.assertEqual(checkpoint["workstream_id"], "GEN-37")
+            self.assertEqual(checkpoint["plan_revision"], PLAN)
+            self.assertEqual(
+                checkpoint["next_action"], context["next_action"],
+            )
+            self.assertEqual(
+                checkpoint["provenance"]["latest"]["event_id"],
+                checkpoint["checkpoint_event_id"],
+            )
+            profile = shipyard_profile.build_launch_profile(
+                context, "GEN-37", shipyard_profile.GitIdentity(
+                    root=root,
+                    repository_coordinate=(
+                        "github.com/generous-corp/agent-workstream"
+                    ),
+                    repository="generous-corp/agent-workstream",
+                    head=HEAD, branch="fix/gen37",
+                ),
+                model="gpt-5.6-sol", reasoning_effort="medium",
+            )
+            self.assertEqual(
+                profile["checkpoint"]["checkpoint_id"],
+                checkpoint["checkpoint_event_id"],
+            )
+
+    def test_full_resume_refuses_stale_checkpoint_disposition_but_inspection_does_not_write(self):
+        strict, _contracts = self.gen37_production_shaped_fixture()
+        stale = deepcopy(strict)
+        current = next(
+            event for event in reversed(stale["projection_events"])
+            if (event["kind"], event["key"]) == ("disposition", "root")
+        )
+        stale_disposition = {
+            **stale["disposition"],
+            "recovered_from_checkpoint": "wsc_" + "e" * 32,
+        }
+        event = build_projection_event(
+            workstream_id="GEN-37", kind="disposition", key="root",
+            value=stale_disposition, plan_revision=PLAN,
+            expected_revision=stale["projection_revision"],
+            created_at="2026-08-29T19:01:00Z",
+            supersedes_event_id=current["event_id"], authority=AUTHORITY,
+        )
+        stale["projection_events"].append(event)
+        stale["projection_revision"] += 1
+        stale["disposition"] = stale_disposition
+        with self.assertRaisesRegex(
+            ResumeError,
+            "disposition_checkpoint_stale_reconcile_required",
+        ):
+            compact_context(
+                stale, "GEN-37", require_projection_authority=True,
+            )
+        inspected = compact_context(
+            stale, "GEN-37", require_projection_authority=False,
+        )
+        self.assertEqual(inspected["resume_authority"], "inspection_only")
+        self.assertEqual(inspected["disposition"], stale_disposition)
 
     def test_explicit_history_retains_full_verbose_evidence_contracts(self):
         strict, contracts = self.gen37_production_shaped_fixture()
@@ -4170,15 +4259,13 @@ class ProjectionTests(unittest.TestCase):
         manifest = reviewed_manifest(adapter, projection)
         snapshot = {
             "root": {"identifier": "GEN-37"},
-            "latest_checkpoint": {
-                "checkpoint_event_id": "wsc-live",
-                "worktree": {"state": "safe", "head": HEAD},
-            },
+            "latest_checkpoint": acknowledged_checkpoint("wsc-live"),
         }
         source = {"identity": "https://example.test/plan", "sha256": PLAN}
         first = reconcile_required_projection(
             adapter, snapshot, manifest, remote_head=HEAD,
             created_at="2026-08-27T18:00:00Z", authenticated_source=source,
+            checkpoint_fence=lambda: "wsc-live",
         )
         self.assertEqual(first["disposition"]["disposition"], "attach")
         self.assertTrue(first["readback_verified"])
@@ -4187,9 +4274,127 @@ class ProjectionTests(unittest.TestCase):
         second = reconcile_required_projection(
             adapter, snapshot, manifest, remote_head=HEAD,
             created_at="2026-08-27T18:01:00Z", authenticated_source=source,
+            checkpoint_fence=lambda: "wsc-live",
         )
         self.assertEqual(second["writes"], [])
         self.assertEqual(len(client.comments), 4)
+
+    def test_product_reconcile_cas_repairs_stale_checkpoint_disposition_and_replays_noop(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        projection = [
+            {"kind": "scope", "key": "root", "value": scope()},
+            {"kind": "source", "key": "root", "value": {
+                "sha256": PLAN, "identity": "https://example.test/plan",
+            }},
+            {"kind": "provenance", "key": "session-m5", "value": {
+                "agent": "codex", "machine": "M5",
+                "session_id": "session-m5",
+                "worktree": {"state": "safe", "head": HEAD},
+            }},
+        ]
+        source = {"identity": "https://example.test/plan", "sha256": PLAN}
+        old_checkpoint = "wsc_" + "e" * 32
+        new_checkpoint = "wsc_" + "3" * 32
+        reconcile_required_projection(
+            adapter,
+            {"root": {"identifier": "GEN-37"},
+             "latest_checkpoint": acknowledged_checkpoint(old_checkpoint)},
+            reviewed_manifest(adapter, projection), remote_head=HEAD,
+            created_at="2026-08-29T20:00:00Z",
+            authenticated_source=source,
+            checkpoint_fence=lambda: old_checkpoint,
+        )
+        old_disposition_event = next(
+            event for event in reversed(adapter.state().events)
+            if (event["kind"], event["key"]) == ("disposition", "root")
+        )
+        refreshed_snapshot = {
+            "root": {"identifier": "GEN-37"},
+            "latest_checkpoint": acknowledged_checkpoint(new_checkpoint),
+        }
+        comments_before = len(client.comments)
+        repaired = reconcile_required_projection(
+            adapter, refreshed_snapshot,
+            reviewed_manifest(adapter, projection), remote_head=HEAD,
+            created_at="2026-08-29T20:01:00Z",
+            authenticated_source=source,
+            checkpoint_fence=lambda: new_checkpoint,
+        )
+        self.assertEqual(len(repaired["writes"]), 1)
+        self.assertEqual(len(client.comments), comments_before + 1)
+        repaired_event = adapter.state().events[-1]
+        self.assertEqual(
+            (repaired_event["kind"], repaired_event["key"]),
+            ("disposition", "root"),
+        )
+        self.assertEqual(
+            repaired_event["supersedes_event_id"],
+            old_disposition_event["event_id"],
+        )
+        self.assertEqual(
+            repaired["disposition"]["recovered_from_checkpoint"],
+            new_checkpoint,
+        )
+        replay = reconcile_required_projection(
+            adapter, refreshed_snapshot,
+            reviewed_manifest(adapter, projection), remote_head=HEAD,
+            created_at="2026-08-29T20:02:00Z",
+            authenticated_source=source,
+            checkpoint_fence=lambda: new_checkpoint,
+        )
+        self.assertEqual(replay["writes"], [])
+        self.assertEqual(len(client.comments), comments_before + 1)
+
+    def test_product_reconcile_refuses_checkpoint_advance_before_cas_write(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        projection = [
+            {"kind": "scope", "key": "root", "value": scope()},
+            {"kind": "source", "key": "root", "value": {
+                "sha256": PLAN, "identity": "https://example.test/plan",
+            }},
+            {"kind": "provenance", "key": "session-m5", "value": {
+                "agent": "codex", "machine": "M5",
+                "session_id": "session-m5",
+                "worktree": {"state": "safe", "head": HEAD},
+            }},
+        ]
+        source = {"identity": "https://example.test/plan", "sha256": PLAN}
+        old_checkpoint = "wsc_" + "e" * 32
+        new_checkpoint = "wsc_" + "3" * 32
+        newer_checkpoint = "wsc_" + "4" * 32
+        reconcile_required_projection(
+            adapter,
+            {"root": {"identifier": "GEN-37"},
+             "latest_checkpoint": acknowledged_checkpoint(old_checkpoint)},
+            reviewed_manifest(adapter, projection), remote_head=HEAD,
+            created_at="2026-08-29T20:00:00Z",
+            authenticated_source=source,
+            checkpoint_fence=lambda: old_checkpoint,
+        )
+        observations = iter((new_checkpoint, newer_checkpoint))
+        comments_before = len(client.comments)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "checkpoint_authority_changed_reload_required",
+        ):
+            reconcile_required_projection(
+                adapter,
+                {"root": {"identifier": "GEN-37"},
+                 "latest_checkpoint": acknowledged_checkpoint(new_checkpoint)},
+                reviewed_manifest(adapter, projection), remote_head=HEAD,
+                created_at="2026-08-29T20:01:00Z",
+                authenticated_source=source,
+                checkpoint_fence=lambda: next(observations),
+            )
+        self.assertEqual(len(client.comments), comments_before)
 
     def test_product_reconcile_activates_exact_reviewed_v1_then_replays_noop(self):
         client = FakeProjectionClient()
@@ -4222,10 +4427,7 @@ class ProjectionTests(unittest.TestCase):
             client.comments.append(legacy_comment(event, f"legacy-{revision}"))
         snapshot = {
             "root": {"identifier": "GEN-37"},
-            "latest_checkpoint": {
-                "checkpoint_event_id": "wsc-live",
-                "worktree": {"state": "safe", "head": HEAD},
-            },
+            "latest_checkpoint": acknowledged_checkpoint("wsc-live"),
         }
         source = {"identity": "https://example.test/plan", "sha256": PLAN}
         manifest = reviewed_manifest(adapter, projection)
@@ -4243,6 +4445,7 @@ class ProjectionTests(unittest.TestCase):
         first = reconcile_required_projection(
             adapter, snapshot, manifest, remote_head=HEAD,
             created_at="2026-08-27T18:00:00Z", authenticated_source=source,
+            checkpoint_fence=lambda: "wsc-live",
         )
         self.assertEqual(len(first["writes"]), 1)
         activation = adapter.state().events[-1]
@@ -4263,6 +4466,7 @@ class ProjectionTests(unittest.TestCase):
         replay = reconcile_required_projection(
             adapter, snapshot, replay_manifest, remote_head=HEAD,
             created_at="2026-08-27T18:01:00Z", authenticated_source=source,
+            checkpoint_fence=lambda: "wsc-live",
         )
         self.assertEqual(replay["writes"], [])
         self.assertEqual(len(client.comments), 5)

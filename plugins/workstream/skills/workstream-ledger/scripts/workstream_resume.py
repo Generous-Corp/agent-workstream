@@ -403,7 +403,8 @@ def _compact_checkpoint(checkpoint: dict[str, Any] | None) -> dict[str, Any] | N
     result = {
         key: checkpoint[key]
         for key in (
-            "checkpoint_event_id", "root_revision", "status", "exact_head",
+            "workstream_id", "checkpoint_event_id", "root_revision",
+            "plan_revision", "status", "exact_head", "next_action",
             "worktree", "acknowledgement",
         )
     }
@@ -418,7 +419,10 @@ def _compact_checkpoint(checkpoint: dict[str, Any] | None) -> dict[str, Any] | N
         "count": len(provenance),
         "latest": {
             key: latest_provenance[key]
-            for key in ("agent", "machine", "session_id")
+            for key in (
+                "event_id", "agent", "provider", "machine", "session_id",
+                "worktree",
+            )
             if latest_provenance.get(key) is not None
         },
         "sha256": hashlib.sha256(json.dumps(
@@ -1117,6 +1121,20 @@ def validate_snapshot(
             ))
             if values != snapshot.get(field):
                 raise ResumeError(f"projection_current_view_mismatch:{field}")
+        if require_projection_authority:
+            disposition = snapshot.get("disposition")
+            expected_checkpoint = (
+                latest_checkpoint.get("checkpoint_event_id")
+                if isinstance(latest_checkpoint, dict) else None
+            )
+            recovered_checkpoint = (
+                disposition.get("recovered_from_checkpoint")
+                if isinstance(disposition, dict) else None
+            )
+            if recovered_checkpoint != expected_checkpoint:
+                raise ResumeError(
+                    "disposition_checkpoint_stale_reconcile_required"
+                )
     try:
         choice_view = reduce_choices(choice_events)
         scope = snapshot.get("scope")

@@ -20,6 +20,7 @@ from workstream_linear import (
     resolve_authenticated_issue_route,
 )
 from workstream_linear_events import LinearCommentEventAdapter
+from workstream_linear_checkpoints import reduce_checkpoint_comments
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
     LinearProjectionError, projection_slot_id, TOMBSTONE,
@@ -29,6 +30,7 @@ from workstream_relation_readback import RelationReadbackError, read_relation_ta
 from workstream_resume import add_material_history, compact_context, extract_token, ResumeError
 from workstream_scope import repository_key, ScopeError, validate_relation_graph
 from workstream_successor import choose_disposition, SuccessorError
+from workstream_checkpoint import CheckpointError, recover_latest
 from workstream_evidence import evidence_errors
 from workstream_child_closure import (
     canonical_digest, evidence_receipts_sha256, terminal_child_readback,
@@ -50,6 +52,50 @@ def _value_digest(value: Any) -> str:
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _latest_acknowledged_checkpoint_id(snapshot: dict[str, Any]) -> str | None:
+    """Return the checkpoint authority that a disposition must name."""
+    checkpoint = snapshot.get("latest_checkpoint")
+    if checkpoint is None:
+        return None
+    acknowledgement = checkpoint.get("acknowledgement")
+    checkpoint_id = checkpoint.get("checkpoint_event_id")
+    if (
+        not isinstance(checkpoint_id, str)
+        or not checkpoint_id
+        or not isinstance(acknowledgement, dict)
+        or acknowledgement.get("state") != "remote_acknowledged"
+        or not isinstance(acknowledgement.get("remote_id"), str)
+        or not acknowledgement["remote_id"]
+    ):
+        raise LinearProjectionError(
+            "latest_checkpoint_not_remote_acknowledged"
+        )
+    return checkpoint_id
+
+
+def latest_acknowledged_checkpoint_id_from_comments(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    plan_revision: str,
+) -> str | None:
+    """Recover the exact acknowledged checkpoint chain tip from remote comments."""
+    checkpoint_log = reduce_checkpoint_comments(
+        comments, workstream_id=workstream_id,
+    )
+    matching = [
+        checkpoint for checkpoint in checkpoint_log.checkpoints
+        if checkpoint.get("plan_revision") == plan_revision
+    ]
+    if not matching:
+        return None
+    try:
+        return recover_latest(
+            list(checkpoint_log.checkpoints), workstream_id,
+            expected_plan_revision=plan_revision,
+        )["checkpoint_event_id"]
+    except CheckpointError as error:
+        raise LinearProjectionError(str(error)) from error
 
 
 def _latest_historical_source(
@@ -1777,11 +1823,13 @@ def reconcile_required_projection(
     ) = None,
     terminal_child_fence: Callable[[list[str]], dict[str, str]] | None = None,
     projection_input_fence: Callable[[], str] | None = None,
+    checkpoint_fence: Callable[[], str | None] | None = None,
     legacy_unresolved_relation_heads: frozenset[tuple[str, str]] = frozenset(),
 ) -> dict[str, Any]:
     """Append only missing/changed values and verify the complete current view."""
     if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", remote_head):
         raise LinearProjectionError("verified_full_remote_head_required")
+    expected_checkpoint_id = _latest_acknowledged_checkpoint_id(snapshot)
     desired, reviewed_retirements = _reviewed_manifest(manifest)
     scope_item = next(item for item in desired if item["kind"] == "scope")
     source_item = next(item for item in desired if item["kind"] == "source")
@@ -2168,8 +2216,21 @@ def reconcile_required_projection(
                 "terminal_child_evidence_seed_input_frontier_changed"
             )
 
+    def fence_checkpoint_authority() -> None:
+        if checkpoint_fence is None:
+            if expected_checkpoint_id is not None:
+                raise LinearProjectionError(
+                    "checkpoint_authority_fence_required"
+                )
+            return
+        if checkpoint_fence() != expected_checkpoint_id:
+            raise LinearProjectionError(
+                "checkpoint_authority_changed_reload_required"
+            )
+
     fence_terminal_repairs()
     fence_projection_inputs()
+    fence_checkpoint_authority()
 
     activation_receipt = None
     if initial.events and all(
@@ -2209,6 +2270,7 @@ def reconcile_required_projection(
     expected_latest_heads = dict(latest_heads)
     for item in write_items:
         fence_projection_inputs()
+        fence_checkpoint_authority()
         state = adapter.state()
         if projection_review_contract(state) != _contract_from_heads(
             expected_revision, expected_active_heads,
@@ -2231,6 +2293,7 @@ def reconcile_required_projection(
         latest_current = expected_latest_heads.get(identity)
         fence_terminal_repairs()
         fence_projection_inputs()
+        fence_checkpoint_authority()
         event = build_projection_event(
             workstream_id=adapter.workstream_id,
             kind=item["kind"], key=item["key"], value=item["value"],
@@ -2270,9 +2333,11 @@ def reconcile_required_projection(
             ],
         ):
             raise LinearProjectionError("projection_changed_during_reconcile")
+        fence_checkpoint_authority()
 
     fence_terminal_repairs()
     fence_projection_inputs()
+    fence_checkpoint_authority()
     final = adapter.state()
     if projection_review_contract(final) != _contract_from_heads(
         expected_revision, expected_active_heads,
@@ -2288,6 +2353,7 @@ def reconcile_required_projection(
         ],
     ):
         raise LinearProjectionError("projection_final_contract_mismatch")
+    fence_checkpoint_authority()
     active: dict[tuple[str, str], dict[str, Any]] = {}
     for event in final.events:
         identity = (event["kind"], event["key"])
@@ -2434,6 +2500,18 @@ def main() -> int:
                 live_graph, live_comments,
             )
 
+        def checkpoint_fence() -> str | None:
+            comments_before = comment_adapter.comments()
+            comments_after = comment_adapter.comments()
+            if comments_before != comments_after:
+                raise LinearProjectionError(
+                    "checkpoint_authority_changed_during_read"
+                )
+            return latest_acknowledged_checkpoint_id_from_comments(
+                comments_after, workstream_id=token,
+                plan_revision=plan_revision,
+            )
+
         result = reconcile_required_projection(
             adapter, snapshot, manifest, remote_head=args.remote_head,
             created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -2441,6 +2519,7 @@ def main() -> int:
             relation_target_resolver=resolver,
             terminal_child_fence=terminal_child_fence,
             projection_input_fence=projection_input_fence,
+            checkpoint_fence=checkpoint_fence,
             legacy_unresolved_relation_heads=legacy_unresolved_relation_heads,
         )
         # Double-collect graph and comments so a concurrent root/child/checkpoint
