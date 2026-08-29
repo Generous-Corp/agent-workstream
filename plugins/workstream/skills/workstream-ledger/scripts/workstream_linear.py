@@ -93,6 +93,45 @@ query WorkstreamIssues($teamId: String!, $after: String) {
 }
 """
 
+RESUME_ROOT_QUERY = """
+query WorkstreamResumeRoot($issueId: String!, $after: String) {
+  issue(id: $issueId) {
+    id identifier title description url updatedAt
+    project { id }
+    team { id organization { id } }
+    state { name type }
+    children(first: 250, after: $after) {
+      nodes {
+        id identifier title description url updatedAt
+        parent { id identifier }
+        project { id }
+        team { id organization { id } }
+        state { name type }
+        comments(first: 250) {
+          nodes { id body createdAt updatedAt }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
+
+RESUME_COMMENTS_QUERY = """
+query WorkstreamResumeComments($issueId: String!, $after: String) {
+  issue(id: $issueId) {
+    id identifier
+    team { id organization { id } }
+    project { id }
+    comments(first: 250, after: $after) {
+      nodes { id body createdAt updatedAt }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
+
 ROUTE_QUERY = """
 query WorkstreamRoute($teamId: String!, $projectId: String!) {
   team(id: $teamId) { id organization { id } }
@@ -322,14 +361,14 @@ class LinearGraphQLTransport:
             payload["projectId"] = self.project_id
         return payload
 
-    def snapshot(self) -> dict[str, Any]:
+    def _issue_snapshot(self, query: str) -> dict[str, Any]:
         self._ensure_route()
         issues: list[dict[str, Any]] = []
         after: str | None = None
         seen_cursors: set[str] = set()
         while True:
             result = self.client.execute(
-                ISSUES_QUERY, {"teamId": self.team_id, "after": after}
+                query, {"teamId": self.team_id, "after": after}
             )
             team = result.get("team")
             if not isinstance(team, dict):
@@ -350,25 +389,147 @@ class LinearGraphQLTransport:
                 raise LinearTransportError("invalid Linear pagination cursor")
             seen_cursors.add(after)
 
+    def snapshot(self) -> dict[str, Any]:
+        return self._issue_snapshot(ISSUES_QUERY)
+
+    def _remaining_resume_comments(
+        self, issue: dict[str, Any], page_info: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if not isinstance(page_info, dict) or not isinstance(
+            page_info.get("hasNextPage"), bool,
+        ):
+            raise LinearTransportError("invalid Linear comment page info")
+        comments: list[dict[str, Any]] = []
+        after = page_info.get("endCursor")
+        seen_cursors: set[str] = set()
+        while page_info.get("hasNextPage"):
+            if not isinstance(after, str) or not after or after in seen_cursors:
+                raise LinearTransportError("invalid Linear comment pagination cursor")
+            seen_cursors.add(after)
+            result = self.client.execute(
+                RESUME_COMMENTS_QUERY,
+                {"issueId": issue.get("identifier"), "after": after},
+            )
+            observed = result.get("issue")
+            if not isinstance(observed, dict):
+                raise LinearTransportError("Linear workstream child not found")
+            if (
+                observed.get("id") != issue.get("id")
+                or observed.get("identifier") != issue.get("identifier")
+            ):
+                raise LinearTransportError("workstream_child_identity_mismatch")
+            if self.workspace_id and self.team_id and self.project_id:
+                validate_issue_route(
+                    observed, workspace_id=self.workspace_id, team_id=self.team_id,
+                    project_id=self.project_id,
+                )
+            connection = observed.get("comments")
+            if not isinstance(connection, dict):
+                raise LinearTransportError("invalid Linear comment connection")
+            nodes = connection.get("nodes")
+            if not isinstance(nodes, list):
+                raise LinearTransportError("invalid Linear comment connection")
+            comments.extend(nodes)
+            page_info = connection.get("pageInfo")
+            if not isinstance(page_info, dict) or not isinstance(
+                page_info.get("hasNextPage"), bool,
+            ):
+                raise LinearTransportError("invalid Linear comment page info")
+            after = page_info.get("endCursor")
+        return comments
+
+    def _resume_root_with_children(self, token: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        self._ensure_route()
+        root: dict[str, Any] | None = None
+        children: list[dict[str, Any]] = []
+        after: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            result = self.client.execute(
+                RESUME_ROOT_QUERY, {"issueId": token, "after": after},
+            )
+            observed = result.get("issue")
+            if not isinstance(observed, dict):
+                raise LinearTransportError(f"Linear root not found: {token}")
+            if str(observed.get("identifier", "")).upper() != token:
+                raise LinearTransportError("workstream_id_mismatch")
+            if self.workspace_id and self.team_id and self.project_id:
+                validate_issue_route(
+                    observed, workspace_id=self.workspace_id, team_id=self.team_id,
+                    project_id=self.project_id,
+                )
+            if root is None:
+                root = {key: value for key, value in observed.items() if key != "children"}
+            elif observed.get("id") != root.get("id"):
+                raise LinearTransportError("workstream_root_identity_mismatch")
+            connection = observed.get("children")
+            if not isinstance(connection, dict):
+                raise LinearTransportError("invalid Linear child connection")
+            nodes = connection.get("nodes")
+            if not isinstance(nodes, list):
+                raise LinearTransportError("invalid Linear child connection")
+            children.extend(nodes)
+            page_info = connection.get("pageInfo")
+            if not isinstance(page_info, dict) or not isinstance(
+                page_info.get("hasNextPage"), bool,
+            ):
+                raise LinearTransportError("invalid Linear child page info")
+            if not page_info.get("hasNextPage"):
+                return root, children
+            after = page_info.get("endCursor")
+            if not isinstance(after, str) or not after or after in seen_cursors:
+                raise LinearTransportError("invalid Linear child pagination cursor")
+            seen_cursors.add(after)
+
     def snapshot_for_root(
-        self, token: str, *, include_description: bool = False,
+        self, token: str, *, include_child_comments: bool = False,
+        include_description: bool = False,
     ) -> dict[str, Any]:
         """Build the bounded resume snapshot for one GEN root from live Linear."""
         token = token.upper()
-        issues = self.snapshot()["issues"]
-        root = next((issue for issue in issues if str(issue.get("identifier", "")).upper() == token), None)
+        if include_child_comments:
+            root, owned_children = self._resume_root_with_children(token)
+            issues = [root, *owned_children]
+        else:
+            issues = self._issue_snapshot(ISSUES_QUERY)["issues"]
+            root = next((
+                issue for issue in issues
+                if str(issue.get("identifier", "")).upper() == token
+            ), None)
         if not root:
             raise LinearTransportError(f"Linear root not found: {token}")
         description = root.get("description") or ""
         plan_revision = parse_plan_revision(description)
         children = []
+        child_comments: dict[str, list[dict[str, Any]]] = {}
         for issue in issues:
             if (issue.get("parent") or {}).get("id") != root.get("id"):
                 continue
             child = dict(issue)
             state = child.pop("state", None) or {}
             child["status"] = state.get("name") or state.get("type") or "Todo"
+            child["status_type"] = state.get("type")
             child["next_action"] = parse_next_action(child.get("description"))
+            comment_connection = child.pop("comments", None)
+            terminal = {
+                str(child.get("status", "")).lower(),
+                str(child.get("status_type", "")).lower(),
+            } & {"done", "completed", "cancelled", "canceled", "superseded"}
+            if include_child_comments and not terminal:
+                if not isinstance(comment_connection, dict):
+                    raise LinearTransportError("missing Linear child comment connection")
+                nodes = comment_connection.get("nodes")
+                if not isinstance(nodes, list):
+                    raise LinearTransportError("invalid Linear child comment connection")
+                page_info = comment_connection.get("pageInfo")
+                if not isinstance(page_info, dict) or not isinstance(
+                    page_info.get("hasNextPage"), bool,
+                ):
+                    raise LinearTransportError("invalid Linear comment page info")
+                child_comments[str(child.get("identifier", "")).upper()] = [
+                    *nodes,
+                    *self._remaining_resume_comments(child, page_info),
+                ]
             children.append(child)
         root_state = root.get("state") or {}
         result = {
@@ -377,11 +538,14 @@ class LinearGraphQLTransport:
                 "plan_revision": plan_revision,
                 "revision": parse_root_revision(description),
                 "status": root_state.get("name") or root_state.get("type"),
+                "status_type": root_state.get("type"),
                 "next_action": parse_next_action(description),
             },
             "children": children,
             "decisions": [], "provenance": [],
         }
+        if include_child_comments:
+            result["child_comments"] = child_comments
         if include_description:
             result["root"]["description"] = description
         return result

@@ -47,7 +47,7 @@ from workstream_scope import repository_key, ScopeError, validate_relations, val
 
 
 TOKEN = re.compile(r"\b[A-Z][A-Z0-9]*-\d+\b", re.I)
-TERMINAL = {"done", "cancelled", "canceled", "superseded"}
+TERMINAL = {"done", "completed", "cancelled", "canceled", "superseded"}
 MATERIAL_OBLIGATION_TERMS = ("requirement", "blocker", "blocked", "followup", "decision")
 MATERIAL_OBLIGATION_KEYS = {
     "requirement", "requirements", "blocker", "blockers",
@@ -58,6 +58,13 @@ RAW_TRANSCRIPT_KEYS = {"raw_transcript", "transcript"}
 
 class ResumeError(ValueError):
     pass
+
+
+def _is_terminal(item: dict[str, Any]) -> bool:
+    return any(
+        str(item.get(field, "")).lower() in TERMINAL
+        for field in ("status_type", "status")
+    )
 
 
 def _without_raw_transcripts(value: Any) -> Any:
@@ -141,6 +148,44 @@ def _event_next_actions(event: dict[str, Any]) -> set[str]:
     return actions
 
 
+def _event_payloads(event: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    payloads = [(event["kind"], event["payload"])]
+    if event["kind"] == "material_boundary":
+        changes = event["payload"].get("changes")
+        if not isinstance(changes, list):
+            raise ResumeError(f"malformed_material_boundary:{event['event_id']}")
+        for change in changes:
+            if (
+                not isinstance(change, dict)
+                or not isinstance(change.get("kind"), str)
+                or not change["kind"]
+                or not isinstance(change.get("payload"), dict)
+            ):
+                raise ResumeError(f"malformed_material_boundary:{event['event_id']}")
+            payloads.append((change["kind"], change["payload"]))
+    return payloads
+
+
+def _event_blockers(event: dict[str, Any]) -> list[dict[str, Any] | None]:
+    blockers: list[dict[str, Any] | None] = []
+    for kind, payload in _event_payloads(event):
+        if "blocker" in payload:
+            value = payload["blocker"]
+        elif kind.lower() in {"blocker", "blocked"}:
+            value = payload
+        else:
+            continue
+        # Early ledger writers stored a concise blocker as a non-empty string.
+        # Preserve that append-only history in the current structured surface
+        # instead of making an otherwise valid historical workstream unreadable.
+        if isinstance(value, str) and value.strip():
+            value = {"text": value.strip()}
+        if value is not None and (not isinstance(value, dict) or not value):
+            raise ResumeError(f"invalid_event_blocker:{event['event_id']}")
+        blockers.append(value)
+    return blockers
+
+
 def _resolved_next_action(
     events: list[dict[str, Any]], current: str | None,
     checkpoint: dict[str, Any] | None,
@@ -164,6 +209,123 @@ def _resolved_next_action(
             if index >= checkpoint_revision:
                 resolved = value
     return resolved
+
+
+def _resolved_blocker(
+    events: list[dict[str, Any]], current: dict[str, Any] | None,
+    checkpoint: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if current is not None and not isinstance(current, dict):
+        raise ResumeError("invalid_child_blocker")
+    checkpoint_revision = 0
+    resolved = deepcopy(current)
+    if checkpoint is not None:
+        checkpoint_revision = checkpoint["root_revision"]
+        resolved = deepcopy(checkpoint["blocker"])
+    blockers_by_revision: dict[int, set[str]] = {}
+    for index, event in enumerate(events):
+        for value in _event_blockers(event):
+            encoded = json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+            values = blockers_by_revision.setdefault(event["expected_revision"], set())
+            values.add(encoded)
+            if len(values) > 1:
+                raise ResumeError(
+                    f"conflicting_concurrent_blocker:{event['expected_revision']}"
+                )
+            if index >= checkpoint_revision:
+                resolved = deepcopy(value)
+    return resolved
+
+
+def _validate_child_route(
+    child: dict[str, Any], *, token: str, authenticated_route: dict[str, str],
+) -> None:
+    if str(child.get("identifier", "")).upper() != token:
+        raise ResumeError(f"child_identity_mismatch:{token}")
+    if not isinstance(child.get("id"), str) or not child["id"]:
+        raise ResumeError(f"child_identity_missing:{token}")
+    parent = child.get("parent") or {}
+    if parent.get("id") != authenticated_route.get("root_issue_id"):
+        raise ResumeError(f"child_parent_route_mismatch:{token}")
+    team = child.get("team") or {}
+    if team.get("id") != authenticated_route.get("team_id"):
+        raise ResumeError(f"child_route_mismatch:{token}:team_id")
+    if (team.get("organization") or {}).get("id") != authenticated_route.get("workspace_id"):
+        raise ResumeError(f"child_route_mismatch:{token}:workspace_id")
+    if (child.get("project") or {}).get("id") != authenticated_route.get("project_id"):
+        raise ResumeError(f"child_route_mismatch:{token}:project_id")
+
+
+def add_child_material_history(
+    snapshot: dict[str, Any], child_comments: dict[str, list[dict[str, Any]]],
+    *, authenticated_route: dict[str, str],
+) -> dict[str, Any]:
+    """Reduce every nonterminal child log without mixing child/root authority."""
+    if not isinstance(child_comments, dict):
+        raise ResumeError("invalid_child_comment_collection")
+    result = dict(snapshot)
+    result["children"] = []
+    nonterminal_tokens = {
+        str(child.get("identifier", "")).upper()
+        for child in snapshot.get("children", [])
+        if not _is_terminal(child)
+    }
+    if set(child_comments) != nonterminal_tokens:
+        raise ResumeError("incomplete_child_comment_collection")
+    plan_revision = (snapshot.get("root") or {}).get("plan_revision")
+    for source_child in snapshot.get("children", []):
+        child = dict(source_child)
+        token = str(child.get("identifier", "")).upper()
+        if _is_terminal(child):
+            result["children"].append(child)
+            continue
+        _validate_child_route(child, token=token, authenticated_route=authenticated_route)
+        comments = child_comments[token]
+        if not isinstance(comments, list):
+            raise ResumeError(f"invalid_child_comment_collection:{token}")
+        event_log = reduce_event_comments(comments, workstream_id=token)
+        checkpoint_log = reduce_checkpoint_comments(comments, workstream_id=token)
+        if not event_log.events and not checkpoint_log.checkpoints:
+            result["children"].append(child)
+            continue
+        events = [_event_record(event) for event in event_log.events]
+        current_checkpoints = [
+            checkpoint for checkpoint in checkpoint_log.checkpoints
+            if checkpoint["plan_revision"] == plan_revision
+        ]
+        stale_checkpoint_count = len(checkpoint_log.checkpoints) - len(current_checkpoints)
+        latest_checkpoint = None
+        if current_checkpoints:
+            latest_checkpoint = recover_latest(
+                current_checkpoints, token, expected_plan_revision=plan_revision,
+            )
+            if latest_checkpoint["root_revision"] > event_log.revision:
+                raise ResumeError(
+                    f"child_checkpoint_ahead_of_material_event_log:{token}"
+                )
+        child["issue_next_action"] = child.get("next_action")
+        child["material_events"] = events
+        child["material_event_revision"] = event_log.revision
+        child["latest_checkpoint"] = latest_checkpoint
+        child["checkpoint_recovery"] = {
+            "state": (
+                "current" if current_checkpoints
+                else "stale_plan" if stale_checkpoint_count
+                else "not_found"
+            ),
+            "stale_plan_count": stale_checkpoint_count,
+        }
+        child["next_action"] = _resolved_next_action(
+            events, child.get("next_action"), latest_checkpoint,
+        )
+        child["blocker"] = _resolved_blocker(
+            events, child.get("blocker"), latest_checkpoint,
+        )
+        result["children"].append(child)
+    result.pop("child_comments", None)
+    return result
 
 
 def _uncheckpointed_material_obligations(
@@ -228,6 +390,21 @@ def _compact_checkpoint(checkpoint: dict[str, Any] | None) -> dict[str, Any] | N
         ).encode()).hexdigest(),
     }
     return result
+
+
+def _checkpoint_item_count(checkpoint: dict[str, Any] | None) -> int:
+    """Count variable-length checkpoint collections present in resume output."""
+    if checkpoint is None:
+        return 0
+    evidence = checkpoint.get("evidence", [])
+    if isinstance(evidence, dict):
+        evidence = evidence.get("items", [])
+    provenance = checkpoint.get("provenance_chain", [])
+    return (
+        len(evidence) if isinstance(evidence, list) else 0
+    ) + (
+        len(provenance) if isinstance(provenance, list) else 0
+    )
 
 
 def _compact_scope(scope: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -379,7 +556,7 @@ def validate_snapshot(
         not isinstance(root_next_action, str) or not root_next_action.strip()
     ):
         raise ResumeError("invalid_root_next_action")
-    if str(root.get("status", "")).lower() not in TERMINAL and not root_next_action:
+    if not _is_terminal(root) and not root_next_action:
         raise ResumeError("nonterminal root missing next_action")
     events_present = "material_events" in snapshot
     revision_present = "material_event_revision" in snapshot
@@ -473,7 +650,7 @@ def validate_snapshot(
     root["next_action"] = _resolved_next_action(
         material_events, root.get("next_action"), latest_checkpoint,
     )
-    if str(root.get("status", "")).lower() not in TERMINAL and not root.get("next_action"):
+    if not _is_terminal(root) and not root.get("next_action"):
         raise ResumeError("nonterminal root missing next_action")
     children = snapshot.get("children")
     if not isinstance(children, list):
@@ -486,8 +663,29 @@ def validate_snapshot(
         if key in keys:
             raise ResumeError(f"duplicate child:{key}")
         keys.add(key)
-        if str(child.get("status", "")).lower() not in TERMINAL and not child.get("next_action"):
+        if not _is_terminal(child) and not child.get("next_action"):
             raise ResumeError(f"nonterminal child missing next_action:{key}")
+        child_events_present = "material_events" in child
+        child_revision_present = "material_event_revision" in child
+        if child_events_present != child_revision_present:
+            raise ResumeError(f"child_material_event_surface_incomplete:{key}")
+        if child_events_present:
+            child_root = {
+                "identifier": key,
+                "url": child.get("url"),
+                "plan_revision": root["plan_revision"],
+                "revision": child.get("material_event_revision"),
+                "status": child.get("status"),
+                "next_action": child.get("next_action"),
+            }
+            validate_snapshot({
+                "root": child_root,
+                "children": [],
+                "material_events": child.get("material_events"),
+                "material_event_revision": child.get("material_event_revision"),
+                "latest_checkpoint": child.get("latest_checkpoint"),
+                "checkpoint_recovery": child.get("checkpoint_recovery"),
+            }, key)
     choice_events = snapshot.get("choice_events", [])
     if not isinstance(choice_events, list):
         raise ResumeError("choice_events must be a list")
@@ -768,14 +966,6 @@ def compact_context(
         require_projection_authority=require_projection_authority,
     )
     root = clean["root"]
-    children = []
-    for child in clean["children"]:
-        if str(child.get("status", "")).lower() in TERMINAL:
-            continue
-        children.append(dict(child) if include_history else {
-            key: value for key, value in child.items()
-            if key not in {"parent", "project", "team"}
-        })
 
     def history_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         encoded = json.dumps(
@@ -791,6 +981,45 @@ def compact_context(
                 if latest.get(key) is not None
             } if latest else None),
         }
+
+    children = []
+    child_material_item_count = 0
+    for child in clean["children"]:
+        if _is_terminal(child):
+            continue
+        compact_child = dict(child) if include_history else {
+            key: value for key, value in child.items()
+            if key not in {
+                "parent", "project", "team", "material_events", "latest_checkpoint",
+            }
+        }
+        if "material_events" in child:
+            checkpoint_revision = (
+                child["latest_checkpoint"]["root_revision"]
+                if child.get("latest_checkpoint") is not None else 0
+            )
+            obligations = _uncheckpointed_material_obligations(
+                child["material_events"], checkpoint_revision,
+            )
+            compact_child["latest_checkpoint"] = (
+                child.get("latest_checkpoint") if include_history
+                else _compact_checkpoint(child.get("latest_checkpoint"))
+            )
+            compact_child["uncheckpointed_material_obligations"] = obligations
+            compact_child["history"] = {
+                "included": include_history,
+                "material_events": history_summary(child["material_events"]),
+            }
+            if include_history:
+                compact_child["material_events"] = child["material_events"]
+            child_material_item_count += len(obligations)
+            child_material_item_count += len(
+                child["material_events"] if include_history else []
+            )
+            child_material_item_count += _checkpoint_item_count(
+                compact_child.get("latest_checkpoint")
+            )
+        children.append(compact_child)
 
     history = {
         "included": include_history,
@@ -857,7 +1086,9 @@ def compact_context(
             "projection_unresolved_quarantine"
         ]
     context = _without_raw_transcripts(context)
-    item_count = sum(
+    item_count = child_material_item_count + _checkpoint_item_count(
+        context["latest_checkpoint"]
+    ) + sum(
         len(value) for value in (
             context["children"], context["decisions"], context["choice_events"],
             context["relations"], context["provenance"],
@@ -868,7 +1099,6 @@ def compact_context(
             context.get("projection_history", []),
             context.get("projection_quarantined", []),
             context.get("projection_unresolved_quarantine", []),
-            (context["latest_checkpoint"] or {}).get("provenance_chain", []),
         )
     )
     if max_items < 0 or item_count > max_items:
@@ -933,7 +1163,9 @@ def main() -> int:
                 workspace_id=route.get("workspace_id"),
                 project_id=route.get("project_id"),
             )
-            live_graph_snapshot = transport.snapshot_for_root(token)
+            live_graph_snapshot = transport.snapshot_for_root(
+                token, include_child_comments=True,
+            )
             complete_route = route if all(
                 route.get(field) for field in ("workspace_id", "team_id", "project_id")
             ) else {}
@@ -943,6 +1175,11 @@ def main() -> int:
                 workspace_id=complete_route.get("workspace_id"),
                 project_id=complete_route.get("project_id"),
             ).comments()
+            child_comments = live_graph_snapshot.pop("child_comments", None)
+            live_graph_snapshot = add_child_material_history(
+                live_graph_snapshot, child_comments,
+                authenticated_route=route,
+            )
             # This first join discovers the projected plan source before its
             # bytes can be authenticated. Lifecycle validation is necessarily
             # provisional here; the full-authority join below repeats the same
