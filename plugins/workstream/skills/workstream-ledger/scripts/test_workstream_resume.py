@@ -154,6 +154,90 @@ class ResumeTests(unittest.TestCase):
         )
         self.assertEqual(resumed["history"]["material_events"]["count"], 4)
 
+    def test_child_full_history_retains_every_checkpoint_and_budgets_old_evidence(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        snapshot = self.live_snapshot(self.snapshot(), route)
+        events = [
+            Delta(
+                f"child-history-event-{index}", "GEN-38", "progress", "agent",
+                {"step": index}, index, f"2026-08-29T00:00:0{index}Z",
+            )
+            for index in range(2)
+        ]
+        execution = {
+            "agent": "codex", "provider": "openai", "session_id": "session",
+            "machine": "M5", "worktree": {
+                "state": "safe", "path": "/repo/child", "branch": "fix/child",
+                "head": "abc123",
+            },
+        }
+        first = build_checkpoint(
+            workstream_id="GEN-38", boundary_id="child-earlier", root_revision=1,
+            plan_revision="sha", before_status="In Progress",
+            after_status="In Progress", execution=execution, exact_head="abc123",
+            evidence=[
+                {"kind": "earlier-test", "id": str(index)} for index in range(20)
+            ],
+            blocker=None, next_action="older child action",
+        )
+        second = build_checkpoint(
+            workstream_id="GEN-38", boundary_id="child-current", root_revision=2,
+            plan_revision="sha", before_status="In Progress",
+            after_status="In Progress", execution=execution, exact_head="abc123",
+            evidence=[{"kind": "current-test", "id": "focused"}],
+            blocker=None, next_action="current child action",
+            predecessor_event_id=first["event_id"],
+        )
+        snapshot["child_comments"]["GEN-38"] = [
+            *[
+                {"id": f"child-event-{index}", "body": encode_event_comment(event)}
+                for index, event in enumerate(events)
+            ],
+            {"id": "child-checkpoint-earlier", "body": encode_checkpoint_comment(first)},
+            {"id": "child-checkpoint-current", "body": encode_checkpoint_comment(second)},
+        ]
+        enriched = MODULE.add_child_material_history(
+            snapshot, snapshot["child_comments"], authenticated_route=route,
+        )
+
+        bounded = MODULE.compact_context(
+            enriched, "GEN-37", max_items=10,
+        )["children"][0]
+        self.assertNotIn("checkpoint_history", bounded)
+        self.assertEqual(bounded["history"]["checkpoints"]["count"], 2)
+        self.assertRegex(bounded["history"]["checkpoints"]["sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(bounded["next_action"], "current child action")
+        self.assertEqual(
+            bounded["latest_checkpoint"]["evidence"]["items"],
+            [{"kind": "current-test", "id": "focused"}],
+        )
+
+        full = MODULE.compact_context(
+            enriched, "GEN-37", include_history=True, max_items=100,
+        )["children"][0]
+        self.assertEqual(
+            [checkpoint["event_id"] for checkpoint in full["checkpoint_history"]],
+            [first["event_id"], second["event_id"]],
+        )
+        self.assertEqual(full["checkpoint_history"][0]["evidence"], first["evidence"])
+        truncated = json.loads(json.dumps(enriched))
+        truncated["children"][0]["checkpoint_history"] = [
+            truncated["children"][0]["checkpoint_history"][-1]
+        ]
+        with self.assertRaisesRegex(
+            MODULE.ResumeError, "invalid_child_checkpoint_history:GEN-38"
+        ):
+            MODULE.compact_context(
+                truncated, "GEN-37", include_history=True, max_items=100,
+            )
+        with self.assertRaisesRegex(MODULE.ResumeError, "over_item_budget"):
+            MODULE.compact_context(
+                enriched, "GEN-37", include_history=True, max_items=10,
+            )
+
     def test_legacy_string_child_blocker_is_preserved_as_structured_state(self):
         route = {
             "workspace_id": "workspace", "team_id": "team",

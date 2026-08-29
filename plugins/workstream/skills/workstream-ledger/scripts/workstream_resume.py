@@ -20,7 +20,7 @@ import sys
 from typing import Any
 
 from workstream_config import load_linear_api_key, resolve_linear_route
-from workstream_checkpoint import CheckpointError, recover_latest
+from workstream_checkpoint import CheckpointError, recover_latest, validate_checkpoint
 from workstream_linear import (
     HttpGraphQLClient, LinearGraphQLTransport,
     LinearTransportError,
@@ -308,6 +308,7 @@ def add_child_material_history(
         child["issue_next_action"] = child.get("next_action")
         child["material_events"] = events
         child["material_event_revision"] = event_log.revision
+        child["checkpoint_history"] = list(checkpoint_log.checkpoints)
         child["latest_checkpoint"] = latest_checkpoint
         child["checkpoint_recovery"] = {
             "state": (
@@ -404,6 +405,14 @@ def _checkpoint_item_count(checkpoint: dict[str, Any] | None) -> int:
         len(evidence) if isinstance(evidence, list) else 0
     ) + (
         len(provenance) if isinstance(provenance, list) else 0
+    )
+
+
+def _checkpoint_history_item_count(checkpoints: list[dict[str, Any]]) -> int:
+    """Count checkpoint records and every evidence item emitted with them."""
+    return len(checkpoints) + sum(
+        len(checkpoint.get("evidence", []))
+        for checkpoint in checkpoints
     )
 
 
@@ -670,6 +679,54 @@ def validate_snapshot(
         if child_events_present != child_revision_present:
             raise ResumeError(f"child_material_event_surface_incomplete:{key}")
         if child_events_present:
+            checkpoint_history = child.get("checkpoint_history")
+            if checkpoint_history is not None:
+                if not isinstance(checkpoint_history, list):
+                    raise ResumeError(f"invalid_child_checkpoint_history:{key}")
+                checkpoint_keys: list[tuple[int, str]] = []
+                for checkpoint in checkpoint_history:
+                    if not isinstance(checkpoint, dict):
+                        raise ResumeError(f"invalid_child_checkpoint_history:{key}")
+                    try:
+                        validate_checkpoint(checkpoint)
+                    except CheckpointError as error:
+                        raise ResumeError(
+                            f"invalid_child_checkpoint_history:{key}:{error}"
+                        ) from error
+                    if (
+                        checkpoint["workstream_id"] != key
+                        or checkpoint["acknowledgement"]["state"]
+                        != "remote_acknowledged"
+                    ):
+                        raise ResumeError(f"invalid_child_checkpoint_history:{key}")
+                    checkpoint_keys.append(
+                        (checkpoint["root_revision"], checkpoint["event_id"])
+                    )
+                if checkpoint_keys != sorted(checkpoint_keys):
+                    raise ResumeError(f"unordered_child_checkpoint_history:{key}")
+                current_checkpoints = [
+                    checkpoint for checkpoint in checkpoint_history
+                    if checkpoint["plan_revision"] == root["plan_revision"]
+                ]
+                recovery = child.get("checkpoint_recovery") or {}
+                if recovery.get("stale_plan_count") != (
+                    len(checkpoint_history) - len(current_checkpoints)
+                ):
+                    raise ResumeError(f"child_checkpoint_history_count_mismatch:{key}")
+                if current_checkpoints:
+                    try:
+                        recovered = recover_latest(
+                            current_checkpoints, key,
+                            expected_plan_revision=root["plan_revision"],
+                        )
+                    except CheckpointError as error:
+                        raise ResumeError(
+                            f"invalid_child_checkpoint_history:{key}:{error}"
+                        ) from error
+                    if recovered != child.get("latest_checkpoint"):
+                        raise ResumeError(f"child_checkpoint_history_tip_mismatch:{key}")
+                elif child.get("latest_checkpoint") is not None:
+                    raise ResumeError(f"child_checkpoint_history_tip_mismatch:{key}")
             child_root = {
                 "identifier": key,
                 "url": child.get("url"),
@@ -990,7 +1047,8 @@ def compact_context(
         compact_child = dict(child) if include_history else {
             key: value for key, value in child.items()
             if key not in {
-                "parent", "project", "team", "material_events", "latest_checkpoint",
+                "parent", "project", "team", "material_events", "checkpoint_history",
+                "latest_checkpoint",
             }
         }
         if "material_events" in child:
@@ -1010,6 +1068,11 @@ def compact_context(
                 "included": include_history,
                 "material_events": history_summary(child["material_events"]),
             }
+            checkpoint_history = child.get("checkpoint_history", [])
+            if "checkpoint_history" in child:
+                compact_child["history"]["checkpoints"] = history_summary(
+                    checkpoint_history
+                )
             if include_history:
                 compact_child["material_events"] = child["material_events"]
             child_material_item_count += len(obligations)
@@ -1019,6 +1082,10 @@ def compact_context(
             child_material_item_count += _checkpoint_item_count(
                 compact_child.get("latest_checkpoint")
             )
+            if include_history:
+                child_material_item_count += _checkpoint_history_item_count(
+                    checkpoint_history
+                )
         children.append(compact_child)
 
     history = {
