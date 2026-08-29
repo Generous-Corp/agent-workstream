@@ -176,6 +176,20 @@ nothing. Use `--github-token-command` with a noninteractive file/keychain/App
 helper, or explicitly opt into `--github-token-env GITHUB_TOKEN`; helper output
 is bounded and never logged.
 
+For one repository, the existing `--repository`, `--repository-id`, `--pr`, and
+`--expected-head` flags remain supported. For a root spanning repositories,
+repeat one qualified group per repository. The repository portion of the
+command is:
+
+```sh
+--repository-binding '{"repository":"Generous-Corp/pulp","repository_id":"R_pulp","pr":123,"expected_head":"<40-hex>"}' \
+--repository-binding '{"repository":"Generous-Corp/vellum","repository_id":"R_vellum","pr":456,"expected_head":"<40-hex>"}'
+```
+
+The fixed-argv receipt adapter returns one schema-v2 aggregate containing a
+repository-qualified receipt for every group. Missing, duplicate, or drifted
+repository truth blocks the aggregate lifecycle write.
+
 Review receipts name and digest the reviewer’s durable artifact and declare the
 `shared_linear_credential` trust boundary. This enforces a separate procedural
 pass, not cryptographic agent identity. Linear CAS slots include the immutable

@@ -42,7 +42,10 @@ separate roots connected by typed `blocks`, `blocked_by`, or `related` links to
 immutable Linear workspace + issue IDs (with the `<TEAM>-*` token retained only as
 a route/display value). `scripts/workstream_scope.py` validates this logical
 contract and rejects missing destinations, unowned children, self-links,
-duplicates, and unknown relation types.
+duplicates, unknown relation types, dangling immutable targets, contradictory
+directed edges, and missing `blocks`/`blocked_by` inverse views. `related`
+remains informational. Closure consumes authenticated peer-edge readback and
+refuses while the current root has an active `blocked_by` relation.
 
 The live Linear graph transport verifies the declared workspace/team/project
 relationship, fences reads to that project, and assigns the project on creates.
@@ -217,10 +220,15 @@ these errors away. Deterministic closure evidence without an explicitly passed
 semantic review remains `Landed — acceptance review required`; invocation alone
 cannot emit `Done`.
 
-`workstreamctl reconcile` is the bounded live landing/closure path. It reads an
-authenticated GitHub repository identity, PR head, and merge SHA; invokes one
+`workstreamctl reconcile` is the bounded live landing/closure path. It reads
+every participating authenticated GitHub repository identity,
+repository-qualified PR head, and merge SHA; invokes one
 explicit fixed-argv Shipyard receipt adapter without a shell; and persists the
-result as the singleton lifecycle projection. Projection revisions use
+aggregate result as the singleton lifecycle projection. Repeatable
+`--repository-binding` JSON groups are the multi-repository interface; the
+original single-repository flags remain compatibility sugar for one group.
+Drift invalidates evidence only for that repository but blocks aggregate
+closure. Projection revisions use
 route-scoped deterministic client-supplied Linear comment IDs as exclusive
 remote slots. Runtime schema introspection must confirm that Linear still
 supports `CommentCreateInput.id`; an identical collision is replay, while a
@@ -229,10 +237,10 @@ history is fenced by one v2 activation event; later v1 writes are quarantined
 and surfaced by count/digest (or exact events in history mode) rather than
 silently admitted. Lifecycle reconciliation refuses while any quarantine is
 unresolved; retiring one requires a reviewed projection disposition naming the
-exact event IDs and event digest. A merged exact head can emit only `Landed —
+exact event IDs and event digest. A merged exact head set can emit only `Landed —
 acceptance review required`. `Done` additionally requires a durably projected
 fresh-session review receipt bound to the exact snapshot, closure input,
-repository key, and head. The receipt names and digests the durable review
+repository-qualified head set, and aggregate landing truth. The receipt names and digests the durable review
 artifact and declares procedural independence under a shared Linear credential;
 it does not claim cryptographic agent identity.
 Resume derives lifecycle status and the closure receipt digest from that durable

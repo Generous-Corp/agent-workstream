@@ -225,21 +225,31 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             if not isinstance(value.get(field), str) or not value[field].strip():
                 raise LinearProjectionError(f"invalid_projection_provenance:{field}")
     if event["kind"] == "closure_review" and not tombstone:
-        review_fields = {
+        review_fields_v1 = {
             "schema_version", "workstream_id", "snapshot_sha256",
             "closure_input_sha256", "repository_key", "exact_head", "verdict",
             "reviewer_agent", "reviewer_session_id", "implementer_session_id",
             "reviewed_at", "review_artifact_identity", "review_artifact_sha256",
             "trust_boundary", "procedural_independence",
         }
-        if set(value) != review_fields or value.get("schema_version") != 1:
+        review_fields_v2 = {
+            "schema_version", "workstream_id", "snapshot_sha256",
+            "closure_input_sha256", "repository_heads", "repository_truth_sha256",
+            "verdict", "reviewer_agent", "reviewer_session_id",
+            "implementer_session_id", "reviewed_at", "review_artifact_identity",
+            "review_artifact_sha256", "trust_boundary", "procedural_independence",
+        }
+        review_version = value.get("schema_version")
+        if not (
+            (review_version == 1 and set(value) == review_fields_v1)
+            or (review_version == 2 and set(value) == review_fields_v2)
+        ):
             raise LinearProjectionError("invalid_projection_closure_review")
         if (
             event["key"] != value.get("snapshot_sha256")
             or value.get("workstream_id") != event["workstream_id"]
             or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("snapshot_sha256", "")))
             or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("closure_input_sha256", "")))
-            or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", str(value.get("exact_head", "")))
             or value.get("verdict") != "pass"
             or value.get("trust_boundary") != "shared_linear_credential"
             or value.get("procedural_independence") is not True
@@ -248,11 +258,29 @@ def validate_projection_event(event: dict[str, Any]) -> None:
                 r"[0-9a-f]{64}", str(value.get("review_artifact_sha256", ""))
             )
             or not all(isinstance(value.get(field), str) and value[field]
-                       for field in ("repository_key", "reviewer_agent",
-                                     "reviewer_session_id", "implementer_session_id",
-                                     "reviewed_at", "review_artifact_identity"))
+                       for field in ("reviewer_agent", "reviewer_session_id",
+                                     "implementer_session_id", "reviewed_at",
+                                     "review_artifact_identity"))
         ):
             raise LinearProjectionError("invalid_projection_closure_review")
+        if review_version == 1 and (
+            not isinstance(value.get("repository_key"), str)
+            or not value["repository_key"]
+            or not re.fullmatch(
+                r"[0-9a-f]{40}(?:[0-9a-f]{24})?", str(value.get("exact_head", ""))
+            )
+        ):
+            raise LinearProjectionError("invalid_projection_closure_review")
+        if review_version == 2:
+            heads = value.get("repository_heads")
+            if (
+                not isinstance(heads, dict) or len(heads) < 2
+                or not all(isinstance(key, str) and key for key in heads)
+                or not all(re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", str(head))
+                           for head in heads.values())
+                or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("repository_truth_sha256", "")))
+            ):
+                raise LinearProjectionError("invalid_projection_closure_review")
     if event["kind"] == "disposition" and not tombstone:
         if value.get("disposition") not in {"attach", "create_successor"}:
             raise LinearProjectionError("invalid_projection_disposition")
@@ -266,51 +294,83 @@ def validate_projection_event(event: dict[str, Any]) -> None:
         ):
             raise LinearProjectionError("invalid_projection_disposition_checkpoint")
     if event["kind"] == "lifecycle" and not tombstone:
-        required = {
+        required_v1 = {
             "status", "github", "shipyard_receipt", "closure_input_sha256",
             "snapshot_sha256", "independent_review", "closure_receipt_sha256",
         }
-        if set(value) != required:
+        required_v2 = {
+            "status", "repositories", "repository_truth_sha256",
+            "closure_input_sha256", "snapshot_sha256", "independent_review",
+            "closure_receipt_sha256",
+        }
+        if set(value) not in (required_v1, required_v2):
             raise LinearProjectionError("invalid_projection_lifecycle_fields")
         if value["status"] not in {"In Progress", "Landed — acceptance review required", "Done"}:
             raise LinearProjectionError("invalid_projection_lifecycle_status")
-        for field in ("github", "shipyard_receipt"):
-            if not isinstance(value[field], dict):
-                raise LinearProjectionError(f"invalid_projection_lifecycle:{field}")
-        github = value["github"]
-        if set(github) != {
+        if set(value) == required_v1 and (
+            not isinstance(value["github"], dict)
+            or not isinstance(value["shipyard_receipt"], dict)
+        ):
+            raise LinearProjectionError("invalid_projection_lifecycle:repositories")
+        repository_truths = (
+            [{"repository_key": value["shipyard_receipt"].get("repository_key"),
+              "github": value["github"], "shipyard_receipt": value["shipyard_receipt"]}]
+            if set(value) == required_v1 else value["repositories"]
+        )
+        if (
+            not isinstance(repository_truths, list)
+            or len(repository_truths) < (1 if set(value) == required_v1 else 2)
+        ):
+            raise LinearProjectionError("invalid_projection_lifecycle:repositories")
+        seen_repository_keys: set[str] = set()
+        for truth in repository_truths:
+            if not isinstance(truth, dict) or set(truth) != {
+                "repository_key", "github", "shipyard_receipt",
+            }:
+                raise LinearProjectionError("invalid_projection_lifecycle:repositories")
+            repository_key_value = truth["repository_key"]
+            if not isinstance(repository_key_value, str) or not repository_key_value or repository_key_value in seen_repository_keys:
+                raise LinearProjectionError("invalid_projection_lifecycle:repositories")
+            seen_repository_keys.add(repository_key_value)
+            github = truth["github"]
+            shipyard = truth["shipyard_receipt"]
+            if not isinstance(github, dict) or set(github) != {
             "repository", "provider_repository_id", "pr_number", "pr_head",
             "merged", "merge_sha",
-        }:
-            raise LinearProjectionError("invalid_projection_lifecycle:github")
-        if (
-            not re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", str(github["repository"]))
-            or not isinstance(github["provider_repository_id"], str)
-            or not github["provider_repository_id"]
-            or not isinstance(github["pr_number"], int) or github["pr_number"] <= 0
-            or not re.fullmatch(r"[0-9a-f]{40}", str(github["pr_head"]))
-            or github["merged"] is not True
-            or not re.fullmatch(r"[0-9a-f]{40}", str(github["merge_sha"]))
-        ):
-            raise LinearProjectionError("invalid_projection_lifecycle:github")
-        shipyard = value["shipyard_receipt"]
-        if set(shipyard) != {
+            }:
+                raise LinearProjectionError("invalid_projection_lifecycle:github")
+            if (
+                not re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", str(github["repository"]))
+                or not isinstance(github["provider_repository_id"], str)
+                or not github["provider_repository_id"]
+                or not isinstance(github["pr_number"], int) or github["pr_number"] <= 0
+                or not re.fullmatch(r"[0-9a-f]{40}", str(github["pr_head"]))
+                or github["merged"] is not True
+                or not re.fullmatch(r"[0-9a-f]{40}", str(github["merge_sha"]))
+            ):
+                raise LinearProjectionError("invalid_projection_lifecycle:github")
+            if not isinstance(shipyard, dict) or set(shipyard) != {
             "schema_version", "repository", "repository_key", "pr_number", "head",
             "disposition", "receipt_id", "receipt_sha256",
-        } or shipyard.get("schema_version") != 1:
-            raise LinearProjectionError("invalid_projection_lifecycle:shipyard_receipt")
-        shipyard_digest = hashlib.sha256(_canonical({
-            key: item for key, item in shipyard.items() if key != "receipt_sha256"
-        })).hexdigest()
-        if (
-            shipyard.get("repository") != github["repository"]
-            or shipyard.get("pr_number") != github["pr_number"]
-            or shipyard.get("head") != github["pr_head"]
-            or shipyard.get("disposition") not in {"merged", "already_merged", "landed"}
-            or not isinstance(shipyard.get("receipt_id"), str) or not shipyard["receipt_id"]
-            or shipyard.get("receipt_sha256") != shipyard_digest
-        ):
-            raise LinearProjectionError("invalid_projection_lifecycle:shipyard_receipt")
+            } or shipyard.get("schema_version") != 1:
+                raise LinearProjectionError("invalid_projection_lifecycle:shipyard_receipt")
+            shipyard_digest = hashlib.sha256(_canonical({
+                key: item for key, item in shipyard.items() if key != "receipt_sha256"
+            })).hexdigest()
+            if (
+                shipyard.get("repository") != github["repository"]
+                or shipyard.get("repository_key") != repository_key_value
+                or shipyard.get("pr_number") != github["pr_number"]
+                or shipyard.get("head") != github["pr_head"]
+                or shipyard.get("disposition") not in {"merged", "already_merged", "landed"}
+                or not isinstance(shipyard.get("receipt_id"), str) or not shipyard["receipt_id"]
+                or shipyard.get("receipt_sha256") != shipyard_digest
+            ):
+                raise LinearProjectionError("invalid_projection_lifecycle:shipyard_receipt")
+        if set(value) == required_v2 and value.get("repository_truth_sha256") != hashlib.sha256(
+            _canonical(repository_truths)
+        ).hexdigest():
+            raise LinearProjectionError("invalid_projection_lifecycle:repository_truth_sha256")
         if not re.fullmatch(r"[0-9a-f]{64}", str(value["closure_input_sha256"])):
             raise LinearProjectionError("invalid_projection_lifecycle:closure_input_sha256")
         if not re.fullmatch(r"[0-9a-f]{64}", str(value["snapshot_sha256"])):
@@ -319,20 +379,33 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             if not isinstance(value["independent_review"], dict):
                 raise LinearProjectionError("done_requires_independent_review")
             review = value["independent_review"]
-            if set(review) != {
+            review_v1 = {
                 "schema_version", "workstream_id", "snapshot_sha256",
                 "closure_input_sha256", "repository_key", "exact_head", "verdict",
                 "reviewer_agent", "reviewer_session_id", "implementer_session_id",
                 "reviewed_at", "review_artifact_identity", "review_artifact_sha256",
                 "trust_boundary", "procedural_independence",
-            } or review.get("schema_version") != 1:
+            }
+            review_v2 = {
+                "schema_version", "workstream_id", "snapshot_sha256",
+                "closure_input_sha256", "repository_heads", "repository_truth_sha256",
+                "verdict", "reviewer_agent", "reviewer_session_id",
+                "implementer_session_id", "reviewed_at", "review_artifact_identity",
+                "review_artifact_sha256", "trust_boundary", "procedural_independence",
+            }
+            aggregate_heads = {
+                truth["repository_key"]: truth["github"]["pr_head"]
+                for truth in repository_truths
+            }
+            if not (
+                (set(value) == required_v1 and set(review) == review_v1 and review.get("schema_version") == 1)
+                or (set(value) == required_v2 and set(review) == review_v2 and review.get("schema_version") == 2)
+            ):
                 raise LinearProjectionError("invalid_projection_lifecycle:independent_review")
             if (
                 review.get("workstream_id") != event["workstream_id"]
                 or review.get("snapshot_sha256") != value["snapshot_sha256"]
                 or review.get("closure_input_sha256") != value["closure_input_sha256"]
-                or review.get("repository_key") != shipyard["repository_key"]
-                or review.get("exact_head") != github["pr_head"]
                 or review.get("verdict") != "pass"
                 or review.get("trust_boundary") != "shared_linear_credential"
                 or review.get("procedural_independence") is not True
@@ -345,6 +418,16 @@ def validate_projection_event(event: dict[str, Any]) -> None:
                            for field in ("reviewer_agent", "reviewer_session_id",
                                          "implementer_session_id", "reviewed_at",
                                          "review_artifact_identity"))
+            ):
+                raise LinearProjectionError("invalid_projection_lifecycle:independent_review")
+            if set(value) == required_v1 and (
+                review.get("repository_key") != repository_truths[0]["repository_key"]
+                or review.get("exact_head") != repository_truths[0]["github"]["pr_head"]
+            ):
+                raise LinearProjectionError("invalid_projection_lifecycle:independent_review")
+            if set(value) == required_v2 and (
+                review.get("repository_heads") != aggregate_heads
+                or review.get("repository_truth_sha256") != value["repository_truth_sha256"]
             ):
                 raise LinearProjectionError("invalid_projection_lifecycle:independent_review")
             if not re.fullmatch(r"[0-9a-f]{64}", str(value["closure_receipt_sha256"])):

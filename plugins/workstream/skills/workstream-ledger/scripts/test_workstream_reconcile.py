@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -13,10 +14,14 @@ from test_workstream_closure import ClosureTests
 from test_workstream_linear_projection import (
     AUTHORITY, FakeProjectionClient, legacy_comment, legacy_event, PLAN, ROOT_UUID, scope,
 )
-from workstream_linear_projection import build_projection_event, LinearProjectionAdapter
+from workstream_linear_projection import (
+    build_projection_event, encode_projection_comment, LinearProjectionAdapter,
+    projection_slot_id,
+)
 from workstream_reconcile import (
     _bounded_command, canonical_digest, github_token_from_command, GitHubTruthReader,
-    ReconcileError, reconcile_lifecycle, ShipyardTruthReader,
+    parse_repository_bindings, read_relation_targets, ReconcileError, reconcile_lifecycle,
+    ShipyardTruthReader,
 )
 from workstream_resume import (
     add_material_history, closure_snapshot_digest, compact_context, ResumeError,
@@ -26,6 +31,9 @@ from workstream_resume import (
 HEAD = "a" * 40
 MERGE = "b" * 40
 KEY = "github.com:id:R_pulp"
+HEAD_2 = "c" * 40
+MERGE_2 = "d" * 40
+KEY_2 = "github.com:id:R_vellum"
 
 
 def github_truth():
@@ -40,6 +48,22 @@ def shipyard_truth():
         "schema_version": 1, "repository": "generous-corp/pulp",
         "repository_key": KEY, "pr_number": 41, "head": HEAD,
         "disposition": "merged", "receipt_id": "shipyard-receipt-41",
+    }
+    return {**value, "receipt_sha256": canonical_digest(value)}
+
+
+def github_truth_2():
+    return {
+        "repository": "generous-corp/vellum", "provider_repository_id": "R_vellum",
+        "pr_number": 52, "pr_head": HEAD_2, "merged": True, "merge_sha": MERGE_2,
+    }
+
+
+def shipyard_truth_2():
+    value = {
+        "schema_version": 1, "repository": "generous-corp/vellum",
+        "repository_key": KEY_2, "pr_number": 52, "head": HEAD_2,
+        "disposition": "merged", "receipt_id": "shipyard-receipt-52",
     }
     return {**value, "receipt_sha256": canonical_digest(value)}
 
@@ -65,6 +89,37 @@ def snapshot():
     value["provenance"] = [{
         "agent": "codex", "machine": "M5", "session_id": "implementer-session",
     }]
+    return value
+
+
+def multi_repository_snapshot():
+    value = snapshot()
+    value["children"].append({
+        "identifier": "GEN-39", "status": "Done", "owner": "agent",
+    })
+    second_repository = {
+        "slug": "github.com/generous-corp/vellum", "provider_repository_id": "R_vellum",
+        "aliases": [], "identity_resolution": {
+            "provider_repository_id": "R_vellum",
+            "resolved_slug": "github.com/generous-corp/vellum",
+            "observed_at": "2026-08-21T11:00:00Z",
+            "evidence": [{"kind": "authenticated_provider_readback", "authenticated": True,
+                          "provider_repository_id": "R_vellum",
+                          "resolved_slug": "github.com/generous-corp/vellum"}],
+        }, "identity_updates": [], "exact_head": HEAD_2, "evidence": [],
+    }
+    value["scope"]["repositories"].append(second_repository)
+    value["scope"]["child_ownership"]["GEN-39"] = KEY_2
+    second_contract = json.loads(json.dumps(value["evidence_contracts"][0]))
+    second_contract.update({
+        "slice_id": "gen-39", "owning_child": "GEN-39",
+        "repository": "github.com/generous-corp/vellum",
+        "repository_key": KEY_2, "exact_head": HEAD_2,
+    })
+    for layer in second_contract["layers"].values():
+        for receipt in layer.get("receipts", []):
+            receipt.update({"repository_key": KEY_2, "exact_head": HEAD_2})
+    value["evidence_contracts"].append(second_contract)
     return value
 
 
@@ -135,6 +190,97 @@ class ReconcileTests(unittest.TestCase):
         snap["projection_revision"] += 1
         snap["closure_reviews"] = [receipt]
         return receipt
+
+    def aggregate_review_receipt(self, snap, material):
+        truths = [
+            {"repository_key": KEY, "github": github_truth(),
+             "shipyard_receipt": shipyard_truth()},
+            {"repository_key": KEY_2, "github": github_truth_2(),
+             "shipyard_receipt": shipyard_truth_2()},
+        ]
+        return {
+            "schema_version": 2, "workstream_id": "GEN-37",
+            "snapshot_sha256": closure_snapshot_digest(snap),
+            "closure_input_sha256": canonical_digest(material),
+            "repository_heads": {KEY: HEAD, KEY_2: HEAD_2},
+            "repository_truth_sha256": canonical_digest(truths),
+            "verdict": "pass", "reviewer_agent": "claude",
+            "reviewer_session_id": "reviewer-session",
+            "implementer_session_id": "implementer-session",
+            "reviewed_at": "2026-08-28T12:00:00Z",
+            "review_artifact_identity": "https://example.test/reviews/GEN-37.md",
+            "review_artifact_sha256": "c" * 64,
+            "trust_boundary": "shared_linear_credential",
+            "procedural_independence": True,
+        }
+
+    def persist_aggregate_review(self, client, snap, material):
+        provenance = build_projection_event(
+            workstream_id="GEN-37", kind="provenance", key="implementer-session",
+            value=snap["provenance"][0], plan_revision="sha",
+            expected_revision=snap["projection_revision"],
+            created_at="2026-08-28T11:59:00Z", authority=self.adapter(client).authority,
+        )
+        self.adapter(client).append(provenance)
+        snap["projection_events"] = list(self.adapter(client).state().events)
+        snap["projection_revision"] += 1
+        receipt = self.aggregate_review_receipt(snap, material)
+        event = build_projection_event(
+            workstream_id="GEN-37", kind="closure_review",
+            key=receipt["snapshot_sha256"], value=receipt, plan_revision="sha",
+            expected_revision=snap["projection_revision"],
+            created_at="2026-08-28T12:00:00Z", authority=self.adapter(client).authority,
+        )
+        self.adapter(client).append(event)
+        snap["projection_events"] = list(self.adapter(client).state().events)
+        snap["projection_revision"] += 1
+        snap["closure_reviews"] = [receipt]
+        return receipt
+
+    def test_multi_repository_landing_and_semantic_closure_are_aggregate(self):
+        client = FakeProjectionClient()
+        snap = multi_repository_snapshot()
+        material = closure_input(); material["required_child_ids"] = ["GEN-38", "GEN-39"]
+        landed = reconcile_lifecycle(
+            snapshot=snap, adapter=self.adapter(client),
+            github=[github_truth(), github_truth_2()],
+            shipyard=[shipyard_truth(), shipyard_truth_2()], closure_input=material,
+            independent_review=None, created_at="2026-08-28T12:00:00Z",
+        )
+        self.assertEqual(landed["status"], "Landed — acceptance review required")
+        self.assertEqual(
+            [item["repository_key"] for item in landed["lifecycle"]["repositories"]],
+            [KEY, KEY_2],
+        )
+
+        client = FakeProjectionClient()
+        snap = multi_repository_snapshot()
+        receipt = self.persist_aggregate_review(client, snap, material)
+        done = reconcile_lifecycle(
+            snapshot=snap, adapter=self.adapter(client),
+            github=[github_truth(), github_truth_2()],
+            shipyard=[shipyard_truth(), shipyard_truth_2()], closure_input=material,
+            independent_review=receipt, created_at="2026-08-28T12:00:00Z",
+        )
+        self.assertEqual(done["status"], "Done")
+
+    def test_multi_repository_missing_or_drifted_truth_blocks_aggregate_with_zero_writes(self):
+        for github_items, error in (
+            ([github_truth()], "repository_truth_keyset_mismatch"),
+            ([github_truth(), {**github_truth_2(), "pr_head": "e" * 40}],
+             f"github_truth_scope_mismatch:{KEY_2}"),
+        ):
+            with self.subTest(error=error):
+                client = FakeProjectionClient()
+                snap = multi_repository_snapshot()
+                material = closure_input(); material["required_child_ids"] = ["GEN-38", "GEN-39"]
+                with self.assertRaisesRegex(ReconcileError, error):
+                    reconcile_lifecycle(
+                        snapshot=snap, adapter=self.adapter(client), github=github_items,
+                        shipyard=[shipyard_truth(), shipyard_truth_2()], closure_input=material,
+                        independent_review=None, created_at="2026-08-28T12:00:00Z",
+                    )
+                self.assertEqual(client.comments, [])
 
     def test_landed_persists_and_fresh_replay_is_zero_write(self):
         client = FakeProjectionClient()
@@ -523,6 +669,85 @@ class ReconcileTests(unittest.TestCase):
                 [sys.executable, "-c", "import time; time.sleep(2)"], timeout=0.05,
             ).read(repository="Generous-Corp/pulp", repository_key_value=KEY,
                    pr_number=41, expected_head=HEAD)
+
+    def test_repeatable_repository_groups_and_aggregate_shipyard_receipt(self):
+        raw_bindings = [
+            json.dumps({"repository": "Generous-Corp/pulp", "repository_id": "R_pulp",
+                        "pr": 41, "expected_head": HEAD}),
+            json.dumps({"repository": "Generous-Corp/vellum", "repository_id": "R_vellum",
+                        "pr": 52, "expected_head": HEAD_2}),
+        ]
+        bindings = parse_repository_bindings(argparse.Namespace(
+            repository=None, repository_id=None, pr=None, expected_head=None,
+            repository_binding=raw_bindings,
+        ))
+        aggregate = {"schema_version": 2, "receipts": [shipyard_truth(), shipyard_truth_2()]}
+        command = [sys.executable, "-c", f"import json; print(json.dumps({aggregate!r}))"]
+        observed = ShipyardTruthReader(command, timeout=2).read_many(bindings)
+        self.assertEqual([item["repository_key"] for item in observed], [KEY, KEY_2])
+
+        missing = {"schema_version": 2, "receipts": [shipyard_truth()]}
+        command = [sys.executable, "-c", f"import json; print(json.dumps({missing!r}))"]
+        with self.assertRaisesRegex(ReconcileError, "aggregate_keyset_mismatch"):
+            ShipyardTruthReader(command, timeout=2).read_many(bindings)
+
+    def test_relation_target_reader_binds_immutable_route_and_peer_edges(self):
+        target_uuid = "22222222-2222-4222-8222-222222222222"
+        target_authority = {
+            "workspace_id": "workspace", "team_id": "team", "project_id": "project",
+            "root_issue_id": target_uuid,
+        }
+        inverse = {"type": "blocked_by", "target": {
+            "workspace_id": "workspace", "issue_id": ROOT_UUID,
+            "identifier": "GEN-37",
+        }}
+        event = build_projection_event(
+            workstream_id="GEN-50", kind="relation", key="blocked_by:GEN-37",
+            value=inverse, plan_revision=PLAN, expected_revision=0,
+            created_at="2026-08-28T12:00:00Z", authority=target_authority,
+        )
+        comment = {
+            "id": projection_slot_id("GEN-50", PLAN, 0, target_authority),
+            "body": encode_projection_comment(event),
+        }
+
+        class Client:
+            def execute(self, query, variables):
+                if "WorkstreamRelationTarget" in query:
+                    return {"issue": {
+                        "id": target_uuid, "identifier": "GEN-50",
+                        "description": f"Plan revision: {PLAN}",
+                        "team": {"id": "team", "organization": {"id": "workspace"}},
+                        "project": {"id": "project"},
+                    }}
+                if "WorkstreamDeltaComments" in query:
+                    return {"issue": {
+                        "id": target_uuid, "identifier": "GEN-50",
+                        "team": {"id": "team", "organization": {"id": "workspace"}},
+                        "project": {"id": "project"},
+                        "comments": {"nodes": [comment], "pageInfo": {"hasNextPage": False}},
+                    }}
+                raise AssertionError((query, variables))
+
+        target = {"workspace_id": "workspace", "issue_id": target_uuid,
+                  "identifier": "GEN-50"}
+        resolved = read_relation_targets(Client(), [{"type": "blocks", "target": target}])
+        self.assertEqual(resolved[f"workspace:{target_uuid}"]["relations"], [inverse])
+
+    def test_single_repository_flags_remain_compatibility_sugar(self):
+        bindings = parse_repository_bindings(argparse.Namespace(
+            repository="Generous-Corp/pulp", repository_id="R_pulp", pr=41,
+            expected_head=HEAD, repository_binding=[],
+        ))
+        self.assertEqual(bindings, [{
+            "repository": "Generous-Corp/pulp", "repository_id": "R_pulp",
+            "pr": 41, "expected_head": HEAD,
+        }])
+        with self.assertRaisesRegex(ReconcileError, "conflicts_with_single"):
+            parse_repository_bindings(argparse.Namespace(
+                repository="Generous-Corp/pulp", repository_id=None, pr=None,
+                expected_head=None, repository_binding=[json.dumps(bindings[0])],
+            ))
 
     def test_shipyard_output_and_inherited_pipe_are_bounded(self):
         with self.assertRaisesRegex(ReconcileError, "shipyard_truth_too_large"):

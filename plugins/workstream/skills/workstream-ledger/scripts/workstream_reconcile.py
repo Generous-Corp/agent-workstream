@@ -25,18 +25,19 @@ from workstream_config import load_linear_api_key, resolve_linear_route
 from workstream_http import default_ssl_context
 from workstream_linear import (
     HttpGraphQLClient, LinearGraphQLTransport, LinearTransportError,
-    resolve_authenticated_issue_route,
+    parse_plan_revision, resolve_authenticated_issue_route,
 )
 from workstream_linear_events import LinearCommentEventAdapter
 from workstream_linear_projection import (
-    build_projection_event, LinearProjectionAdapter, LinearProjectionError, TOMBSTONE,
+    build_projection_event, LinearProjectionAdapter, LinearProjectionError,
+    reduce_projection_comments, TOMBSTONE,
 )
 from workstream_plan import plan_payload
 from workstream_projection import stable_live_readback
 from workstream_resume import (
     add_material_history, closure_snapshot_digest, extract_token, ResumeError,
 )
-from workstream_scope import repository_key
+from workstream_scope import relation_target_key, repository_key
 
 
 OID = re.compile(r"[0-9a-f]{40}")
@@ -47,6 +48,15 @@ SAFE_COMMAND_ENV = {
     "PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT",
     "TMP", "TEMP", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
 }
+RELATION_TARGET_QUERY = """
+query WorkstreamRelationTarget($issueId: String!) {
+  issue(id: $issueId) {
+    id identifier description
+    team { id organization { id } }
+    project { id }
+  }
+}
+"""
 
 
 class ReconcileError(RuntimeError):
@@ -246,14 +256,17 @@ class ShipyardTruthReader:
         self.argv = list(argv)
         self.timeout = timeout
 
-    def read(
-        self, *, repository: str, repository_key_value: str,
-        pr_number: int, expected_head: str,
-    ) -> dict[str, Any]:
+    def _payload(self) -> Any:
         try:
-            payload = json.loads(_bounded_command(self.argv, self.timeout))
+            return json.loads(_bounded_command(self.argv, self.timeout))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ReconcileError("shipyard_truth_malformed") from error
+
+    @staticmethod
+    def _validate(
+        payload: Any, *, repository: str, repository_key_value: str,
+        pr_number: int, expected_head: str,
+    ) -> dict[str, Any]:
         required = {
             "schema_version", "repository", "repository_key", "pr_number", "head",
             "disposition", "receipt_id", "receipt_sha256",
@@ -276,6 +289,147 @@ class ShipyardTruthReader:
         if not DIGEST.fullmatch(str(payload["receipt_sha256"])) or payload["receipt_sha256"] != expected_digest:
             raise ReconcileError("shipyard_receipt_digest_mismatch")
         return payload
+
+    def read(
+        self, *, repository: str, repository_key_value: str,
+        pr_number: int, expected_head: str,
+    ) -> dict[str, Any]:
+        return self._validate(
+            self._payload(), repository=repository,
+            repository_key_value=repository_key_value, pr_number=pr_number,
+            expected_head=expected_head,
+        )
+
+    def read_many(self, bindings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Read one versioned aggregate receipt from the fixed-argv adapter."""
+        payload = self._payload()
+        if (
+            not isinstance(payload, dict) or set(payload) != {"schema_version", "receipts"}
+            or payload.get("schema_version") != 2
+            or not isinstance(payload.get("receipts"), list)
+        ):
+            raise ReconcileError("shipyard_truth_aggregate_schema_mismatch")
+        receipts = payload["receipts"]
+        if len(receipts) != len(bindings):
+            raise ReconcileError("shipyard_truth_aggregate_keyset_mismatch")
+        by_key = {
+            item.get("repository_key"): item for item in receipts
+            if isinstance(item, dict) and isinstance(item.get("repository_key"), str)
+        }
+        expected_keys = {f"github.com:id:{item['repository_id']}" for item in bindings}
+        if len(by_key) != len(receipts) or set(by_key) != expected_keys:
+            raise ReconcileError("shipyard_truth_aggregate_keyset_mismatch")
+        return [
+            self._validate(
+                by_key[f"github.com:id:{binding['repository_id']}"],
+                repository=binding["repository"],
+                repository_key_value=f"github.com:id:{binding['repository_id']}",
+                pr_number=binding["pr"], expected_head=binding["expected_head"],
+            )
+            for binding in bindings
+        ]
+
+
+def parse_repository_bindings(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Normalize repeatable qualified groups or the legacy single-repo flags."""
+    legacy = (args.repository, args.repository_id, args.pr, args.expected_head)
+    if args.repository_binding:
+        if any(value is not None for value in legacy):
+            raise ReconcileError("repository_binding_conflicts_with_single_repository_flags")
+        bindings: list[dict[str, Any]] = []
+        for raw in args.repository_binding:
+            try:
+                binding = json.loads(raw)
+            except json.JSONDecodeError as error:
+                raise ReconcileError("repository_binding_malformed") from error
+            if not isinstance(binding, dict) or set(binding) != {
+                "repository", "repository_id", "pr", "expected_head",
+            }:
+                raise ReconcileError("repository_binding_schema_mismatch")
+            bindings.append(binding)
+    else:
+        if any(value is None for value in legacy):
+            raise ReconcileError("single_repository_flags_incomplete")
+        bindings = [{
+            "repository": args.repository, "repository_id": args.repository_id,
+            "pr": args.pr, "expected_head": args.expected_head,
+        }]
+    for binding in bindings:
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", str(binding["repository"]))
+            or not isinstance(binding["repository_id"], str) or not binding["repository_id"]
+            or not isinstance(binding["pr"], int) or binding["pr"] <= 0
+            or not OID.fullmatch(str(binding["expected_head"]))
+        ):
+            raise ReconcileError("repository_binding_invalid")
+    keys = [f"github.com:id:{item['repository_id']}" for item in bindings]
+    if len(keys) != len(set(keys)):
+        raise ReconcileError("duplicate_repository_binding")
+    return bindings
+
+
+def read_relation_targets(
+    client: HttpGraphQLClient, relations: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Resolve every immutable target and reduce its complete peer-edge state."""
+    resolved: dict[str, dict[str, Any]] = {}
+    for relation in relations:
+        if not isinstance(relation, dict) or not isinstance(relation.get("target"), dict):
+            raise ReconcileError("invalid_relation_target")
+        target = relation["target"]
+        key = relation_target_key(target)
+        if key in resolved:
+            continue
+        response = client.execute(
+            RELATION_TARGET_QUERY, {"issueId": target.get("issue_id")}
+        )
+        issue = response.get("issue") if isinstance(response, dict) else None
+        team = issue.get("team") if isinstance(issue, dict) else None
+        workspace_id = ((team or {}).get("organization") or {}).get("id")
+        if (
+            not isinstance(issue, dict)
+            or issue.get("id") != target.get("issue_id")
+            or issue.get("identifier") != target.get("identifier")
+            or workspace_id != target.get("workspace_id")
+        ):
+            raise ReconcileError(f"dangling_relation_target:{target.get('identifier')}")
+        team_id = (team or {}).get("id")
+        project_id = (issue.get("project") or {}).get("id")
+        plan_revision = parse_plan_revision(issue.get("description"))
+        if not all(isinstance(item, str) and item for item in (
+            team_id, project_id, plan_revision,
+        )):
+            raise ReconcileError(
+                f"relation_target_readback_incomplete:{target.get('identifier')}"
+            )
+        route = {
+            "workspace_id": workspace_id, "team_id": team_id,
+            "project_id": project_id, "root_issue_id": issue["id"],
+        }
+        comments = LinearCommentEventAdapter(
+            client, issue_id=issue["identifier"], workspace_id=workspace_id,
+            team_id=team_id, project_id=project_id,
+        ).comments()
+        projection = reduce_projection_comments(
+            comments, workstream_id=issue["identifier"],
+            expected_plan_revision=plan_revision, authenticated_route=route,
+        ).snapshot
+        resolved[key] = {
+            "workspace_id": workspace_id, "issue_id": issue["id"],
+            "identifier": issue["identifier"],
+            "relations": projection.get("relations") or [],
+        }
+    return resolved
+
+
+def add_relation_target_readback(
+    snapshot: dict[str, Any], client: HttpGraphQLClient,
+) -> dict[str, Any]:
+    value = deepcopy(snapshot)
+    relations = value.get("relations") or []
+    if relations:
+        value["relation_targets"] = read_relation_targets(client, relations)
+    return value
 
 
 def _active_lifecycle(state: Any) -> dict[str, Any] | None:
@@ -338,24 +492,43 @@ def _implementer_session(snapshot: dict[str, Any]) -> str:
 
 def _validate_independent_review(
     receipt: dict[str, Any], *, token: str, snapshot_sha256: str,
-    closure_input_sha256: str, repository_key_value: str, exact_head: str,
-    implementer_session_id: str,
+    closure_input_sha256: str, repository_heads: dict[str, str],
+    repository_truth_sha256: str, implementer_session_id: str,
 ) -> None:
-    required = {
+    single_required = {
         "schema_version", "workstream_id", "snapshot_sha256",
         "closure_input_sha256", "repository_key", "exact_head", "verdict",
         "reviewer_agent", "reviewer_session_id", "implementer_session_id", "reviewed_at",
         "review_artifact_identity", "review_artifact_sha256", "trust_boundary",
         "procedural_independence",
     }
-    if not isinstance(receipt, dict) or set(receipt) != required or receipt.get("schema_version") != 1:
+    aggregate_required = {
+        "schema_version", "workstream_id", "snapshot_sha256",
+        "closure_input_sha256", "repository_heads", "repository_truth_sha256",
+        "verdict", "reviewer_agent", "reviewer_session_id",
+        "implementer_session_id", "reviewed_at", "review_artifact_identity",
+        "review_artifact_sha256", "trust_boundary", "procedural_independence",
+    }
+    if not isinstance(receipt, dict):
+        raise ReconcileError("independent_review_schema_mismatch")
+    if len(repository_heads) == 1:
+        if set(receipt) != single_required or receipt.get("schema_version") != 1:
+            raise ReconcileError("independent_review_schema_mismatch")
+    elif set(receipt) != aggregate_required or receipt.get("schema_version") != 2:
         raise ReconcileError("independent_review_schema_mismatch")
     expected = {
         "workstream_id": token, "snapshot_sha256": snapshot_sha256,
         "closure_input_sha256": closure_input_sha256,
-        "repository_key": repository_key_value, "exact_head": exact_head,
         "implementer_session_id": implementer_session_id,
     }
+    if len(repository_heads) == 1:
+        key, head = next(iter(repository_heads.items()))
+        expected.update({"repository_key": key, "exact_head": head})
+    else:
+        expected.update({
+            "repository_heads": repository_heads,
+            "repository_truth_sha256": repository_truth_sha256,
+        })
     for field, value in expected.items():
         if receipt.get(field) != value:
             raise ReconcileError(f"independent_review_mismatch:{field}")
@@ -377,9 +550,66 @@ def _validate_independent_review(
         raise ReconcileError("independent_review_same_session")
 
 
+def _repository_truths(
+    scope: dict[str, Any], github: dict[str, Any] | list[dict[str, Any]],
+    shipyard: dict[str, Any] | list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Normalize compatibility inputs into one repository-qualified truth set."""
+    repositories = scope.get("repositories") or []
+    expected = {repository_key(item): item for item in repositories}
+    github_items = github if isinstance(github, list) else [github]
+    shipyard_items = shipyard if isinstance(shipyard, list) else [shipyard]
+    github_by_key: dict[str, dict[str, Any]] = {}
+    for item in github_items:
+        if not isinstance(item, dict):
+            raise ReconcileError("github_truth_schema_mismatch")
+        key = f"github.com:id:{item.get('provider_repository_id')}"
+        if key in github_by_key:
+            raise ReconcileError(f"duplicate_github_truth:{key}")
+        github_by_key[key] = item
+    shipyard_by_key: dict[str, dict[str, Any]] = {}
+    for item in shipyard_items:
+        if not isinstance(item, dict) or not isinstance(item.get("repository_key"), str):
+            raise ReconcileError("shipyard_truth_schema_mismatch")
+        key = item["repository_key"]
+        if key in shipyard_by_key:
+            raise ReconcileError(f"duplicate_shipyard_truth:{key}")
+        shipyard_by_key[key] = item
+    if set(github_by_key) != set(expected) or set(shipyard_by_key) != set(expected):
+        raise ReconcileError("repository_truth_keyset_mismatch")
+    truths: list[dict[str, Any]] = []
+    heads: dict[str, str] = {}
+    for key, repository in expected.items():
+        github_item = github_by_key[key]
+        shipyard_item = shipyard_by_key[key]
+        expected_head = repository.get("exact_head")
+        coordinate = str(repository.get("slug", "")).removeprefix("github.com/").lower()
+        if (
+            github_item.get("repository") != coordinate
+            or github_item.get("provider_repository_id") != repository.get("provider_repository_id")
+            or github_item.get("pr_head") != expected_head
+            or not github_item.get("merged")
+        ):
+            raise ReconcileError(f"github_truth_scope_mismatch:{key}")
+        if (
+            shipyard_item.get("repository", "").lower() != coordinate
+            or shipyard_item.get("repository_key") != key
+            or shipyard_item.get("pr_number") != github_item.get("pr_number")
+            or shipyard_item.get("head") != expected_head
+        ):
+            raise ReconcileError(f"shipyard_truth_scope_mismatch:{key}")
+        heads[key] = expected_head
+        truths.append({
+            "repository_key": key, "github": deepcopy(github_item),
+            "shipyard_receipt": deepcopy(shipyard_item),
+        })
+    return truths, heads
+
+
 def reconcile_lifecycle(
     *, snapshot: dict[str, Any], adapter: LinearProjectionAdapter,
-    github: dict[str, Any], shipyard: dict[str, Any], closure_input: dict[str, Any],
+    github: dict[str, Any] | list[dict[str, Any]],
+    shipyard: dict[str, Any] | list[dict[str, Any]], closure_input: dict[str, Any],
     independent_review: dict[str, Any] | None, created_at: str,
     snapshot_fence: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -391,25 +621,10 @@ def reconcile_lifecycle(
         raise ReconcileError("unresolved_v1_projection_quarantine_review_required")
     repositories = scope.get("repositories") or []
     primary_key = scope.get("primary_repository")
-    repository = next((item for item in repositories if repository_key(item) == primary_key), None)
-    if not token or repository is None:
+    if not token or not any(repository_key(item) == primary_key for item in repositories):
         raise ReconcileError("authoritative_primary_repository_missing")
-    expected_head = repository.get("exact_head")
-    coordinate = str(repository.get("slug", "")).removeprefix("github.com/").lower()
-    if (
-        github.get("repository") != coordinate
-        or github.get("provider_repository_id") != repository.get("provider_repository_id")
-        or github.get("pr_head") != expected_head
-        or not github.get("merged")
-    ):
-        raise ReconcileError("github_truth_scope_mismatch")
-    if (
-        shipyard.get("repository", "").lower() != coordinate
-        or shipyard.get("repository_key") != primary_key
-        or shipyard.get("pr_number") != github.get("pr_number")
-        or shipyard.get("head") != expected_head
-    ):
-        raise ReconcileError("shipyard_truth_scope_mismatch")
+    repository_truths, repository_heads = _repository_truths(scope, github, shipyard)
+    repository_truth_sha256 = canonical_digest(repository_truths)
 
     snapshot_sha256 = closure_snapshot_digest(snapshot)
     required_closure_input = {"criteria", "evidence", "excluded", "required_child_ids"}
@@ -445,7 +660,8 @@ def reconcile_lifecycle(
         _validate_independent_review(
             independent_review, token=token, snapshot_sha256=snapshot_sha256,
             closure_input_sha256=closure_input_sha256,
-            repository_key_value=primary_key, exact_head=expected_head,
+            repository_heads=repository_heads,
+            repository_truth_sha256=repository_truth_sha256,
             implementer_session_id=implementer_session_id,
         )
         durable_review = _active_closure_review(state, snapshot_sha256)
@@ -463,7 +679,7 @@ def reconcile_lifecycle(
             excluded=closure_input.get("excluded") or [],
             semantic_review_invoked=True, semantic_review_passed=True,
             required_child_ids=set(closure_input.get("required_child_ids") or []),
-            repository_heads={primary_key: expected_head},
+            repository_heads=repository_heads,
         )
         if not result["ok"] or result["receipt"]["final_disposition"] != "Done":
             errors = ",".join(result.get("errors") or ["semantic_closure_refused"])
@@ -471,15 +687,22 @@ def reconcile_lifecycle(
         closure_receipt = {
             **result["receipt"], "snapshot_sha256": snapshot_sha256,
             "closure_input_sha256": closure_input_sha256,
-            "github": github, "shipyard_receipt_sha256": shipyard["receipt_sha256"],
             "independent_review": independent_review,
         }
+        if len(repository_truths) == 1:
+            closure_receipt.update({
+                "github": repository_truths[0]["github"],
+                "shipyard_receipt_sha256": repository_truths[0]["shipyard_receipt"]["receipt_sha256"],
+            })
+        else:
+            closure_receipt.update({
+                "repositories": repository_truths,
+                "repository_truth_sha256": repository_truth_sha256,
+            })
         status = "Done"
 
     lifecycle = {
         "status": status,
-        "github": deepcopy(github),
-        "shipyard_receipt": deepcopy(shipyard),
         "closure_input_sha256": closure_input_sha256,
         "snapshot_sha256": snapshot_sha256,
         "independent_review": deepcopy(independent_review),
@@ -487,12 +710,29 @@ def reconcile_lifecycle(
             canonical_digest(closure_receipt) if closure_receipt is not None else None
         ),
     }
+    if len(repository_truths) == 1:
+        lifecycle.update({
+            "github": repository_truths[0]["github"],
+            "shipyard_receipt": repository_truths[0]["shipyard_receipt"],
+        })
+    else:
+        lifecycle.update({
+            "repositories": repository_truths,
+            "repository_truth_sha256": repository_truth_sha256,
+        })
     if snapshot_fence is not None and closure_snapshot_digest(snapshot_fence()) != snapshot_sha256:
         raise ReconcileError("closure_snapshot_changed_reload_required")
     if current is not None and current["value"].get("status") == "Done" and current["value"] != lifecycle:
         if independent_review is None and all(
             current["value"].get(field) == lifecycle.get(field)
-            for field in ("github", "shipyard_receipt", "closure_input_sha256", "snapshot_sha256")
+            for field in (
+                ("github", "shipyard_receipt")
+                if len(repository_truths) == 1 else
+                ("repositories", "repository_truth_sha256")
+            )
+        ) and all(
+            current["value"].get(field) == lifecycle.get(field)
+            for field in ("closure_input_sha256", "snapshot_sha256")
         ):
             return {
                 "workstream_id": token, "status": "Done",
@@ -535,10 +775,15 @@ def reconcile_lifecycle(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("token")
-    parser.add_argument("--repository", required=True, help="GitHub OWNER/REPO")
-    parser.add_argument("--repository-id", required=True)
-    parser.add_argument("--pr", required=True, type=int)
-    parser.add_argument("--expected-head", required=True)
+    parser.add_argument("--repository", help="GitHub OWNER/REPO (single-repository compatibility)")
+    parser.add_argument("--repository-id")
+    parser.add_argument("--pr", type=int)
+    parser.add_argument("--expected-head")
+    parser.add_argument(
+        "--repository-binding", action="append", default=[], metavar="JSON",
+        help=("repeatable repository-qualified JSON object with repository, "
+              "repository_id, pr, and expected_head"),
+    )
     github_auth = parser.add_mutually_exclusive_group(required=True)
     github_auth.add_argument("--github-token-command")
     github_auth.add_argument(
@@ -559,6 +804,7 @@ def main() -> int:
     try:
         if args.github_token_arg and not args.github_token_command:
             raise ReconcileError("github_token_args_require_command")
+        bindings = parse_repository_bindings(args)
         token = extract_token(args.token)
         authenticated_source = plan_payload(args.plan_source, args.plan_identity)["source"]
         api_key = load_linear_api_key()
@@ -595,6 +841,7 @@ def main() -> int:
             authenticated_route=route, authenticated_source=authenticated_source,
             permit_stale_lifecycle_for_reconcile=True,
         )
+        snapshot = add_relation_target_readback(snapshot, client)
         if snapshot["root"].get("plan_revision") != authenticated_source["sha256"]:
             raise ReconcileError("root_plan_revision_source_bytes_mismatch")
 
@@ -602,21 +849,31 @@ def main() -> int:
             graph_fence, comments_fence = stable_live_readback(
                 transport, comments_adapter, token,
             )
-            return add_material_history(
+            fenced = add_material_history(
                 graph_fence, comments_fence, token,
                 authenticated_route=route, authenticated_source=authenticated_source,
                 permit_stale_lifecycle_for_reconcile=True,
             )
-        github = GitHubTruthReader(github_token).read(
-            repository=args.repository, provider_repository_id=args.repository_id,
-            pr_number=args.pr, expected_head=args.expected_head,
-        )
-        shipyard = ShipyardTruthReader(
+            return add_relation_target_readback(fenced, client)
+        github_reader = GitHubTruthReader(github_token)
+        github_items = [
+            github_reader.read(
+                repository=binding["repository"],
+                provider_repository_id=binding["repository_id"],
+                pr_number=binding["pr"], expected_head=binding["expected_head"],
+            )
+            for binding in bindings
+        ]
+        shipyard_reader = ShipyardTruthReader(
             [args.shipyard_command, *args.shipyard_arg], timeout=args.shipyard_timeout,
-        ).read(
-            repository=args.repository,
-            repository_key_value=f"github.com:id:{args.repository_id}",
-            pr_number=args.pr, expected_head=args.expected_head,
+        )
+        shipyard_items = (
+            [shipyard_reader.read(
+                repository=bindings[0]["repository"],
+                repository_key_value=f"github.com:id:{bindings[0]['repository_id']}",
+                pr_number=bindings[0]["pr"], expected_head=bindings[0]["expected_head"],
+            )]
+            if len(bindings) == 1 else shipyard_reader.read_many(bindings)
         )
         closure_input = json.loads(Path(args.closure_input).read_text(encoding="utf-8"))
         independent_review = (
@@ -634,8 +891,11 @@ def main() -> int:
                 authenticated_route=route, authenticated_source=authenticated_source,
                 permit_stale_lifecycle_for_reconcile=True,
             )
+            snapshot = add_relation_target_readback(snapshot, client)
         result = reconcile_lifecycle(
-            snapshot=snapshot, adapter=adapter, github=github, shipyard=shipyard,
+            snapshot=snapshot, adapter=adapter,
+            github=github_items[0] if len(github_items) == 1 else github_items,
+            shipyard=shipyard_items[0] if len(shipyard_items) == 1 else shipyard_items,
             closure_input=closure_input, independent_review=independent_review,
             created_at=created_at,
             snapshot_fence=snapshot_fence,

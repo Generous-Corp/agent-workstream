@@ -296,6 +296,37 @@ def evidence_contract() -> dict:
 
 
 class ProjectionTests(unittest.TestCase):
+    def test_concurrent_same_logical_relation_converges_without_duplicate_or_loss(self):
+        client = FakeProjectionClient()
+        first = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        second = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        relation = {"type": "related", "target": {
+            "workspace_id": "workspace",
+            "issue_id": "22222222-2222-4222-8222-222222222222",
+            "identifier": "GEN-50",
+        }}
+        event_a = build_projection_event(
+            workstream_id="GEN-37", kind="relation", key="related:GEN-50",
+            value=relation, plan_revision=PLAN, expected_revision=0,
+            created_at="2026-08-28T12:00:00Z", authority=AUTHORITY,
+        )
+        event_b = build_projection_event(
+            workstream_id="GEN-37", kind="relation", key="related:GEN-50",
+            value=relation, plan_revision=PLAN, expected_revision=0,
+            created_at="2026-08-28T12:00:00Z", authority=AUTHORITY,
+        )
+        receipt_a = first.append(event_a)
+        receipt_b = second.append(event_b)
+        self.assertEqual(receipt_a["event_id"], receipt_b["event_id"])
+        self.assertEqual(len(client.comments), 1)
+        self.assertEqual(first.state().snapshot["relations"], [relation])
+
     def _single_legacy_activation_comments(self, value):
         legacy = legacy_event(
             "scope", "root", scope(), 0, "2026-08-27T17:00:00Z",
