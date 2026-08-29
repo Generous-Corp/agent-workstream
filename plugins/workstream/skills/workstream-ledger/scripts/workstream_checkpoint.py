@@ -164,13 +164,10 @@ def acknowledge_checkpoint(
     return result
 
 
-def recover_latest(
-    checkpoints: list[dict[str, Any]],
-    workstream_id: str,
-    *,
-    expected_plan_revision: str,
-) -> dict[str, Any]:
-    """Deduplicate and validate a remote checkpoint chain, then return its tip."""
+def recover_generations(
+    checkpoints: list[dict[str, Any]], workstream_id: str,
+) -> dict[str, dict[str, Any]]:
+    """Validate every immutable plan generation and return each chain tip."""
     token = workstream_id.upper()
     if not TOKEN.fullmatch(token):
         raise CheckpointError("invalid_workstream_id")
@@ -191,47 +188,71 @@ def recover_latest(
             unique[event_id] = checkpoint
     if not unique:
         raise CheckpointError("checkpoint_not_found")
-    records = sorted(unique.values(), key=lambda item: (item.get("root_revision", -1), item["event_id"]))
-    if records[0].get("predecessor_event_id") is not None:
-        raise CheckpointError("checkpoint_chain_truncated")
-    previous: dict[str, Any] | None = None
-    provenance: list[dict[str, Any]] = []
-    for checkpoint in records:
+
+    generations: dict[str, list[dict[str, Any]]] = {}
+    for checkpoint in unique.values():
         validate_checkpoint(checkpoint)
         if checkpoint["acknowledgement"]["state"] != "remote_acknowledged":
             raise CheckpointError("checkpoint_not_remote_acknowledged")
-        if checkpoint["plan_revision"] != expected_plan_revision:
-            raise CheckpointError("plan_sync_required")
-        if previous is not None:
-            if checkpoint["root_revision"] <= previous["root_revision"]:
-                raise CheckpointError("checkpoint_revision_not_monotonic")
-            if checkpoint.get("predecessor_event_id") != previous["event_id"]:
-                raise CheckpointError("checkpoint_chain_broken")
-        execution = checkpoint["execution"]
-        provenance.append(
-            {
-                "event_id": checkpoint["event_id"],
-                "agent": execution["agent"],
-                "provider": execution["provider"],
-                "session_id": execution["session_id"],
-                "machine": execution["machine"],
-                "worktree": deepcopy(execution["worktree"]),
-            }
+        generations.setdefault(checkpoint["plan_revision"], []).append(checkpoint)
+
+    recovered: dict[str, dict[str, Any]] = {}
+    for plan_revision, generation in generations.items():
+        records = sorted(
+            generation,
+            key=lambda item: (item["root_revision"], item["event_id"]),
         )
-        previous = checkpoint
-    assert previous is not None
-    execution = previous["execution"]
-    return {
-        "workstream_id": token,
-        "checkpoint_event_id": previous["event_id"],
-        "root_revision": previous["root_revision"],
-        "plan_revision": previous["plan_revision"],
-        "status": deepcopy(previous["status"]),
-        "exact_head": previous["exact_head"],
-        "evidence": deepcopy(previous["evidence"]),
-        "blocker": deepcopy(previous["blocker"]),
-        "next_action": previous["next_action"],
-        "worktree": deepcopy(execution["worktree"]),
-        "acknowledgement": deepcopy(previous["acknowledgement"]),
-        "provenance_chain": provenance,
-    }
+        if records[0].get("predecessor_event_id") is not None:
+            raise CheckpointError("checkpoint_chain_truncated")
+        previous: dict[str, Any] | None = None
+        provenance: list[dict[str, Any]] = []
+        for checkpoint in records:
+            if previous is not None:
+                if checkpoint["root_revision"] <= previous["root_revision"]:
+                    raise CheckpointError("checkpoint_revision_not_monotonic")
+                if checkpoint.get("predecessor_event_id") != previous["event_id"]:
+                    raise CheckpointError("checkpoint_chain_broken")
+            execution = checkpoint["execution"]
+            provenance.append(
+                {
+                    "event_id": checkpoint["event_id"],
+                    "agent": execution["agent"],
+                    "provider": execution["provider"],
+                    "session_id": execution["session_id"],
+                    "machine": execution["machine"],
+                    "worktree": deepcopy(execution["worktree"]),
+                }
+            )
+            previous = checkpoint
+        assert previous is not None
+        execution = previous["execution"]
+        recovered[plan_revision] = {
+            "workstream_id": token,
+            "checkpoint_event_id": previous["event_id"],
+            "root_revision": previous["root_revision"],
+            "plan_revision": previous["plan_revision"],
+            "status": deepcopy(previous["status"]),
+            "exact_head": previous["exact_head"],
+            "evidence": deepcopy(previous["evidence"]),
+            "blocker": deepcopy(previous["blocker"]),
+            "next_action": previous["next_action"],
+            "worktree": deepcopy(execution["worktree"]),
+            "acknowledgement": deepcopy(previous["acknowledgement"]),
+            "provenance_chain": provenance,
+        }
+    return recovered
+
+
+def recover_latest(
+    checkpoints: list[dict[str, Any]],
+    workstream_id: str,
+    *,
+    expected_plan_revision: str,
+) -> dict[str, Any]:
+    """Validate all plan generations and return the exact expected chain tip."""
+    recovered = recover_generations(checkpoints, workstream_id)
+    try:
+        return deepcopy(recovered[expected_plan_revision])
+    except KeyError as error:
+        # Checkpoints exist, but none belong to the caller's expected plan.
+        raise CheckpointError("plan_sync_required") from error

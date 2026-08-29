@@ -282,6 +282,48 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
         self.assertEqual(receipt.remote_id, client.comments[0]["id"])
         self.assertEqual(len(client.comments), 1)
 
+    def test_lost_event_response_refuses_concurrent_broken_stale_generation(self):
+        broken = build_checkpoint(
+            workstream_id="GEN-37", boundary_id="broken-stale",
+            root_revision=1, plan_revision="old-plan",
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai", "session_id": "old",
+                "machine": "m1", "worktree": {
+                    "state": "safe", "path": "/repo", "branch": "old",
+                    "head": "head-old",
+                },
+            }, exact_head="head-old", evidence=[], blocker=None,
+            next_action="old", predecessor_event_id="wsc_missing",
+        )
+
+        class LostResponseWithBrokenGeneration(FakeCommentClient):
+            lost = False
+
+            def execute(self, query, variables):
+                if "commentCreate" in query and not self.lost:
+                    self.lost = True
+                    super().execute(query, variables)
+                    self.comments.append({
+                        "id": "arbitrary-broken-stale-id",
+                        "body": encode_checkpoint_comment(broken),
+                        "createdAt": "now", "updatedAt": "now",
+                    })
+                    raise LinearTransportError("response lost")
+                return super().execute(query, variables)
+
+        client = LostResponseWithBrokenGeneration()
+        client.comments.append({
+            "id": "legacy-material-1",
+            "body": encode_event_comment(delta("event-1", {"order": 1})),
+            "createdAt": "then", "updatedAt": "then",
+        })
+
+        with self.assertRaisesRegex(LinearEventError, "checkpoint_chain_truncated"):
+            LinearCommentEventAdapter(client, issue_id="GEN-37").apply(
+                delta("event-2", {"order": 2}, expected_revision=1)
+            )
+
     def test_foreign_winner_at_same_revision_refuses(self):
         class ForeignWinnerClient(FakeCommentClient):
             injected = False

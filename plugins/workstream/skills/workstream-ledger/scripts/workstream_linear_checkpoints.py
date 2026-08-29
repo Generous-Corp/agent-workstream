@@ -23,6 +23,7 @@ from typing import Any
 from workstream_checkpoint import (
     CheckpointError,
     acknowledge_checkpoint,
+    recover_generations,
     recover_latest,
     validate_checkpoint,
 )
@@ -305,6 +306,19 @@ class LinearCheckpointAdapter:
         ):
             raise LinearCheckpointError("checkpoint_material_history_incomplete")
 
+    @staticmethod
+    def _recover_checkpoint_generations(
+        checkpoints: ReducedCheckpointLog,
+    ) -> dict[str, dict[str, Any]]:
+        if not checkpoints.checkpoints:
+            return {}
+        try:
+            return recover_generations(
+                list(checkpoints.checkpoints), checkpoints.workstream_id,
+            )
+        except CheckpointError as error:
+            raise LinearCheckpointError(str(error)) from error
+
     def _confirmed_readback(
         self, checkpoint: dict[str, Any], *, expected_remote_id: str
     ) -> dict[str, Any]:
@@ -313,6 +327,7 @@ class LinearCheckpointAdapter:
         checkpoints = reduce_checkpoint_comments(
             comments, workstream_id=self.workstream_id
         )
+        self._recover_checkpoint_generations(checkpoints)
         observed = next(
             (
                 item for item in checkpoints.checkpoints
@@ -340,6 +355,7 @@ class LinearCheckpointAdapter:
         before = reduce_checkpoint_comments(
             comments, workstream_id=self.workstream_id
         )
+        generations = self._recover_checkpoint_generations(before)
         existing_id = before.remote_ids.get(checkpoint["event_id"])
         if existing_id:
             existing = next(
@@ -361,15 +377,7 @@ class LinearCheckpointAdapter:
         material = reduce_event_comments(comments, workstream_id=self.workstream_id)
         self._validate_material_history(before, material.revision)
 
-        try:
-            current = recover_latest(
-                list(before.checkpoints), self.workstream_id,
-                expected_plan_revision=checkpoint["plan_revision"],
-            )
-        except CheckpointError as error:
-            if str(error) != "checkpoint_not_found":
-                raise LinearCheckpointError(str(error)) from error
-            current = None
+        current = generations.get(checkpoint["plan_revision"])
         expected_predecessor = (
             current["checkpoint_event_id"] if current is not None else None
         )
