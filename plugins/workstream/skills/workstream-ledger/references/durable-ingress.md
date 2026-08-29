@@ -107,6 +107,14 @@ not offer client-supplied comment IDs, so simultaneous identical writers may
 append duplicate physical comments; the authenticated reducer treats them as
 one logical marker and refuses conflicting copies.
 
+The promotion identity includes the canonical lowercase GitHub `owner/repo`
+and exact ingress issue number as well as the raw event and immutable Linear
+route. Replaying the same-looking event from another repository or issue
+refuses. Both the reviewed request and the final encoded promotion/processed
+comment envelopes are capped at 16 KiB; expansion during encoding is checked
+before any write. Recovery does not hide a promoted capture until read-only
+Linear validation proves the marker's exact event and receipt.
+
 Use the older `process` command only for reviewed `no-material-delta` or
 `superseded` dispositions. Material promotion must use `promote`, which proves
 the Linear receipt before acknowledging the raw event.

@@ -109,7 +109,11 @@ class WorkstreamIngressTests(unittest.TestCase):
 
     def test_remote_recovery_deduplicates_and_hides_processed(self):
         capture = {"event_id": "e1", "captured_at": "2026-08-14T01:00:00Z", "workstream_id": "ABC-12"}
-        processed = {"event_id": "e1", "processed_at": "2026-08-14T02:00:00Z"}
+        processed = {
+            "schema_version": 1, "event_id": "e1",
+            "processed_at": "2026-08-14T02:00:00Z",
+            "disposition": "no-material-delta", "promoted_issue": None,
+        }
         comments = [
             {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture), "html_url": "u1"},
             {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture), "html_url": "u2"},
@@ -1046,6 +1050,65 @@ class ManagedPromotionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires.*promote"):
             MODULE.command_process(args)
         self.assertEqual(self.remote.writes, [])
+
+    def test_final_encoded_marker_budget_is_checked_before_write(self):
+        request = json.loads(self.request.read_text())
+        request["changes"][0]["payload"]["padding"] = ""
+        compact = json.dumps(request, separators=(",", ":"))
+        target = 16_341
+        request["changes"][0]["payload"]["padding"] = "x" * (target - len(compact))
+        compact = json.dumps(request, separators=(",", ":"))
+        self.assertEqual(len(compact.encode()), target)
+        self.request.write_text(compact)
+        with self.assertRaisesRegex(ValueError, "output_envelope_over_budget"):
+            self._promote()
+        self.assertEqual(self.remote.writes, [])
+        self.assertEqual(self.linear.mutations, 0)
+
+    def test_ingress_repo_issue_route_is_part_of_promotion_identity(self):
+        request = json.loads(self.request.read_text())
+        first = MODULE.promotion_payload(request, self.capture)
+        other = json.loads(self.request.read_text())
+        other["ingress"]["repo"] = "public/other"
+        other["ingress"]["remote_issue"] = 999
+        second = MODULE.promotion_payload(other, self.capture)
+        self.assertNotEqual(first["promotion_id"], second["promotion_id"])
+        self.assertNotEqual(first["ingress_route"], second["ingress_route"])
+
+    def test_staged_intent_cannot_be_replayed_from_a_different_repo_issue(self):
+        request = json.loads(self.request.read_text())
+        promotion = MODULE.promotion_payload(request, self.capture)
+        self.remote.comments.append({"id": "promotion", "body": MODULE.comment_body(
+            MODULE.PROMOTION_MARKER, promotion)})
+        args = self.args(request=False)
+        args.repo = "public/other"
+        args.remote_issue = 999
+        with self.assertRaisesRegex(ValueError, "promotion_ingress_route_mismatch"):
+            with mock.patch.object(MODULE.sys, "stdout", io.StringIO()):
+                MODULE.command_promote(args)
+        self.assertEqual(self.linear.mutations, 0)
+
+    def test_remote_recover_refuses_forged_processed_receipt(self):
+        request = json.loads(self.request.read_text())
+        promotion = MODULE.promotion_payload(request, self.capture)
+        delta = MODULE.promotion_delta(promotion)
+        processed = {
+            "schema_version": 1, "event_id": "wsi_raw",
+            "processed_at": "2026-08-29T01:01:00Z", "disposition": "promoted",
+            "promoted_issue": "GEN-37", "promotion_id": promotion["promotion_id"],
+            "material_event_id": delta.event_id, "material_revision": 1,
+            "material_remote_id": "forged",
+        }
+        comments = [
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, self.capture)},
+            {"body": MODULE.comment_body(MODULE.PROMOTION_MARKER, promotion)},
+            {"body": MODULE.comment_body(MODULE.PROCESSED_MARKER, processed)},
+        ]
+        with mock.patch.object(MODULE, "gh", side_effect=[
+            [{"number": 7, "url": "i", "title": "ingress"}], [comments],
+        ]):
+            with self.assertRaisesRegex(ValueError, "processed_material_event_missing"):
+                MODULE.remote_events("private/ingress", "GEN-37")
 
 
 if __name__ == "__main__":

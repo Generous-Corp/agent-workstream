@@ -439,6 +439,26 @@ def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def canonical_ingress_route(repo: Any, issue: Any) -> dict[str, Any]:
+    if (
+        not isinstance(repo, str)
+        or not re.fullmatch(
+            r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}", repo
+        )
+        or repo.endswith(".git")
+    ):
+        raise ValueError("ingress_repository_route_invalid")
+    if not isinstance(issue, int) or isinstance(issue, bool) or issue <= 0:
+        raise ValueError("ingress_issue_route_invalid")
+    return {"provider": "github", "repository": repo.lower(), "issue": issue}
+
+
+def validate_output_envelope(marker: str, payload: dict[str, Any]) -> None:
+    size = len(comment_body(marker, payload).encode("utf-8"))
+    if size > MAX_PROMOTION_BYTES:
+        raise ValueError(f"ingress_output_envelope_over_budget:{size}>{MAX_PROMOTION_BYTES}")
+
+
 def promotion_id_for(value: dict[str, Any]) -> str:
     material = canonical_json(value).encode("utf-8")
     return "wsp_" + hashlib.sha256(material).hexdigest()[:32]
@@ -475,6 +495,7 @@ def load_promotion_request(path: str) -> dict[str, Any]:
         or ingress["remote_issue"] <= 0
     ):
         raise ValueError("promotion_request_remote_issue_invalid")
+    canonical_ingress_route(ingress["repo"], ingress["remote_issue"])
     if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", request["workstream_id"] or ""):
         raise ValueError("promotion_request_workstream_invalid")
     authority = request["authority"]
@@ -514,6 +535,9 @@ def promotion_payload(request: dict[str, Any], capture: dict[str, Any]) -> dict[
         "prompt_sha256": request["ingress"]["prompt_sha256"],
         "workstream_id": request["workstream_id"],
         "authority": request["authority"],
+        "ingress_route": canonical_ingress_route(
+            request["ingress"]["repo"], request["ingress"]["remote_issue"]
+        ),
         "expected_material_revision": request["expected_material_revision"],
         "changes": request["changes"],
         # A source timestamp is stable across machines and retries. It is the
@@ -526,8 +550,8 @@ def promotion_payload(request: dict[str, Any], capture: dict[str, Any]) -> dict[
 def validate_promotion_payload(promotion: Any) -> dict[str, Any]:
     if not isinstance(promotion, dict) or set(promotion) != {
         "schema_version", "event_id", "prompt_sha256", "workstream_id",
-        "authority", "expected_material_revision", "changes", "source_captured_at",
-        "promotion_id",
+        "authority", "ingress_route", "expected_material_revision", "changes",
+        "source_captured_at", "promotion_id",
     }:
         raise ValueError("promotion_marker_schema_invalid")
     request = {
@@ -546,9 +570,6 @@ def validate_promotion_payload(promotion: Any) -> dict[str, Any]:
         "expected_material_revision": promotion["expected_material_revision"],
         "changes": promotion["changes"],
     }
-    encoded = canonical_json(promotion)
-    if len(encoded.encode("utf-8")) > MAX_PROMOTION_BYTES:
-        raise ValueError("promotion_marker_over_budget")
     # Validate the same shapes as a first-attempt request without reading a
     # file or trusting a successor's local state.
     if request["schema_version"] != 1:
@@ -571,6 +592,12 @@ def validate_promotion_payload(promotion: Any) -> dict[str, Any]:
             valid = False
         if not valid:
             raise ValueError(f"promotion_marker_{field}_invalid")
+    route = promotion["ingress_route"]
+    if not isinstance(route, dict) or set(route) != {"provider", "repository", "issue"}:
+        raise ValueError("promotion_marker_ingress_route_invalid")
+    canonical_route = canonical_ingress_route(route.get("repository"), route.get("issue"))
+    if route != canonical_route:
+        raise ValueError("promotion_marker_ingress_route_not_canonical")
     revision = promotion["expected_material_revision"]
     if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
         raise ValueError("promotion_marker_expected_revision_invalid")
@@ -589,6 +616,7 @@ def validate_promotion_payload(promotion: Any) -> dict[str, Any]:
     immutable = {key: value for key, value in promotion.items() if key != "promotion_id"}
     if promotion.get("promotion_id") != promotion_id_for(immutable):
         raise ValueError(f"promotion_digest_mismatch:{promotion['event_id']}")
+    validate_output_envelope(PROMOTION_MARKER, promotion)
     return promotion
 
 
@@ -607,6 +635,7 @@ def promotion_delta(promotion: dict[str, Any]) -> Delta:
                 "event_id": promotion["event_id"],
                 "prompt_sha256": promotion["prompt_sha256"],
                 "promotion_id": promotion["promotion_id"],
+                "route": promotion["ingress_route"],
             },
         },
         expected_revision=promotion["expected_material_revision"],
@@ -694,7 +723,10 @@ def _payload_without_time(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if key != "processed_at"}
 
 
-def reduce_ingress_comments(comments: list[dict[str, Any]], *, event_id: str) -> dict[str, Any]:
+def reduce_ingress_comments(
+    comments: list[dict[str, Any]], *, event_id: str,
+    repo: str | None = None, issue: int | None = None,
+) -> dict[str, Any]:
     """Reduce one raw event and its durable successor chain without guessing."""
     captures: list[dict[str, Any]] = []
     promotions: list[dict[str, Any]] = []
@@ -732,6 +764,9 @@ def reduce_ingress_comments(comments: list[dict[str, Any]], *, event_id: str) ->
                    "context_url": binding.get("context_url")}
     if promotion:
         validate_promotion_payload(promotion)
+        if repo is not None or issue is not None:
+            if promotion["ingress_route"] != canonical_ingress_route(repo, issue):
+                raise ValueError(f"promotion_ingress_route_mismatch:{event_id}")
         if not capture:
             raise ValueError(f"promotion_without_capture:{event_id}")
         if (
@@ -747,6 +782,7 @@ def reduce_ingress_comments(comments: list[dict[str, Any]], *, event_id: str) ->
                 "promotion_id", "material_event_id", "material_revision", "material_remote_id",
             }:
                 raise ValueError(f"processed_promotion_schema_invalid:{event_id}")
+            validate_output_envelope(PROCESSED_MARKER, disposition)
             if (
                 disposition.get("schema_version") != 1
                 or not isinstance(disposition.get("processed_at"), str)
@@ -779,11 +815,16 @@ def remote_issue_comments(repo: str, issue: int) -> list[dict[str, Any]]:
 
 
 def remote_event_state(repo: str, issue: int, event_id: str) -> dict[str, Any]:
-    return reduce_ingress_comments(remote_issue_comments(repo, issue), event_id=event_id)
+    canonical_ingress_route(repo, issue)
+    return reduce_ingress_comments(
+        remote_issue_comments(repo, issue), event_id=event_id, repo=repo, issue=issue,
+    )
 
 
-def append_ingress_marker(repo: str, issue: int, marker: str, payload: dict[str, Any]) -> None:
-    gh(
+def append_ingress_marker(repo: str, issue: int, marker: str, payload: dict[str, Any]) -> Any:
+    canonical_ingress_route(repo, issue)
+    validate_output_envelope(marker, payload)
+    return gh(
         ["api", f"repos/{repo}/issues/{issue}/comments", "--input", "-"],
         stdin=json.dumps({"body": comment_body(marker, payload)}), timeout=10,
     )
@@ -863,6 +904,7 @@ def parse_comment(body: str, marker: str) -> dict[str, Any] | None:
 
 
 def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, Any]]:
+    canonical_repo = canonical_ingress_route(repo, 1)["repository"]
     issues = gh([
         "issue", "list", "--repo", repo, "--state", "all", "--label", LABEL,
         "--limit", "100", "--json", "number,url,title",
@@ -871,22 +913,37 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
     processed: dict[str, dict[str, Any]] = {}
     promotions: dict[str, dict[str, Any]] = {}
     bindings: dict[str, dict[str, Any]] = {}
+    event_routes: dict[str, dict[str, Any]] = {}
+    comments_by_issue: dict[int, list[dict[str, Any]]] = {}
+
+    def bind_route(event_id: str, issue_number: int) -> None:
+        route = canonical_ingress_route(canonical_repo, issue_number)
+        previous = event_routes.get(event_id)
+        if previous and previous != route:
+            raise ValueError(f"ingress_event_route_collision:{event_id}")
+        event_routes[event_id] = route
+
     for issue in issues:
+        issue_number = issue.get("number")
+        canonical_ingress_route(canonical_repo, issue_number)
         pages = gh([
             "api", "--paginate", "--slurp",
-            f"repos/{repo}/issues/{issue['number']}/comments?per_page=100",
+            f"repos/{repo}/issues/{issue_number}/comments?per_page=100",
         ], timeout=20)
         comments = [comment for page in pages for comment in page] if pages and isinstance(pages[0], list) else pages
+        comments_by_issue[issue_number] = comments
         for comment in comments:
             item = parse_comment(comment.get("body", ""), CAPTURE_MARKER)
             if item:
-                item["remote_issue"] = issue["number"]
+                bind_route(item["event_id"], issue_number)
+                item["remote_issue"] = issue_number
                 item["remote_repo"] = repo
                 item["remote_url"] = comment.get("html_url")
                 captures[item["event_id"]] = item
                 continue
             item = parse_comment(comment.get("body", ""), PROCESSED_MARKER)
             if item:
+                bind_route(item["event_id"], issue_number)
                 previous = processed.get(item["event_id"])
                 if previous and _payload_without_time(previous) != _payload_without_time(item):
                     raise ValueError(f"conflicting_processed:{item['event_id']}")
@@ -894,6 +951,10 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
                 continue
             item = parse_comment(comment.get("body", ""), PROMOTION_MARKER)
             if item:
+                bind_route(item["event_id"], issue_number)
+                validate_promotion_payload(item)
+                if item["ingress_route"] != canonical_ingress_route(canonical_repo, issue_number):
+                    raise ValueError(f"promotion_ingress_route_mismatch:{item['event_id']}")
                 previous = promotions.get(item["event_id"])
                 if previous and previous != item:
                     raise ValueError(f"conflicting_promotion:{item['event_id']}")
@@ -901,6 +962,7 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
                 continue
             item = parse_comment(comment.get("body", ""), BIND_MARKER)
             if item:
+                bind_route(item["event_id"], issue_number)
                 bindings[item["event_id"]] = item
     for event_id, binding in bindings.items():
         if event_id in captures:
@@ -909,11 +971,44 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
     for event_id, promotion in promotions.items():
         if event_id not in captures:
             raise ValueError(f"promotion_without_capture:{event_id}")
+        route = event_routes[event_id]
+        staged = reduce_ingress_comments(
+            comments_by_issue[route["issue"]], event_id=event_id,
+            repo=route["repository"], issue=route["issue"],
+        )
+        if staged["promotion"] != promotion:
+            raise ValueError(f"promotion_state_mismatch:{event_id}")
         captures[event_id]["promotion"] = promotion
         captures[event_id]["promotion_state"] = "staged"
-    result = [event for event_id, event in captures.items() if event_id not in processed]
+    candidates = captures.items()
     if workstream:
-        result = [event for event in result if event.get("workstream_id") == workstream]
+        candidates = [item for item in candidates if item[1].get("workstream_id") == workstream]
+    verified_processed: set[str] = set()
+    for event_id, event in candidates:
+        disposition = processed.get(event_id)
+        if not disposition:
+            continue
+        if disposition.get("disposition") in {"no-material-delta", "superseded"}:
+            if set(disposition) != {
+                "schema_version", "event_id", "processed_at", "disposition", "promoted_issue",
+            }:
+                raise ValueError(f"processed_classification_schema_invalid:{event_id}")
+            verified_processed.add(event_id)
+            continue
+        if disposition.get("disposition") != "promoted":
+            raise ValueError(f"processed_disposition_invalid:{event_id}")
+        route = event_routes[event_id]
+        state = reduce_ingress_comments(
+            comments_by_issue[route["issue"]], event_id=event_id,
+            repo=route["repository"], issue=route["issue"],
+        )
+        promotion = state["promotion"]
+        if not promotion:
+            raise ValueError(f"processed_without_promotion:{event_id}")
+        adapter = linear_adapter_for_promotion(promotion)
+        verify_processed_promotion(adapter, promotion_delta(promotion), disposition)
+        verified_processed.add(event_id)
+    result = [event for event_id, event in candidates if event_id not in verified_processed]
     return sorted(result, key=lambda event: event.get("captured_at", ""))
 
 
@@ -1210,9 +1305,8 @@ def command_process(args: argparse.Namespace) -> int:
         "disposition": args.disposition,
         "promoted_issue": args.issue,
     }
-    response = gh(
-        ["api", f"repos/{args.repo}/issues/{args.remote_issue}/comments", "--input", "-"],
-        stdin=json.dumps({"body": comment_body(PROCESSED_MARKER, payload)}), timeout=10,
+    response = append_ingress_marker(
+        args.repo, args.remote_issue, PROCESSED_MARKER, payload,
     )
     conn = connect()
     conn.execute(
@@ -1266,6 +1360,7 @@ def command_promote(args: argparse.Namespace) -> int:
         if capture.get("workstream_id") != request["workstream_id"]:
             raise ValueError("promotion_workstream_mismatch")
         proposed = promotion_payload(request, capture)
+        validate_promotion_payload(proposed)
         if state["promotion"] and state["promotion"] != proposed:
             raise ValueError(f"conflicting_promotion:{event_id}")
         promotion = state["promotion"] or proposed
