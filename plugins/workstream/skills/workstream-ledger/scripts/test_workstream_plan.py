@@ -144,6 +144,32 @@ class PlanIntakeTests(unittest.TestCase):
             "FETCH_HEAD:PLAN.md",
         ])
 
+    def test_one_labeled_canonical_plan_url_is_deduplicated_from_markdown(self):
+        url = (
+            "https://github.com/acme/plans/blob/" + "a" * 40 + "/PLAN.md"
+        )
+        description = f"Canonical plan: [{url}](<{url}>)\nOther: https://example.test"
+        self.assertEqual(MODULE.canonical_plan_url(description), url)
+
+    def test_zero_or_multiple_canonical_plan_urls_refuse_precisely(self):
+        with self.assertRaisesRegex(ValueError, "canonical_plan_source_missing"):
+            MODULE.canonical_plan_url("Plan: https://example.test/not-labeled")
+        with self.assertRaisesRegex(ValueError, "canonical_plan_source_ambiguous"):
+            MODULE.canonical_plan_url(
+                "Canonical plan: https://example.test/one\n"
+                "Canonical plan: https://example.test/two"
+            )
+
+    def test_main_and_exact_commit_identify_the_same_github_plan_document(self):
+        main = "https://github.com/acme/plans/blob/main/plans/PLAN.md"
+        exact = (
+            "https://github.com/ACME/PLANS/blob/" + "a" * 40
+            + "/plans/PLAN.md"
+        )
+        other = "https://github.com/acme/plans/blob/main/plans/OTHER.md"
+        self.assertTrue(MODULE.same_plan_document(main, exact))
+        self.assertFalse(MODULE.same_plan_document(main, other))
+
     def test_github_ssh_fallback_refuses_mutable_or_malformed_blob_urls(self):
         invalid = [
             "https://github.com/acme/plans/blob/master/PLAN.md",

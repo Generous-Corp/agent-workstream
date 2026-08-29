@@ -350,7 +350,9 @@ class LinearGraphQLTransport:
                 raise LinearTransportError("invalid Linear pagination cursor")
             seen_cursors.add(after)
 
-    def snapshot_for_root(self, token: str) -> dict[str, Any]:
+    def snapshot_for_root(
+        self, token: str, *, include_description: bool = False,
+    ) -> dict[str, Any]:
         """Build the bounded resume snapshot for one GEN root from live Linear."""
         token = token.upper()
         issues = self.snapshot()["issues"]
@@ -369,7 +371,7 @@ class LinearGraphQLTransport:
             child["next_action"] = parse_next_action(child.get("description"))
             children.append(child)
         root_state = root.get("state") or {}
-        return {
+        result = {
             "root": {
                 "identifier": root["identifier"], "url": root.get("url"),
                 "plan_revision": plan_revision,
@@ -380,6 +382,9 @@ class LinearGraphQLTransport:
             "children": children,
             "decisions": [], "provenance": [],
         }
+        if include_description:
+            result["root"]["description"] = description
+        return result
 
     def _intake_route(self) -> dict[str, str]:
         if not self.workspace_id or not self.project_id:

@@ -23,7 +23,7 @@ from workstream_linear_events import LinearCommentEventAdapter
 from workstream_linear_projection import (
     build_projection_event, LinearProjectionAdapter, LinearProjectionError, TOMBSTONE,
 )
-from workstream_plan import plan_payload
+from workstream_plan import canonical_plan_url, plan_payload, same_plan_document
 from workstream_relation_readback import RelationReadbackError, read_relation_targets
 from workstream_resume import add_material_history, compact_context, extract_token, ResumeError
 from workstream_scope import ScopeError, validate_relation_graph
@@ -38,6 +38,132 @@ def _value_digest(value: Any) -> str:
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _latest_historical_source(
+    projection_history: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """Recover the last source head when the current plan generation is empty."""
+    if projection_history is None:
+        return None
+    if not isinstance(projection_history, list):
+        raise LinearProjectionError("invalid_projection_history")
+    source_events = [
+        event for event in projection_history
+        if isinstance(event, dict) and event.get("kind") == "source"
+    ]
+    if not source_events:
+        return None
+    dated: list[tuple[datetime, dict[str, Any]]] = []
+    for event in source_events:
+        created_at = event.get("created_at")
+        try:
+            observed = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        except ValueError as error:
+            raise LinearProjectionError(
+                "historical_source_order_ambiguous_requires_explicit_review"
+            ) from error
+        if observed.tzinfo is None:
+            raise LinearProjectionError(
+                "historical_source_order_ambiguous_requires_explicit_review"
+            )
+        dated.append((observed.astimezone(timezone.utc), event))
+    latest_time = max(item[0] for item in dated)
+    latest = [event for observed, event in dated if observed == latest_time]
+    generations = {event.get("plan_revision") for event in latest}
+    if len(generations) != 1:
+        raise LinearProjectionError(
+            "historical_source_order_ambiguous_requires_explicit_review"
+        )
+    generation = next(iter(generations))
+    generation_events = sorted(
+        (event for event in source_events if event.get("plan_revision") == generation),
+        key=lambda event: (
+            event.get("expected_revision"), event.get("created_at"),
+            event.get("event_id"),
+        ),
+    )
+    head: dict[str, Any] | None = None
+    for event in generation_events:
+        supersedes = event.get("supersedes_event_id")
+        if (head is None and supersedes is not None) or (
+            head is not None and supersedes != head.get("event_id")
+        ):
+            raise LinearProjectionError(
+                "historical_source_chain_ambiguous_requires_explicit_review"
+            )
+        head = event
+    if head is None or head.get("value") == TOMBSTONE:
+        return None
+    value = head.get("value")
+    if not isinstance(value, dict):
+        raise LinearProjectionError("invalid_historical_projection_source")
+    return deepcopy(value)
+
+
+def synchronize_manifest_source(
+    manifest: dict[str, Any], description: str | None,
+    authenticated_source: dict[str, Any],
+    live_source: dict[str, Any] | None = None,
+    projection_history: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Bind one labeled issue plan to the desired structured source."""
+    canonical = canonical_plan_url(description)
+    supplied_identity = authenticated_source.get("identity")
+    if (
+        isinstance(supplied_identity, str)
+        and supplied_identity.startswith(("http://", "https://"))
+        and not same_plan_document(canonical, supplied_identity)
+    ):
+        raise LinearProjectionError("plan_source_conflicts_canonical_issue_url")
+    result = deepcopy(manifest)
+    projection = result.get("projection")
+    if not isinstance(projection, list):
+        raise LinearProjectionError("manifest_projection_must_be_list")
+    source_items = [
+        item for item in projection
+        if isinstance(item, dict) and item.get("kind") == "source"
+    ]
+    if len(source_items) > 1:
+        raise LinearProjectionError("manifest_projection_multiple_sources")
+    if source_items:
+        current_value = source_items[0].get("value")
+        if not isinstance(current_value, dict):
+            raise LinearProjectionError("invalid_manifest_projection_source")
+        current_identity = current_value.get("identity") or current_value.get("url")
+        if current_identity and not same_plan_document(canonical, current_identity):
+            raise LinearProjectionError("manifest_source_conflicts_canonical_issue_url")
+    elif live_source is None:
+        live_source = _latest_historical_source(projection_history)
+    if live_source is not None:
+        if not isinstance(live_source, dict):
+            raise LinearProjectionError("invalid_live_projection_source")
+        live_identity = live_source.get("identity") or live_source.get("url")
+        if not isinstance(live_identity, str) or not live_identity:
+            raise LinearProjectionError("invalid_live_projection_source")
+        if not same_plan_document(canonical, live_identity) and not source_items:
+            raise LinearProjectionError(
+                "live_source_document_change_requires_explicit_review:"
+                "add the canonical source to the reviewed projection manifest"
+            )
+    source = {
+        "identity": canonical,
+        "sha256": authenticated_source.get("sha256"),
+    }
+    item = {"kind": "source", "key": "root", "value": source}
+    if source_items:
+        projection[projection.index(source_items[0])] = item
+    else:
+        projection.append(item)
+    return result, {**authenticated_source, "identity": canonical}
+
+
+def validate_canonical_source_readback(
+    description: str | None, authenticated_source: dict[str, Any],
+) -> None:
+    """Refuse success if the issue's canonical source changed during writes."""
+    if canonical_plan_url(description) != authenticated_source.get("identity"):
+        raise LinearProjectionError("canonical_plan_changed_during_projection")
 
 
 def _active_heads(state: Any) -> dict[tuple[str, str], dict[str, Any]]:
@@ -184,14 +310,20 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
 def stable_live_readback(
     transport: LinearGraphQLTransport,
     comments: LinearCommentEventAdapter,
-    token: str,
+    token: str, *, include_description: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Double-collect both surfaces and refuse a mixed concurrent snapshot."""
-    graph_before = transport.snapshot_for_root(token)
+    graph_before = transport.snapshot_for_root(
+        token, include_description=include_description,
+    )
     comments_before = comments.comments()
-    graph_after = transport.snapshot_for_root(token)
+    graph_after = transport.snapshot_for_root(
+        token, include_description=include_description,
+    )
     comments_after = comments.comments()
-    graph_fence = transport.snapshot_for_root(token)
+    graph_fence = transport.snapshot_for_root(
+        token, include_description=include_description,
+    )
     if (
         graph_before != graph_after
         or graph_after != graph_fence
@@ -658,19 +790,28 @@ def main() -> int:
             client, team_id=route["team_id"], workspace_id=route["workspace_id"],
             project_id=route["project_id"],
         )
-        graph = transport.snapshot_for_root(token)
+        graph = transport.snapshot_for_root(token, include_description=True)
         if graph["root"].get("plan_revision") != plan_revision:
             raise LinearProjectionError("root_plan_revision_source_bytes_mismatch")
-        comments = LinearCommentEventAdapter(
+        comment_adapter = LinearCommentEventAdapter(
             client, issue_id=token, workspace_id=route["workspace_id"],
             team_id=route["team_id"], project_id=route["project_id"],
-        ).comments()
+        )
         adapter = LinearProjectionAdapter(
             client, issue_id=token, workstream_id=token,
             plan_revision=plan_revision, workspace_id=route["workspace_id"],
             team_id=route["team_id"], project_id=route["project_id"],
             root_issue_id=route["root_issue_id"],
         )
+        projection_state = adapter.state()
+        manifest, authenticated_source = synchronize_manifest_source(
+            manifest, graph["root"].get("description"), authenticated_source,
+            projection_state.snapshot.get("source"),
+            projection_state.snapshot.get("projection_history"),
+        )
+        graph = deepcopy(graph)
+        graph["root"].pop("description", None)
+        comments = comment_adapter.comments()
         resolver = lambda relations: read_relation_targets(client, relations)
         snapshot, legacy_unresolved_relation_heads = (
             load_material_history_for_projection_reconcile(
@@ -694,8 +835,13 @@ def main() -> int:
             team_id=route["team_id"], project_id=route["project_id"],
         )
         graph_after, comments_after = stable_live_readback(
-            transport, final_comments, token,
+            transport, final_comments, token, include_description=True,
         )
+        validate_canonical_source_readback(
+            graph_after["root"].get("description"), authenticated_source,
+        )
+        graph_after = deepcopy(graph_after)
+        graph_after["root"].pop("description", None)
         verified = add_material_history(
             graph_after, comments_after, token, authenticated_route=route,
             authenticated_source=authenticated_source,
@@ -708,6 +854,11 @@ def main() -> int:
             require_projection_authority=True,
         )
         choose_disposition(context, remote_head=args.remote_head)
+        result["source_sync"] = {
+            "identity": authenticated_source["identity"],
+            "sha256": authenticated_source["sha256"],
+            "resume_authority": context["resume_authority"],
+        }
         json.dump(result, sys.stdout, sort_keys=True, indent=2)
         sys.stdout.write("\n")
         return 0

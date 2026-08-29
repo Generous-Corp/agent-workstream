@@ -35,6 +35,8 @@ GITHUB_REPOSITORY = re.compile(
 )
 GITHUB_PATH_SEGMENT = re.compile(r"[A-Za-z0-9._+@,-]+")
 EXACT_GIT_COMMIT = re.compile(r"[0-9a-f]{40}")
+HTTPS_URL = re.compile(r"https://[^\s<>\])]+")
+CANONICAL_PLAN_LINE = re.compile(r"^\s*Canonical plan\s*:\s*(.+?)\s*$", re.I | re.M)
 GIT_FETCH_TIMEOUT_SECONDS = 30
 GIT_SHOW_TIMEOUT_SECONDS = 5
 PROCESS_REAP_TIMEOUT_SECONDS = 2
@@ -79,6 +81,35 @@ def _github_ssh_blob(source: str) -> tuple[str, str, str, str] | None:
     ):
         return None
     return owner, repository, commit, path
+
+
+def canonical_plan_url(description: str | None) -> str:
+    """Return the one labeled canonical plan URL or a precise remediation."""
+    candidates: set[str] = set()
+    for match in CANONICAL_PLAN_LINE.finditer(description or ""):
+        candidates.update(HTTPS_URL.findall(match.group(1)))
+    if not candidates:
+        raise ValueError(
+            "canonical_plan_source_missing:add exactly one 'Canonical plan: <URL>' line"
+        )
+    if len(candidates) != 1:
+        raise ValueError(
+            "canonical_plan_source_ambiguous:keep exactly one canonical plan URL"
+        )
+    return next(iter(candidates))
+
+
+def same_plan_document(first: str, second: str) -> bool:
+    """Compare plan identities, allowing main and exact GitHub refs to match."""
+    if first == second:
+        return True
+    left = _github_ssh_blob(first)
+    right = _github_ssh_blob(second)
+    return bool(
+        left and right
+        and (left[0].lower(), left[1].lower(), left[3])
+        == (right[0].lower(), right[1].lower(), right[3])
+    )
 
 
 def _git_ssh_environment() -> dict[str, str]:
