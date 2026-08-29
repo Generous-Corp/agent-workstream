@@ -150,7 +150,15 @@ def apply_title(
     cmux = which("cmux")
     if not cmux:
         return {"status": "unavailable", "reason": "cmux_cli_unavailable", "token": token}
-    context = _surface_context(cmux, target, runner)
+    try:
+        context = _surface_context(cmux, target, runner)
+    except TabTitleError as error:
+        if str(error) == "cmux_target_unresolved":
+            return {
+                "status": "unavailable", "reason": "cmux_target_unresolved",
+                "token": token,
+            }
+        raise
     if context is None:
         return {"status": "unavailable", "reason": "cmux_unavailable", "token": token}
     before = _read_title(cmux, context, runner)

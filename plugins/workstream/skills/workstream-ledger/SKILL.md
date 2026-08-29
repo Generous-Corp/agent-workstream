@@ -123,7 +123,9 @@ infer a repository, worktree, or Linear project from the Markdown's cwd.
 After intake returns the canonical root token, invoke
 `scripts/workstream_tab.py GEN-123`. In cmux it preserves the existing tab
 title and appends exactly one token; the same token is a no-op and a different
-token refuses without mutation. Outside cmux it reports an optional no-op.
+token refuses without mutation. Outside cmux, or when the current surface
+cannot be resolved, it reports an optional no-op without changing the preceding
+full-authority recovery result.
 
 ### Material-delta journal
 

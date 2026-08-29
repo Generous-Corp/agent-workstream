@@ -1,9 +1,11 @@
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("workstream_tab.py")
@@ -117,6 +119,43 @@ class WorkstreamTabTests(unittest.TestCase):
                 which=lambda _: "/opt/cmux",
             )
         self.assertNotIn("rename-tab", [call[1] for call in fake.calls])
+
+    def test_reachable_cmux_without_caller_binding_is_optional_noop(self):
+        fake = FakeCmux()
+
+        def runner(argv, **kwargs):
+            if argv[1] == "identify":
+                return subprocess.CompletedProcess(argv, 0, "{}", "")
+            return fake(argv, **kwargs)
+
+        result = tab.apply_title(
+            "GEN-37", target="surface:404", runner=runner,
+            which=lambda _: "/opt/cmux",
+        )
+
+        self.assertEqual(result, {
+            "status": "unavailable", "reason": "cmux_target_unresolved",
+            "token": "GEN-37",
+        })
+        self.assertNotIn("rename-tab", [call[1] for call in fake.calls])
+
+    def test_cli_distinguishes_optional_unavailable_from_binding_error(self):
+        unavailable = {
+            "status": "unavailable", "reason": "cmux_target_unresolved",
+            "token": "GEN-37",
+        }
+        with mock.patch.object(tab, "apply_title", return_value=unavailable), \
+             mock.patch.object(sys, "stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(tab.main(["GEN-37"]), 0)
+        self.assertEqual(json.loads(stdout.getvalue()), unavailable)
+
+        with mock.patch.object(
+            tab, "apply_title", side_effect=tab.TabTitleError("cmux_command_failed"),
+        ), mock.patch.object(
+            sys, "stderr", new_callable=io.StringIO,
+        ) as stderr:
+            self.assertEqual(tab.main(["GEN-37"]), 2)
+        self.assertEqual(stderr.getvalue().strip(), "workstream-tab: cmux_command_failed")
 
     def test_malformed_title_read_fails_closed(self):
         fake = FakeCmux()
