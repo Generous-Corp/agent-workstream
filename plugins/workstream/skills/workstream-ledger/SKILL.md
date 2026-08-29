@@ -329,6 +329,20 @@ their reviewed event and value digest. It never retires an omitted key. A late
 key or changed head requires reload and review before any append. The command
 computes the concrete attach/successor disposition against a verified remote
 head and rereads the complete comment stream before reporting success.
+Projection synchronization treats a labeled `Canonical plan: <URL>` line on
+the existing root issue as the source identity. Exactly one distinct URL is
+required before any write; zero or multiple candidates refuse with a concrete
+remediation and never create another issue or project. The command adds a
+missing structured source or refreshes its identity and SHA-256 when the living
+plan revision changes, while preserving the issue and append-only history. A
+change to a different plan document must be explicit in the reviewed manifest;
+an omitted source cannot silently replace the active document. The command
+rechecks the labeled URL after its writes, so a concurrent description edit
+refuses success. Repeated synchronization with a current review contract writes
+nothing. Intake does not add a labeled canonical URL by itself; any issue
+mutation that adds or changes that line must finish through this projection
+transaction. A projection operation is not reported successful until the same
+strict bounded validation as resume returns `resume_authority: full`.
 If a historical relation points to a peer created before the relation-readback
 contract, only this reconcile command may load that incomplete head, and only
 when the reviewed manifest exactly retires or replaces every incomplete

@@ -1878,6 +1878,160 @@ class ProjectionTests(unittest.TestCase):
             )
         self.assertEqual(client.comments, [])
 
+    def test_manifest_source_sync_refreshes_stale_same_document_source(self):
+        exact = (
+            "https://github.com/acme/plans/blob/" + "a" * 40 + "/PLAN.md"
+        )
+        manifest = {"projection": [{
+            "kind": "source", "key": "root", "value": {
+                "identity": "https://github.com/acme/plans/blob/main/PLAN.md",
+                "sha256": "old",
+            },
+        }]}
+
+        synced, source = workstream_projection.synchronize_manifest_source(
+            manifest, f"Canonical plan: {exact}",
+            {"identity": "https://github.com/acme/plans/blob/main/PLAN.md",
+             "sha256": "new", "bytes": 10},
+        )
+
+        self.assertEqual(synced["projection"][0]["value"], {
+            "identity": exact, "sha256": "new",
+        })
+        self.assertEqual(source, {"identity": exact, "sha256": "new", "bytes": 10})
+        self.assertEqual(manifest["projection"][0]["value"]["sha256"], "old")
+
+    def test_manifest_source_sync_refuses_ambiguous_issue_without_mutation(self):
+        manifest = {"projection": []}
+        original = deepcopy(manifest)
+        with self.assertRaisesRegex(ValueError, "canonical_plan_source_ambiguous"):
+            workstream_projection.synchronize_manifest_source(
+                manifest,
+                "Canonical plan: https://example.test/one\n"
+                "Canonical plan: https://example.test/two",
+                {"identity": "https://example.test/one", "sha256": "new"},
+            )
+        self.assertEqual(manifest, original)
+
+    def test_manifest_source_sync_refuses_unreviewed_live_document_change(self):
+        manifest = {"projection": []}
+        original = deepcopy(manifest)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "live_source_document_change_requires_explicit_review",
+        ):
+            workstream_projection.synchronize_manifest_source(
+                manifest,
+                "Canonical plan: https://github.com/acme/new/blob/main/PLAN.md",
+                {"identity": "https://github.com/acme/new/blob/main/PLAN.md",
+                 "sha256": "new"},
+                {"identity": "https://github.com/acme/old/blob/main/PLAN.md",
+                 "sha256": "old"},
+            )
+        self.assertEqual(manifest, original)
+
+    def test_manifest_source_sync_allows_reviewed_live_document_change(self):
+        canonical = "https://github.com/acme/new/blob/main/PLAN.md"
+        manifest = {"projection": [{
+            "kind": "source", "key": "root", "value": {
+                "identity": canonical, "sha256": "new",
+            },
+        }]}
+
+        synced, source = workstream_projection.synchronize_manifest_source(
+            manifest, f"Canonical plan: {canonical}",
+            {"identity": canonical, "sha256": "new"},
+            {"identity": "https://github.com/acme/old/blob/main/PLAN.md",
+             "sha256": "old"},
+        )
+
+        self.assertEqual(synced["projection"][0]["value"], source)
+        self.assertEqual(source, {"identity": canonical, "sha256": "new"})
+
+    def test_manifest_source_sync_refreshes_same_live_document_without_explicit_item(self):
+        exact = "https://github.com/acme/plans/blob/" + "a" * 40 + "/PLAN.md"
+        manifest = {"projection": []}
+
+        synced, source = workstream_projection.synchronize_manifest_source(
+            manifest, f"Canonical plan: {exact}",
+            {"identity": exact, "sha256": "new"},
+            {"identity": "https://github.com/acme/plans/blob/main/PLAN.md",
+             "sha256": "old"},
+        )
+
+        self.assertEqual(synced["projection"], [
+            {"kind": "source", "key": "root", "value": source},
+        ])
+        self.assertEqual(manifest, {"projection": []})
+
+    def test_manifest_source_sync_checks_prior_generation_document(self):
+        old_plan = "b" * 64
+        old_identity = "https://github.com/acme/old/blob/main/PLAN.md"
+        old = build_projection_event(
+            workstream_id="GEN-37", kind="source", key="root",
+            value={"identity": old_identity, "sha256": old_plan},
+            plan_revision=old_plan, expected_revision=0,
+            created_at="2026-08-26T12:00:00Z", authority=AUTHORITY,
+        )
+        reduced = reduce_projection_comments(
+            [projection_comment(old)], workstream_id="GEN-37",
+            expected_plan_revision=PLAN,
+        )
+        self.assertIsNone(reduced.snapshot["source"])
+        manifest = {"projection": []}
+        original = deepcopy(manifest)
+
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "live_source_document_change_requires_explicit_review",
+        ):
+            workstream_projection.synchronize_manifest_source(
+                manifest,
+                "Canonical plan: https://github.com/acme/new/blob/main/PLAN.md",
+                {"identity": "https://github.com/acme/new/blob/main/PLAN.md",
+                 "sha256": PLAN},
+                reduced.snapshot["source"],
+                reduced.snapshot["projection_history"],
+            )
+
+        self.assertEqual(manifest, original)
+
+    def test_manifest_source_sync_auto_refreshes_prior_generation_same_document(self):
+        old_plan = "b" * 64
+        old = build_projection_event(
+            workstream_id="GEN-37", kind="source", key="root",
+            value={
+                "identity": "https://github.com/acme/plans/blob/main/PLAN.md",
+                "sha256": old_plan,
+            },
+            plan_revision=old_plan, expected_revision=0,
+            created_at="2026-08-26T12:00:00Z", authority=AUTHORITY,
+        )
+        reduced = reduce_projection_comments(
+            [projection_comment(old)], workstream_id="GEN-37",
+            expected_plan_revision=PLAN,
+        )
+        exact = "https://github.com/acme/plans/blob/" + "a" * 40 + "/PLAN.md"
+
+        synced, source = workstream_projection.synchronize_manifest_source(
+            {"projection": []}, f"Canonical plan: {exact}",
+            {"identity": exact, "sha256": PLAN},
+            reduced.snapshot["source"], reduced.snapshot["projection_history"],
+        )
+
+        self.assertEqual(synced["projection"][0]["value"], source)
+        self.assertEqual(source, {"identity": exact, "sha256": PLAN})
+
+    def test_canonical_source_final_readback_refuses_concurrent_change(self):
+        with self.assertRaisesRegex(
+            LinearProjectionError, "canonical_plan_changed_during_projection",
+        ):
+            workstream_projection.validate_canonical_source_readback(
+                "Canonical plan: https://github.com/acme/new/blob/main/PLAN.md",
+                {"identity": "https://github.com/acme/old/blob/main/PLAN.md",
+                 "sha256": "a" * 64},
+            )
+
     def test_projection_cli_end_to_end_is_idempotent_and_full_resume_verified(self):
         raw = b"# Exact plan\n\n## Deliver\n"
         digest = hashlib.sha256(raw).hexdigest()
@@ -1894,9 +2048,6 @@ class ProjectionTests(unittest.TestCase):
             "retirements": [],
             "projection": [
             {"kind": "scope", "key": "root", "value": scoped},
-            {"kind": "source", "key": "root", "value": {
-                "sha256": digest, "identity": identity,
-            }},
             {"kind": "provenance", "key": "session", "value": {
                 "agent": "codex", "machine": "M5", "session_id": "session",
                 "worktree": {"state": "safe", "head": HEAD},
@@ -1904,6 +2055,7 @@ class ProjectionTests(unittest.TestCase):
         ]}
         graph = {
             "root": {"identifier": "GEN-37", "url": "https://linear/GEN-37",
+                     "description": f"Canonical plan: {identity}",
                      "plan_revision": digest, "revision": 0,
                      "status": "In Progress", "next_action": "continue"},
             "children": [{"identifier": "GEN-38", "title": "Resume transport",
@@ -1913,6 +2065,11 @@ class ProjectionTests(unittest.TestCase):
         route = {"workspace_id": "workspace", "team_id": "team",
                  "project_id": "project", "root_issue_id": ROOT_UUID}
         comments = mock.Mock()
+        historical_comment = {
+            "id": "existing-history", "body": "preserve this prior comment",
+            "createdAt": "before", "updatedAt": "before",
+        }
+        client.comments.append(dict(historical_comment))
         comments.comments.side_effect = lambda: [dict(item) for item in client.comments]
         transport = mock.Mock()
         transport.snapshot_for_root.return_value = graph
@@ -1928,7 +2085,7 @@ class ProjectionTests(unittest.TestCase):
                 "--max-bytes", "65536", "--max-items", "500",
             ]
             compact = workstream_projection.compact_context
-            for expected_writes in (4, 4):
+            for expected_writes in (5, 5):
                 manifest_path.write_text(json.dumps(manifest))
                 output = io.StringIO()
                 with mock.patch.object(workstream_projection.sys, "argv", argv), \
@@ -1947,8 +2104,18 @@ class ProjectionTests(unittest.TestCase):
                         self.assertEqual(compact_mock.call_args.kwargs["max_items"], 500)
                 payload = json.loads(output.getvalue())
                 self.assertTrue(payload["readback_verified"])
+                self.assertEqual(payload["source_sync"], {
+                    "identity": identity,
+                    "sha256": digest,
+                    "resume_authority": "full",
+                })
                 self.assertEqual(len(client.comments), expected_writes)
                 manifest.update(payload["projection_contract"])
+        self.assertEqual(client.comments[0], historical_comment)
+        self.assertFalse(any(
+            "issueCreate" in query or "issueUpdate" in query
+            for query, _variables in client.calls
+        ))
         self.assertEqual(len(json.loads(output.getvalue())["writes"]), 0)
 
     def test_final_live_readback_refuses_concurrent_graph_or_checkpoint_change(self):
