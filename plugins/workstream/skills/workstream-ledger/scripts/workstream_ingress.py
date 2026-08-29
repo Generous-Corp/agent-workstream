@@ -477,7 +477,7 @@ def load_promotion_request(path: str) -> dict[str, Any]:
         raise ValueError("promotion_request_invalid_json") from error
     if not isinstance(request, dict) or set(request) != {
         "schema_version", "ingress", "authority", "workstream_id",
-        "expected_material_revision", "changes",
+        "plan_revision", "expected_material_revision", "changes",
     }:
         raise ValueError("promotion_request_schema_invalid")
     if type(request["schema_version"]) is not int or request["schema_version"] != 1:
@@ -501,6 +501,8 @@ def load_promotion_request(path: str) -> dict[str, Any]:
     canonical_ingress_route(ingress["repo"], ingress["remote_issue"])
     if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", request["workstream_id"] or ""):
         raise ValueError("promotion_request_workstream_invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", request["plan_revision"] or ""):
+        raise ValueError("promotion_request_plan_revision_invalid")
     authority = request["authority"]
     required_authority = {"workspace_id", "team_id", "project_id", "root_issue_id"}
     if not isinstance(authority, dict) or set(authority) != required_authority:
@@ -537,6 +539,7 @@ def promotion_payload(request: dict[str, Any], capture: dict[str, Any]) -> dict[
         "event_id": request["ingress"]["event_id"],
         "prompt_sha256": request["ingress"]["prompt_sha256"],
         "workstream_id": request["workstream_id"],
+        "plan_revision": request["plan_revision"],
         "authority": request["authority"],
         "ingress_route": canonical_ingress_route(
             request["ingress"]["repo"], request["ingress"]["remote_issue"]
@@ -553,7 +556,7 @@ def promotion_payload(request: dict[str, Any], capture: dict[str, Any]) -> dict[
 def validate_promotion_payload(promotion: Any) -> dict[str, Any]:
     if not isinstance(promotion, dict) or set(promotion) != {
         "schema_version", "event_id", "prompt_sha256", "workstream_id",
-        "authority", "ingress_route", "expected_material_revision", "changes",
+        "plan_revision", "authority", "ingress_route", "expected_material_revision", "changes",
         "source_captured_at", "promotion_id",
     }:
         raise ValueError("promotion_marker_schema_invalid")
@@ -569,6 +572,7 @@ def validate_promotion_payload(promotion: Any) -> dict[str, Any]:
             "prompt_sha256": promotion["prompt_sha256"],
         },
         "workstream_id": promotion["workstream_id"],
+        "plan_revision": promotion["plan_revision"],
         "authority": promotion["authority"],
         "expected_material_revision": promotion["expected_material_revision"],
         "changes": promotion["changes"],
@@ -586,6 +590,8 @@ def validate_promotion_payload(promotion: Any) -> dict[str, Any]:
         raise ValueError("promotion_marker_prompt_sha256_invalid")
     if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", promotion["workstream_id"] or ""):
         raise ValueError("promotion_marker_workstream_invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", promotion["plan_revision"] or ""):
+        raise ValueError("promotion_marker_plan_revision_invalid")
     authority = promotion["authority"]
     required_authority = {"workspace_id", "team_id", "project_id", "root_issue_id"}
     if not isinstance(authority, dict) or set(authority) != required_authority:
@@ -641,6 +647,7 @@ def promotion_delta(promotion: dict[str, Any]) -> Delta:
                 "event_id": promotion["event_id"],
                 "prompt_sha256": promotion["prompt_sha256"],
                 "promotion_id": promotion["promotion_id"],
+                "plan_revision": promotion["plan_revision"],
                 "route": promotion["ingress_route"],
             },
         },
@@ -718,6 +725,7 @@ def linear_adapter_for_promotion(
         HttpGraphQLClient(token), issue_id=promotion["workstream_id"],
         workspace_id=authority["workspace_id"], team_id=authority["team_id"],
         project_id=authority["project_id"], root_issue_id=authority["root_issue_id"],
+        plan_revision=promotion["plan_revision"],
     )
 
 
@@ -1452,6 +1460,7 @@ def command_promote(args: argparse.Namespace) -> int:
         print(json.dumps({
             "event_id": event_id, "promotion_id": promotion["promotion_id"],
             "material_event_id": delta.event_id, "workstream_id": promotion["workstream_id"],
+            "plan_revision": promotion["plan_revision"],
             "expected_material_revision": promotion["expected_material_revision"],
             "changes": len(promotion["changes"]), "would_stage": state["promotion"] is None,
             "would_apply": True,

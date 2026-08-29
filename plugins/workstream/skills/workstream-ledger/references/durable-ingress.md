@@ -83,6 +83,7 @@ The reviewed promotion request is exact JSON:
     "root_issue_id": "<immutable Linear root issue UUID>"
   },
   "workstream_id": "ABC-123",
+  "plan_revision": "<authenticated plan source digest, 64 lowercase hex>",
   "expected_material_revision": 7,
   "changes": [
     {"kind": "requirement", "payload": {"text": "...", "acceptance": "..."}}

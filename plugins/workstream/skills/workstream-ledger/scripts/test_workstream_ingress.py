@@ -1081,7 +1081,8 @@ class ManagedPromotionTests(unittest.TestCase):
                 "project_id": "33333333-3333-4333-8333-333333333333",
                 "root_issue_id": "44444444-4444-4444-8444-444444444444",
             },
-            "workstream_id": "GEN-37", "expected_material_revision": 0,
+            "workstream_id": "GEN-37", "plan_revision": "b" * 64,
+            "expected_material_revision": 0,
             "changes": [{"kind": "requirement", "payload": {
                 "text": "Add the missing recovery gate", "acceptance": "planted crash passes"}}],
         }))
@@ -1202,6 +1203,23 @@ class ManagedPromotionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expected_revision_invalid"):
             self._promote()
         self.assertEqual(self.remote.writes, [])
+
+    def test_plan_revision_is_required_and_validated_before_remote_reads(self):
+        request = json.loads(self.request.read_text())
+        request["plan_revision"] = "not-a-plan-digest"
+        self.request.write_text(json.dumps(request))
+        with self.assertRaisesRegex(ValueError, "promotion_request_plan_revision_invalid"):
+            self._promote()
+        self.assertEqual(self.remote.writes, [])
+
+    def test_plan_revision_is_bound_into_promotion_identity(self):
+        request = MODULE.load_promotion_request(str(self.request))
+        first = MODULE.promotion_payload(request, self.capture)
+        request["plan_revision"] = "c" * 64
+        second = MODULE.promotion_payload(request, self.capture)
+        self.assertNotEqual(first["promotion_id"], second["promotion_id"])
+        self.assertEqual(first["plan_revision"], "b" * 64)
+        self.assertEqual(second["plan_revision"], "c" * 64)
 
     def test_promotion_request_schema_float_is_rejected_before_remote_reads(self):
         request = json.loads(self.request.read_text())
