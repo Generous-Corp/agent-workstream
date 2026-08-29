@@ -47,7 +47,9 @@ from workstream_child_closure import (
     canonical_digest, evidence_receipts_sha256, terminal_child_readback,
     ChildClosureError,
 )
-from workstream_scope import repository_key, ScopeError, validate_relations, validate_scope
+from workstream_scope import (
+    repository_key, ScopeError, validate_relations, validate_scope,
+)
 
 
 TOKEN = re.compile(r"\b[A-Z][A-Z0-9]*-\d+\b", re.I)
@@ -398,21 +400,24 @@ def _compact_checkpoint(checkpoint: dict[str, Any] | None) -> dict[str, Any] | N
     result = {
         key: checkpoint[key]
         for key in (
-            "workstream_id", "checkpoint_event_id", "root_revision", "plan_revision",
-            "status", "exact_head", "blocker", "next_action", "worktree",
-            "acknowledgement",
+            "checkpoint_event_id", "root_revision", "status", "exact_head",
+            "worktree", "acknowledgement",
         )
     }
     result["evidence"] = {
         "count": len(evidence),
-        "items": evidence,
         "sha256": hashlib.sha256(json.dumps(
             evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ).encode()).hexdigest(),
     }
+    latest_provenance = provenance[-1]
     result["provenance"] = {
         "count": len(provenance),
-        "latest": provenance[-1],
+        "latest": {
+            key: latest_provenance[key]
+            for key in ("agent", "machine", "session_id")
+            if latest_provenance.get(key) is not None
+        },
         "sha256": hashlib.sha256(json.dumps(
             provenance, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ).encode()).hexdigest(),
@@ -426,13 +431,19 @@ def _checkpoint_item_count(checkpoint: dict[str, Any] | None) -> int:
         return 0
     evidence = checkpoint.get("evidence", [])
     if isinstance(evidence, dict):
-        evidence = evidence.get("items", [])
-    provenance = checkpoint.get("provenance_chain", [])
-    return (
-        len(evidence) if isinstance(evidence, list) else 0
-    ) + (
-        len(provenance) if isinstance(provenance, list) else 0
+        evidence_count = evidence.get("count", len(evidence.get("items", [])))
+    else:
+        evidence_count = len(evidence) if isinstance(evidence, list) else 0
+    provenance = checkpoint.get(
+        "provenance_chain", checkpoint.get("provenance", []),
     )
+    if isinstance(provenance, dict):
+        provenance_count = provenance.get("count", 0)
+    else:
+        provenance_count = len(provenance) if isinstance(provenance, list) else 0
+    return (
+        evidence_count if isinstance(evidence_count, int) else 0
+    ) + (provenance_count if isinstance(provenance_count, int) else 0)
 
 
 def _checkpoint_history_item_count(checkpoints: list[dict[str, Any]]) -> int:
@@ -468,6 +479,172 @@ def _compact_scope(scope: dict[str, Any] | None) -> dict[str, Any] | None:
         "validated_sha256": hashlib.sha256(json.dumps(
             scope, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ).encode()).hexdigest(),
+    }
+
+
+def _active_projection_heads(
+    projection_events: list[dict[str, Any]], kind: str,
+) -> list[dict[str, str]]:
+    active: dict[str, dict[str, str]] = {}
+    for event in projection_events:
+        if event.get("kind") != kind:
+            continue
+        key = event.get("key")
+        if not isinstance(key, str):
+            continue
+        if event.get("value") == TOMBSTONE:
+            active.pop(key, None)
+            continue
+        active[key] = {
+            "key": key,
+            "event_id": event["event_id"],
+            "value_sha256": canonical_digest(event["value"]),
+        }
+    return list(active.values())
+
+
+def _projection_head_for_value(
+    value: dict[str, Any], active_heads: list[dict[str, str]], label: str,
+) -> dict[str, str] | None:
+    digest = canonical_digest(value)
+    matches = [head for head in active_heads if head["value_sha256"] == digest]
+    if len(matches) > 1:
+        raise ResumeError(f"{label}_projection_head_ambiguous")
+    return matches[0] if matches else None
+
+
+def _compact_evidence_contracts(
+    contracts: list[dict[str, Any]], projection_events: list[dict[str, Any]],
+    *, require_projection_authority: bool,
+) -> list[dict[str, Any]]:
+    """Return digest-bound routing facts without embedding receipt prose.
+
+    Full contracts have already passed projection, scope, exact-head, and
+    terminal-closure validation before this function runs.  Default resume
+    needs their stable identity and authority bindings, not every receipt body.
+    ``--include-history`` remains the explicit audit surface for those bodies.
+    """
+    active_heads = _active_projection_heads(projection_events, "evidence_contract")
+
+    result = []
+    for contract in contracts:
+        summary = {
+            key: contract[key]
+            for key in (
+                "slice_id", "owning_child", "repository_key", "exact_head",
+            )
+        }
+        summary["receipt_count"] = sum(
+            len(layer.get("receipts", []))
+            for layer in contract["layers"].values()
+        )
+        summary["contract_sha256"] = canonical_digest(contract)
+        summary["evidence_receipts_sha256"] = evidence_receipts_sha256([contract])
+        head = _projection_head_for_value(
+            contract, active_heads,
+            f"evidence_compaction:{contract['slice_id']}",
+        )
+        if require_projection_authority and head is None:
+            raise ResumeError(
+                f"evidence_compaction_projection_head_missing:{contract['slice_id']}"
+            )
+        if head is not None:
+            # Do not infer that a projection key equals slice_id.  The exact
+            # active event tuple is what closure authority binds.
+            summary["projection_head"] = head
+        result.append(summary)
+    return result
+
+
+def _compact_child_closures(
+    closures: list[dict[str, Any]], projection_events: list[dict[str, Any]],
+    *, require_projection_authority: bool,
+) -> list[dict[str, Any]]:
+    active_heads = _active_projection_heads(projection_events, "child_closure")
+    result = []
+    for closure in closures:
+        summary = {
+            key: closure[key]
+            for key in (
+                "child_identifier", "repository_key", "exact_head",
+                "assignee_id", "state_name", "state_type", "child_readback_sha256",
+            )
+        }
+        summary["evidence_head_count"] = len(closure["evidence_heads"])
+        summary["evidence_heads_sha256"] = canonical_digest(
+            closure["evidence_heads"]
+        )
+        head = _projection_head_for_value(
+            closure, active_heads,
+            f"child_closure_compaction:{closure['child_identifier']}",
+        )
+        if require_projection_authority and head is None:
+            raise ResumeError(
+                "child_closure_compaction_projection_head_missing:"
+                + closure["child_identifier"]
+            )
+        if head is not None:
+            summary["projection_head"] = head
+        result.append(summary)
+    return result
+
+
+def _compact_description(description: Any) -> dict[str, Any] | None:
+    if not isinstance(description, str):
+        return None
+    encoded = description.encode("utf-8")
+    return {
+        "bytes": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _compact_child(child: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        key: child[key]
+        for key in (
+            "id", "identifier", "title", "url", "status", "status_type",
+            "state_id", "assignee", "owner", "updatedAt", "next_action",
+            "blocker", "review_condition", "material_event_revision",
+            "checkpoint_recovery", "uncheckpointed_material_obligations",
+        )
+        if key in child
+    }
+    description = _compact_description(child.get("description"))
+    if description is not None:
+        result["description_summary"] = description
+    return result
+
+
+def _compact_provenance(
+    items: list[dict[str, Any]], projection_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    encoded = json.dumps(
+        items, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode()
+    candidates = [
+        item for item in items
+        if isinstance(item, dict) and item.get("worktree")
+    ]
+    latest = candidates[0] if len(candidates) == 1 else None
+    head = (
+        _projection_head_for_value(
+            latest, _active_projection_heads(projection_events, "provenance"),
+            "provenance_compaction",
+        )
+        if latest is not None else None
+    )
+    return {
+        "count": len(items),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "worktree_authority_count": len(candidates),
+        "worktree_authority_ambiguous": len(candidates) > 1,
+        "latest": ({
+            key: latest[key]
+            for key in ("agent", "machine", "session_id", "worktree")
+            if latest.get(key) is not None
+        } if latest is not None else None),
+        "latest_projection_head": head,
     }
 
 
@@ -1172,13 +1349,7 @@ def compact_context(
     for child in clean["children"]:
         if _is_terminal(child):
             continue
-        compact_child = dict(child) if include_history else {
-            key: value for key, value in child.items()
-            if key not in {
-                "parent", "project", "team", "material_events", "checkpoint_history",
-                "latest_checkpoint",
-            }
-        }
+        compact_child = dict(child) if include_history else _compact_child(child)
         if "material_events" in child:
             checkpoint_revision = (
                 child["latest_checkpoint"]["root_revision"]
@@ -1234,6 +1405,13 @@ def compact_context(
         clean["material_events"], checkpoint_revision,
     )
     context = {
+        "context_schema": {
+            "name": "agent-workstream.resume-context",
+            "version": 2,
+            "representation": (
+                "full_validated" if include_history else "compact_validated"
+            ),
+        },
         "workstream_id": root["identifier"].upper(),
         "context_url": root["url"],
         "plan_revision": root["plan_revision"],
@@ -1241,15 +1419,33 @@ def compact_context(
         "issue_revision": root.get("issue_revision"),
         "status": root.get("status"),
         "next_action": root.get("next_action"),
+        "blocker": root.get("blocker"),
         "children": children,
         "decisions": clean["decisions"],
         "choice_events": clean["choice_events"],
         "scope": clean["scope"] if include_history else _compact_scope(clean["scope"]),
         "relations": clean["relations"],
-        "evidence_contracts": clean["evidence_contracts"],
-        "child_closures": clean["child_closures"],
+        "evidence_contracts": (
+            clean["evidence_contracts"] if include_history
+            else _compact_evidence_contracts(
+                clean["evidence_contracts"], clean["projection_events"],
+                require_projection_authority=require_projection_authority,
+            )
+        ),
+        "child_closures": (
+            clean["child_closures"] if include_history
+            else _compact_child_closures(
+                clean["child_closures"], clean["projection_events"],
+                require_projection_authority=require_projection_authority,
+            )
+        ),
         "surface_availability": clean["surface_availability"],
-        "provenance": clean["provenance"],
+        "provenance": (
+            clean["provenance"] if include_history
+            else _compact_provenance(
+                clean["provenance"], clean["projection_events"],
+            )
+        ),
         "material_event_revision": clean["material_event_revision"],
         "latest_checkpoint": (
             clean["latest_checkpoint"] if include_history
@@ -1289,7 +1485,7 @@ def compact_context(
     ) + sum(
         len(value) for value in (
             context["children"], context["decisions"], context["choice_events"],
-            context["relations"], context["provenance"],
+            context["relations"],
             context["evidence_contracts"],
             context["child_closures"],
             context["uncheckpointed_material_obligations"],
@@ -1299,7 +1495,7 @@ def compact_context(
             context.get("projection_quarantined", []),
             context.get("projection_unresolved_quarantine", []),
         )
-    )
+    ) + len(clean["provenance"])
     if max_items < 0 or item_count > max_items:
         raise ResumeError(f"resume_context_over_item_budget:{item_count}>{max_items}")
     encoded = json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()

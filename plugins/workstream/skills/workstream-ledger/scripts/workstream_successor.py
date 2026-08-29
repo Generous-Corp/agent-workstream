@@ -62,7 +62,25 @@ def choose_disposition(snapshot: dict[str, Any], *, remote_head: str | None = No
         worktree = (candidates[0] if candidates else {}).get("worktree") or {}
         recovered_from = None
     elif isinstance(provenance, dict):
-        worktree = provenance.get("worktree") or {}
+        compact_latest = provenance.get("latest")
+        is_compact = (
+            (snapshot.get("context_schema") or {}).get("representation")
+            == "compact_validated"
+        )
+        if is_compact and (
+            provenance.get("worktree_authority_ambiguous") is True
+            or provenance.get("worktree_authority_count", 0) > 1
+        ):
+            raise SuccessorError("multiple projected worktree authorities")
+        if is_compact and provenance.get("worktree_authority_count") == 1:
+            if (
+                not isinstance(compact_latest, dict)
+                or not isinstance(provenance.get("latest_projection_head"), dict)
+            ):
+                raise SuccessorError("compact worktree authority is incomplete")
+            worktree = compact_latest.get("worktree") or {}
+        else:
+            worktree = provenance.get("worktree") or {}
         recovered_from = None
     else:
         worktree = {}
