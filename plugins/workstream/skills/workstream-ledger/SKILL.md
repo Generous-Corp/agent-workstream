@@ -47,6 +47,41 @@ directed edges, and missing `blocks`/`blocked_by` inverse views. `related`
 remains informational. Closure consumes authenticated peer-edge readback and
 refuses while the current root has an active `blocked_by` relation.
 
+Dependencies between already-owned children use the separately bounded
+`scripts/workstream_child_dependencies.py` transport. It authenticates the
+declared route, immutable root, and both direct-child identities, fences the
+root material/projection frontier plus the child dependency graph, reserves a
+deterministic append-only `child_dependency_authorization` projection slot,
+then projects that immutable authority into a native `blocks` cache relation
+with one deterministic client-supplied UUIDv4. The authorization is ordered
+after the exact pre-grant material/projection/graph state; the graph frontier
+includes a canonical SHA-256 so a same-count edge replacement cannot pass as
+unchanged. Root comments observed beyond the reviewed material frontier must
+have a strictly later server creation time than the grant. Projection CAS
+orders later projection events after it. Events ordered after the grant do not
+retroactively invalidate it: contradictions or scope changes require an
+append-only superseding event and reconciliation of the derived native cache.
+Runtime schema introspection must confirm that `IssueRelationCreateInput.id`,
+the `blocks` enum, archived-inclusive relation connections, and global relation
+slot enumeration remain available. Complete pagination must recover the exact
+active `blocks` view on the blocker, inverse `blocked_by` view on the blocked
+child, and any occupied or archived deterministic slot before mutation. A lost
+response converges and an exact batch replay performs no comment or relation
+write. Ambiguous, duplicate, conflicting, self, cross-root, stale-frontier,
+archived-slot, partial-inverse, and mismatched readbacks fail closed. A truly
+never-seen UUID cannot be reserved or dry-run through Linear, so availability
+cannot be proven beyond complete occupied-slot preflight; deterministic create
+and authoritative readback bound that API limitation safely. The transport
+never creates or updates an issue, project, or workstream root.
+
+The supported invocation is
+`python3 scripts/workstream_child_dependencies.py --request REQUEST.json --apply`.
+The JSON object must contain exactly `schema_version`, `authority` (including
+the explicit workspace/team/project/root UUID and root identifier),
+`plan_revision`, the complete `owned_children` identity set, `relations`, and
+the reviewed `expected_frontier`. The command does not infer a route or child
+set and emits the complete JSON receipt on stdout.
+
 The live Linear graph transport verifies the declared workspace/team/project
 relationship, fences reads to that project, and assigns the project on creates.
 The append-only projection transport persists scope and typed cross-workstream
@@ -119,6 +154,28 @@ An exact repeat is a zero-write no-op, and the same plan revision may add a
 newly reviewed missing child. Changed-plan and other existing-graph mutations
 still fail `remote_cas_unavailable` until a remote CAS authority exists. Never
 infer a repository, worktree, or Linear project from the Markdown's cwd.
+
+For an existing legacy root that has no deterministic intake marker, never run
+initial intake again. After authenticated resume and graph review, add exactly
+one missing child through the separately fenced extension command:
+
+```sh
+python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_extend_child.py" ./PLAN.md \
+  --identity <canonical-immutable-plan-url> \
+  --plan-revision <authenticated-source-sha256> \
+  --workstream-id GEN-123 --root-issue-id <root-uuid> \
+  --candidate-key <reviewed-stable-key> \
+  --material-revision <live-material-revision> \
+  --projection-revision <live-projection-revision> \
+  --workspace-id <uuid> --team-id <uuid> --project-id <uuid> --apply
+```
+
+The command requires exact plan bytes, route, root identity, reviewed candidate,
+and both live frontiers. It can create only the deterministic child beneath the
+existing root, leaves it `planned_pending_projection`, and returns an
+authorization plus readback receipt. A replay converges; it never creates or
+updates a root or project. Project the child's ownership, status, evidence, and
+dependencies before treating it as executable.
 
 After intake returns the canonical root token, invoke
 `scripts/workstream_tab.py GEN-123`. In cmux or Herdr it preserves the existing

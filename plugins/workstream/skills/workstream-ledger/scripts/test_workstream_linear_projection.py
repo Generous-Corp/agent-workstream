@@ -33,6 +33,7 @@ from workstream_relation_readback import RelationReadbackError
 import workstream_projection
 import workstream_linear_projection as projection_module
 import workstream_resume as resume_module
+import workstream_shipyard_profile as shipyard_profile
 from workstream_projection import (
     load_material_history_for_projection_reconcile, projection_review_contract,
     prepare_terminal_child_evidence_seeds, prepare_terminal_child_repairs,
@@ -126,6 +127,18 @@ def fixed_terminal_fence(value):
     return lambda child_ids: {child_id: value for child_id in child_ids}
 
 
+def acknowledged_checkpoint(checkpoint_id, *, head=HEAD):
+    return {
+        "checkpoint_event_id": checkpoint_id,
+        "worktree": {"state": "safe", "head": head},
+        "acknowledgement": {
+            "state": "remote_acknowledged",
+            "remote_id": f"comment-{checkpoint_id}",
+            "applied_revision": 0,
+        },
+    }
+
+
 def reviewed_retirement(adapter, kind, key):
     state = adapter.state()
     event = next(
@@ -165,7 +178,8 @@ class FakeProjectionClient:
                 raise LinearTransportError("duplicate comment id")
             comment = {"id": comment_id,
                        "body": variables["input"]["body"],
-                       "createdAt": "now", "updatedAt": "now"}
+                       "createdAt": f"2026-08-20T00:00:{len(self.comments):02d}Z",
+                       "updatedAt": f"2026-08-20T00:00:{len(self.comments):02d}Z"}
             self.comments.append(comment)
             return {"commentCreate": {"success": True, "comment": dict(comment)}}
         raise AssertionError("unexpected GraphQL operation")
@@ -320,6 +334,188 @@ def evidence_contract() -> dict:
 
 
 class ProjectionTests(unittest.TestCase):
+    @staticmethod
+    def authorization_adapter(client):
+        return LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+
+    @staticmethod
+    def reserve_child(adapter, **overrides):
+        values = {
+            "source": {"identity": "plan:legacy", "sha256": PLAN},
+            "reviewed_candidate_key": "candidate-a",
+            "child_issue_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "expected_material_revision": 0,
+            "expected_projection_revision": 0,
+        }
+        values.update(overrides)
+        return adapter.reserve_child_extension(**values)
+
+    def test_child_extension_authorization_is_durable_and_replay_is_noop(self):
+        client = FakeProjectionClient()
+        adapter = self.authorization_adapter(client)
+
+        first = self.reserve_child(adapter)
+        replay = self.reserve_child(
+            adapter, expected_projection_revision=1,
+        )
+
+        self.assertEqual(first["event"], replay["event"])
+        self.assertEqual(first["remote_id"], replay["remote_id"])
+        self.assertEqual(len(client.comments), 1)
+        self.assertEqual(first["event"]["kind"], "child_extension_authorization")
+        self.assertEqual(
+            first["event"]["value"]["initial_state"],
+            "planned_pending_projection",
+        )
+        self.assertEqual(first["disposition"], "created")
+        self.assertEqual(replay["disposition"], "existing")
+
+    def test_preexisting_child_requires_preexisting_authorization(self):
+        client = FakeProjectionClient()
+        adapter = self.authorization_adapter(client)
+
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "child_extension_preexisting_child_without_authorization",
+        ):
+            self.reserve_child(adapter, require_existing=True)
+
+        self.assertEqual(client.comments, [])
+
+    def test_child_extension_boolean_frontiers_refuse_before_remote_access(self):
+        class NoRemoteAccessClient(FakeProjectionClient):
+            def execute(self, query, variables):
+                raise AssertionError("invalid frontier must fail before remote access")
+
+        for overrides, message in (
+            ({"expected_material_revision": False},
+             "invalid_child_extension_material_frontier"),
+            ({"expected_projection_revision": False},
+             "invalid_child_extension_projection_frontier"),
+        ):
+            client = NoRemoteAccessClient()
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(LinearProjectionError, message):
+                    self.reserve_child(self.authorization_adapter(client), **overrides)
+            self.assertEqual(client.comments, [])
+
+    def test_child_extension_authorization_lost_response_converges(self):
+        class LostResponseClient(FakeProjectionClient):
+            def __init__(self):
+                super().__init__()
+                self.lost = False
+
+            def execute(self, query, variables):
+                response = super().execute(query, variables)
+                if "commentCreate" in query and not self.lost:
+                    self.lost = True
+                    raise TimeoutError("authorization response lost after commit")
+                return response
+
+        client = LostResponseClient()
+        receipt = self.reserve_child(self.authorization_adapter(client))
+
+        self.assertEqual(len(client.comments), 1)
+        self.assertEqual(receipt["remote_id"], client.comments[0]["id"])
+
+    def test_later_material_event_does_not_revoke_child_authorization(self):
+        client = FakeProjectionClient()
+        adapter = self.authorization_adapter(client)
+        first = self.reserve_child(adapter)
+        later = Delta(
+            "material-later", "GEN-37", "requirement", "agent",
+            {"text": "later"}, 0, "2026-08-20T00:00:01Z",
+        )
+        client.comments.append({
+            "id": "material-later-comment", "body": encode_event_comment(later),
+            "createdAt": "2026-08-20T00:00:01Z",
+            "updatedAt": "2026-08-20T00:00:01Z",
+        })
+
+        replay = self.reserve_child(
+            adapter, expected_material_revision=1,
+            expected_projection_revision=1,
+        )
+
+        self.assertEqual(replay["event"], first["event"])
+        self.assertEqual(len(client.comments), 2)
+
+    def test_child_extension_authorization_loses_planted_projection_slot_race(self):
+        winner = build_projection_event(
+            workstream_id="GEN-37", kind="source", key="root",
+            value={"identity": "plan:legacy", "sha256": PLAN},
+            plan_revision=PLAN, expected_revision=0,
+            created_at="2026-08-20T00:00:00Z", authority=AUTHORITY,
+        )
+        client = RacingProjectionClient(winner)
+
+        with self.assertRaisesRegex(
+            LinearProjectionError, "projection_slot_lost_reload_required",
+        ):
+            self.reserve_child(self.authorization_adapter(client))
+
+        state = self.authorization_adapter(client).state()
+        self.assertFalse(any(
+            event["kind"] == "child_extension_authorization"
+            for event in state.events
+        ))
+
+    def test_material_event_before_authorization_is_refused_by_remote_order(self):
+        class MaterialRaceClient(FakeProjectionClient):
+            def __init__(self):
+                super().__init__()
+                self.injected = False
+
+            def execute(self, query, variables):
+                if "commentCreate" in query and not self.injected:
+                    self.injected = True
+                    event = Delta(
+                        "material-race", "GEN-37", "requirement", "agent",
+                        {"text": "raced"}, 0, "2026-08-20T00:00:00Z",
+                    )
+                    self.comments.append({
+                        "id": "material-comment",
+                        "body": encode_event_comment(event),
+                        "createdAt": "2026-08-20T00:00:00Z",
+                        "updatedAt": "2026-08-20T00:00:00Z",
+                    })
+                return super().execute(query, variables)
+
+        client = MaterialRaceClient()
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "child_extension_material_preceded_authorization_reload_required",
+        ):
+            self.reserve_child(self.authorization_adapter(client))
+
+        # The planted race may reserve authority, but callers never receive an
+        # executable grant and therefore must not create the child.
+        self.assertEqual(len(client.comments), 2)
+
+    def test_superseded_child_extension_authorization_refuses_readback(self):
+        client = FakeProjectionClient()
+        adapter = self.authorization_adapter(client)
+        receipt = self.reserve_child(adapter)
+        original = receipt["event"]
+        value = deepcopy(original["value"])
+        value["expected_projection_revision"] = 1
+        replacement = build_projection_event(
+            workstream_id="GEN-37", kind="child_extension_authorization",
+            key=original["key"], value=value, plan_revision=PLAN,
+            expected_revision=1, created_at="1970-01-01T00:00:00Z",
+            supersedes_event_id=original["event_id"], authority=AUTHORITY,
+        )
+        adapter.append(replacement)
+
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "child_extension_authorization_superseded_or_conflicting",
+        ):
+            adapter.assert_child_extension_authorized(original)
+
     @staticmethod
     def relation_target_resolver(relations):
         root = {
@@ -762,6 +958,9 @@ class ProjectionTests(unittest.TestCase):
             terminal_child_fence=lambda child_ids: {
                 child_id: expected[child_id] for child_id in child_ids
             },
+            checkpoint_fence=lambda: preview["latest_checkpoint"][
+                "checkpoint_event_id"
+            ],
             legacy_unresolved_relation_heads=unresolved,
         )
         strict = add_material_history(
@@ -834,6 +1033,79 @@ class ProjectionTests(unittest.TestCase):
                 compact["projection_head"]["event_id"],
                 r"^wsp_[0-9a-f]{32}$",
             )
+
+    def test_compact_resume_builds_launch_profile_without_authority_rehydration(self):
+        strict, _contracts = self.gen37_production_shaped_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            worktree = strict["latest_checkpoint"]["worktree"]
+            worktree["path"] = str(root)
+            strict["latest_checkpoint"]["provenance_chain"][-1][
+                "worktree"
+            ] = deepcopy(worktree)
+            context = compact_context(
+                strict, "GEN-37", max_bytes=16 * 1024, max_items=100,
+                require_projection_authority=True,
+            )
+            checkpoint = context["latest_checkpoint"]
+            self.assertEqual(checkpoint["workstream_id"], "GEN-37")
+            self.assertEqual(checkpoint["plan_revision"], PLAN)
+            self.assertEqual(
+                checkpoint["next_action"], context["next_action"],
+            )
+            self.assertEqual(
+                checkpoint["provenance"]["latest"]["event_id"],
+                checkpoint["checkpoint_event_id"],
+            )
+            profile = shipyard_profile.build_launch_profile(
+                context, "GEN-37", shipyard_profile.GitIdentity(
+                    root=root,
+                    repository_coordinate=(
+                        "github.com/generous-corp/agent-workstream"
+                    ),
+                    repository="generous-corp/agent-workstream",
+                    head=HEAD, branch="fix/gen37",
+                ),
+                model="gpt-5.6-sol", reasoning_effort="medium",
+            )
+            self.assertEqual(
+                profile["checkpoint"]["checkpoint_id"],
+                checkpoint["checkpoint_event_id"],
+            )
+
+    def test_full_resume_refuses_stale_checkpoint_disposition_but_inspection_does_not_write(self):
+        strict, _contracts = self.gen37_production_shaped_fixture()
+        stale = deepcopy(strict)
+        current = next(
+            event for event in reversed(stale["projection_events"])
+            if (event["kind"], event["key"]) == ("disposition", "root")
+        )
+        stale_disposition = {
+            **stale["disposition"],
+            "recovered_from_checkpoint": "wsc_" + "e" * 32,
+        }
+        event = build_projection_event(
+            workstream_id="GEN-37", kind="disposition", key="root",
+            value=stale_disposition, plan_revision=PLAN,
+            expected_revision=stale["projection_revision"],
+            created_at="2026-08-29T19:01:00Z",
+            supersedes_event_id=current["event_id"], authority=AUTHORITY,
+        )
+        stale["projection_events"].append(event)
+        stale["projection_revision"] += 1
+        stale["disposition"] = stale_disposition
+        with self.assertRaisesRegex(
+            ResumeError,
+            "disposition_checkpoint_stale_reconcile_required",
+        ):
+            compact_context(
+                stale, "GEN-37", require_projection_authority=True,
+            )
+        inspected = compact_context(
+            stale, "GEN-37", require_projection_authority=False,
+        )
+        self.assertEqual(inspected["resume_authority"], "inspection_only")
+        self.assertEqual(inspected["disposition"], stale_disposition)
 
     def test_explicit_history_retains_full_verbose_evidence_contracts(self):
         strict, contracts = self.gen37_production_shaped_fixture()
@@ -4170,15 +4442,13 @@ class ProjectionTests(unittest.TestCase):
         manifest = reviewed_manifest(adapter, projection)
         snapshot = {
             "root": {"identifier": "GEN-37"},
-            "latest_checkpoint": {
-                "checkpoint_event_id": "wsc-live",
-                "worktree": {"state": "safe", "head": HEAD},
-            },
+            "latest_checkpoint": acknowledged_checkpoint("wsc-live"),
         }
         source = {"identity": "https://example.test/plan", "sha256": PLAN}
         first = reconcile_required_projection(
             adapter, snapshot, manifest, remote_head=HEAD,
             created_at="2026-08-27T18:00:00Z", authenticated_source=source,
+            checkpoint_fence=lambda: "wsc-live",
         )
         self.assertEqual(first["disposition"]["disposition"], "attach")
         self.assertTrue(first["readback_verified"])
@@ -4187,9 +4457,127 @@ class ProjectionTests(unittest.TestCase):
         second = reconcile_required_projection(
             adapter, snapshot, manifest, remote_head=HEAD,
             created_at="2026-08-27T18:01:00Z", authenticated_source=source,
+            checkpoint_fence=lambda: "wsc-live",
         )
         self.assertEqual(second["writes"], [])
         self.assertEqual(len(client.comments), 4)
+
+    def test_product_reconcile_cas_repairs_stale_checkpoint_disposition_and_replays_noop(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        projection = [
+            {"kind": "scope", "key": "root", "value": scope()},
+            {"kind": "source", "key": "root", "value": {
+                "sha256": PLAN, "identity": "https://example.test/plan",
+            }},
+            {"kind": "provenance", "key": "session-m5", "value": {
+                "agent": "codex", "machine": "M5",
+                "session_id": "session-m5",
+                "worktree": {"state": "safe", "head": HEAD},
+            }},
+        ]
+        source = {"identity": "https://example.test/plan", "sha256": PLAN}
+        old_checkpoint = "wsc_" + "e" * 32
+        new_checkpoint = "wsc_" + "3" * 32
+        reconcile_required_projection(
+            adapter,
+            {"root": {"identifier": "GEN-37"},
+             "latest_checkpoint": acknowledged_checkpoint(old_checkpoint)},
+            reviewed_manifest(adapter, projection), remote_head=HEAD,
+            created_at="2026-08-29T20:00:00Z",
+            authenticated_source=source,
+            checkpoint_fence=lambda: old_checkpoint,
+        )
+        old_disposition_event = next(
+            event for event in reversed(adapter.state().events)
+            if (event["kind"], event["key"]) == ("disposition", "root")
+        )
+        refreshed_snapshot = {
+            "root": {"identifier": "GEN-37"},
+            "latest_checkpoint": acknowledged_checkpoint(new_checkpoint),
+        }
+        comments_before = len(client.comments)
+        repaired = reconcile_required_projection(
+            adapter, refreshed_snapshot,
+            reviewed_manifest(adapter, projection), remote_head=HEAD,
+            created_at="2026-08-29T20:01:00Z",
+            authenticated_source=source,
+            checkpoint_fence=lambda: new_checkpoint,
+        )
+        self.assertEqual(len(repaired["writes"]), 1)
+        self.assertEqual(len(client.comments), comments_before + 1)
+        repaired_event = adapter.state().events[-1]
+        self.assertEqual(
+            (repaired_event["kind"], repaired_event["key"]),
+            ("disposition", "root"),
+        )
+        self.assertEqual(
+            repaired_event["supersedes_event_id"],
+            old_disposition_event["event_id"],
+        )
+        self.assertEqual(
+            repaired["disposition"]["recovered_from_checkpoint"],
+            new_checkpoint,
+        )
+        replay = reconcile_required_projection(
+            adapter, refreshed_snapshot,
+            reviewed_manifest(adapter, projection), remote_head=HEAD,
+            created_at="2026-08-29T20:02:00Z",
+            authenticated_source=source,
+            checkpoint_fence=lambda: new_checkpoint,
+        )
+        self.assertEqual(replay["writes"], [])
+        self.assertEqual(len(client.comments), comments_before + 1)
+
+    def test_product_reconcile_refuses_checkpoint_advance_before_cas_write(self):
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        projection = [
+            {"kind": "scope", "key": "root", "value": scope()},
+            {"kind": "source", "key": "root", "value": {
+                "sha256": PLAN, "identity": "https://example.test/plan",
+            }},
+            {"kind": "provenance", "key": "session-m5", "value": {
+                "agent": "codex", "machine": "M5",
+                "session_id": "session-m5",
+                "worktree": {"state": "safe", "head": HEAD},
+            }},
+        ]
+        source = {"identity": "https://example.test/plan", "sha256": PLAN}
+        old_checkpoint = "wsc_" + "e" * 32
+        new_checkpoint = "wsc_" + "3" * 32
+        newer_checkpoint = "wsc_" + "4" * 32
+        reconcile_required_projection(
+            adapter,
+            {"root": {"identifier": "GEN-37"},
+             "latest_checkpoint": acknowledged_checkpoint(old_checkpoint)},
+            reviewed_manifest(adapter, projection), remote_head=HEAD,
+            created_at="2026-08-29T20:00:00Z",
+            authenticated_source=source,
+            checkpoint_fence=lambda: old_checkpoint,
+        )
+        observations = iter((new_checkpoint, newer_checkpoint))
+        comments_before = len(client.comments)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "checkpoint_authority_changed_reload_required",
+        ):
+            reconcile_required_projection(
+                adapter,
+                {"root": {"identifier": "GEN-37"},
+                 "latest_checkpoint": acknowledged_checkpoint(new_checkpoint)},
+                reviewed_manifest(adapter, projection), remote_head=HEAD,
+                created_at="2026-08-29T20:01:00Z",
+                authenticated_source=source,
+                checkpoint_fence=lambda: next(observations),
+            )
+        self.assertEqual(len(client.comments), comments_before)
 
     def test_product_reconcile_activates_exact_reviewed_v1_then_replays_noop(self):
         client = FakeProjectionClient()
@@ -4222,10 +4610,7 @@ class ProjectionTests(unittest.TestCase):
             client.comments.append(legacy_comment(event, f"legacy-{revision}"))
         snapshot = {
             "root": {"identifier": "GEN-37"},
-            "latest_checkpoint": {
-                "checkpoint_event_id": "wsc-live",
-                "worktree": {"state": "safe", "head": HEAD},
-            },
+            "latest_checkpoint": acknowledged_checkpoint("wsc-live"),
         }
         source = {"identity": "https://example.test/plan", "sha256": PLAN}
         manifest = reviewed_manifest(adapter, projection)
@@ -4243,6 +4628,7 @@ class ProjectionTests(unittest.TestCase):
         first = reconcile_required_projection(
             adapter, snapshot, manifest, remote_head=HEAD,
             created_at="2026-08-27T18:00:00Z", authenticated_source=source,
+            checkpoint_fence=lambda: "wsc-live",
         )
         self.assertEqual(len(first["writes"]), 1)
         activation = adapter.state().events[-1]
@@ -4263,6 +4649,7 @@ class ProjectionTests(unittest.TestCase):
         replay = reconcile_required_projection(
             adapter, snapshot, replay_manifest, remote_head=HEAD,
             created_at="2026-08-27T18:01:00Z", authenticated_source=source,
+            checkpoint_fence=lambda: "wsc-live",
         )
         self.assertEqual(replay["writes"], [])
         self.assertEqual(len(client.comments), 5)

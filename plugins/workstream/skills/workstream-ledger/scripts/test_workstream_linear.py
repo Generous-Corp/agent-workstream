@@ -14,10 +14,14 @@ from workstream_linear import (
     LinearGraphQLTransport,
     LinearTransportError,
     MARKER,
+    deterministic_existing_root_child_id,
     deterministic_issue_id,
     parse_next_action,
     parse_plan_revision,
     parse_root_revision,
+)
+from workstream_linear_projection import (
+    build_projection_event, encode_projection_comment, LinearProjectionAdapter,
 )
 
 
@@ -70,6 +74,69 @@ class UUIDv4ValidatingFakeClient(FakeClient):
             ):
                 raise LinearTransportError("id must be a UUID")
         return super().execute(query, variables)
+
+
+class FakeChildAuthorization:
+    def __init__(self, failure=None):
+        self.failure = failure
+        self.event = None
+        self.reserve_calls = 0
+        self.assert_calls = 0
+
+    def reserve_child_extension(self, **values):
+        self.reserve_calls += 1
+        if self.failure:
+            raise self.failure
+        if values.get("require_existing") and self.event is None:
+            raise LinearTransportError(
+                "child_extension_preexisting_child_without_authorization"
+            )
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project",
+            "root_issue_id": "409c1423-f949-4655-9f5f-d3213d7b434f",
+        }
+        static_value = {
+            "root_issue_id": route["root_issue_id"],
+            "route": route,
+            "source": values["source"],
+            "plan_revision": values["source"]["sha256"],
+            "reviewed_candidate_key": values["reviewed_candidate_key"],
+            "child_issue_id": values["child_issue_id"],
+            "initial_state": "planned_pending_projection",
+        }
+        if self.event is None:
+            value = {
+                **static_value,
+                "expected_material_revision": values["expected_material_revision"],
+                "expected_projection_revision": values["expected_projection_revision"],
+            }
+            self.event = build_projection_event(
+                workstream_id="GEN-37", kind="child_extension_authorization",
+                key=values["child_issue_id"], value=value,
+                plan_revision=values["source"]["sha256"],
+                expected_revision=values["expected_projection_revision"],
+                created_at="1970-01-01T00:00:00Z", authority=route,
+            )
+            disposition = "created"
+        else:
+            if {
+                key: self.event["value"].get(key) for key in static_value
+            } != static_value:
+                raise LinearTransportError("authorization mismatch")
+            disposition = "existing"
+        return {
+            "event": self.event, "remote_id": "comment-a", "revision": 8,
+            "disposition": disposition,
+        }
+
+    def assert_child_extension_authorized(self, event):
+        self.assert_calls += 1
+        if self.failure:
+            raise self.failure
+        if event != self.event:
+            raise LinearTransportError("authorization mismatch")
+        return {"event": event, "remote_id": "comment-a", "revision": 8}
 
 
 class LinearTransportTests(unittest.TestCase):
@@ -138,6 +205,45 @@ class LinearTransportTests(unittest.TestCase):
     def routed_transport(self, fake):
         return LinearGraphQLTransport(
             fake, team_id="team", workspace_id="workspace", project_id="project"
+        )
+
+    def legacy_extension_plan(self):
+        plan = self.plan()
+        plan["source"] = {
+            "identity": "plan:legacy", "sha256": "sha-demo", "bytes": 10,
+        }
+        return plan
+
+    def legacy_root(self):
+        return {
+            "id": "409c1423-f949-4655-9f5f-d3213d7b434f",
+            "identifier": "GEN-37",
+            "title": "Legacy root",
+            "description": "Plan revision: sha-demo\nLedger revision: 3",
+            "url": "https://linear.test/37",
+            "updatedAt": "now",
+            "state": {"name": "In Progress", "type": "started"},
+            "parent": None,
+            "project": {"id": "project"},
+            "team": {
+                "id": "team", "organization": {"id": "workspace"},
+            },
+        }
+
+    def extend_legacy(
+        self, transport, *, authorization_adapter=None, expected_frontier=None,
+    ):
+        frontier = expected_frontier or {
+            "material_revision": 3, "projection_revision": 7,
+        }
+        return transport.extend_existing_root_reviewed_child(
+            self.legacy_extension_plan(),
+            root_issue_id="409c1423-f949-4655-9f5f-d3213d7b434f",
+            reviewed_candidate_key="a",
+            source_revision="sha-demo",
+            plan_revision="sha-demo",
+            expected_frontier=frontier,
+            authorization_adapter=authorization_adapter or FakeChildAuthorization(),
         )
 
     def test_reviewed_plan_creates_one_root_and_child(self):
@@ -214,6 +320,308 @@ class LinearTransportTests(unittest.TestCase):
         self.assertEqual(len(fake.issues), 2)
         self.assertTrue(all(uuid.UUID(issue["id"]).version == 4 for issue in fake.issues))
         self.assertEqual(result["receipts"]["root"]["id"], fake.issues[0]["id"])
+
+    def test_existing_legacy_root_extension_creates_only_scoped_child(self):
+        fake = UUIDv4ValidatingFakeClient()
+        fake.issues.append(self.legacy_root())
+
+        result = self.extend_legacy(self.routed_transport(fake))
+
+        child_id = deterministic_existing_root_child_id(
+            workspace_id="workspace", team_id="team", project_id="project",
+            root_issue_id="409c1423-f949-4655-9f5f-d3213d7b434f",
+            child_stable_key="a",
+        )
+        self.assertEqual(len(fake.issues), 2)
+        self.assertEqual(result["root"]["identifier"], "GEN-37")
+        self.assertEqual(result["receipt"]["id"], child_id)
+        self.assertEqual(result["receipt"]["parent_id"], self.legacy_root()["id"])
+        self.assertEqual(result["receipt"]["disposition"], "created")
+        self.assertEqual(result["initial_state"], "planned_pending_projection")
+        self.assertEqual(sum("issueCreate" in query for query, _ in fake.calls), 1)
+        create_input = next(
+            variables["input"] for query, variables in fake.calls
+            if "issueCreate" in query
+        )
+        self.assertNotIn("stateId", create_input)
+        self.assertNotIn("assigneeId", create_input)
+
+    def test_existing_root_extension_replay_is_a_zero_write_no_op(self):
+        fake = FakeClient()
+        fake.issues.append(self.legacy_root())
+        transport = self.routed_transport(fake)
+        authorization = FakeChildAuthorization()
+        first = self.extend_legacy(
+            transport, authorization_adapter=authorization,
+        )
+        fake.calls.clear()
+
+        second = self.extend_legacy(
+            transport, authorization_adapter=authorization,
+            expected_frontier={
+                "material_revision": 3, "projection_revision": 8,
+            },
+        )
+
+        self.assertEqual(first["receipt"]["id"], second["receipt"]["id"])
+        self.assertEqual(second["receipt"]["disposition"], "existing")
+        self.assertEqual(second["issues"], [])
+        self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
+
+    def test_preexisting_exact_child_without_prior_grant_refuses(self):
+        fake = FakeClient()
+        fake.issues.append(self.legacy_root())
+        transport = self.routed_transport(fake)
+        self.extend_legacy(
+            transport, authorization_adapter=FakeChildAuthorization(),
+        )
+        fake.calls.clear()
+
+        with self.assertRaisesRegex(
+            LinearTransportError,
+            "child_extension_preexisting_child_without_authorization",
+        ):
+            self.extend_legacy(
+                transport, authorization_adapter=FakeChildAuthorization(),
+            )
+
+        self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
+
+    def test_existing_root_extension_lost_response_converges(self):
+        class LostResponseFake(FakeClient):
+            def execute(self, query, variables):
+                result = super().execute(query, variables)
+                if "issueCreate" in query:
+                    raise TimeoutError("response lost after commit")
+                return result
+
+        fake = LostResponseFake()
+        fake.issues.append(self.legacy_root())
+
+        result = self.extend_legacy(self.routed_transport(fake))
+
+        self.assertEqual(len(fake.issues), 2)
+        self.assertEqual(result["receipt"]["disposition"], "converged")
+
+    def test_existing_root_extension_recovers_crash_after_authorization(self):
+        class CrashBeforeCreateFake(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.crash = True
+
+            def execute(self, query, variables):
+                if "issueCreate" in query and self.crash:
+                    self.crash = False
+                    raise OSError("crash after authorization before create")
+                return super().execute(query, variables)
+
+        fake = CrashBeforeCreateFake()
+        fake.issues.append(self.legacy_root())
+        authorization = FakeChildAuthorization()
+        with self.assertRaisesRegex(
+            LinearTransportError, "intake_create_unconfirmed",
+        ):
+            self.extend_legacy(
+                self.routed_transport(fake), authorization_adapter=authorization,
+            )
+
+        result = self.extend_legacy(
+            self.routed_transport(fake), authorization_adapter=authorization,
+            expected_frontier={
+                "material_revision": 3, "projection_revision": 8,
+            },
+        )
+        self.assertEqual(result["receipt"]["disposition"], "created")
+        self.assertEqual(authorization.reserve_calls, 2)
+
+    def test_existing_root_extension_collision_fails_closed(self):
+        fake = FakeClient()
+        fake.issues.append(self.legacy_root())
+        child_id = deterministic_existing_root_child_id(
+            workspace_id="workspace", team_id="team", project_id="project",
+            root_issue_id=self.legacy_root()["id"], child_stable_key="a",
+        )
+        fake.issues.append({
+            **self.legacy_root(),
+            "id": child_id,
+            "identifier": "GEN-99",
+            "title": "Collision",
+            "description": "<!-- workstream-key:other -->\nPlan revision: sha-demo",
+        })
+
+        with self.assertRaisesRegex(LinearTransportError, "intake_identity_collision"):
+            self.extend_legacy(self.routed_transport(fake))
+        self.assertEqual(len(fake.issues), 2)
+
+    def test_existing_root_extension_stale_frontier_is_zero_write(self):
+        fake = FakeClient()
+        fake.issues.append(self.legacy_root())
+
+        with self.assertRaisesRegex(
+            LinearTransportError, "existing_root_frontier_changed_reload_required",
+        ):
+            self.extend_legacy(
+                self.routed_transport(fake),
+                authorization_adapter=FakeChildAuthorization(
+                    LinearTransportError(
+                        "existing_root_frontier_changed_reload_required"
+                    )
+                ),
+            )
+
+        self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
+
+    def test_existing_root_extension_mismatched_authorization_is_zero_write(self):
+        class WrongRouteAuthorization(FakeChildAuthorization):
+            def reserve_child_extension(self, **values):
+                receipt = super().reserve_child_extension(**values)
+                receipt["event"] = {
+                    **receipt["event"],
+                    "authority": {
+                        **receipt["event"]["authority"],
+                        "root_issue_id": "wrong-root",
+                    },
+                }
+                return receipt
+
+        fake = FakeClient()
+        fake.issues.append(self.legacy_root())
+        with self.assertRaisesRegex(
+            LinearTransportError, "child_extension_authorization_receipt_mismatch",
+        ):
+            self.extend_legacy(
+                self.routed_transport(fake),
+                authorization_adapter=WrongRouteAuthorization(),
+            )
+
+        self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
+
+    def test_existing_root_extension_concurrent_advance_before_create_is_zero_write(self):
+        fake = FakeClient()
+        fake.issues.append(self.legacy_root())
+        authorization = FakeChildAuthorization()
+
+        def superseded(_event):
+            raise LinearTransportError(
+                "child_extension_authorization_superseded_or_conflicting"
+            )
+
+        authorization.assert_child_extension_authorized = superseded
+
+        with self.assertRaisesRegex(
+            LinearTransportError,
+            "child_extension_authorization_superseded_or_conflicting",
+        ):
+            self.extend_legacy(
+                self.routed_transport(fake), authorization_adapter=authorization,
+            )
+
+        self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
+
+    def test_existing_root_extension_planted_projection_race_never_creates_child(self):
+        class CombinedRaceClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.comments = []
+                self.injected = False
+
+            def execute(self, query, variables):
+                if "WorkstreamProjectionCommentCreateCapability" in query:
+                    return {"__type": {"inputFields": [{"name": "id"}]}}
+                if "query WorkstreamDeltaComments" in query:
+                    return {"issue": {
+                        "id": self.issues[0]["id"], "identifier": "GEN-37",
+                        "team": self.issues[0]["team"],
+                        "project": self.issues[0]["project"],
+                        "comments": {
+                            "nodes": list(self.comments),
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        },
+                    }}
+                if "commentCreate" in query:
+                    if not self.injected:
+                        self.injected = True
+                        winner = build_projection_event(
+                            workstream_id="GEN-37",
+                            kind="child_extension_authorization",
+                            key="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                            value={
+                                "root_issue_id": self.issues[0]["id"],
+                                "route": {
+                                    "workspace_id": "workspace", "team_id": "team",
+                                    "project_id": "project",
+                                    "root_issue_id": self.issues[0]["id"],
+                                },
+                                "source": {
+                                    "identity": "plan:legacy", "sha256": "sha-demo",
+                                },
+                                "plan_revision": "sha-demo",
+                                "reviewed_candidate_key": "candidate-b",
+                                "child_issue_id": (
+                                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                                ),
+                                "expected_material_revision": 0,
+                                "expected_projection_revision": 0,
+                                "initial_state": "planned_pending_projection",
+                            },
+                            plan_revision="sha-demo", expected_revision=0,
+                            created_at="2026-08-20T00:00:00Z",
+                            authority={
+                                "workspace_id": "workspace", "team_id": "team",
+                                "project_id": "project",
+                                "root_issue_id": self.issues[0]["id"],
+                            },
+                        )
+                        self.comments.append({
+                            "id": variables["input"]["id"],
+                            "body": encode_projection_comment(winner),
+                            "createdAt": "2026-08-20T00:00:00Z",
+                            "updatedAt": "2026-08-20T00:00:00Z",
+                        })
+                        raise LinearTransportError("duplicate comment id")
+                return super().execute(query, variables)
+
+        client = CombinedRaceClient()
+        client.issues.append(self.legacy_root())
+        authorization = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision="sha-demo", workspace_id="workspace", team_id="team",
+            project_id="project", root_issue_id=self.legacy_root()["id"],
+        )
+
+        with self.assertRaisesRegex(
+            LinearTransportError, "projection_slot_lost_reload_required",
+        ):
+            self.extend_legacy(
+                self.routed_transport(client),
+                authorization_adapter=authorization,
+                expected_frontier={
+                    "material_revision": 0, "projection_revision": 0,
+                },
+            )
+
+        self.assertEqual(len(client.issues), 1)
+        self.assertFalse(any("issueCreate" in query for query, _ in client.calls))
+
+    def test_existing_root_extension_requires_exact_reviewed_source_before_network(self):
+        fake = FakeClient()
+        fake.issues.append(self.legacy_root())
+        transport = self.routed_transport(fake)
+
+        with self.assertRaisesRegex(GraphReviewRequired, "source revision"):
+            transport.extend_existing_root_reviewed_child(
+                self.legacy_extension_plan(),
+                root_issue_id=self.legacy_root()["id"],
+                reviewed_candidate_key="a",
+                source_revision="sha-other",
+                plan_revision="sha-demo",
+                expected_frontier={
+                    "material_revision": 3, "projection_revision": 7,
+                },
+                authorization_adapter=FakeChildAuthorization(),
+            )
+
+        self.assertEqual(fake.calls, [])
 
     def test_live_uuid_contract_fake_rejects_legacy_uuid_v5(self):
         fake = UUIDv4ValidatingFakeClient()

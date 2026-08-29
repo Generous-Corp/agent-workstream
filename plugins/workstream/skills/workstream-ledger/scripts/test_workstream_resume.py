@@ -820,6 +820,33 @@ class ResumeTests(unittest.TestCase):
             "payload": {"requirement": "must preserve offline recovery"},
         }])
 
+    def test_default_budget_accepts_bounded_actionable_resume_over_16k(self):
+        snapshot = self.snapshot()
+        requirement = "preserve exact recovery context " + ("x" * 18000)
+        snapshot["root"]["revision"] = 1
+        snapshot["material_events"] = [{
+            "event_id": "requirement-large", "workstream_id": "GEN-37",
+            "kind": "requirement", "source": "user_turn",
+            "payload": {"requirement": requirement},
+            "expected_revision": 0, "created_at": "2026-08-21T00:00:00Z",
+        }]
+        snapshot["material_event_revision"] = 1
+
+        with self.assertRaisesRegex(MODULE.ResumeError, "over_budget"):
+            MODULE.compact_context(snapshot, "GEN-37", max_bytes=16 * 1024)
+        context = MODULE.compact_context(snapshot, "GEN-37")
+        self.assertEqual(
+            context["uncheckpointed_material_obligations"][0]["payload"]
+            ["requirement"],
+            requirement,
+        )
+        self.assertLess(
+            len(MODULE.json.dumps(
+                context, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode()),
+            MODULE.DEFAULT_RESUME_MAX_BYTES,
+        )
+
     def test_checkpoint_fence_uses_ordered_position_not_stale_writer_revision(self):
         prefix = {
             "event_id": "progress-1", "workstream_id": "GEN-37", "kind": "progress",

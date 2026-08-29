@@ -20,6 +20,7 @@ import os
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from workstream_linear import (
@@ -42,6 +43,7 @@ KINDS = {
     "scope", "relation", "choice", "evidence_contract", "source",
     "provenance", "disposition", "closure_review", "lifecycle", "cas_activation",
     "quarantine_disposition", "child_closure",
+    "child_extension_authorization", "child_dependency_authorization",
 }
 SINGLETON_KINDS = {
     "scope", "source", "disposition", "lifecycle", "cas_activation",
@@ -65,7 +67,7 @@ def projection_slot_id(
         raise LinearProjectionError("invalid_projection_workstream")
     if not isinstance(plan_revision, str) or not plan_revision:
         raise LinearProjectionError("projection_missing:plan_revision")
-    if not isinstance(revision, int) or revision < 0:
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
         raise LinearProjectionError("invalid_projection_revision")
     validate_projection_authority(authority)
     material = _canonical([
@@ -214,6 +216,80 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             )
         ):
             raise LinearProjectionError("invalid_projection_quarantine_disposition")
+    if event["kind"] == "child_extension_authorization":
+        required_authorization = {
+            "root_issue_id", "route", "source", "plan_revision",
+            "reviewed_candidate_key", "child_issue_id",
+            "expected_material_revision", "expected_projection_revision",
+            "initial_state",
+        }
+        route = value.get("route") if isinstance(value, dict) else None
+        source = value.get("source") if isinstance(value, dict) else None
+        if (
+            schema_version != 2
+            or tombstone
+            or set(value) != required_authorization
+            or event["key"] != value.get("child_issue_id")
+            or value.get("root_issue_id") != event["authority"]["root_issue_id"]
+            or route != event["authority"]
+            or not isinstance(source, dict)
+            or set(source) != {"identity", "sha256"}
+            or not all(isinstance(source.get(field), str) and source[field]
+                       for field in ("identity", "sha256"))
+            or source.get("sha256") != event["plan_revision"]
+            or value.get("plan_revision") != event["plan_revision"]
+            or not isinstance(value.get("reviewed_candidate_key"), str)
+            or not value["reviewed_candidate_key"]
+            or not isinstance(value.get("child_issue_id"), str)
+            or not value["child_issue_id"]
+            or value.get("expected_projection_revision")
+            != event["expected_revision"]
+            or not isinstance(value.get("expected_material_revision"), int)
+            or isinstance(value.get("expected_material_revision"), bool)
+            or value["expected_material_revision"] < 0
+            or value.get("initial_state") != "planned_pending_projection"
+        ):
+            raise LinearProjectionError("invalid_child_extension_authorization")
+    if event["kind"] == "child_dependency_authorization":
+        required_authorization = {
+            "root_issue_id", "route", "plan_revision", "batch_id",
+            "relation_ids", "relations_sha256", "expected_material_revision",
+            "expected_projection_revision", "expected_graph_revision",
+            "expected_graph_sha256",
+            "initial_state",
+        }
+        route = value.get("route") if isinstance(value, dict) else None
+        relation_ids = value.get("relation_ids") if isinstance(value, dict) else None
+        if (
+            schema_version != 2
+            or tombstone
+            or set(value) != required_authorization
+            or event["key"] != value.get("batch_id")
+            or not re.fullmatch(r"wsdb_[0-9a-f]{32}", str(value.get("batch_id", "")))
+            or value.get("root_issue_id") != event["authority"]["root_issue_id"]
+            or route != event["authority"]
+            or value.get("plan_revision") != event["plan_revision"]
+            or value.get("expected_projection_revision") != event["expected_revision"]
+            or not isinstance(relation_ids, list)
+            or not relation_ids
+            or relation_ids != sorted(set(relation_ids))
+            or not all(re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+                r"[89ab][0-9a-f]{3}-[0-9a-f]{12}", str(item), re.IGNORECASE,
+            ) for item in relation_ids)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("relations_sha256", "")))
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(value.get("expected_graph_sha256", "")),
+            )
+            or any(
+                not isinstance(value.get(field), int)
+                or isinstance(value.get(field), bool)
+                or value[field] < 0
+                for field in ("expected_material_revision", "expected_graph_revision")
+            )
+            or value.get("initial_state") != "owned_children_validated"
+        ):
+            raise LinearProjectionError("invalid_child_dependency_authorization")
     if event["kind"] == "source" and not tombstone:
         if not re.fullmatch(r"[0-9a-f]{64}", str(value.get("sha256", ""))):
             raise LinearProjectionError("invalid_projection_source_digest")
@@ -504,7 +580,7 @@ def validate_projection_event(event: dict[str, Any]) -> None:
         ):
             raise LinearProjectionError("invalid_projection_child_closure")
     revision = event.get("expected_revision")
-    if not isinstance(revision, int) or revision < 0:
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
         raise LinearProjectionError("invalid_projection_revision")
     supersedes = event.get("supersedes_event_id")
     if supersedes is not None and (not isinstance(supersedes, str) or not supersedes):
@@ -970,7 +1046,7 @@ class LinearProjectionAdapter:
                     "body": encode_projection_comment(event),
                 }},
             )
-        except LinearTransportError:
+        except (LinearTransportError, OSError, TimeoutError):
             # A deterministic create-ID collision is the remote CAS loser path.
             # Reload before deciding whether this is identical replay or a
             # conflicting winner; an unavailable reload preserves the original
@@ -1008,3 +1084,283 @@ class LinearProjectionAdapter:
         if after.remote_ids.get(event["event_id"]) != comment["id"]:
             raise LinearProjectionError("projection_append_not_observed")
         return {"event_id": event["event_id"], "remote_id": comment["id"], "revision": after.revision}
+
+    @staticmethod
+    def _remote_time(comment: dict[str, Any]) -> datetime:
+        value = comment.get("createdAt")
+        if not isinstance(value, str) or not value:
+            raise LinearProjectionError("child_extension_remote_order_missing")
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise LinearProjectionError("child_extension_remote_order_invalid") from error
+        if parsed.tzinfo is None:
+            raise LinearProjectionError("child_extension_remote_order_invalid")
+        return parsed.astimezone(timezone.utc)
+
+    def _assert_child_extension_authorization(
+        self, event: dict[str, Any], comments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        state = reduce_projection_comments(
+            comments, workstream_id=self.workstream_id,
+            expected_plan_revision=self.plan_revision,
+            authenticated_route=self.authority,
+        )
+        matching = [
+            item for item in state.events
+            if item["kind"] == "child_extension_authorization"
+            and item["key"] == event["key"]
+        ]
+        if not matching or matching[-1] != event:
+            raise LinearProjectionError(
+                "child_extension_authorization_superseded_or_conflicting"
+            )
+        remote_id = state.remote_ids.get(event["event_id"])
+        comment = next(
+            (item for item in comments if item.get("id") == remote_id), None
+        )
+        if not isinstance(comment, dict):
+            raise LinearProjectionError("child_extension_authorization_readback_missing")
+        return {"event": event, "remote_id": remote_id, "revision": state.revision}
+
+    def reserve_child_extension(
+        self, *, source: dict[str, str], reviewed_candidate_key: str,
+        child_issue_id: str, expected_material_revision: int,
+        expected_projection_revision: int, require_existing: bool = False,
+    ) -> dict[str, Any]:
+        """Win one durable projection-CAS authorization before child creation."""
+        if (
+            not isinstance(expected_material_revision, int)
+            or isinstance(expected_material_revision, bool)
+            or expected_material_revision < 0
+        ):
+            raise LinearProjectionError("invalid_child_extension_material_frontier")
+        if (
+            not isinstance(expected_projection_revision, int)
+            or isinstance(expected_projection_revision, bool)
+            or expected_projection_revision < 0
+        ):
+            raise LinearProjectionError("invalid_child_extension_projection_frontier")
+        before_comments = self._comments()
+        from workstream_linear_events import reduce_event_comments
+
+        material_before = reduce_event_comments(
+            before_comments, workstream_id=self.workstream_id
+        )
+        before = reduce_projection_comments(
+            before_comments, workstream_id=self.workstream_id,
+            expected_plan_revision=self.plan_revision,
+            authenticated_route=self.authority,
+        )
+        static_value = {
+            "root_issue_id": self.root_issue_id,
+            "route": self.authority,
+            "source": deepcopy(source),
+            "plan_revision": self.plan_revision,
+            "reviewed_candidate_key": reviewed_candidate_key,
+            "child_issue_id": child_issue_id,
+            "initial_state": "planned_pending_projection",
+        }
+        matching = [
+            item for item in before.events
+            if item["kind"] == "child_extension_authorization"
+            and item["key"] == child_issue_id
+        ]
+        if len(matching) > 1:
+            raise LinearProjectionError(
+                "child_extension_authorization_ambiguous"
+            )
+        if matching:
+            event = matching[0]
+            value = event.get("value")
+            if (
+                not isinstance(value, dict)
+                or {
+                    key: value.get(key) for key in static_value
+                } != static_value
+                or not isinstance(value.get("expected_material_revision"), int)
+                or isinstance(value.get("expected_material_revision"), bool)
+                or not isinstance(value.get("expected_projection_revision"), int)
+                or isinstance(value.get("expected_projection_revision"), bool)
+                or event.get("expected_revision")
+                != value["expected_projection_revision"]
+            ):
+                raise LinearProjectionError(
+                    "child_extension_authorization_superseded_or_conflicting"
+                )
+            if material_before.revision != expected_material_revision:
+                raise LinearProjectionError(
+                    "child_extension_material_frontier_stale_reload_required"
+                )
+            if before.revision != expected_projection_revision:
+                raise LinearProjectionError(
+                    "child_extension_projection_frontier_stale_reload_required"
+                )
+            after_comments = before_comments
+            disposition = "existing"
+        else:
+            if require_existing:
+                raise LinearProjectionError(
+                    "child_extension_preexisting_child_without_authorization"
+                )
+            if material_before.revision != expected_material_revision:
+                raise LinearProjectionError(
+                    "child_extension_material_frontier_stale_reload_required"
+                )
+            if before.revision != expected_projection_revision:
+                raise LinearProjectionError(
+                    "child_extension_projection_frontier_stale_reload_required"
+                )
+            value = {
+                **static_value,
+                "expected_material_revision": expected_material_revision,
+                "expected_projection_revision": expected_projection_revision,
+            }
+            event = build_projection_event(
+                workstream_id=self.workstream_id,
+                kind="child_extension_authorization", key=child_issue_id,
+                value=value, plan_revision=self.plan_revision,
+                expected_revision=expected_projection_revision,
+                created_at="1970-01-01T00:00:00Z", authority=self.authority,
+            )
+            self.append(event)
+            after_comments = self._comments()
+            disposition = "created"
+        receipt = self._assert_child_extension_authorization(event, after_comments)
+
+        authorization_comment = next(
+            item for item in after_comments
+            if item.get("id") == receipt["remote_id"]
+        )
+        authorization_time = self._remote_time(authorization_comment)
+        material_after = reduce_event_comments(
+            after_comments, workstream_id=self.workstream_id
+        )
+        grant_material_revision = event["value"]["expected_material_revision"]
+        for delta in material_after.events[grant_material_revision:]:
+            remote_id = material_after.remote_ids.get(delta.event_id)
+            comment = next(
+                (item for item in after_comments if item.get("id") == remote_id), None
+            )
+            if not isinstance(comment, dict) or self._remote_time(comment) <= authorization_time:
+                raise LinearProjectionError(
+                    "child_extension_material_preceded_authorization_reload_required"
+                )
+        return {**receipt, "disposition": disposition}
+
+    def assert_child_extension_authorized(
+        self, event: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Re-read the exact durable grant; later unrelated events stay valid."""
+        return self._assert_child_extension_authorization(event, self._comments())
+
+    def _assert_child_dependency_authorization(
+        self, event: dict[str, Any], comments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        state = reduce_projection_comments(
+            comments, workstream_id=self.workstream_id,
+            expected_plan_revision=self.plan_revision,
+            authenticated_route=self.authority,
+        )
+        matching = [
+            item for item in state.events
+            if item["kind"] == "child_dependency_authorization"
+            and item["key"] == event["key"]
+        ]
+        if not matching or matching[-1] != event:
+            raise LinearProjectionError(
+                "child_dependency_authorization_superseded_or_conflicting"
+            )
+        remote_id = state.remote_ids.get(event["event_id"])
+        if not any(item.get("id") == remote_id for item in comments):
+            raise LinearProjectionError(
+                "child_dependency_authorization_readback_missing"
+            )
+        return {"event": event, "remote_id": remote_id, "revision": state.revision}
+
+    def reserve_child_dependencies(
+        self, *, batch_id: str, relation_ids: list[str], relations_sha256: str,
+        expected_material_revision: int, expected_projection_revision: int,
+        expected_graph_revision: int, expected_graph_sha256: str,
+    ) -> dict[str, Any]:
+        """Win a durable projection-CAS grant before native relation creation."""
+        before_comments = self._comments()
+        from workstream_linear_events import reduce_event_comments
+
+        material = reduce_event_comments(
+            before_comments, workstream_id=self.workstream_id,
+        )
+        before = reduce_projection_comments(
+            before_comments, workstream_id=self.workstream_id,
+            expected_plan_revision=self.plan_revision,
+            authenticated_route=self.authority,
+        )
+        value = {
+            "root_issue_id": self.root_issue_id,
+            "route": self.authority,
+            "plan_revision": self.plan_revision,
+            "batch_id": batch_id,
+            "relation_ids": sorted(relation_ids),
+            "relations_sha256": relations_sha256,
+            "expected_material_revision": expected_material_revision,
+            "expected_projection_revision": expected_projection_revision,
+            "expected_graph_revision": expected_graph_revision,
+            "expected_graph_sha256": expected_graph_sha256,
+            "initial_state": "owned_children_validated",
+        }
+        event = build_projection_event(
+            workstream_id=self.workstream_id,
+            kind="child_dependency_authorization", key=batch_id,
+            value=value, plan_revision=self.plan_revision,
+            expected_revision=expected_projection_revision,
+            created_at="1970-01-01T00:00:00Z", authority=self.authority,
+        )
+        existing = next(
+            (item for item in before.events if item["event_id"] == event["event_id"]),
+            None,
+        )
+        if existing is None:
+            if material.revision != expected_material_revision:
+                raise LinearProjectionError(
+                    "child_dependency_material_frontier_stale_reload_required"
+                )
+            if before.revision != expected_projection_revision:
+                raise LinearProjectionError(
+                    "child_dependency_projection_frontier_stale_reload_required"
+                )
+            self.append(event)
+            after_comments = self._comments()
+        else:
+            if existing != event:
+                raise LinearProjectionError(
+                    "child_dependency_authorization_superseded_or_conflicting"
+                )
+            after_comments = before_comments
+        receipt = self._assert_child_dependency_authorization(event, after_comments)
+        authorization_comment = next(
+            item for item in after_comments
+            if item.get("id") == receipt["remote_id"]
+        )
+        authorization_time = self._remote_time(authorization_comment)
+        material_after = reduce_event_comments(
+            after_comments, workstream_id=self.workstream_id,
+        )
+        for delta in material_after.events[expected_material_revision:]:
+            remote_id = material_after.remote_ids.get(delta.event_id)
+            comment = next(
+                (item for item in after_comments if item.get("id") == remote_id), None
+            )
+            if (
+                not isinstance(comment, dict)
+                or self._remote_time(comment) <= authorization_time
+            ):
+                raise LinearProjectionError(
+                    "child_dependency_material_preceded_authorization_reload_required"
+                )
+        return receipt
+
+    def assert_child_dependencies_authorized(
+        self, event: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Re-read the exact durable native-dependency grant."""
+        return self._assert_child_dependency_authorization(event, self._comments())
