@@ -36,7 +36,9 @@ from workstream_projection import (
     stable_live_readback,
 )
 from workstream_successor import choose_disposition
-from workstream_child_closure import canonical_digest, terminal_child_readback
+from workstream_child_closure import (
+    canonical_digest, ChildClosureError, terminal_child_readback,
+)
 
 
 PLAN = "f38baae4441485b14e5b16ea0255e3a07e42aa94a4fb0e6e04e7aa513693719d"
@@ -445,7 +447,9 @@ class ProjectionTests(unittest.TestCase):
         }
         return client, adapter, source, graph, child, manifest
 
-    def multi_terminal_repair_fixture(self, *, evidence_active=True):
+    def multi_terminal_repair_fixture(
+        self, *, evidence_active=True, unassigned_child=None,
+    ):
         client = FakeProjectionClient()
         adapter = LinearProjectionAdapter(
             client, issue_id="GEN-37", workstream_id="GEN-37",
@@ -476,6 +480,11 @@ class ProjectionTests(unittest.TestCase):
                 "state_id": state_id,
                 "status": "Done", "status_type": "completed",
             })
+        if unassigned_child is not None:
+            next(
+                child for child in children
+                if child["identifier"] == unassigned_child
+            )["assignee"] = None
         owned_scope = scope()
         for child in children:
             owned_scope["child_ownership"][child["identifier"]] = (
@@ -516,7 +525,9 @@ class ProjectionTests(unittest.TestCase):
                     "expected_child_readback_sha256": canonical_digest(
                         terminal_child_readback(child)
                     ),
-                    "expected_assignee_id": child["assignee"]["id"],
+                    "expected_assignee_id": (
+                        child.get("assignee") or {}
+                    ).get("id"),
                     "evidence_keys": [
                         contract["slice_id"] for contract in contracts
                         if contract["owning_child"] == child["identifier"]
@@ -542,7 +553,9 @@ class ProjectionTests(unittest.TestCase):
                 "expected_child_readback_sha256": canonical_digest(
                     terminal_child_readback(child)
                 ),
-                "expected_assignee_id": child["assignee"]["id"],
+                "expected_assignee_id": (
+                    child.get("assignee") or {}
+                ).get("id"),
                 "approved_evidence_heads": [{
                     "key": event["key"], "event_id": event["event_id"],
                     "value_sha256": canonical_digest(event["value"]),
@@ -631,6 +644,78 @@ class ProjectionTests(unittest.TestCase):
             "issueCreate" in query or "issueUpdate" in query
             for query, _variables in client.calls
         ))
+
+    def test_terminal_repair_preserves_explicitly_unassigned_child(self):
+        client, adapter, source, graph, _children, manifest = (
+            self.multi_terminal_repair_fixture(unassigned_child="GEN-70")
+        )
+        prepared = prepare_terminal_child_repairs(
+            manifest, graph, adapter.state(),
+        )
+        unassigned_closure = deepcopy(next(
+            item["value"] for item in prepared["projection"]
+            if (item["kind"], item["key"])
+            == ("child_closure", "GEN-70")
+        ))
+        self.assertEqual(unassigned_closure["schema_version"], 2)
+        unassigned_closure["schema_version"] = 1
+        with self.assertRaisesRegex(
+            LinearProjectionError, "invalid_projection_child_closure",
+        ):
+            build_projection_event(
+                workstream_id="GEN-37", kind="child_closure", key="GEN-70",
+                value=unassigned_closure, plan_revision=PLAN,
+                expected_revision=adapter.state().revision,
+                created_at="2026-08-27T18:30:00Z", authority=AUTHORITY,
+            )
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", prepared, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        expected = {
+            repair["child_identifier"]:
+            repair["expected_child_readback_sha256"]
+            for repair in manifest["terminal_child_repairs"]
+        }
+        reconcile_required_projection(
+            adapter, preview, prepared, remote_head=HEAD,
+            created_at="2026-08-27T19:00:00Z",
+            authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda child_ids: {
+                child_id: expected[child_id] for child_id in child_ids
+            },
+            legacy_unresolved_relation_heads=unresolved,
+        )
+        context = compact_context(
+            add_material_history(
+                graph, client.comments, "GEN-37",
+                authenticated_route=AUTHORITY, authenticated_source=source,
+            ),
+            "GEN-37", require_projection_authority=True,
+        )
+        gen70 = next(
+            closure for closure in context["child_closures"]
+            if closure["child_identifier"] == "GEN-70"
+        )
+        self.assertIsNone(gen70["assignee_id"])
+        self.assertEqual(context["resume_authority"], "full")
+
+    def test_terminal_readback_distinguishes_unassigned_from_missing_field(self):
+        _client, _adapter, _source, _graph, children, _manifest = (
+            self.multi_terminal_repair_fixture(unassigned_child="GEN-70")
+        )
+        child = next(
+            item for item in children if item["identifier"] == "GEN-70"
+        )
+        self.assertIsNone(terminal_child_readback(child)["assignee_id"])
+        child.pop("assignee")
+        with self.assertRaisesRegex(
+            ChildClosureError, "terminal_child_readback_missing:assignee",
+        ):
+            terminal_child_readback(child)
 
     def test_terminal_evidence_seed_is_add_only_partial_and_idempotent(self):
         client, adapter, source, graph, _children, stale_manifest = (
@@ -1620,32 +1705,32 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(len(client.comments), writes_before)
 
     def test_terminal_child_repair_contradictions_refuse_without_writes(self):
-        cases = {
-            "terminal_child_readback_missing:assignee_id": lambda graph, manifest: (
+        cases = [
+            ("terminal_child_readback_changed_reload_required", lambda graph, manifest: (
                 graph["children"][1].__setitem__("assignee", None)
-            ),
-            "terminal_child_not_completed": lambda graph, manifest: (
+            )),
+            ("terminal_child_not_completed", lambda graph, manifest: (
                 graph["children"][1].__setitem__("status_type", "canceled")
-            ),
-            "terminal_child_repair_route_mismatch:project_id": lambda graph, manifest: (
+            )),
+            ("terminal_child_repair_route_mismatch:project_id", lambda graph, manifest: (
                 graph["children"][1].__setitem__("project", {"id": "other-project"}),
                 manifest["terminal_child_repairs"][0].__setitem__(
                     "expected_child_readback_sha256",
                     canonical_digest(terminal_child_readback(graph["children"][1])),
                 ),
-            ),
-            "terminal_child_readback_changed_reload_required": lambda graph, manifest: (
+            )),
+            ("terminal_child_readback_changed_reload_required", lambda graph, manifest: (
                 manifest["terminal_child_repairs"][0].__setitem__(
                     "expected_assignee_id", "other-assignee"
                 )
-            ),
-            "terminal_child_repair_evidence_set_changed_reload_required": lambda graph, manifest: (
+            )),
+            ("terminal_child_repair_evidence_set_changed_reload_required", lambda graph, manifest: (
                 manifest["terminal_child_repairs"][0]["approved_evidence_heads"][0].__setitem__(
                     "value_sha256", "0" * 64
                 )
-            ),
-        }
-        for expected, mutate in cases.items():
+            )),
+        ]
+        for expected, mutate in cases:
             with self.subTest(expected=expected):
                 client, adapter, _source, graph, _child, manifest = (
                     self.terminal_repair_fixture()

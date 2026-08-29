@@ -465,7 +465,7 @@ def validate_projection_event(event: dict[str, Any]) -> None:
         )
         if (
             set(value) != required_closure
-            or value.get("schema_version") != 1
+            or value.get("schema_version") not in {1, 2}
             or event["key"] != value.get("child_identifier")
             or value.get("plan_revision") != event["plan_revision"]
             or value.get("state_type") != "completed"
@@ -480,8 +480,25 @@ def validate_projection_event(event: dict[str, Any]) -> None:
                 isinstance(value.get(field), str) and value[field]
                 for field in (
                     "child_identifier", "child_issue_id", "parent_issue_id",
-                    "workspace_id", "team_id", "project_id", "assignee_id",
+                    "workspace_id", "team_id", "project_id",
                     "state_id", "state_name", "repository_key",
+                )
+            )
+            or (
+                value.get("schema_version") == 1
+                and not (
+                    isinstance(value.get("assignee_id"), str)
+                    and bool(value["assignee_id"])
+                )
+            )
+            or (
+                value.get("schema_version") == 2
+                and not (
+                    value.get("assignee_id") is None
+                    or (
+                        isinstance(value.get("assignee_id"), str)
+                        and bool(value["assignee_id"])
+                    )
                 )
             )
         ):

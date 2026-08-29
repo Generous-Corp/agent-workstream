@@ -352,8 +352,15 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         )
         if (
             not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", str(repair.get("child_identifier", "")))
-            or not all(isinstance(repair.get(field), str) and repair[field]
-                       for field in ("child_issue_id", "expected_assignee_id"))
+            or not isinstance(repair.get("child_issue_id"), str)
+            or not repair["child_issue_id"]
+            or not (
+                repair.get("expected_assignee_id") is None
+                or (
+                    isinstance(repair.get("expected_assignee_id"), str)
+                    and bool(repair["expected_assignee_id"])
+                )
+            )
             or not re.fullmatch(r"[0-9a-f]{64}", str(repair.get("expected_child_readback_sha256", "")))
             or not valid_heads
             or heads != sorted(heads, key=lambda item: (item.get("key", ""), item.get("event_id", "")))
@@ -396,9 +403,14 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         keys = seed.get("evidence_keys")
         if (
             not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", child_id)
-            or not all(
-                isinstance(seed.get(field), str) and seed[field]
-                for field in ("child_issue_id", "expected_assignee_id")
+            or not isinstance(seed.get("child_issue_id"), str)
+            or not seed["child_issue_id"]
+            or not (
+                seed.get("expected_assignee_id") is None
+                or (
+                    isinstance(seed.get("expected_assignee_id"), str)
+                    and bool(seed["expected_assignee_id"])
+                )
             )
             or not re.fullmatch(
                 r"[0-9a-f]{64}",
@@ -488,7 +500,7 @@ def _with_validation_only_seed_closures(
             if repository_key(item) == owner
         )
         closure = {
-            "schema_version": 1,
+            "schema_version": 2,
             **readback,
             "plan_revision": adapter.plan_revision,
             "repository_key": owner,
@@ -809,7 +821,7 @@ def prepare_terminal_child_repairs(
             )
         desired_scope["child_ownership"][child_id] = owner
         closure = {
-            "schema_version": 1,
+            "schema_version": 2,
             **readback,
             "plan_revision": scope_event["plan_revision"],
             "repository_key": owner,
