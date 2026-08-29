@@ -27,8 +27,13 @@ from workstream_linear_projection import (
 from workstream_plan import canonical_plan_url, plan_payload, same_plan_document
 from workstream_relation_readback import RelationReadbackError, read_relation_targets
 from workstream_resume import add_material_history, compact_context, extract_token, ResumeError
-from workstream_scope import ScopeError, validate_relation_graph
+from workstream_scope import repository_key, ScopeError, validate_relation_graph
 from workstream_successor import choose_disposition, SuccessorError
+from workstream_evidence import evidence_errors
+from workstream_child_closure import (
+    canonical_digest, evidence_receipts_sha256, terminal_child_readback,
+    ChildClosureError,
+)
 
 
 REQUIRED_KINDS = {"scope", "source", "provenance"}
@@ -235,7 +240,10 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         "expected_legacy_v1_events_sha256", "expected_projection_quarantine_count",
         "expected_projection_quarantine_sha256",
     }
-    if not isinstance(manifest, dict) or set(manifest) != required:
+    allowed = required | {"terminal_child_repairs"}
+    if not isinstance(manifest, dict) or frozenset(manifest) not in {
+        frozenset(required), frozenset(allowed),
+    }:
         raise LinearProjectionError("manifest_review_contract_required")
     revision = manifest["expected_projection_revision"]
     if not isinstance(revision, int) or revision < 0:
@@ -305,7 +313,190 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         if not re.fullmatch(r"[0-9a-f]{64}", str(retirement.get("expected_value_sha256", ""))):
             raise LinearProjectionError(f"invalid_manifest_retirement_digest:{index}")
         retired.add(identity)
+    repairs = manifest.get("terminal_child_repairs", [])
+    if not isinstance(repairs, list) or len(repairs) > 1:
+        raise LinearProjectionError("invalid_manifest_terminal_child_repairs")
+    for index, repair in enumerate(repairs):
+        if not isinstance(repair, dict) or set(repair) != {
+            "child_identifier", "child_issue_id", "expected_child_readback_sha256",
+            "expected_assignee_id", "approved_evidence_heads",
+        }:
+            raise LinearProjectionError(f"invalid_manifest_terminal_child_repair:{index}")
+        heads = repair.get("approved_evidence_heads")
+        if (
+            not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", str(repair.get("child_identifier", "")))
+            or not all(isinstance(repair.get(field), str) and repair[field]
+                       for field in ("child_issue_id", "expected_assignee_id"))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(repair.get("expected_child_readback_sha256", "")))
+            or not isinstance(heads, list) or not heads
+            or heads != sorted(heads, key=lambda item: (item.get("key", ""), item.get("event_id", "")))
+            or not all(
+                isinstance(head, dict)
+                and set(head) == {"key", "event_id", "value_sha256"}
+                and all(isinstance(head.get(field), str) and head[field]
+                        for field in ("key", "event_id"))
+                and re.fullmatch(r"[0-9a-f]{64}", str(head.get("value_sha256", "")))
+                for head in (heads or [])
+            )
+        ):
+            raise LinearProjectionError(f"invalid_manifest_terminal_child_repair:{index}")
     return _desired_items(manifest), retirements
+
+
+def prepare_terminal_child_repairs(
+    manifest: dict[str, Any], snapshot: dict[str, Any], state: Any,
+) -> dict[str, Any]:
+    """Derive one terminal ownership repair from exact live/evidence truth."""
+    result = deepcopy(manifest)
+    repairs = result.get("terminal_child_repairs") or []
+    if not repairs:
+        return result
+    if result.get("retirements"):
+        raise LinearProjectionError("terminal_child_repair_forbids_retirements")
+    repair = repairs[0]
+    child_id = repair["child_identifier"].upper()
+    matching = [
+        child for child in snapshot.get("children", [])
+        if str(child.get("identifier", "")).upper() == child_id
+    ]
+    if len(matching) != 1:
+        raise LinearProjectionError("terminal_child_repair_ambiguous_child")
+    child = matching[0]
+    try:
+        readback = terminal_child_readback(child)
+    except ChildClosureError as error:
+        raise LinearProjectionError(str(error)) from error
+    if (
+        readback["child_issue_id"] != repair["child_issue_id"]
+        or readback["assignee_id"] != repair["expected_assignee_id"]
+        or canonical_digest(readback) != repair["expected_child_readback_sha256"]
+    ):
+        raise LinearProjectionError("terminal_child_readback_changed_reload_required")
+
+    active = _active_heads(state)
+    scope_event = active.get(("scope", "root"))
+    if scope_event is None:
+        raise LinearProjectionError("terminal_child_repair_scope_missing")
+    current_scope = deepcopy(scope_event["value"])
+    for field in ("workspace_id", "team_id", "project_id", "root_issue_id"):
+        expected = current_scope["linear"][field]
+        observed = (
+            readback["parent_issue_id"] if field == "root_issue_id"
+            else readback[field]
+        )
+        if observed != expected:
+            raise LinearProjectionError(f"terminal_child_repair_route_mismatch:{field}")
+
+    contracts: list[dict[str, Any]] = []
+    approved_heads: list[dict[str, str]] = []
+    active_evidence_heads = [
+        {
+            "key": key,
+            "event_id": event["event_id"],
+            "value_sha256": canonical_digest(event["value"]),
+        }
+        for (kind, key), event in active.items()
+        if kind == "evidence_contract"
+        and event["value"].get("owning_child") == child_id
+    ]
+    active_evidence_heads.sort(key=lambda item: (item["key"], item["event_id"]))
+    if repair["approved_evidence_heads"] != active_evidence_heads:
+        raise LinearProjectionError(
+            "terminal_child_repair_evidence_set_changed_reload_required"
+        )
+    for expected in repair["approved_evidence_heads"]:
+        event = active.get(("evidence_contract", expected["key"]))
+        if (
+            event is None
+            or event["event_id"] != expected["event_id"]
+            or canonical_digest(event["value"]) != expected["value_sha256"]
+        ):
+            raise LinearProjectionError("terminal_child_repair_evidence_changed_reload_required")
+        contract = event["value"]
+        errors = evidence_errors(contract)
+        if errors or contract.get("owning_child") != child_id:
+            raise LinearProjectionError(
+                "terminal_child_repair_evidence_invalid:"
+                + ",".join(errors or ["wrong_owner"])
+            )
+        contracts.append(contract)
+        approved_heads.append(deepcopy(expected))
+    owners = {(contract["repository_key"], contract["exact_head"]) for contract in contracts}
+    if len(owners) != 1:
+        raise LinearProjectionError("terminal_child_repair_owner_ambiguous")
+    owner, exact_head = next(iter(owners))
+    repository = next((
+        item for item in current_scope["repositories"]
+        if repository_key(item) == owner
+    ), None)
+    if repository is None or repository.get("exact_head") != exact_head:
+        raise LinearProjectionError("terminal_child_repair_repository_head_mismatch")
+    existing_owner = current_scope["child_ownership"].get(child_id)
+    if existing_owner not in {None, owner}:
+        raise LinearProjectionError("terminal_child_repair_ownership_conflict")
+    desired_scope = deepcopy(current_scope)
+    desired_scope["child_ownership"][child_id] = owner
+    closure = {
+        "schema_version": 1,
+        **readback,
+        "plan_revision": scope_event["plan_revision"],
+        "repository_key": owner,
+        "exact_head": exact_head,
+        "evidence_heads": approved_heads,
+        "evidence_receipts_sha256": evidence_receipts_sha256(contracts),
+        "child_readback_sha256": canonical_digest(readback),
+    }
+    existing_closure = active.get(("child_closure", child_id))
+    if existing_closure is not None and existing_closure["value"] != closure:
+        raise LinearProjectionError("terminal_child_repair_closure_conflict")
+
+    desired = result["projection"]
+    scope_item = next(item for item in desired if item["kind"] == "scope")
+    pre_repair_scope = deepcopy(current_scope)
+    pre_repair_scope["child_ownership"].pop(child_id, None)
+    if (
+        scope_item["value"] != current_scope
+        and scope_item["value"] != desired_scope
+        and scope_item["value"] != pre_repair_scope
+    ):
+        raise LinearProjectionError("terminal_child_repair_scope_widened")
+    source_item = next(item for item in desired if item["kind"] == "source")
+    current_source = active.get(("source", "root"))
+    if current_source is None or source_item["value"] != current_source["value"]:
+        raise LinearProjectionError("terminal_child_repair_source_changed")
+    for item in desired:
+        identity = (item["kind"], item["key"])
+        if identity == ("scope", "root") or identity == ("child_closure", child_id):
+            continue
+        current = active.get(identity)
+        if current is None or current["value"] != item["value"]:
+            raise LinearProjectionError(
+                f"terminal_child_repair_unrelated_change:{identity[0]}:{identity[1]}"
+            )
+    scope_item["value"] = desired_scope
+    desired[:] = [
+        {"kind": "child_closure", "key": child_id, "value": closure},
+        *[
+            item for item in desired
+            if (item["kind"], item["key"]) != ("child_closure", child_id)
+        ],
+    ]
+
+    active_matches = (
+        existing_owner == owner
+        and existing_closure is not None
+        and existing_closure["value"] == closure
+    )
+    if active_matches:
+        desired_by_identity = {
+            (item["kind"], item["key"]): item["value"] for item in desired
+        }
+        if all(
+            identity in active and active[identity]["value"] == value
+            for identity, value in desired_by_identity.items()
+        ):
+            result.update(projection_review_contract(state))
+    return result
 
 
 def stable_live_readback(
@@ -339,6 +530,7 @@ def load_material_history_for_projection_reconcile(
     manifest: dict[str, Any], adapter: LinearProjectionAdapter, *,
     authenticated_route: dict[str, str], authenticated_source: dict[str, Any],
     remote_head: str | None = None,
+    max_bytes: int = 16 * 1024, max_items: int = 100,
     relation_target_resolver: Callable[
         [list[dict[str, Any]]], dict[str, dict[str, Any]]
     ],
@@ -377,6 +569,36 @@ def load_material_history_for_projection_reconcile(
     desired_by_identity = {
         (item["kind"], item["key"]): item["value"] for item in desired
     }
+    unresolved: set[tuple[str, str]] = set()
+    for identity, event in active.items():
+        if identity[0] != "relation":
+            continue
+        try:
+            relation_target_resolver([deepcopy(event["value"])])
+        except RelationReadbackError:
+            unresolved.add(identity)
+
+    retirements_by_identity = {
+        (item["kind"], item["key"]): item for item in reviewed_retirements
+    }
+    uncovered: list[str] = []
+    for identity in sorted(unresolved):
+        current = active[identity]
+        replacement = desired_by_identity.get(identity)
+        retirement = retirements_by_identity.get(identity)
+        replaced = replacement is not None and replacement != current["value"]
+        retired = retirement is not None and (
+            retirement["expected_event_id"] == current["event_id"]
+            and retirement["expected_value_sha256"]
+            == _value_digest(current["value"])
+        )
+        if not replaced and not retired:
+            uncovered.append(f"{identity[0]}:{identity[1]}")
+    if uncovered:
+        raise LinearProjectionError(
+            "legacy_unresolved_relation_migration_required:"
+            + ",".join(uncovered)
+        )
     scope_or_source_changes = any(
         identity[0] in {"scope", "source"}
         and (identity not in active or active[identity]["value"] != value)
@@ -404,6 +626,18 @@ def load_material_history_for_projection_reconcile(
             retirement_items.append({
                 "kind": identity[0], "key": identity[1], "value": TOMBSTONE,
             })
+
+        def migration_first(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [
+                *[
+                    item for item in items
+                    if (item["kind"], item["key"]) in unresolved
+                ],
+                *[
+                    item for item in items
+                    if (item["kind"], item["key"]) not in unresolved
+                ],
+            ]
 
         def prospective(items: list[dict[str, Any]]) -> dict[str, Any]:
             candidate_comments = deepcopy(comments)
@@ -448,7 +682,9 @@ def load_material_history_for_projection_reconcile(
                 permit_stale_lifecycle_for_reconcile=True,
             )
 
-        provisional = prospective([*desired, *retirement_items])
+        provisional = prospective(migration_first([*desired, *retirement_items]))
+        provisional = dict(provisional)
+        provisional.pop("disposition", None)
         decision = choose_disposition(provisional, remote_head=remote_head)
         disposition = {
             "kind": "disposition", "key": "root", "value": {
@@ -459,12 +695,15 @@ def load_material_history_for_projection_reconcile(
                 ),
             },
         }
-        candidate = prospective([*desired, disposition, *retirement_items])
+        candidate_items = migration_first([
+            *desired, disposition, *retirement_items,
+        ])
+        candidate = prospective(candidate_items)
         compact_context(
-            candidate, token, max_bytes=100_000_000, max_items=1_000_000,
+            candidate, token, max_bytes=max_bytes, max_items=max_items,
             require_projection_authority=True,
         )
-        return candidate, frozenset()
+        return candidate, frozenset(unresolved)
 
     try:
         return add_material_history(
@@ -476,43 +715,9 @@ def load_material_history_for_projection_reconcile(
         if projection_review_contract(initial) != reviewed_contract:
             raise LinearProjectionError("projection_review_stale_reload_required")
 
-        active = _active_heads(initial)
-        unresolved: set[tuple[str, str]] = set()
-        for identity, event in active.items():
-            if identity[0] != "relation":
-                continue
-            try:
-                relation_target_resolver([deepcopy(event["value"])])
-            except RelationReadbackError:
-                unresolved.add(identity)
         if not unresolved:
             # Do not turn an unexpected batched-read failure into a bypass.
             raise
-
-        desired_by_identity = {
-            (item["kind"], item["key"]): item["value"] for item in desired
-        }
-        retirements_by_identity = {
-            (item["kind"], item["key"]): item for item in reviewed_retirements
-        }
-        uncovered: list[str] = []
-        for identity in sorted(unresolved):
-            current = active[identity]
-            replacement = desired_by_identity.get(identity)
-            retirement = retirements_by_identity.get(identity)
-            replaced = replacement is not None and replacement != current["value"]
-            retired = retirement is not None and (
-                retirement["expected_event_id"] == current["event_id"]
-                and retirement["expected_value_sha256"]
-                == _value_digest(current["value"])
-            )
-            if not replaced and not retired:
-                uncovered.append(f"{identity[0]}:{identity[1]}")
-        if uncovered:
-            raise LinearProjectionError(
-                "legacy_unresolved_relation_migration_required:"
-                + ",".join(uncovered)
-            )
 
         return add_material_history(
             snapshot, comments, token, authenticated_route=authenticated_route,
@@ -906,6 +1111,9 @@ def main() -> int:
             projection_state.snapshot.get("source"),
             projection_state.snapshot.get("projection_history"),
         )
+        manifest = prepare_terminal_child_repairs(
+            manifest, graph, projection_state,
+        )
         graph = deepcopy(graph)
         graph["root"].pop("description", None)
         comments = comment_adapter.comments()
@@ -916,6 +1124,7 @@ def main() -> int:
                 authenticated_route=route,
                 authenticated_source=authenticated_source,
                 remote_head=args.remote_head,
+                max_bytes=args.max_bytes, max_items=args.max_items,
                 relation_target_resolver=resolver,
             )
         )

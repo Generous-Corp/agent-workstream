@@ -43,6 +43,10 @@ from workstream_plan import plan_payload
 from workstream_relation_readback import read_relation_targets
 from workstream_choices import ChoiceError, reduce_choices
 from workstream_evidence import evidence_errors
+from workstream_child_closure import (
+    canonical_digest, evidence_receipts_sha256, terminal_child_readback,
+    ChildClosureError,
+)
 from workstream_scope import repository_key, ScopeError, validate_relations, validate_scope
 
 
@@ -299,10 +303,10 @@ def add_child_material_history(
     for source_child in snapshot.get("children", []):
         child = dict(source_child)
         token = str(child.get("identifier", "")).upper()
+        _validate_child_route(child, token=token, authenticated_route=authenticated_route)
         if _is_terminal(child):
             result["children"].append(child)
             continue
-        _validate_child_route(child, token=token, authenticated_route=authenticated_route)
         comments = child_comments[token]
         if not isinstance(comments, list):
             raise ResumeError(f"invalid_child_comment_collection:{token}")
@@ -867,6 +871,7 @@ def validate_snapshot(
     ):
         raise ResumeError("invalid_lifecycle_recovery")
     authenticated_route = snapshot.get("authenticated_route")
+    active: dict[tuple[str, str], dict[str, Any]] = {}
     if projection_events:
         if not isinstance(authenticated_route, dict) or not all(
             isinstance(authenticated_route.get(field), str) and authenticated_route[field]
@@ -883,7 +888,6 @@ def validate_snapshot(
             raise ResumeError("projection_provenance_missing")
         if snapshot.get("disposition") is None:
             raise ResumeError("projection_disposition_missing")
-        active: dict[tuple[str, str], dict[str, Any]] = {}
         heads: dict[tuple[str, str], dict[str, Any]] = {}
         for event in projection_events:
             identity = (event["kind"], event["key"])
@@ -918,6 +922,7 @@ def validate_snapshot(
             raise ResumeError("projection_current_view_mismatch:lifecycle_root")
         for kind, field in (("relation", "relations"), ("choice", "choice_events"),
                             ("evidence_contract", "evidence_contracts"),
+                            ("child_closure", "child_closures"),
                             ("provenance", "provenance"),
                             ("closure_review", "closure_reviews")):
             values = [event["value"] for (event_kind, _), event in active.items()
@@ -975,6 +980,54 @@ def validate_snapshot(
                     raise ResumeError(f"evidence_repository_route_unknown:{index}")
                 if contract.get("exact_head") != scoped_repository["exact_head"]:
                     raise ResumeError(f"evidence_head_mismatch:{index}")
+        child_closures = snapshot.get("child_closures", [])
+        if not isinstance(child_closures, list):
+            raise ResumeError("child_closures must be a list")
+        child_by_identifier = {
+            str(child.get("identifier", "")).upper(): child for child in children
+        }
+        for index, closure in enumerate(child_closures):
+            child_id = str(closure.get("child_identifier", "")).upper()
+            child = child_by_identifier.get(child_id)
+            if child is None:
+                raise ResumeError(f"child_closure_child_missing:{index}")
+            try:
+                readback = terminal_child_readback(child)
+            except ChildClosureError as error:
+                raise ResumeError(f"child_closure_readback_invalid:{index}:{error}") from error
+            if (
+                canonical_digest(readback) != closure.get("child_readback_sha256")
+                or any(closure.get(field) != readback[field] for field in readback)
+            ):
+                raise ResumeError(f"child_closure_readback_mismatch:{index}")
+            if scope is None or scope["child_ownership"].get(child_id) != closure.get("repository_key"):
+                raise ResumeError(f"child_closure_ownership_mismatch:{index}")
+            scoped_repository = next((
+                repository for repository in scope["repositories"]
+                if repository_key(repository) == closure.get("repository_key")
+            ), None)
+            if scoped_repository is None or scoped_repository.get("exact_head") != closure.get("exact_head"):
+                raise ResumeError(f"child_closure_repository_mismatch:{index}")
+            contracts: list[dict[str, Any]] = []
+            for head in closure.get("evidence_heads", []):
+                event = active.get(("evidence_contract", head.get("key")))
+                if (
+                    event is None
+                    or event.get("event_id") != head.get("event_id")
+                    or canonical_digest(event.get("value")) != head.get("value_sha256")
+                ):
+                    raise ResumeError(f"child_closure_evidence_head_mismatch:{index}")
+                contract = event["value"]
+                if (
+                    contract.get("owning_child") != child_id
+                    or contract.get("repository_key") != closure.get("repository_key")
+                    or contract.get("exact_head") != closure.get("exact_head")
+                    or evidence_errors(contract)
+                ):
+                    raise ResumeError(f"child_closure_evidence_invalid:{index}")
+                contracts.append(contract)
+            if evidence_receipts_sha256(contracts) != closure.get("evidence_receipts_sha256"):
+                raise ResumeError(f"child_closure_receipts_mismatch:{index}")
         for choice_id, view in choice_view.items():
             event = view["record"]
             if event["workstream_id"] != identifier.upper():
@@ -1001,6 +1054,7 @@ def validate_snapshot(
                 "material_events",
             )
         }
+        availability["child_closures"] = "available"
         availability["latest_checkpoint"] = (
             "available" if "latest_checkpoint" in snapshot else "transport_unimplemented"
         )
@@ -1014,6 +1068,7 @@ def validate_snapshot(
     return {"root": root, "children": children, "decisions": snapshot.get("decisions", []),
             "choice_events": choice_events, "scope": scope,
             "relations": relations, "evidence_contracts": evidence_contracts,
+            "child_closures": snapshot.get("child_closures", []),
             "surface_availability": availability,
             "provenance": snapshot.get("provenance", []),
             "material_events": material_events,
@@ -1141,6 +1196,7 @@ def compact_context(
         "scope": clean["scope"] if include_history else _compact_scope(clean["scope"]),
         "relations": clean["relations"],
         "evidence_contracts": clean["evidence_contracts"],
+        "child_closures": clean["child_closures"],
         "surface_availability": clean["surface_availability"],
         "provenance": clean["provenance"],
         "material_event_revision": clean["material_event_revision"],
@@ -1182,6 +1238,7 @@ def compact_context(
             context["children"], context["decisions"], context["choice_events"],
             context["relations"], context["provenance"],
             context["evidence_contracts"],
+            context["child_closures"],
             context["uncheckpointed_material_obligations"],
             context.get("material_events", []),
             context.get("projection_events", []),

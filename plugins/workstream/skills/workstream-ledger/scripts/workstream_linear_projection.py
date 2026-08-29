@@ -41,7 +41,7 @@ PROJECTION_RE = re.compile(r"<!-- workstream-projection:v1:([A-Za-z0-9_-]+) -->"
 KINDS = {
     "scope", "relation", "choice", "evidence_contract", "source",
     "provenance", "disposition", "closure_review", "lifecycle", "cas_activation",
-    "quarantine_disposition",
+    "quarantine_disposition", "child_closure",
 }
 SINGLETON_KINDS = {
     "scope", "source", "disposition", "lifecycle", "cas_activation",
@@ -441,6 +441,48 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             raise LinearProjectionError("projection_evidence_key_mismatch")
         if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", str(value.get("owning_child", ""))):
             raise LinearProjectionError("projection_evidence_owner_invalid")
+    if event["kind"] == "child_closure" and not tombstone:
+        required_closure = {
+            "schema_version", "child_identifier", "child_issue_id",
+            "parent_issue_id", "workspace_id", "team_id", "project_id",
+            "assignee_id", "state_id", "state_name", "state_type",
+            "plan_revision", "repository_key", "exact_head",
+            "evidence_heads", "evidence_receipts_sha256",
+            "child_readback_sha256",
+        }
+        evidence_heads = value.get("evidence_heads")
+        if (
+            set(value) != required_closure
+            or value.get("schema_version") != 1
+            or event["key"] != value.get("child_identifier")
+            or value.get("plan_revision") != event["plan_revision"]
+            or value.get("state_type") != "completed"
+            or not isinstance(evidence_heads, list)
+            or not evidence_heads
+            or evidence_heads != sorted(
+                evidence_heads, key=lambda item: (item.get("key", ""), item.get("event_id", ""))
+            )
+            or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", str(value.get("exact_head", "")))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("evidence_receipts_sha256", "")))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("child_readback_sha256", "")))
+            or not all(
+                isinstance(value.get(field), str) and value[field]
+                for field in (
+                    "child_identifier", "child_issue_id", "parent_issue_id",
+                    "workspace_id", "team_id", "project_id", "assignee_id",
+                    "state_id", "state_name", "repository_key",
+                )
+            )
+            or not all(
+                isinstance(item, dict)
+                and set(item) == {"key", "event_id", "value_sha256"}
+                and all(isinstance(item.get(field), str) and item[field]
+                        for field in ("key", "event_id"))
+                and re.fullmatch(r"[0-9a-f]{64}", str(item.get("value_sha256", "")))
+                for item in (evidence_heads or [])
+            )
+        ):
+            raise LinearProjectionError("invalid_projection_child_closure")
     revision = event.get("expected_revision")
     if not isinstance(revision, int) or revision < 0:
         raise LinearProjectionError("invalid_projection_revision")
@@ -670,6 +712,7 @@ def reduce_projection_comments(
         "relations": by_kind["relation"],
         "choice_events": by_kind["choice"],
         "evidence_contracts": by_kind["evidence_contract"],
+        "child_closures": by_kind["child_closure"],
         "source": source,
         "provenance": by_kind["provenance"],
         "closure_reviews": by_kind["closure_review"],
