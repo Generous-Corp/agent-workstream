@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
+import base64
+import hashlib
 import unittest
 
 from workstream_child_proposal import (
-    activated_comments, append_proposal, build_proposal, encode_proposal,
-    proposal_slot_id,
+    _canonical, activated_comments, append_proposal, build_proposal,
+    decode_proposal, encode_proposal, pending_proposal_obligations, PREFIX,
+    proposal_id, proposal_slot_id,
 )
 from workstream_linear import LinearTransportError
 
@@ -77,6 +80,38 @@ class ChildProposalTests(unittest.TestCase):
                 with self.assertRaisesRegex(LinearTransportError, "mismatch"):
                     activated_comments([{"id": remote, "body": body}], [auth],
                                        child_workstream_id="GEN-38", child_issue_id=CHILD)
+
+    def test_activated_retired_plan_proposal_is_not_pending_or_foreign(self):
+        proposal = self.proposal()
+        remote = proposal_slot_id(CHILD, proposal["proposal_id"])
+        auth = self.authorization(proposal, remote)
+        comments = [{"id": remote, "body": encode_proposal(proposal)}]
+        self.assertEqual(pending_proposal_obligations(
+            comments, [auth], child_workstream_id="GEN-38",
+            child_issue_id=CHILD, plan_revision="b" * 64,
+        ), [])
+        self.assertEqual(len(activated_comments(
+            comments, [auth], child_workstream_id="GEN-38",
+            child_issue_id=CHILD,
+        )), 2)
+
+    def test_decode_refuses_digested_bogus_kind_and_record(self):
+        record = {}
+        value = {
+            "schema_version": 1,
+            "proposal_id": proposal_id("bogus", record),
+            "kind": "bogus", "child_workstream_id": "GEN-38",
+            "child_issue_id": CHILD, "plan_revision": PLAN,
+            "record": record,
+            "record_sha256": hashlib.sha256(_canonical(record)).hexdigest(),
+        }
+        envelope = {
+            "proposal": value,
+            "sha256": hashlib.sha256(_canonical(value)).hexdigest(),
+        }
+        encoded = base64.urlsafe_b64encode(_canonical(envelope)).decode().rstrip("=")
+        with self.assertRaisesRegex(LinearTransportError, "malformed_child_proposal"):
+            decode_proposal(f"{PREFIX}{encoded} -->")
 
 
 if __name__ == "__main__":

@@ -582,7 +582,9 @@ collects the first comment page for every nonterminal child and paginates only
 continuations; each child is route/identity validated and independently reduces
 its own material events and checkpoints. Child state never inherits root events
 or another child's events, and malformed, conflicting, or incomplete child logs
-refuse the whole resume. A newer material-event
+refuse the whole resume. Root-authorized children hidden from native
+`root.children` by reparent/project drift are recovered by immutable ID before
+both ordinary resume and strict generation-candidate validation. A newer material-event
 `next_action` supersedes stale root description prose. The projection restores
 scope, relations, choices, evidence contracts, source, provenance, and the
 recorded attach/successor disposition. An acknowledged checkpoint restores its
@@ -614,6 +616,9 @@ business payload. Crash before activation leaves a recoverable inert proposal;
 `workstreamctl child-proposal-activate` reads that exact proposal by its pending
 handle and root-CAS activates it without the original payload or checkpoint
 file. Crash after activation makes that exact proposal authoritative.
+Proposal decoding validates the supported kind and complete canonical event or
+checkpoint record before exposing even a pending handle. Every activated grant
+revalidates its immutable child origin before its business record is reduced.
 Exact replay is zero-write, including after sealed generation retirement or a
 later scope removal; an unowned new or mismatched child refuses.
 

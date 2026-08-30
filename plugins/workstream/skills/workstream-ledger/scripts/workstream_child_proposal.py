@@ -46,14 +46,37 @@ def proposal_slot_id(child_issue_id: str, proposal: str) -> str:
     return str(uuid.UUID(bytes=bytes(raw)))
 
 
+def _validate_proposal_record(kind: str, record: dict[str, Any]) -> None:
+    if kind == "event":
+        required = {
+            "created_at", "event_id", "expected_revision", "kind", "payload",
+            "source", "workstream_id",
+        }
+        if (
+            not isinstance(record, dict) or set(record) != required
+            or not all(
+                isinstance(record.get(field), str) and record[field]
+                for field in (
+                    "created_at", "event_id", "kind", "source", "workstream_id",
+                )
+            )
+            or not isinstance(record.get("expected_revision"), int)
+            or isinstance(record.get("expected_revision"), bool)
+            or record["expected_revision"] < 0
+            or not isinstance(record.get("payload"), dict)
+        ):
+            raise ValueError("invalid child event proposal record")
+        Delta(**record)
+        return
+    if kind == "checkpoint":
+        validate_checkpoint(record)
+        return
+    raise ValueError("invalid child proposal kind")
+
+
 def build_proposal(kind: str, record: dict[str, Any], *, child_workstream_id: str,
                    child_issue_id: str, plan_revision: str) -> dict[str, Any]:
-    if kind == "event":
-        Delta(**record)
-    elif kind == "checkpoint":
-        validate_checkpoint(record)
-    else:
-        raise ValueError("invalid child proposal kind")
+    _validate_proposal_record(kind, record)
     value = {
         "schema_version": 1, "kind": kind,
         "child_workstream_id": child_workstream_id,
@@ -72,6 +95,7 @@ def encode_proposal(value: dict[str, Any]) -> str:
     }
     if set(value) != expected or value["schema_version"] != 1:
         raise ValueError("invalid child proposal")
+    _validate_proposal_record(value.get("kind"), value.get("record"))
     if value["proposal_id"] != proposal_id(value["kind"], value["record"]):
         raise ValueError("invalid child proposal ID")
     if value["record_sha256"] != hashlib.sha256(
@@ -193,17 +217,17 @@ def pending_proposal_obligations(
     }
     result = []
     for proposal, comment in proposal_index(comments).values():
+        expected_remote = proposal_slot_id(child_issue_id, proposal["proposal_id"])
+        if comment.get("id") != expected_remote:
+            raise LinearTransportError("child_proposal_slot_mismatch")
+        if proposal["proposal_id"] in activated:
+            continue
         if (
             proposal["child_workstream_id"] != child_workstream_id
             or proposal["child_issue_id"] != child_issue_id
             or proposal["plan_revision"] != plan_revision
         ):
             raise LinearTransportError("foreign_child_proposal")
-        expected_remote = proposal_slot_id(child_issue_id, proposal["proposal_id"])
-        if comment.get("id") != expected_remote:
-            raise LinearTransportError("child_proposal_slot_mismatch")
-        if proposal["proposal_id"] in activated:
-            continue
         result.append({
             "proposal_id": proposal["proposal_id"],
             "proposal_remote_id": expected_remote,

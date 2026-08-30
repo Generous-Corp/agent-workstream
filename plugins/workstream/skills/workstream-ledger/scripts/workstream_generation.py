@@ -1464,7 +1464,6 @@ def strict_candidate_loader(
         graph = transport.snapshot_for_root(
             token, include_description=True, include_child_comments=True,
         )
-        child_comments = graph.pop("child_comments", None)
         description_plan_revision = (
             graph["root"].get("plan_revision") or plan_revision
         )
@@ -1477,6 +1476,19 @@ def strict_candidate_loader(
             description_plan_revision=description_plan_revision,
             authenticated_route=authority,
         )
+        from workstream_linear_projection import (
+            child_mutation_authorizations_from_comments,
+        )
+        mutation_authorizations = child_mutation_authorizations_from_comments(
+            comments, workstream_id=token,
+            description_plan_revision=description_plan_revision,
+            authenticated_route=authority,
+        )
+        if mutation_authorizations:
+            graph = transport.recover_authorized_children(
+                graph, mutation_authorizations,
+            )
+        child_comments = graph.pop("child_comments", None)
         graph["root"]["plan_revision"] = plan_revision
         selected_checkpoints = None
         if selected["plan_revision"] == plan_revision:

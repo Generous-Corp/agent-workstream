@@ -1334,6 +1334,74 @@ def child_extension_authorizations_from_comments(
     return result
 
 
+def validate_child_origin_value(
+    value: dict[str, Any], *, extension_origins: list[dict[str, Any]],
+    authenticated_route: dict[str, str],
+) -> None:
+    """Validate one mutation grant's immutable child-creation provenance."""
+    origin = value.get("child_origin")
+    if not isinstance(origin, dict):
+        raise LinearProjectionError("child_origin_provenance_missing")
+    if origin.get("kind") == "child_extension_authorization":
+        matches = [
+            event for event in extension_origins
+            if event["event_id"] == origin.get("event_id")
+        ]
+        if len(matches) != 1:
+            raise LinearProjectionError("child_origin_authorization_missing")
+        origin_value = matches[0]["value"]
+        from workstream_linear import deterministic_existing_root_child_id
+        expected_id = deterministic_existing_root_child_id(
+            workspace_id=authenticated_route["workspace_id"],
+            team_id=authenticated_route["team_id"],
+            project_id=authenticated_route["project_id"],
+            root_issue_id=authenticated_route["root_issue_id"],
+            child_stable_key=origin_value.get("reviewed_candidate_key"),
+        )
+        if (
+            set(origin) != {"kind", "event_id", "value_sha256", "candidate_key"}
+            or origin.get("candidate_key")
+            != origin_value.get("reviewed_candidate_key")
+            or origin.get("value_sha256")
+            != hashlib.sha256(_canonical(origin_value)).hexdigest()
+            or origin_value.get("root_issue_id")
+            != authenticated_route["root_issue_id"]
+            or origin_value.get("route") != authenticated_route
+            or expected_id != value.get("child_issue_id")
+        ):
+            raise LinearProjectionError("child_origin_authorization_invalid")
+        return
+    if origin.get("kind") == "deterministic_intake_marker":
+        from workstream_linear import deterministic_issue_id
+        marker = {
+            "root_stable_key": origin.get("root_stable_key"),
+            "child_stable_key": origin.get("child_stable_key"),
+        }
+        if (
+            set(origin) != {
+                "kind", "root_stable_key", "child_stable_key", "marker_sha256",
+            }
+            or origin.get("marker_sha256")
+            != hashlib.sha256(_canonical(marker)).hexdigest()
+            or deterministic_issue_id(
+                workspace_id=authenticated_route["workspace_id"],
+                team_id=authenticated_route["team_id"],
+                project_id=authenticated_route["project_id"],
+                root_stable_key=origin.get("root_stable_key"),
+            ) != authenticated_route["root_issue_id"]
+            or deterministic_issue_id(
+                workspace_id=authenticated_route["workspace_id"],
+                team_id=authenticated_route["team_id"],
+                project_id=authenticated_route["project_id"],
+                root_stable_key=origin.get("root_stable_key"),
+                child_stable_key=origin.get("child_stable_key"),
+            ) != value.get("child_issue_id")
+        ):
+            raise LinearProjectionError("child_origin_intake_marker_invalid")
+        return
+    raise LinearProjectionError("child_origin_provenance_invalid")
+
+
 def child_mutation_authorizations_from_comments(
     comments: list[dict[str, Any]], *, workstream_id: str,
     description_plan_revision: str | None,
@@ -1354,6 +1422,11 @@ def child_mutation_authorizations_from_comments(
         for frontier in (control["value"]["from"], control["value"]["to"])
     )
     result: list[dict[str, Any]] = []
+    extension_origins = child_extension_authorizations_from_comments(
+        comments, workstream_id=workstream_id,
+        description_plan_revision=description_plan_revision,
+        authenticated_route=authenticated_route,
+    )
     for plan in plans:
         state = reduce_projection_comments(
             comments, workstream_id=workstream_id,
@@ -1426,6 +1499,14 @@ def child_mutation_authorizations_from_comments(
                 ) != value["repository_owner"]
             ):
                 raise LinearProjectionError("child_mutation_scope_proof_invalid")
+            validate_child_origin_value(
+                value, extension_origins=[
+                    origin for origin in extension_origins
+                    if origin["plan_revision"] != plan
+                    or origin in events[:index]
+                ],
+                authenticated_route=authenticated_route,
+            )
             result.append(event)
     return result
 
@@ -3252,73 +3333,20 @@ class LinearProjectionAdapter:
         comments: list[dict[str, Any]],
     ) -> None:
         """Bind child authority to immutable root provenance, never native caches."""
-        origin = value.get("child_origin")
-        if not isinstance(origin, dict):
-            raise LinearProjectionError("child_origin_provenance_missing")
-        if origin.get("kind") == "child_extension_authorization":
-            matches = [
-                event for event in list(events)[:before_index]
-                if event["kind"] == "child_extension_authorization"
-                and event["event_id"] == origin.get("event_id")
-            ]
-            if not matches:
-                matches = [
-                    event for event in child_extension_authorizations_from_comments(
-                        comments, workstream_id=self.workstream_id,
-                        description_plan_revision=value[
-                            "generation_authority"
-                        ].get("description_plan_revision"),
-                        authenticated_route=self.authority,
-                    ) if event["event_id"] == origin.get("event_id")
-                ]
-            if len(matches) != 1:
-                raise LinearProjectionError("child_origin_authorization_missing")
-            event = matches[0]
-            origin_value = event["value"]
-            from workstream_linear import deterministic_existing_root_child_id
-            expected_id = deterministic_existing_root_child_id(
-                workspace_id=self.workspace_id, team_id=self.team_id,
-                project_id=self.project_id, root_issue_id=self.root_issue_id,
-                child_stable_key=origin_value.get("reviewed_candidate_key"),
-            )
-            if (
-                set(origin) != {"kind", "event_id", "value_sha256", "candidate_key"}
-                or origin.get("candidate_key") != origin_value.get("reviewed_candidate_key")
-                or origin.get("value_sha256")
-                != hashlib.sha256(_canonical(origin_value)).hexdigest()
-                or origin_value.get("root_issue_id") != self.root_issue_id
-                or origin_value.get("route") != self.authority
-                or expected_id != value.get("child_issue_id")
-            ):
-                raise LinearProjectionError("child_origin_authorization_invalid")
-            return
-        if origin.get("kind") == "deterministic_intake_marker":
-            from workstream_linear import deterministic_issue_id
-            marker = {
-                "root_stable_key": origin.get("root_stable_key"),
-                "child_stable_key": origin.get("child_stable_key"),
-            }
-            if (
-                set(origin) != {
-                    "kind", "root_stable_key", "child_stable_key", "marker_sha256",
-                }
-                or origin.get("marker_sha256")
-                != hashlib.sha256(_canonical(marker)).hexdigest()
-                or deterministic_issue_id(
-                    workspace_id=self.workspace_id, team_id=self.team_id,
-                    project_id=self.project_id,
-                    root_stable_key=origin.get("root_stable_key"),
-                ) != self.root_issue_id
-                or deterministic_issue_id(
-                    workspace_id=self.workspace_id, team_id=self.team_id,
-                    project_id=self.project_id,
-                    root_stable_key=origin.get("root_stable_key"),
-                    child_stable_key=origin.get("child_stable_key"),
-                ) != value.get("child_issue_id")
-            ):
-                raise LinearProjectionError("child_origin_intake_marker_invalid")
-            return
-        raise LinearProjectionError("child_origin_provenance_invalid")
+        extension_origins = child_extension_authorizations_from_comments(
+            comments, workstream_id=self.workstream_id,
+            description_plan_revision=value["generation_authority"].get(
+                "description_plan_revision"
+            ), authenticated_route=self.authority,
+        )
+        current_events = list(events)[:before_index]
+        validate_child_origin_value(
+            value, extension_origins=[
+                origin for origin in extension_origins
+                if origin["plan_revision"] != self.plan_revision
+                or origin in current_events
+            ], authenticated_route=self.authority,
+        )
 
     def child_mutation_authorizations(self) -> list[dict[str, Any]]:
         comments = self._comments()

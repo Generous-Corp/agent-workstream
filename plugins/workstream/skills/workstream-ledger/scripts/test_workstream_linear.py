@@ -1270,6 +1270,42 @@ class LinearTransportTests(unittest.TestCase):
         )
         self.assertEqual(client.execute.call_count, 2)
 
+    def test_recover_authorized_reparented_child_preserves_exact_state(self):
+        child_id = "22222222-2222-4222-8222-222222222222"
+        client = mock.Mock()
+        client.execute.return_value = {"issue": {
+            "id": child_id, "identifier": "GEN-43", "title": "Authorized",
+            "description": "Next action: preserve exact child state",
+            "url": "https://linear/GEN-43", "updatedAt": "now",
+            "parent": {"id": "other-root", "identifier": "GEN-99"},
+            "project": {"id": "other-project"},
+            "team": {"id": "other-team", "organization": {"id": "workspace"}},
+            "assignee": {"id": "owner"},
+            "state": {"id": "state", "name": "In Progress", "type": "started"},
+            "comments": {
+                "nodes": [{"id": "child-comment", "body": "plain"}],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            },
+        }}
+        snapshot = {"root": {"identifier": "GEN-37"}, "children": [],
+                    "child_comments": {}}
+        authorization = {"value": {
+            "child_issue_id": child_id, "child_workstream_id": "GEN-43",
+        }}
+        recovered = LinearGraphQLTransport(
+            client, team_id="team", workspace_id="workspace",
+            project_id="project",
+        ).recover_authorized_children(snapshot, [authorization])
+        child = recovered["children"][0]
+        self.assertEqual(child["parent"]["id"], "other-root")
+        self.assertEqual(child["project"]["id"], "other-project")
+        self.assertEqual(child["state_id"], "state")
+        self.assertEqual(child["status"], "In Progress")
+        self.assertEqual(child["next_action"], "preserve exact child state")
+        self.assertEqual(
+            recovered["child_comments"]["GEN-43"][0]["id"], "child-comment",
+        )
+
     def test_resume_refuses_null_child_connection(self):
         client = mock.Mock()
         client.execute.return_value = {"issue": {

@@ -571,6 +571,76 @@ class WorkstreamChildStateTests(unittest.TestCase):
             workstream_child_event.run(second, client_factory=lambda _token: client)
         self.assertEqual(len(client.root_comments), root_count)
 
+    def test_second_child_event_receipt_reduces_full_authoritative_history(self):
+        client = FakeChildStateClient()
+        def event(revision, value):
+            return [
+                *self.common(), "--kind", "progress", "--source", "user_turn",
+                "--expected-revision", str(revision), "--created-at", "now",
+                "--payload-json", json.dumps({"value": value}),
+            ]
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch:
+            first = workstream_child_event.run(
+                event(0, "first"), client_factory=lambda _token: client,
+            )
+            second = workstream_child_event.run(
+                event(1, "second"), client_factory=lambda _token: client,
+            )
+            root_writes = len(client.root_comments)
+            child_writes = len(client.child_comments)
+            replay = workstream_child_event.run(
+                event(1, "second"), client_factory=lambda _token: client,
+            )
+        self.assertEqual(first["receipt"]["revision"], 1)
+        self.assertEqual(second["receipt"]["revision"], 2)
+        self.assertEqual(replay["receipt"], second["receipt"])
+        self.assertEqual(len(client.root_comments), root_writes)
+        self.assertEqual(len(client.child_comments), child_writes)
+
+    def test_resume_refuses_activated_grant_with_missing_child_origin(self):
+        client = FakeChildStateClient()
+        args = [
+            *self.common(), "--kind", "progress", "--source", "user_turn",
+            "--expected-revision", "0", "--created-at", "now",
+            "--payload-json", '{"next_action":"must stay authenticated"}',
+        ]
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch:
+            result = workstream_child_event.run(
+                args, client_factory=lambda _token: client,
+            )
+        grant = result["authorization"]["event"]
+        bad = build_projection_event(
+            workstream_id=grant["workstream_id"], kind=grant["kind"],
+            key=grant["key"], value={**grant["value"], "child_origin": {}},
+            plan_revision=grant["plan_revision"],
+            expected_revision=grant["expected_revision"],
+            created_at=grant["created_at"], authority=grant["authority"],
+        )
+        grant_comment = client.root_comments[-1]
+        grant_comment["body"] = encode_projection_comment(bad)
+        snapshot = {
+            "root": {
+                "identifier": "GEN-37", "plan_revision": PLAN,
+                "url": "https://linear.test/GEN-37", "revision": 0,
+                "status": "In Progress", "status_type": "started",
+            },
+            "children": [{
+                "id": CHILD_ID, "identifier": "GEN-38", "title": "Child",
+                "url": "https://linear.test/GEN-38", "status": "In Progress",
+                "status_type": "started", "parent": {"id": ROOT_ID},
+                "project": {"id": "project"},
+                "team": {"id": "team", "organization": {"id": "workspace"}},
+            }],
+        }
+        with self.assertRaisesRegex(Exception, "child_origin_provenance"):
+            add_child_material_history(
+                snapshot, {"GEN-38": deepcopy(client.child_comments)},
+                authenticated_route={**ROUTE, "root_issue_id": ROOT_ID},
+                root_comments=deepcopy(client.root_comments),
+            )
+
     def test_nonmonotonic_checkpoint_refuses_before_second_grant(self):
         client = FakeChildStateClient()
         def checkpoint(boundary, predecessor):

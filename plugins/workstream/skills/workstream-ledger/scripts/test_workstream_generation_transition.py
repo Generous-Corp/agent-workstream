@@ -1680,14 +1680,21 @@ class GenerationTransitionTests(unittest.TestCase):
         })
         snapshot_transport = MagicMock()
         snapshot_transport.snapshot_for_root.return_value = deepcopy(graph)
+        snapshot_transport.recover_authorized_children.return_value = deepcopy(graph)
         child_history = MagicMock(
             side_effect=lambda value, *_args, **_kwargs: value,
         )
+        activated_child = {"value": {
+            "child_issue_id": "child-id", "child_workstream_id": "GEN-43",
+        }}
         with patch("workstream_generation.plan_payload", return_value={
             "source": {"identity": f"https://example.test/{OLD}",
                        "sha256": OLD},
         }), patch("workstream_generation.LinearGraphQLTransport",
                   return_value=snapshot_transport), patch(
+            "workstream_linear_projection.child_mutation_authorizations_from_comments",
+            return_value=[activated_child],
+        ), patch(
             "workstream_generation.add_child_material_history",
             child_history,
         ), patch("workstream_generation.add_material_history",
@@ -1703,6 +1710,9 @@ class GenerationTransitionTests(unittest.TestCase):
         self.assertEqual(compact.call_args.kwargs["max_items"], 100)
         self.assertEqual(
             child_history.call_args.kwargs["root_comments"], self.client.comments,
+        )
+        snapshot_transport.recover_authorized_children.assert_called_once_with(
+            snapshot_transport.snapshot_for_root.return_value, [activated_child],
         )
 
         with tempfile.NamedTemporaryFile("w", suffix=".md") as plan_file, \
