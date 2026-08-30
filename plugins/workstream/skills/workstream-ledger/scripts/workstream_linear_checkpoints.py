@@ -130,6 +130,11 @@ def reduce_checkpoint_comments(
     comments: list[dict[str, Any]], *, workstream_id: str
 ) -> ReducedCheckpointLog:
     """Reduce a complete comment snapshot and derive remote acknowledgements."""
+    from workstream_generation import generation_quarantined_comment_ids
+
+    quarantined_ids = generation_quarantined_comment_ids(
+        comments, workstream_id=workstream_id,
+    )
     observed: dict[str, tuple[dict[str, Any], str, bytes]] = {}
     for comment in comments:
         body = comment.get("body")
@@ -138,6 +143,8 @@ def reduce_checkpoint_comments(
         if not isinstance(body, str):
             raise LinearCheckpointError("malformed_checkpoint_marker")
         if CHECKPOINT_PREFIX not in body:
+            continue
+        if comment.get("id") in quarantined_ids:
             continue
         matches = CHECKPOINT_RE.findall(body)
         if len(matches) != 1 or body.count(CHECKPOINT_PREFIX) != 1:
@@ -383,6 +390,24 @@ class LinearCheckpointAdapter:
             authenticated_route=self._observed_authority,
             current_plan_revision=checkpoint["plan_revision"],
         )
+        if self._observed_authority is None:
+            raise LinearCheckpointError("comment_slot_authority_incomplete")
+        from workstream_generation import (
+            assert_generation_write_authority,
+            assert_no_pending_generation_reservation,
+        )
+        try:
+            assert_no_pending_generation_reservation(
+                comments, workstream_id=self.workstream_id,
+                authenticated_route=self._observed_authority,
+            )
+            assert_generation_write_authority(
+                comments, workstream_id=self.workstream_id,
+                plan_revision=checkpoint["plan_revision"],
+                authenticated_route=self._observed_authority,
+            )
+        except LinearTransportError as error:
+            raise LinearCheckpointError(str(error)) from error
 
         current = generations.get(checkpoint["plan_revision"])
         expected_predecessor = (
@@ -405,8 +430,6 @@ class LinearCheckpointAdapter:
             raise LinearCheckpointError(
                 "checkpoint_material_revision_advanced_reload_and_rebuild_required"
             )
-        if self._observed_authority is None:
-            raise LinearCheckpointError("comment_slot_authority_incomplete")
         frontier = ledger_serialization_frontier(
             sorted(item["event_id"] for item in before.checkpoints), comments,
             workstream_id=self.workstream_id,

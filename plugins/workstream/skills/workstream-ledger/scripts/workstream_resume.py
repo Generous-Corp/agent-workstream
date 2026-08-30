@@ -38,7 +38,7 @@ from workstream_linear_events import (
 from workstream_linear_projection import (
     _inspect_unsealed_identity_history, inspect_unsealed_identity_history,
     LinearProjectionError,
-    reduce_projection_comments, TOMBSTONE,
+    reduce_projection_comments, select_plan_generation, TOMBSTONE,
     validate_projection_event,
 )
 from workstream_plan import plan_payload
@@ -102,6 +102,11 @@ def closure_snapshot_digest(snapshot: dict[str, Any]) -> str:
         issue_status = root.pop("issue_status", root.get("status"))
         root["status"] = issue_status
         root.pop("closure_receipt", None)
+        root.pop("description_plan_revision", None)
+        root.pop("generation_transition_tip_event_id", None)
+        root.pop("generation_activation_epoch", None)
+        root.pop("generation_authority_origin", None)
+        root.pop("quarantined_legacy_writes", None)
     events = material.get("projection_events")
     if isinstance(events, list):
         material["projection_events"] = [
@@ -669,6 +674,11 @@ def add_material_history(
     """Join one complete Linear comment read to the issue-graph snapshot."""
     result = dict(snapshot)
     result["root"] = dict(snapshot.get("root") or {})
+    from workstream_generation import generation_quarantine_metadata
+
+    result["root"]["quarantined_legacy_writes"] = generation_quarantine_metadata(
+        comments, workstream_id=token,
+    )
     event_log = reduce_event_comments(comments, workstream_id=token)
     checkpoint_log = reduce_checkpoint_comments(comments, workstream_id=token)
     plan_revision = result["root"].get("plan_revision")
@@ -1471,6 +1481,18 @@ def compact_context(
         "workstream_id": root["identifier"].upper(),
         "context_url": root["url"],
         "plan_revision": root["plan_revision"],
+        "description_plan_revision": root.get(
+            "description_plan_revision", root["plan_revision"],
+        ),
+        "generation_transition_tip_event_id": root.get(
+            "generation_transition_tip_event_id"
+        ),
+        "generation_activation_epoch": root.get("generation_activation_epoch"),
+        "generation_authority_origin": root.get("generation_authority_origin"),
+        "quarantined_legacy_writes": root.get("quarantined_legacy_writes", {
+            "count": 0,
+            "sha256": hashlib.sha256(b"[]").hexdigest(),
+        }),
         "root_revision": root["revision"],
         "issue_revision": root.get("issue_revision"),
         "status": root.get("status"),
@@ -1626,6 +1648,24 @@ def main() -> int:
                 workspace_id=complete_route.get("workspace_id"),
                 project_id=complete_route.get("project_id"),
             ).comments()
+            generation = select_plan_generation(
+                comments, workstream_id=token,
+                description_plan_revision=live_graph_snapshot["root"]["plan_revision"],
+                authenticated_route=route,
+            )
+            live_graph_snapshot["root"]["plan_revision"] = generation["plan_revision"]
+            live_graph_snapshot["root"]["description_plan_revision"] = generation[
+                "description_plan_revision"
+            ]
+            live_graph_snapshot["root"]["generation_transition_tip_event_id"] = (
+                generation["transition_tip_event_id"]
+            )
+            live_graph_snapshot["root"]["generation_activation_epoch"] = (
+                generation["activation_epoch"]
+            )
+            live_graph_snapshot["root"]["generation_authority_origin"] = (
+                generation["authority_origin"]
+            )
             child_comments = live_graph_snapshot.pop("child_comments", None)
             live_graph_snapshot = add_child_material_history(
                 live_graph_snapshot, child_comments,
