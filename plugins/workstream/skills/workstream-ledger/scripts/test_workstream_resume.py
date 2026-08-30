@@ -67,22 +67,36 @@ class ResumeTests(unittest.TestCase):
         ):
             changed = copy.deepcopy(snapshot)
             changed["root"][field] = value
-            if field == "status":
-                changed["root"]["state"]["name"] = value
-            elif field == "status_type":
-                changed["root"]["state"]["type"] = value
-            else:
-                changed["root"]["state"]["id"] = value
             self.assertNotEqual(
                 MODULE._issue_graph_repair_frontier(changed, [], {})["sha256"],
                 baseline["sha256"], field,
             )
-        child_changed = copy.deepcopy(snapshot)
-        child_changed["children"][0]["description"] = "changed child description"
-        self.assertNotEqual(
-            MODULE._issue_graph_repair_frontier(child_changed, [], {})["sha256"],
-            baseline["sha256"],
-        )
+        for field, value in (
+            ("id", "nested-state-2"), ("name", "Blocked"),
+            ("type", "canceled"),
+        ):
+            changed = copy.deepcopy(snapshot)
+            changed["root"]["state"][field] = value
+            self.assertNotEqual(
+                MODULE._issue_graph_repair_frontier(changed, [], {})["sha256"],
+                baseline["sha256"], "state." + field,
+            )
+        snapshot["children"][0].update({
+            "description": "Plan revision: " + "a" * 64 + "\nRevision: 4",
+            "plan_revision": "a" * 64, "revision": 4,
+        })
+        baseline = MODULE._issue_graph_repair_frontier(snapshot, [], {})
+        for field, value in (
+            ("description", "changed child description"),
+            ("plan_revision", "b" * 64), ("revision", 5),
+            ("title", "changed child title"),
+        ):
+            changed = copy.deepcopy(snapshot)
+            changed["children"][0][field] = value
+            self.assertNotEqual(
+                MODULE._issue_graph_repair_frontier(changed, [], {})["sha256"],
+                baseline["sha256"], field,
+            )
         relation = [{"type": "related", "target": {
             "workspace_id": "workspace", "issue_id": "target",
             "identifier": "GEN-50",

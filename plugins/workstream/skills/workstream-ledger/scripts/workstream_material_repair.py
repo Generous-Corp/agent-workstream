@@ -19,6 +19,7 @@ from workstream_linear_events import (
     encode_reviewed_repair_comment, ledger_boundary_slot_id,
     ledger_serialization_frontier, material_frontier,
     PinnedRepairPreconditionError, reduce_event_comments,
+    validate_review_artifact_identity,
 )
 from workstream_linear_projection import reduce_projection_comments, select_plan_generation
 from workstream_plan import plan_payload, source_bytes
@@ -57,19 +58,8 @@ def _verify_review_artifact(payload: dict, path: str | None) -> None:
         "target_bindings": payload.get("target_bindings"),
     }:
         raise ValueError("material_repair_review_artifact_content_mismatch")
-    commit = artifact.get("commit")
-    artifact_path = artifact.get("path")
     identity = artifact.get("identity")
-    repository = artifact.get("repository")
-    if (
-        not isinstance(commit, str) or len(commit) != 40
-        or any(ch not in "0123456789abcdef" for ch in commit)
-        or not isinstance(artifact_path, str) or not artifact_path
-        or not isinstance(identity, str)
-        or not isinstance(repository, str) or not repository
-        or identity != f"https://{repository}/blob/{commit}/{artifact_path}"
-    ):
-        raise ValueError("material_repair_review_artifact_identity_mismatch")
+    validate_review_artifact_identity(artifact)
     try:
         fetched, fetched_identity = source_bytes(identity, identity)
     except Exception as error:

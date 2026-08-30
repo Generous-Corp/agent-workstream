@@ -577,6 +577,8 @@ class LinearGraphQLTransport:
             child["status"] = state.get("name") or state.get("type") or "Todo"
             child["status_type"] = state.get("type")
             child["next_action"] = parse_next_action(child.get("description"))
+            child["plan_revision"] = parse_plan_revision(child.get("description"))
+            child["revision"] = parse_root_revision(child.get("description"))
             comment_connection = child.pop("comments", None)
             terminal = {
                 str(child.get("status", "")).lower(),

@@ -142,9 +142,11 @@ an ordering convention from being mistaken for the frontier identity.
 The reviewed target artifact is a separate exact JSON object containing only
 `schema_version`, `workstream_id`, and the two target bindings. The CLI reads
 those local bytes, verifies their SHA-256, verifies their content against the
-payload, checks the exact immutable GitHub repository/commit/path identity,
-then retrieves that identity through the authenticated plan-source byte loader
-(token with private-GitHub SSH fallback). Fetched bytes, local bytes, and the
+payload, requires the canonical lowercase
+`github.com/<owner>/<repository>` key and exact
+`https://github.com/<same>/blob/<40-lowercase-hex-commit>/<normalized-path>`
+identity, then retrieves that identity through the authenticated plan-source
+byte loader (token with private-GitHub SSH fallback). Fetched bytes, local bytes, and the
 bound SHA-256 must all match before any Linear read or write.
 
 The normalized replacement retains the target event ID, workstream, source,

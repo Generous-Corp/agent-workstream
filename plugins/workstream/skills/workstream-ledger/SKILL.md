@@ -409,9 +409,11 @@ workstreamctl material-repair GEN-123 --manifest repair.json \
   --plan-source ./PLAN.md --plan-identity <canonical-url> --apply
 ```
 
-The reviewed target file is authenticated locally by immutable commit/path and
-SHA-256 and fetched through the authenticated source-byte loader; fetched and
-local bytes must match before Linear access. Normalization is mechanically lossless: exactly two incident targets,
+The reviewed target file requires a canonical lowercase GitHub repository key,
+40-lowercase-hex commit URL, and normalized artifact path. It is authenticated
+locally by immutable commit/path and SHA-256 and fetched through the
+authenticated source-byte loader; fetched and local bytes must match before Linear access.
+Normalization is mechanically lossless: exactly two incident targets,
 `repair:<event-id>`, and one `progress` change containing the complete original
 payload. The material comment uses one deterministic slot; the complete
 cross-surface readback is a preflight/postcheck fence, not transactional CAS.

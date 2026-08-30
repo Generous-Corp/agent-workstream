@@ -242,10 +242,22 @@ class MaterialRepairCliTests(unittest.TestCase):
         client = self._client()
         with tempfile.TemporaryDirectory() as directory:
             manifest_path, artifact_path, outer = self._prepare(directory, client)
-            argv = [
+            dry_argv = [
                 "workstream_material_repair.py", "GEN-37", "--manifest", str(manifest_path),
-                "--review-artifact", str(artifact_path), "--plan-source", "plan", "--apply",
+                "--review-artifact", str(artifact_path), "--plan-source", "plan",
             ]
+            code, output, error = self._invoke(dry_argv, client)
+            self.assertEqual((code, error), (0, ""))
+            preview = json.loads(output)
+            for gate in (
+                "production_compact_resume", "production_full_resume",
+                "strict_generation_candidate",
+            ):
+                self.assertEqual(
+                    preview["postwrite_validation"][gate],
+                    "external_gate_required",
+                )
+            argv = [*dry_argv, "--apply"]
             code, output, error = self._invoke(argv, client)
             self.assertEqual((code, error), (0, ""))
             applied = json.loads(output)
@@ -253,6 +265,14 @@ class MaterialRepairCliTests(unittest.TestCase):
             self.assertEqual(applied["receipt"]["revision"], 58)
             self.assertEqual(applied["repair_count"], 2)
             self.assertEqual(applied["recovery_state"], "complete")
+            for gate in (
+                "production_compact_resume", "production_full_resume",
+                "strict_generation_candidate",
+            ):
+                self.assertEqual(
+                    applied["postwrite_validation"][gate],
+                    "external_gate_required",
+                )
             self.assertEqual(
                 outer["payload"]["postwrite_oracle"]["strict_target_candidate_sha256"],
                 STRICT_CANDIDATE,
@@ -276,6 +296,14 @@ class MaterialRepairCliTests(unittest.TestCase):
             replay = json.loads(output)
             self.assertTrue(replay["replay"])
             self.assertEqual(replay["postwrite_validation"]["exact_manifest_replay"], "valid")
+            for gate in (
+                "production_compact_resume", "production_full_resume",
+                "strict_generation_candidate",
+            ):
+                self.assertEqual(
+                    replay["postwrite_validation"][gate],
+                    "external_gate_required",
+                )
             self.assertEqual(
                 len([call for call in client.calls if "commentCreate" in call[0]]), writes,
             )
@@ -326,63 +354,115 @@ class MaterialRepairCliTests(unittest.TestCase):
                 "identity": f"https://example.test/{generation_tests.NEW}",
                 "sha256": generation_tests.NEW,
             }
-            generation_authority = target.select_child_extension_generation(
-                description_plan_revision=generation_tests.OLD,
-                source=successor_source,
-            )
-            target.reserve_child_extension(
-                source=successor_source, reviewed_candidate_key="successor-child",
-                child_issue_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-                expected_material_revision=58,
-                expected_projection_revision=target.state().revision,
-                native_initialization={
-                    "state_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-                    "assignee_id": None,
-                },
-                generation_authority=generation_authority,
-                native_validation_sha256="0" * 64,
-            )
-            comments = copy.deepcopy(successor.comments)
-            selected = select_plan_generation(
-                comments, workstream_id="GEN-37",
-                description_plan_revision=generation_tests.OLD,
-                authenticated_route=self.route,
-            )
-            graph = MODULE.LinearGraphQLTransport(
+            successor_plan = {
+                "graph_review_required": True,
+                "source": {**successor_source, "bytes": 10},
+                "root": {"plan_revision": generation_tests.NEW},
+                "children": [{
+                    "key": "successor-child", "title": "Successor child",
+                    "next_action": "Validate the repaired successor.",
+                }],
+            }
+            child_result = generation_tests.LinearGraphQLTransport(
                 successor, team_id=self.route["team_id"],
                 workspace_id=self.route["workspace_id"],
                 project_id=self.route["project_id"],
-            ).snapshot_for_root(
-                "GEN-37", include_child_comments=False,
-                include_description=True,
+            ).extend_existing_root_reviewed_child(
+                successor_plan, root_issue_id=self.route["root_issue_id"],
+                reviewed_candidate_key="successor-child",
+                source_revision=generation_tests.NEW,
+                plan_revision=generation_tests.NEW,
+                expected_frontier={
+                    "material_revision": 58,
+                    "projection_revision": target.state().revision,
+                }, state_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                assignee_id=None, unassigned=True,
+                authorization_adapter=target,
             )
-            graph["root"].update({
-                "plan_revision": selected["plan_revision"],
-                "description_plan_revision": selected["description_plan_revision"],
-                "generation_transition_tip_event_id": selected[
-                    "transition_tip_event_id"
-                ],
-                "generation_activation_epoch": selected["activation_epoch"],
-                "generation_authority_origin": selected["authority_origin"],
-            })
-            resumed = workstream_resume.add_material_history(
-                graph, comments, "GEN-37", authenticated_route=self.route,
-                authenticated_source=successor_source,
+            self.assertEqual(child_result["receipt"]["disposition"], "created")
+            self.assertEqual(len(successor.children), 1)
+            successor.children[0]["state"] = {
+                "id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                "name": "In Progress", "type": "started",
+            }
+            successor.children[0]["updatedAt"] = "transitioned"
+            successor_projection = target.state()
+            scope_event = next(
+                event for event in successor_projection.events
+                if event["kind"] == "scope"
             )
-            compact = workstream_resume.compact_context(
-                resumed, "GEN-37", require_projection_authority=True,
-                max_items=200, max_bytes=100 * 1024,
-            )
-            full = workstream_resume.compact_context(
-                resumed, "GEN-37", require_projection_authority=True,
-                include_history=True, max_items=300, max_bytes=150 * 1024,
-            )
+            evolved_scope = copy.deepcopy(successor_projection.snapshot["scope"])
+            evolved_scope["child_ownership"]["GEN-38"] = "github.com:id:R_repo"
+            target.append(build_projection_event(
+                workstream_id="GEN-37", kind="scope", key="root",
+                value=evolved_scope, plan_revision=generation_tests.NEW,
+                expected_revision=successor_projection.revision,
+                created_at="2026-08-30T01:00:02Z",
+                supersedes_event_id=scope_event["event_id"],
+                authority=self.route,
+            ))
+            original_execute = successor.execute
+
+            def execute_with_resume_children(query, variables):
+                if "query WorkstreamResumeRoot" in query:
+                    children = copy.deepcopy(successor.children)
+                    for child in children:
+                        child["comments"] = {
+                            "nodes": [], "pageInfo": {
+                                "hasNextPage": False, "endCursor": None,
+                            },
+                        }
+                    return {"issue": {**successor.root_issue(), "children": {
+                        "nodes": children, "pageInfo": {
+                            "hasNextPage": False, "endCursor": None,
+                        },
+                    }}}
+                return original_execute(query, variables)
+
+            successor.execute = execute_with_resume_children
+
+            def production_resume(include_history=False):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                resume_argv = [
+                    "workstream_resume.py", "GEN-37", "--plan-source", "plan",
+                    "--max-items", "400", "--max-bytes", str(300 * 1024),
+                ]
+                if include_history:
+                    resume_argv.append("--include-history")
+                with mock.patch.object(
+                    workstream_resume, "load_linear_api_key", return_value="token",
+                ), mock.patch.object(
+                    workstream_resume, "HttpGraphQLClient", return_value=successor,
+                ), mock.patch.object(
+                    workstream_resume, "resolve_linear_route", return_value=(None, None),
+                ), mock.patch.object(
+                    workstream_resume, "resolve_authenticated_issue_route",
+                    return_value=self.route,
+                ), mock.patch.object(
+                    workstream_resume, "plan_payload",
+                    return_value={"source": successor_source},
+                ), mock.patch.object(
+                    workstream_resume.sys, "argv", resume_argv,
+                ), mock.patch.object(
+                    workstream_resume.sys, "stdout", stdout,
+                ), mock.patch.object(
+                    workstream_resume.sys, "stderr", stderr,
+                ):
+                    code = workstream_resume.main()
+                self.assertEqual((code, stderr.getvalue()), (0, ""))
+                return json.loads(stdout.getvalue())
+
+            mutations_before_resume = len(successor.mutations)
+            compact = production_resume()
+            full = production_resume(include_history=True)
             self.assertEqual(compact["resume_authority"], "full")
             self.assertEqual(compact["plan_revision"], generation_tests.NEW)
+            self.assertEqual(compact["children"][0]["status"], "In Progress")
             self.assertTrue(any(
                 event["kind"] == "child_extension_authorization"
                 for event in full["projection_events"]
             ))
+            self.assertEqual(len(successor.mutations), mutations_before_resume)
 
             mutations_before = len(successor.mutations)
             code, output, error = self._invoke(argv, successor)
@@ -612,6 +692,55 @@ class MaterialRepairCliTests(unittest.TestCase):
                          return_value=(fetched, fetched_identity),
                      ), self.assertRaisesRegex(ValueError, "remote_mismatch"):
                     MODULE._verify_review_artifact(payload, str(path))
+
+    def test_review_artifact_requires_canonical_immutable_github_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "targets.json"
+            reviewed = {
+                "schema_version": 1, "workstream_id": "GEN-37",
+                "target_bindings": self.payload["target_bindings"],
+            }
+            material = json.dumps(reviewed, sort_keys=True).encode()
+            path.write_bytes(material)
+            base = {
+                "identity": (
+                    "https://github.com/review/repo/blob/" + "1" * 40
+                    + "/repairs/targets.json"
+                ),
+                "repository": "github.com/review/repo", "commit": "1" * 40,
+                "path": "repairs/targets.json",
+                "sha256": hashlib.sha256(material).hexdigest(),
+                "reviewed_at": "2026-08-30T11:13:05Z",
+            }
+            hostile = (
+                {"repository": "evil.example/review/repo",
+                 "identity": "https://evil.example/review/repo/blob/" + "1" * 40 + "/repairs/targets.json"},
+                {"repository": "github.com.evil/review/repo",
+                 "identity": "https://github.com.evil/review/repo/blob/" + "1" * 40 + "/repairs/targets.json"},
+                {"repository": "github.com/Review/repo",
+                 "identity": "https://github.com/Review/repo/blob/" + "1" * 40 + "/repairs/targets.json"},
+                {"commit": "A" * 40,
+                 "identity": "https://github.com/review/repo/blob/" + "A" * 40 + "/repairs/targets.json"},
+                {"commit": "main",
+                 "identity": "https://github.com/review/repo/blob/main/repairs/targets.json"},
+                {"path": "../targets.json",
+                 "identity": "https://github.com/review/repo/blob/" + "1" * 40 + "/../targets.json"},
+                {"path": "repairs//targets.json",
+                 "identity": "https://github.com/review/repo/blob/" + "1" * 40 + "/repairs//targets.json"},
+                {"path": "repairs/%2e%2e/targets.json",
+                 "identity": "https://github.com/review/repo/blob/" + "1" * 40 + "/repairs/%2e%2e/targets.json"},
+                {"path": "repairs/targets.json?raw=1",
+                 "identity": "https://github.com/review/repo/blob/" + "1" * 40 + "/repairs/targets.json?raw=1"},
+                {"identity": base["identity"] + "?raw=1"},
+            )
+            for mutation in hostile:
+                artifact = {**base, **mutation}
+                payload = {**reviewed, "review_artifact": artifact}
+                with self.subTest(mutation=mutation), mock.patch.object(
+                    MODULE, "source_bytes",
+                ) as fetch, self.assertRaisesRegex(ValueError, "identity_mismatch"):
+                    MODULE._verify_review_artifact(payload, str(path))
+                fetch.assert_not_called()
 
     def test_remote_review_artifact_mismatch_refuses_before_linear_read(self):
         prepare_client = self._client()

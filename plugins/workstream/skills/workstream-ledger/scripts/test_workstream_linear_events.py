@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
+import copy
 import threading
 import tempfile
 import unittest
@@ -16,6 +18,7 @@ from workstream_linear import LinearTransportError
 from workstream_checkpoint import build_checkpoint
 from workstream_linear_checkpoints import encode_checkpoint_comment
 from workstream_linear_events import (
+    EVENT_PREFIX,
     LinearCommentEventAdapter,
     LinearEventError,
     apply_material_semantic_repairs,
@@ -336,16 +339,181 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
                     ledger_serialization_frontier_value=[],
                 )
 
-    def test_repair_refuses_incomplete_drift_valid_and_forward_targets(self):
+    def test_repair_refuses_incomplete_target_set_at_intended_branch(self):
+        comments, payload, checkpoint, projection, generation, route, source, graph = self._repair_fixture()
+        third = Delta(
+            "flat-c", "GEN-37", "material_boundary", "system",
+            {"progress": "third malformed"}, 2, "2026-08-30T00:00:02Z",
+        )
+        canonical = linear_events_module._canonical_event(third)
+        encoded = base64.urlsafe_b64encode(json.dumps(
+            canonical, sort_keys=True, separators=(",", ":"),
+        ).encode()).decode().rstrip("=")
+        prefix = [*comments[:-1], {
+            "id": "remote-third", "body": f"{EVENT_PREFIX}{encoded} -->",
+        }]
+        changed = json.loads(json.dumps(payload))
+        changed["raw_frontier"] = material_frontier(
+            reduce_event_comments(prefix, workstream_id="GEN-37")
+        )
+        changed["postwrite_oracle"]["target_binding_count"] = 2
+        changed["postwrite_oracle"]["target_bindings_sha256"] = (
+            linear_events_module.canonical_sha256(changed["target_bindings"])
+        )
+        control = Delta(
+            "repair", "GEN-37", "material_semantic_repair", "system",
+            changed, 3, "2026-08-30T00:01:00Z",
+        )
+        candidate = [*prefix, {
+            "id": ledger_boundary_slot_id("GEN-37", 3, [], route),
+            "body": encode_reviewed_repair_comment(control),
+        }]
+        with self.assertRaisesRegex(
+            LinearEventError, "material_semantic_repair_incomplete_target_set",
+        ):
+            apply_material_semantic_repairs(
+                reduce_event_comments(candidate, workstream_id="GEN-37"), candidate,
+                checkpoint_frontier=checkpoint, projection_frontier=projection,
+                generation=generation, authenticated_route=route,
+                authenticated_source=source, issue_graph_frontier=graph,
+                ledger_serialization_frontier_value=[],
+            )
+
+    def test_repair_target_validator_refuses_exact_duplicate_unknown_valid_and_drift_branches(self):
+        for mutation, reason in (
+            ("duplicate", "duplicate_material_semantic_repair_target"),
+            ("unknown", "material_semantic_repair_forward_or_unknown_target"),
+            ("valid", "material_semantic_repair_valid_target"),
+            ("drift", "material_semantic_repair_target_drift"),
+        ):
+            comments, payload, checkpoint, projection, generation, route, source, graph = self._repair_fixture()
+            changed = json.loads(json.dumps(payload))
+            prefix = comments[:-1]
+            expected_revision = 2
+            if mutation == "duplicate":
+                changed["target_bindings"][1] = copy.deepcopy(
+                    changed["target_bindings"][0]
+                )
+            elif mutation == "unknown":
+                changed["target_bindings"][1]["event_id"] = "unknown-target"
+            elif mutation == "drift":
+                changed["target_bindings"][1]["remote_comment_id"] = "wrong-remote"
+            else:
+                valid = Delta(
+                    "valid-boundary", "GEN-37", "material_boundary", "system",
+                    {"boundary_id": "valid", "changes": [{
+                        "kind": "progress", "payload": {"progress": "valid"},
+                    }]}, 2, "2026-08-30T00:00:02Z",
+                )
+                prefix = [*prefix, {
+                    "id": "remote-valid", "body": encode_event_comment(valid),
+                }]
+                expected_revision = 3
+                changed["raw_frontier"] = material_frontier(
+                    reduce_event_comments(prefix, workstream_id="GEN-37")
+                )
+                changed["target_bindings"][1]["event_id"] = valid.event_id
+            changed["postwrite_oracle"]["target_bindings_sha256"] = (
+                linear_events_module.canonical_sha256(changed["target_bindings"])
+            )
+            control = Delta(
+                "repair", "GEN-37", "material_semantic_repair", "system",
+                changed, expected_revision, "2026-08-30T00:01:00Z",
+            )
+            candidate = [*prefix, {
+                "id": ledger_boundary_slot_id(
+                    "GEN-37", expected_revision, [], route,
+                ),
+                "body": encode_reviewed_repair_comment(control),
+            }]
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(
+                LinearEventError, reason,
+            ):
+                apply_material_semantic_repairs(
+                    reduce_event_comments(candidate, workstream_id="GEN-37"),
+                    candidate, checkpoint_frontier=checkpoint,
+                    projection_frontier=projection, generation=generation,
+                    authenticated_route=route, authenticated_source=source,
+                    issue_graph_frontier=graph,
+                    ledger_serialization_frontier_value=[],
+                )
+
+    def test_postwrite_oracle_each_bound_proof_refuses_at_exact_branch(self):
+        mutations = {
+            "source_identity": "material_semantic_repair_postwrite_oracle_source_identity_drift",
+            "source_sha256": "material_semantic_repair_postwrite_oracle_source_sha256_drift",
+            "source_event_id": "material_semantic_repair_postwrite_oracle_source_event_id_drift",
+            "source_remote_comment_id": "material_semantic_repair_postwrite_oracle_source_remote_comment_id_drift",
+            "source_comment_body_sha256": "material_semantic_repair_postwrite_oracle_source_comment_body_sha256_drift",
+            "source_event_sha256": "material_semantic_repair_postwrite_oracle_source_event_sha256_drift",
+            "projection_seal_event_id": "material_semantic_repair_postwrite_oracle_projection_seal_event_id_drift",
+            "projection_seal_remote_comment_id": "material_semantic_repair_postwrite_oracle_projection_seal_remote_comment_id_drift",
+            "projection_seal_comment_body_sha256": "material_semantic_repair_postwrite_oracle_projection_seal_comment_body_sha256_drift",
+            "projection_seal_event_sha256": "material_semantic_repair_postwrite_oracle_projection_seal_event_sha256_drift",
+            "fences_sha256": "material_semantic_repair_postwrite_oracle_fences_sha256_drift",
+            "generation_tip_event_id": "material_semantic_repair_postwrite_oracle_generation_tip_event_id_drift",
+        }
+        for field, reason in mutations.items():
+            comments, payload, checkpoint, projection, generation, route, source, graph = self._repair_fixture()
+            changed = json.loads(json.dumps(payload))
+            changed["postwrite_oracle"][field] = (
+                "missing-remote" if "remote_comment_id" in field
+                else "0" * 64 if field.endswith("sha256")
+                else "wrong-event"
+            )
+            control = Delta(
+                "repair", "GEN-37", "material_semantic_repair", "system",
+                changed, 2, "2026-08-30T00:01:00Z",
+            )
+            candidate = [*comments[:-1], {
+                "id": comments[-1]["id"],
+                "body": encode_reviewed_repair_comment(control),
+            }]
+            with self.subTest(field=field), self.assertRaisesRegex(
+                LinearEventError, reason,
+            ):
+                apply_material_semantic_repairs(
+                    reduce_event_comments(candidate, workstream_id="GEN-37"),
+                    candidate, checkpoint_frontier=checkpoint,
+                    projection_frontier=projection, generation=generation,
+                    authenticated_route=route, authenticated_source=source,
+                    issue_graph_frontier=graph,
+                    ledger_serialization_frontier_value=[],
+                )
+
+    def test_repair_reducer_rejects_noncanonical_review_artifact_identity(self):
+        comments, payload, checkpoint, projection, generation, route, source, graph = self._repair_fixture()
+        changed = json.loads(json.dumps(payload))
+        changed["review_artifact"].update({
+            "repository": "evil.example/review/repo",
+            "identity": (
+                "https://evil.example/review/repo/blob/" + "1" * 40
+                + "/repair.json"
+            ),
+        })
+        control = Delta(
+            "repair", "GEN-37", "material_semantic_repair", "system",
+            changed, 2, "2026-08-30T00:01:00Z",
+        )
+        candidate = [*comments[:-1], {
+            "id": comments[-1]["id"],
+            "body": encode_reviewed_repair_comment(control),
+        }]
+        with self.assertRaisesRegex(
+            LinearEventError, "malformed_material_semantic_repair_artifact",
+        ):
+            apply_material_semantic_repairs(
+                reduce_event_comments(candidate, workstream_id="GEN-37"),
+                candidate, checkpoint_frontier=checkpoint,
+                projection_frontier=projection, generation=generation,
+                authenticated_route=route, authenticated_source=source,
+                issue_graph_frontier=graph,
+                ledger_serialization_frontier_value=[],
+            )
+
+    def test_repair_refuses_live_frontier_drift(self):
         cases = []
         comments, payload, checkpoint, projection, generation, route, source, graph = self._repair_fixture()
-        incomplete = [dict(item) for item in comments]
-        p = dict(payload); p["target_bindings"] = payload["target_bindings"][:1]
-        control = Delta("repair", "GEN-37", "material_semantic_repair", "system", p, 2,
-                        "2026-08-30T00:01:00Z")
-        incomplete[-1] = {"id": comments[-1]["id"], "body": encode_reviewed_repair_comment(control)}
-        cases.append((incomplete, checkpoint,
-                      "malformed_material_semantic_repair_postwrite_oracle"))
         drift = dict(checkpoint); drift["revision"] = 1
         cases.append((comments, drift, "checkpoint_frontier_drift"))
         for candidate, checkpoint_value, reason in cases:

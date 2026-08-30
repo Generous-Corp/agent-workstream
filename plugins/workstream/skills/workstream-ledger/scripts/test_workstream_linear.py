@@ -1200,6 +1200,8 @@ class LinearTransportTests(unittest.TestCase):
         self.assertEqual(snapshot["root"]["next_action"], "Review child graph.")
         self.assertEqual(snapshot["children"][0]["next_action"], "Run focused tests.")
         self.assertEqual(snapshot["root"]["revision"], 0)
+        self.assertEqual(snapshot["children"][0]["plan_revision"], "sha-demo")
+        self.assertEqual(snapshot["children"][0]["revision"], 0)
 
     def test_resume_collects_child_comments_in_one_graph_read_then_paginates(self):
         root = {
@@ -1525,7 +1527,7 @@ class LinearTransportTests(unittest.TestCase):
             },
             {
                 "id": "id-2", "identifier": "GEN-2", "title": "Build",
-                "description": "Current next action (2026-08-20): Run focused tests.",
+                "description": "Plan revision: child-sha\nLedger revision: 6\nCurrent next action (2026-08-20): Run focused tests.",
                 "url": "https://linear.test/2", "updatedAt": "now",
                 "state": {"name": "Todo", "type": "unstarted"},
                 "parent": {"id": "id-1", "identifier": "GEN-1"},
@@ -1534,6 +1536,8 @@ class LinearTransportTests(unittest.TestCase):
         snapshot = LinearGraphQLTransport(fake, team_id="team").snapshot_for_root("GEN-1")
         self.assertEqual(snapshot["root"]["next_action"], "Resume safely.")
         self.assertEqual(snapshot["children"][0]["next_action"], "Run focused tests.")
+        self.assertEqual(snapshot["children"][0]["plan_revision"], "child-sha")
+        self.assertEqual(snapshot["children"][0]["revision"], 6)
 
         from workstream_resume import compact_context
         context = compact_context(snapshot, "GEN-1")

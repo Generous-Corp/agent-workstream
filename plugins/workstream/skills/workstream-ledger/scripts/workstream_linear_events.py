@@ -640,6 +640,43 @@ def _body_by_remote_id(comments: list[dict[str, Any]]) -> dict[str, str]:
     return result
 
 
+def validate_review_artifact_identity(artifact: Any) -> None:
+    """Require one canonical immutable GitHub commit:path artifact identity."""
+    if not isinstance(artifact, dict) or set(artifact) != {
+        "identity", "repository", "commit", "path", "sha256", "reviewed_at",
+    }:
+        raise ValueError("material_repair_review_artifact_identity_mismatch")
+    repository = artifact.get("repository")
+    owner = r"[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?"
+    repo = r"[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?"
+    artifact_path = artifact.get("path")
+    path_is_canonical = (
+        isinstance(artifact_path, str)
+        and bool(artifact_path)
+        and "\\" not in artifact_path
+        and all(
+            segment not in {"", ".", ".."}
+            and re.fullmatch(r"[A-Za-z0-9._-]+", segment) is not None
+            for segment in artifact_path.split("/")
+        )
+    )
+    if (
+        not isinstance(repository, str)
+        or re.fullmatch(rf"github\.com/{owner}/{repo}", repository) is None
+        or re.fullmatch(r"[0-9a-f]{40}", str(artifact.get("commit", ""))) is None
+        or re.fullmatch(r"[0-9a-f]{64}", str(artifact.get("sha256", ""))) is None
+        or not path_is_canonical
+        or artifact.get("identity") != (
+            f"https://{repository}/blob/{artifact.get('commit')}/{artifact_path}"
+        )
+        or re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z",
+            str(artifact.get("reviewed_at", "")),
+        ) is None
+    ):
+        raise ValueError("material_repair_review_artifact_identity_mismatch")
+
+
 def material_frontier(log: ReducedEventLog) -> dict[str, Any]:
     records = [_canonical_event(event) for event in log.raw_events or log.events]
     ids = [event["event_id"] for event in records]
@@ -751,24 +788,9 @@ def apply_material_semantic_repairs(
             if payload[name] != actual:
                 raise LinearEventError(f"material_semantic_repair_{name}_drift")
     artifact = payload["review_artifact"]
-    if (
-        not isinstance(artifact, dict)
-        or set(artifact) != {
-            "identity", "repository", "commit", "path", "sha256", "reviewed_at",
-        }
-        or not all(isinstance(artifact.get(k), str) and artifact[k]
-                   for k in artifact)
-        or re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"]) is None
-        or re.fullmatch(r"[0-9a-f]{40}", artifact["commit"]) is None
-        or artifact["identity"] != (
-            f"https://{artifact['repository']}/blob/{artifact['commit']}/"
-            f"{artifact['path']}"
-        )
-        or re.fullmatch(
-            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z",
-            artifact["reviewed_at"],
-        ) is None
-    ):
+    try:
+        validate_review_artifact_identity(artifact)
+    except ValueError:
         raise LinearEventError("malformed_material_semantic_repair_artifact")
     bindings = payload["target_bindings"]
     if not isinstance(bindings, list) or not bindings:
@@ -790,8 +812,47 @@ def apply_material_semantic_repairs(
             "authenticated_route", "authenticated_source", "issue_graph_frontier",
         )
     }
-    source_body = bodies.get(oracle.get("source_remote_comment_id"))
-    seal_body = bodies.get(oracle.get("projection_seal_remote_comment_id"))
+    if (
+        set(oracle) != oracle_fields
+        or oracle.get("schema_version") != 1
+        or oracle.get("target_binding_count") != 2
+        or len(bindings) != 2
+        or oracle.get("target_bindings_sha256") != canonical_sha256(bindings)
+        or re.fullmatch(r"[0-9a-f]{64}", str(
+            oracle.get("strict_target_candidate_sha256", "")
+        )) is None
+    ):
+        raise LinearEventError("malformed_material_semantic_repair_postwrite_oracle")
+    if oracle["source_identity"] != payload["authenticated_source"].get("identity"):
+        raise LinearEventError(
+            "material_semantic_repair_postwrite_oracle_source_identity_drift"
+        )
+    if oracle["source_sha256"] != payload["authenticated_source"].get("sha256"):
+        raise LinearEventError(
+            "material_semantic_repair_postwrite_oracle_source_sha256_drift"
+        )
+    source_body = bodies.get(oracle["source_remote_comment_id"])
+    if source_body is None:
+        raise LinearEventError(
+            "material_semantic_repair_postwrite_oracle_source_remote_comment_id_drift"
+        )
+    if hashlib.sha256(source_body.encode()).hexdigest() != oracle[
+        "source_comment_body_sha256"
+    ]:
+        raise LinearEventError(
+            "material_semantic_repair_postwrite_oracle_source_comment_body_sha256_drift"
+        )
+    seal_body = bodies.get(oracle["projection_seal_remote_comment_id"])
+    if seal_body is None:
+        raise LinearEventError(
+            "material_semantic_repair_postwrite_oracle_projection_seal_remote_comment_id_drift"
+        )
+    if hashlib.sha256(seal_body.encode()).hexdigest() != oracle[
+        "projection_seal_comment_body_sha256"
+    ]:
+        raise LinearEventError(
+            "material_semantic_repair_postwrite_oracle_projection_seal_comment_body_sha256_drift"
+        )
     try:
         from workstream_linear_projection import (
             PROJECTION_RE, _decode_projection,
@@ -804,39 +865,50 @@ def apply_material_semantic_repairs(
         seal_event = _decode_projection(seal_matches[0])
     except Exception:
         source_event = seal_event = None
-    if (
-        set(oracle) != oracle_fields
-        or oracle.get("schema_version") != 1
-        or oracle.get("target_binding_count") != 2
-        or len(bindings) != 2
-        or oracle.get("target_bindings_sha256") != canonical_sha256(bindings)
-        or re.fullmatch(r"[0-9a-f]{64}", str(
-            oracle.get("strict_target_candidate_sha256", "")
-        )) is None
-        or oracle.get("source_identity")
-        != payload["authenticated_source"].get("identity")
-        or oracle.get("source_sha256")
-        != payload["authenticated_source"].get("sha256")
-        or not isinstance(source_event, dict)
-        or source_event.get("event_id") != oracle.get("source_event_id")
-        or source_event.get("kind") != "source"
-        or source_event.get("value") != payload["authenticated_source"]
-        or hashlib.sha256((source_body or "").encode()).hexdigest()
-        != oracle.get("source_comment_body_sha256")
-        or canonical_sha256(source_event) != oracle.get("source_event_sha256")
-        or oracle.get("projection_seal_event_id")
-        != payload["projection_frontier"].get("frontier_event_id")
-        or not isinstance(seal_event, dict)
-        or seal_event.get("event_id") != oracle.get("projection_seal_event_id")
-        or canonical_sha256(seal_event) != oracle.get("projection_seal_event_sha256")
-        or oracle.get("generation_tip_event_id")
-        != payload["generation"].get("transition_tip_event_id")
-        or oracle.get("fences_sha256") != canonical_sha256(fence_values)
-        or seal_body is None
-        or hashlib.sha256(seal_body.encode()).hexdigest()
-        != oracle.get("projection_seal_comment_body_sha256")
+    if not isinstance(source_event, dict) or source_event.get("kind") != "source":
+        raise LinearEventError(
+            "material_semantic_repair_postwrite_oracle_source_event_malformed"
+        )
+    if source_event.get("event_id") != oracle["source_event_id"]:
+        raise LinearEventError(
+            "material_semantic_repair_postwrite_oracle_source_event_id_drift"
+        )
+    if source_event.get("value") != payload["authenticated_source"]:
+        raise LinearEventError(
+            "material_semantic_repair_postwrite_oracle_source_event_value_drift"
+        )
+    if canonical_sha256(source_event) != oracle["source_event_sha256"]:
+        raise LinearEventError(
+            "material_semantic_repair_postwrite_oracle_source_event_sha256_drift"
+        )
+    if oracle["projection_seal_event_id"] != payload[
+        "projection_frontier"
+    ].get("frontier_event_id"):
+        raise LinearEventError(
+            "material_semantic_repair_postwrite_oracle_projection_seal_event_id_drift"
+        )
+    if not isinstance(seal_event, dict):
+        raise LinearEventError(
+            "material_semantic_repair_postwrite_oracle_projection_seal_event_malformed"
+        )
+    if seal_event.get("event_id") != oracle["projection_seal_event_id"]:
+        raise LinearEventError(
+            "material_semantic_repair_postwrite_oracle_projection_seal_event_id_drift"
+        )
+    if canonical_sha256(seal_event) != oracle["projection_seal_event_sha256"]:
+        raise LinearEventError(
+            "material_semantic_repair_postwrite_oracle_projection_seal_event_sha256_drift"
+        )
+    if oracle["generation_tip_event_id"] != payload["generation"].get(
+        "transition_tip_event_id"
     ):
-        raise LinearEventError("malformed_material_semantic_repair_postwrite_oracle")
+        raise LinearEventError(
+            "material_semantic_repair_postwrite_oracle_generation_tip_event_id_drift"
+        )
+    if oracle["fences_sha256"] != canonical_sha256(fence_values):
+        raise LinearEventError(
+            "material_semantic_repair_postwrite_oracle_fences_sha256_drift"
+        )
     malformed_ids = {event.event_id for event in malformed}
     bound: dict[str, dict[str, Any]] = {}
     positions = {event.event_id: index for index, event in enumerate(raw.events)}
