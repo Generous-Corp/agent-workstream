@@ -170,7 +170,7 @@ class MaterialRepairCliTests(unittest.TestCase):
         client.root_issue_id = self.route["root_issue_id"]
         return client
 
-    def _invoke(self, argv, client, *, fetched_artifact=None):
+    def _invoke(self, argv, client, *, fetched_artifact=None, plan_source=None):
         transport = mock.Mock()
         transport.snapshot_for_root.return_value = copy.deepcopy(self.graph)
         stdout = io.StringIO()
@@ -192,7 +192,9 @@ class MaterialRepairCliTests(unittest.TestCase):
                 MODULE, "resolve_authenticated_issue_route", return_value=self.route,
             ))
             stack.enter_context(mock.patch.object(
-                MODULE, "plan_payload", return_value={"source": self.source},
+                MODULE, "plan_payload", return_value={
+                    "source": self.source if plan_source is None else plan_source,
+                },
             ))
             stack.enter_context(mock.patch.object(
                 MODULE, "LinearGraphQLTransport", return_value=transport,
@@ -203,7 +205,7 @@ class MaterialRepairCliTests(unittest.TestCase):
             code = MODULE.main()
         return code, stdout.getvalue(), stderr.getvalue()
 
-    def _prepare(self, directory, client):
+    def _prepare(self, directory, client, *, plan_source=None):
         artifact_path = Path(directory) / "reviewed-targets.json"
         reviewed = {
             "schema_version": 1, "workstream_id": "GEN-37",
@@ -231,12 +233,56 @@ class MaterialRepairCliTests(unittest.TestCase):
             "workstream_material_repair.py", "GEN-37", "--manifest", str(payload_path),
             "--review-artifact", str(artifact_path), "--plan-source", "plan",
             "--prepare",
-        ], client)
+        ], client, plan_source=plan_source)
         self.assertEqual((code, error), (0, ""))
         outer = json.loads(output)
         manifest_path = Path(directory) / "manifest.json"
         manifest_path.write_text(json.dumps(outer), encoding="utf-8")
         return manifest_path, artifact_path, outer
+
+    def test_prepare_normalizes_real_plan_source_bytes_without_write(self):
+        client = self._client()
+        with tempfile.TemporaryDirectory() as directory:
+            _manifest_path, _artifact_path, outer = self._prepare(
+                directory, client,
+                plan_source={**self.source, "bytes": 65753},
+            )
+        self.assertEqual(outer["payload"]["authenticated_source"], self.source)
+        self.assertNotIn("bytes", outer["payload"]["authenticated_source"])
+        self.assertFalse(any(
+            "commentCreate" in query for query, _variables in client.calls
+        ))
+
+    def test_identity_or_digest_source_drift_still_refuses_without_write(self):
+        prepare_client = self._client()
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path, artifact_path, _outer = self._prepare(
+                directory, prepare_client,
+            )
+            argv = [
+                "workstream_material_repair.py", "GEN-37",
+                "--manifest", str(manifest_path),
+                "--review-artifact", str(artifact_path),
+                "--plan-source", "plan",
+            ]
+            for changed in (
+                {**self.source, "identity": "different-plan", "bytes": 65753},
+                {**self.source, "sha256": "b" * 64, "bytes": 65753},
+            ):
+                client = self._client()
+                with self.subTest(source=changed):
+                    code, output, error = self._invoke(
+                        argv, client, plan_source=changed,
+                    )
+                    self.assertEqual((code, output), (2, ""))
+                    self.assertIn(
+                        "material_semantic_repair_authenticated_source_drift",
+                        error,
+                    )
+                    self.assertFalse(any(
+                        "commentCreate" in query
+                        for query, _variables in client.calls
+                    ))
 
     def test_prepare_apply_replay_is_one_rev58_control_and_zero_duplicate(self):
         client = self._client()
@@ -440,7 +486,7 @@ class MaterialRepairCliTests(unittest.TestCase):
                     return_value=self.route,
                 ), mock.patch.object(
                     workstream_resume, "plan_payload",
-                    return_value={"source": successor_source},
+                    return_value={"source": {**successor_source, "bytes": 10}},
                 ), mock.patch.object(
                     workstream_resume.sys, "argv", resume_argv,
                 ), mock.patch.object(
