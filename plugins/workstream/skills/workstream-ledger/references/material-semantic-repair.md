@@ -158,6 +158,14 @@ checkpoint, projection, generation, graph, and serialization checks are a final
 complete preflight plus postcheck, not a transactional cross-surface CAS; a
 concurrent change is reported for reconciliation.
 
+The final material append also uses the repair-only pinned adapter path. Its
+own last combined material/checkpoint/reservation read must equal the manifest's
+exact serialization frontier, and the adapter writes only the supplied reviewed
+slot. It never recomputes or follows a newly derived slot. A checkpoint or
+reservation appearing after the CLI preflight therefore causes a known
+zero-write precondition refusal; a writer starting after that internal read
+still contends for the same shared slot.
+
 If apply returns `durable_partial_replay_required`, the control comment was
 reobserved with its exact receipt. If it returns
 `outcome_unknown_replay_required`, no receipt was observable after the failed

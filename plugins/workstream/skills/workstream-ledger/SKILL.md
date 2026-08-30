@@ -414,6 +414,9 @@ SHA-256. Normalization is mechanically lossless: exactly two incident targets,
 `repair:<event-id>`, and one `progress` change containing the complete original
 payload. The material comment uses one deterministic slot; the complete
 cross-surface readback is a preflight/postcheck fence, not transactional CAS.
+The repair-only adapter performs another combined read immediately before the
+create, requires the exact pinned serialization frontier, and writes only the
+reviewed slot—never a recomputed successor slot.
 Later authorized generation, source, or child evolution does not invalidate the
 immutable historical repair proof.
 

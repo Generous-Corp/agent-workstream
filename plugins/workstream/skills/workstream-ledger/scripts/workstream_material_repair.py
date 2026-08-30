@@ -17,7 +17,7 @@ from workstream_linear_checkpoints import reduce_checkpoint_comments
 from workstream_linear_events import (
     LinearCommentEventAdapter, apply_material_semantic_repairs,
     ledger_boundary_slot_id, ledger_serialization_frontier, material_frontier,
-    reduce_event_comments,
+    PinnedRepairPreconditionError, reduce_event_comments,
 )
 from workstream_linear_projection import reduce_projection_comments, select_plan_generation
 from workstream_plan import plan_payload
@@ -412,7 +412,14 @@ def main() -> int:
                 ):
                     raise ValueError("material_repair_final_prewrite_fence_drift")
             try:
-                receipt = adapter.apply(candidate)
+                receipt = adapter.apply_pinned_repair(
+                    candidate, expected_remote_slot=expected_slot,
+                    expected_serialization_frontier=(
+                        payload["ledger_serialization_frontier"]
+                    ),
+                )
+            except PinnedRepairPreconditionError:
+                raise
             except Exception as apply_error:
                 try:
                     uncertain_comments = adapter.comments()

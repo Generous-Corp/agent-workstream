@@ -12,13 +12,16 @@ from unittest import mock
 from test_workstream_linear_events import FakeCommentClient
 import test_workstream_linear_events as linear_event_tests
 from workstream_delta import Delta
-from workstream_linear_checkpoints import reduce_checkpoint_comments
+from workstream_checkpoint import build_checkpoint
+from workstream_linear_checkpoints import (
+    encode_checkpoint_comment, reduce_checkpoint_comments,
+)
 from workstream_linear_events import (
-    EVENT_PREFIX, _canonical_event, encode_event_comment, material_frontier,
-    reduce_event_comments,
+    EVENT_PREFIX, _canonical_event, encode_event_comment,
+    encode_ledger_reservation, material_frontier, reduce_event_comments,
 )
 from workstream_linear_projection import (
-    reduce_projection_comments, select_plan_generation,
+    build_projection_event, reduce_projection_comments, select_plan_generation,
 )
 import workstream_material_repair as MODULE
 import workstream_resume
@@ -322,6 +325,99 @@ class MaterialRepairCliTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertIn("final_prewrite_fence_drift", error)
             self.assertFalse(any("commentCreate" in call[0] for call in racing.calls))
+
+    def test_pinned_apply_refuses_checkpoint_or_reservation_internal_read_race(self):
+        for race_kind in ("checkpoint", "reservation"):
+            prepare_client = self._client()
+            with self.subTest(race_kind=race_kind), tempfile.TemporaryDirectory() as directory:
+                manifest_path, artifact_path, outer = self._prepare(
+                    directory, prepare_client,
+                )
+                racing = self._client()
+                expected_slot = outer["control"]["remote_slot_id"]
+                if race_kind == "checkpoint":
+                    checkpoint = build_checkpoint(
+                        workstream_id="GEN-37", boundary_id="repair-race",
+                        root_revision=57, plan_revision="a" * 64,
+                        before_status="In Progress", after_status="In Progress",
+                        execution={
+                            "agent": "codex", "provider": "openai",
+                            "session_id": "race", "machine": "test",
+                            "worktree": {"state": "safe", "path": "/repo",
+                                         "branch": "main", "head": "1" * 40},
+                        },
+                        exact_head="1" * 40, evidence=[], blocker=None,
+                        next_action="continue", predecessor_event_id=None,
+                    )
+                    planted = encode_checkpoint_comment(checkpoint)
+                else:
+                    projection = reduce_projection_comments(
+                        racing.comments, workstream_id="GEN-37",
+                        expected_plan_revision="a" * 64,
+                        authenticated_route=self.route,
+                        authenticated_source=self.source,
+                    )
+                    scope_event = next(
+                        event for event in projection.events
+                        if event["kind"] == "scope"
+                    )
+                    intended = build_projection_event(
+                        workstream_id="GEN-37", kind="scope", key="root",
+                        value=projection.snapshot["scope"],
+                        plan_revision="a" * 64,
+                        expected_revision=projection.revision,
+                        created_at="2026-08-30T00:01:01Z",
+                        supersedes_event_id=scope_event["event_id"],
+                        authority=self.route,
+                    )
+                    reservation = {
+                        "schema_version": 1, "workstream_id": "GEN-37",
+                        "material_revision": 57,
+                        "intent_kind": "repository_identity_projection",
+                        "plan_revision": "a" * 64,
+                        "projection_revision": projection.revision,
+                        "projection_frontier_ids": [
+                            projection.remote_ids[event["event_id"]]
+                            for event in projection.events
+                        ],
+                        "frontier_ids": [], "authority": self.route,
+                        "intent_event": intended,
+                        "intent_sha256": hashlib.sha256(json.dumps(
+                            intended, sort_keys=True, separators=(",", ":"),
+                        ).encode()).hexdigest(),
+                    }
+                    planted = encode_ledger_reservation(reservation)
+                original_execute = racing.execute
+                reads = 0
+
+                def inject_on_internal_read(query, variables):
+                    nonlocal reads
+                    if "query WorkstreamDeltaComments" in query:
+                        reads += 1
+                        if reads == 3:
+                            racing.comments.append({
+                                "id": expected_slot, "body": planted,
+                                "createdAt": "race", "updatedAt": "race",
+                            })
+                    return original_execute(query, variables)
+
+                racing.execute = inject_on_internal_read
+                code, _output, error = self._invoke([
+                    "workstream_material_repair.py", "GEN-37",
+                    "--manifest", str(manifest_path),
+                    "--review-artifact", str(artifact_path),
+                    "--plan-source", "plan", "--apply",
+                ], racing)
+                self.assertEqual(code, 2)
+                self.assertIn(
+                    "pinned_repair_serialization_frontier_drift"
+                    if race_kind == "checkpoint"
+                    else "pinned_repair_serialization_authority_drift",
+                    error,
+                )
+                self.assertFalse(any(
+                    "commentCreate" in call[0] for call in racing.calls
+                ))
 
     def test_live_reviewed_gen37_target_artifact_matches_immutable_authority(self):
         path = Path(

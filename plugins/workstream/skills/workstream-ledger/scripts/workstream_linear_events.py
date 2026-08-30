@@ -75,6 +75,10 @@ class LinearEventError(LinearTransportError):
     """The remote event journal cannot be reduced without guessing."""
 
 
+class PinnedRepairPreconditionError(LinearEventError):
+    """A repair's final internal read no longer matches its pinned manifest."""
+
+
 @dataclass(frozen=True)
 class ReducedEventLog:
     workstream_id: str
@@ -1045,6 +1049,140 @@ class LinearCommentEventAdapter:
         }:
             raise LinearEventError("linear_comment_create_id_capability_unavailable")
         self._comment_id_capability_verified = True
+
+    def apply_pinned_repair(
+        self, delta: Delta, *, expected_remote_slot: str,
+        expected_serialization_frontier: list[str],
+    ) -> MutationReceipt:
+        """Append one repair only at its reviewed slot after one final read."""
+        if delta.workstream_id != self.issue_id or delta.kind != MATERIAL_REPAIR_KIND:
+            raise PinnedRepairPreconditionError("pinned_repair_event_required")
+        if (
+            not isinstance(expected_remote_slot, str) or not expected_remote_slot
+            or not isinstance(expected_serialization_frontier, list)
+            or expected_serialization_frontier
+            != sorted(set(expected_serialization_frontier))
+            or not all(
+                isinstance(item, str) and item
+                for item in expected_serialization_frontier
+            )
+        ):
+            raise PinnedRepairPreconditionError("invalid_pinned_repair_frontier")
+        before, checkpoints, comments = self._combined_state()
+        self._validate_checkpoint_prefix(before, checkpoints)
+        existing_id = before.remote_ids.get(delta.event_id)
+        if existing_id:
+            existing = next(
+                event for event in before.events if event.event_id == delta.event_id
+            )
+            if (
+                existing_id != expected_remote_slot
+                or not _rebase_compatible_replay(existing, delta)
+            ):
+                raise PinnedRepairPreconditionError(
+                    f"conflicting_pinned_repair:{delta.event_id}"
+                )
+            return MutationReceipt(
+                delta.event_id, _event_applied_revision(before, delta.event_id),
+                existing_id,
+            )
+        try:
+            validate_material_event_semantics(delta)
+        except ValueError as error:
+            raise PinnedRepairPreconditionError(str(error)) from error
+        if delta.expected_revision != before.revision:
+            raise PinnedRepairPreconditionError(
+                "pinned_repair_material_revision_drift"
+            )
+        if self._observed_authority is None:
+            raise PinnedRepairPreconditionError(
+                "comment_slot_authority_incomplete"
+            )
+        from workstream_generation import (
+            assert_generation_write_authority,
+            assert_no_pending_generation_reservation,
+        )
+        try:
+            assert_no_pending_ledger_reservation(
+                comments, workstream_id=self.issue_id,
+                authenticated_route=self._observed_authority,
+                current_plan_revision=self.plan_revision,
+            )
+            assert_no_pending_generation_reservation(
+                comments, workstream_id=self.issue_id,
+                authenticated_route=self._observed_authority,
+            )
+            assert_generation_write_authority(
+                comments, workstream_id=self.issue_id,
+                plan_revision=self.plan_revision,
+                authenticated_route=self._observed_authority,
+            )
+        except LinearTransportError as error:
+            raise PinnedRepairPreconditionError(
+                "pinned_repair_serialization_authority_drift"
+            ) from error
+        actual_frontier = ledger_serialization_frontier(
+            self._checkpoint_frontier(checkpoints), comments,
+            workstream_id=self.issue_id,
+            authenticated_route=self._observed_authority,
+            current_plan_revision=self.plan_revision,
+            material_revision=before.revision,
+        )
+        if actual_frontier != expected_serialization_frontier:
+            raise PinnedRepairPreconditionError(
+                "pinned_repair_serialization_frontier_drift"
+            )
+        if ledger_boundary_slot_id(
+            delta.workstream_id, before.revision, actual_frontier,
+            self._observed_authority,
+        ) != expected_remote_slot:
+            raise PinnedRepairPreconditionError("pinned_repair_remote_slot_drift")
+        self._assert_comment_id_capability()
+        try:
+            response = self.client.execute(
+                COMMENT_CREATE_MUTATION,
+                {"input": {
+                    "id": expected_remote_slot,
+                    "issueId": self.issue_id,
+                    "body": encode_event_comment(delta),
+                }},
+            )
+        except LinearTransportError:
+            after, after_checkpoints, _ = self._combined_state()
+            self._validate_checkpoint_prefix(after, after_checkpoints)
+            existing_id = after.remote_ids.get(delta.event_id)
+            existing = next(
+                (event for event in after.events if event.event_id == delta.event_id),
+                None,
+            )
+            if (
+                existing_id == expected_remote_slot
+                and existing is not None
+                and _canonical_event(existing) == _canonical_event(delta)
+            ):
+                return MutationReceipt(
+                    delta.event_id,
+                    _event_applied_revision(after, delta.event_id),
+                    expected_remote_slot,
+                )
+            raise
+        created = response.get("commentCreate") or {}
+        comment = created.get("comment")
+        if (
+            created.get("success") is not True or not comment
+            or comment.get("id") != expected_remote_slot
+        ):
+            raise LinearEventError(
+                "Linear comment creation returned no durable receipt"
+            )
+        after, after_checkpoints, _ = self._combined_state()
+        self._validate_checkpoint_prefix(after, after_checkpoints)
+        if after.remote_ids.get(delta.event_id) != expected_remote_slot:
+            raise LinearEventError("event_append_not_observed")
+        return MutationReceipt(
+            delta.event_id, _event_applied_revision(after, delta.event_id),
+            expected_remote_slot,
+        )
 
     def apply(self, delta: Delta) -> MutationReceipt:
         if delta.workstream_id != self.issue_id:
