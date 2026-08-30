@@ -33,6 +33,8 @@ from workstream_linear_checkpoints import (
 from workstream_linear_events import (
     LinearCommentEventAdapter,
     LinearEventError,
+    apply_material_semantic_repairs,
+    ledger_serialization_frontier,
     reduce_event_comments,
 )
 from workstream_linear_projection import (
@@ -136,7 +138,101 @@ def _event_record(event: Any) -> dict[str, Any]:
     }
 
 
+def _checkpoint_repair_frontier(
+    checkpoints: Any, *, count: int | None = None,
+) -> dict[str, Any]:
+    records = list(checkpoints.checkpoints)
+    if count is not None:
+        if type(count) is not int or count < 0:
+            raise ResumeError("invalid_repair_checkpoint_frontier_count")
+        records = records[:count]
+    ids = [item["event_id"] for item in records]
+    return {
+        "algorithm": "checkpoint-reducer-order-v1",
+        "count": len(records),
+        "revision": max((item["root_revision"] for item in records), default=0),
+        "event_ids_reducer_order_sha256": hashlib.sha256(json.dumps(
+            ids, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest(),
+        "event_ids_sorted_set_sha256": hashlib.sha256(json.dumps(
+            sorted(set(ids)), ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode()).hexdigest(),
+        "checkpoints_sha256": hashlib.sha256(json.dumps(
+            records, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest(),
+    }
+
+
+def _projection_repair_frontier(
+    projection: Any, *, revision: int | None = None,
+) -> dict[str, Any]:
+    records = list(projection.events)
+    if revision is not None:
+        if type(revision) is not int or revision < 0:
+            raise ResumeError("invalid_repair_projection_frontier_revision")
+        records = records[:revision]
+    return {
+        "algorithm": "active-projection-reducer-order-v1",
+        "revision": len(records),
+        "frontier_event_id": records[-1]["event_id"] if records else None,
+        "events_sha256": hashlib.sha256(json.dumps(
+            records, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest(),
+    }
+
+
+def _generation_repair_binding(root: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "plan_revision": root.get("plan_revision"),
+        "transition_tip_event_id": root.get("generation_transition_tip_event_id"),
+        "activation_epoch": root.get("generation_activation_epoch"),
+        "authority_origin": root.get("generation_authority_origin"),
+    }
+
+
+def _issue_graph_repair_frontier(
+    snapshot: dict[str, Any], relations: list[dict[str, Any]],
+    relation_targets: dict[str, Any] | None,
+) -> dict[str, Any]:
+    def native(issue: Any) -> dict[str, Any]:
+        if not isinstance(issue, dict):
+            return {}
+        state = issue.get("state")
+        if not isinstance(state, dict):
+            state = {
+                "id": issue.get("state_id"), "name": issue.get("status"),
+                "type": issue.get("status_type"),
+            }
+        return {
+            key: issue.get(key) for key in (
+                "id", "identifier", "url", "title", "parent", "team", "project",
+                "assignee", "archivedAt", "updatedAt", "description",
+                "next_action", "revision", "plan_revision", "status",
+                "status_type", "state_id",
+            )
+        } | {"state": state}
+    graph = {
+        "root": native(snapshot.get("root")),
+        "children": sorted(
+            (native(item) for item in snapshot.get("children", [])),
+            key=lambda item: (str(item.get("identifier")), str(item.get("id"))),
+        ),
+        "relations": relations,
+        "relation_targets": relation_targets or {},
+    }
+    return {
+        "algorithm": "authenticated-root-children-relations-v1",
+        "issues": graph,
+        "sha256": hashlib.sha256(json.dumps(
+            graph, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest(),
+    }
+
+
 def _event_next_actions(event: dict[str, Any]) -> set[str]:
+    if event["kind"] == "material_semantic_repair":
+        return set()
     payloads = [event["payload"]]
     if event["kind"] == "material_boundary":
         changes = event["payload"].get("changes")
@@ -165,6 +261,8 @@ def _event_next_actions(event: dict[str, Any]) -> set[str]:
 
 
 def _event_payloads(event: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    if event["kind"] == "material_semantic_repair":
+        return []
     payloads = [(event["kind"], event["payload"])]
     if event["kind"] == "material_boundary":
         changes = event["payload"].get("changes")
@@ -451,6 +549,8 @@ def _uncheckpointed_material_obligations(
         # concurrent appenders. The canonical reduced-log position is what a
         # checkpoint root_revision actually fences.
         if index < checkpoint_revision:
+            continue
+        if event["kind"] == "material_semantic_repair":
             continue
         append(event, event["kind"], event["payload"])
         if event["kind"] == "material_boundary":
@@ -761,14 +861,78 @@ def add_material_history(
         comments, workstream_id=token,
         selected_activation_checkpoints=selected_checkpoints,
     )
+    projected_relations = projection_log.snapshot.get("relations") or []
+    repair_relation_targets = (
+        relation_target_resolver(projected_relations)
+        if projected_relations and relation_target_resolver is not None else {}
+    )
+    issue_graph_frontier = _issue_graph_repair_frontier(
+        result, projected_relations, repair_relation_targets,
+    )
+    if any(event.kind == "material_semantic_repair" for event in event_log.events):
+        if authenticated_route is None:
+            raise ResumeError("material_semantic_repair_authority_missing")
+        try:
+            repair_control = next(
+                event for event in event_log.events
+                if event.kind == "material_semantic_repair"
+            )
+            repair_payload = repair_control.payload
+            bound_checkpoint_count = (
+                repair_payload.get("checkpoint_frontier", {}).get("count")
+            )
+            bound_projection_revision = (
+                repair_payload.get("projection_frontier", {}).get("revision")
+            )
+            ledger_frontier = ledger_serialization_frontier(
+                sorted(item["event_id"] for item in checkpoint_log.checkpoints),
+                comments, workstream_id=token,
+                authenticated_route=authenticated_route,
+                current_plan_revision=plan_revision,
+                material_revision=repair_control.expected_revision,
+            )
+            event_log = apply_material_semantic_repairs(
+                event_log, comments,
+                checkpoint_frontier=_checkpoint_repair_frontier(
+                    checkpoint_log, count=bound_checkpoint_count,
+                ),
+                projection_frontier=_projection_repair_frontier(
+                    projection_log, revision=bound_projection_revision,
+                ),
+                generation=_generation_repair_binding(result["root"]),
+                authenticated_route=authenticated_route,
+                authenticated_source=authenticated_source or {},
+                issue_graph_frontier=issue_graph_frontier,
+                ledger_serialization_frontier_value=ledger_frontier,
+                validate_live_fences=False,
+            )
+        except LinearEventError as error:
+            raise ResumeError(str(error)) from error
+    else:
+        # Full-authority resume must not interpret malformed historical
+        # boundaries until a later, fully bound repair control exists.
+        try:
+            event_log = apply_material_semantic_repairs(
+                event_log, comments,
+                checkpoint_frontier={}, projection_frontier={}, generation={},
+                authenticated_route={}, authenticated_source={},
+                issue_graph_frontier={},
+                ledger_serialization_frontier_value=[],
+            )
+        except LinearEventError as error:
+            raise ResumeError(str(error)) from error
     events = [_event_record(event) for event in event_log.events]
 
     result["material_events"] = events
+    result["raw_material_events"] = [
+        _event_record(event) for event in (event_log.raw_events or event_log.events)
+    ]
+    result["material_semantic_repairs"] = list(event_log.repair_bindings)
     result["material_event_revision"] = event_log.revision
     result.update(projection_log.snapshot)
     relations = result.get("relations") or []
     if relations and relation_target_resolver is not None:
-        result["relation_targets"] = relation_target_resolver(relations)
+        result["relation_targets"] = repair_relation_targets
     result["authenticated_route"] = dict(authenticated_route) if authenticated_route else None
     result["authenticated_source"] = (
         dict(authenticated_source) if authenticated_source else None
@@ -1428,6 +1592,10 @@ def validate_snapshot(
             raise ResumeError("projection_authority_absent")
         if snapshot.get("authenticated_source") is None:
             raise ResumeError("projection_source_bytes_unverified")
+    repairs = snapshot.get("material_semantic_repairs", [])
+    raw_material_events = snapshot.get("raw_material_events", material_events)
+    if not isinstance(repairs, list) or not isinstance(raw_material_events, list):
+        raise ResumeError("invalid_material_semantic_repair_surface")
     return {"root": root, "children": children, "decisions": snapshot.get("decisions", []),
             "choice_events": choice_events, "scope": scope,
             "relations": relations, "evidence_contracts": evidence_contracts,
@@ -1435,6 +1603,8 @@ def validate_snapshot(
             "surface_availability": availability,
             "provenance": snapshot.get("provenance", []),
             "material_events": material_events,
+            "raw_material_events": raw_material_events,
+            "material_semantic_repairs": repairs,
             "material_event_revision": material_revision,
             "latest_checkpoint": latest_checkpoint,
             "checkpoint_recovery": checkpoint_recovery,
@@ -1531,6 +1701,10 @@ def compact_context(
     history = {
         "included": include_history,
         "material_events": history_summary(clean["material_events"]),
+        "raw_material_events": history_summary(clean["raw_material_events"]),
+        "material_semantic_repairs": history_summary(
+            clean["material_semantic_repairs"]
+        ),
         "projection_events": history_summary(clean["projection_events"]),
         "projection_history": history_summary(clean["projection_history"]),
         "projection_quarantined": history_summary(clean["projection_quarantined"]),
@@ -1600,6 +1774,9 @@ def compact_context(
             )
         ),
         "material_event_revision": clean["material_event_revision"],
+        "material_semantic_repair": history_summary(
+            clean["material_semantic_repairs"]
+        ),
         "latest_checkpoint": (
             clean["latest_checkpoint"] if include_history
             else _compact_checkpoint(clean["latest_checkpoint"])
@@ -1626,6 +1803,10 @@ def compact_context(
     }
     if include_history:
         context["material_events"] = clean["material_events"]
+        context["raw_material_events"] = clean["raw_material_events"]
+        context["material_semantic_repairs"] = clean[
+            "material_semantic_repairs"
+        ]
         context["projection_events"] = clean["projection_events"]
         context["projection_history"] = clean["projection_history"]
         context["projection_quarantined"] = clean["projection_quarantined"]
@@ -1643,6 +1824,8 @@ def compact_context(
             context["child_closures"],
             context["uncheckpointed_material_obligations"],
             context.get("material_events", []),
+            context.get("raw_material_events", []),
+            context.get("material_semantic_repairs", []),
             context.get("projection_events", []),
             context.get("projection_history", []),
             context.get("projection_quarantined", []),

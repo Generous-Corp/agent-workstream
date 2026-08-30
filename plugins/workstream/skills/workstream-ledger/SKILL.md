@@ -390,6 +390,42 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.31 closes an incident in which two callers encoded flat progress
+payloads while labeling them `material_boundary`. New journal and remote writes
+now require a nonempty boundary ID and one or more exact `{kind, payload}`
+changes. Historical envelopes remain inspectable, but resume will not interpret
+a malformed boundary unless a later reviewed `material_semantic_repair` control
+binds every malformed event and the exact material, checkpoint, projection,
+generation, route, and plan-source frontiers. The repair is append-only: it
+overlays normalized boundaries at their original positions and never edits or
+deletes the original comments. Preview the reviewed manifest first, then apply:
+
+```sh
+workstreamctl material-repair GEN-123 --manifest repair.json \
+  --review-artifact reviewed-targets.json \
+  --plan-source ./PLAN.md --plan-identity <canonical-url>
+workstreamctl material-repair GEN-123 --manifest repair.json \
+  --review-artifact reviewed-targets.json \
+  --plan-source ./PLAN.md --plan-identity <canonical-url> --apply
+```
+
+The reviewed target file requires a canonical lowercase GitHub repository key,
+40-lowercase-hex commit URL, and normalized artifact path. It is authenticated
+locally by immutable commit/path and SHA-256 and fetched through the
+authenticated source-byte loader; fetched and local bytes must match before Linear access.
+Exact replay also hashes the complete pinned remote comment body, so surrounding
+prose, whitespace, extra markers, or another comment at that slot refuse.
+Normalization is mechanically lossless: exactly two incident targets,
+`repair:<event-id>`, and one `progress` change containing the complete original
+payload. The material comment uses one deterministic slot; the complete
+cross-surface readback is a preflight/postcheck fence, not transactional CAS.
+The repair-only adapter performs another combined read immediately before the
+create, requires the exact pinned serialization frontier, and writes only the
+reviewed slot—never a recomputed successor slot.
+Later authorized generation, source, or child evolution does not invalidate the
+immutable historical repair proof.
+The control kind is reserved from generic journal/encoder/adapter paths.
+
 ### Durable choice events
 
 Material choices made where the specification was silent are typed immutable

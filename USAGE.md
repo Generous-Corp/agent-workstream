@@ -74,6 +74,13 @@ The agent records material changes only. Diagnostic conversation with no scope,
 decision, blocker, evidence, or next-action change should produce no ledger
 write.
 
+Malformed historical material boundaries are repaired only through a reviewed,
+append-only control event; originals are never edited or deleted. The
+`workstreamctl material-repair` command is dry-run by default and requires
+`--apply` for the single remote append. Its JSON manifest binds the exact raw
+comments and material/checkpoint/projection/generation/route/source frontiers,
+so any change after review refuses before writing.
+
 ## Common scenarios
 
 | You want to | Ask the agent to |

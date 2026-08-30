@@ -1,4 +1,5 @@
 import copy
+import base64
 import hashlib
 import io
 import json
@@ -11,6 +12,7 @@ from workstream_checkpoint import build_checkpoint
 from workstream_delta import Delta
 from workstream_linear_checkpoints import encode_checkpoint_comment
 from workstream_linear_events import encode_event_comment
+import workstream_linear_events as linear_events_module
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, projection_slot_id,
 )
@@ -40,6 +42,114 @@ class ResumeTests(unittest.TestCase):
             if str(child.get("status", "")).lower() not in MODULE.TERMINAL
         }
         return snapshot
+
+    def test_repair_graph_frontier_binds_native_status_and_state_identity(self):
+        snapshot = self.snapshot()
+        snapshot["root"].update({
+            "id": "root", "title": "Repair", "description": "full description",
+            "next_action": "continue", "updatedAt": "2026-08-30T00:00:00Z",
+            "revision": 7, "plan_revision": "a" * 64,
+            "status": "In Progress", "status_type": "started",
+            "state_id": "state-1", "state": {
+                "id": "state-1", "name": "In Progress", "type": "started",
+            },
+        })
+        baseline = MODULE._issue_graph_repair_frontier(snapshot, [], {})
+        self.assertEqual(baseline["issues"]["root"]["state_id"], "state-1")
+        for field, value in (
+            ("status", "Blocked"), ("status_type", "canceled"),
+            ("state_id", "state-2"),
+            ("id", "root-2"), ("title", "Changed title"),
+            ("description", "changed description"),
+            ("next_action", "changed action"), ("revision", 8),
+            ("plan_revision", "b" * 64),
+            ("updatedAt", "2026-08-30T00:01:00Z"),
+        ):
+            changed = copy.deepcopy(snapshot)
+            changed["root"][field] = value
+            self.assertNotEqual(
+                MODULE._issue_graph_repair_frontier(changed, [], {})["sha256"],
+                baseline["sha256"], field,
+            )
+        for field, value in (
+            ("id", "nested-state-2"), ("name", "Blocked"),
+            ("type", "canceled"),
+        ):
+            changed = copy.deepcopy(snapshot)
+            changed["root"]["state"][field] = value
+            self.assertNotEqual(
+                MODULE._issue_graph_repair_frontier(changed, [], {})["sha256"],
+                baseline["sha256"], "state." + field,
+            )
+        snapshot["children"][0].update({
+            "description": "Plan revision: " + "a" * 64 + "\nRevision: 4",
+            "plan_revision": "a" * 64, "revision": 4,
+        })
+        baseline = MODULE._issue_graph_repair_frontier(snapshot, [], {})
+        for field, value in (
+            ("description", "changed child description"),
+            ("plan_revision", "b" * 64), ("revision", 5),
+            ("title", "changed child title"),
+        ):
+            changed = copy.deepcopy(snapshot)
+            changed["children"][0][field] = value
+            self.assertNotEqual(
+                MODULE._issue_graph_repair_frontier(changed, [], {})["sha256"],
+                baseline["sha256"], field,
+            )
+        relation = [{"type": "related", "target": {
+            "workspace_id": "workspace", "issue_id": "target",
+            "identifier": "GEN-50",
+        }}]
+        targets = {"workspace:target": {
+            "id": "target", "identifier": "GEN-50", "status": "Todo",
+        }}
+        relation_baseline = MODULE._issue_graph_repair_frontier(
+            snapshot, relation, targets,
+        )
+        changed_targets = copy.deepcopy(targets)
+        changed_targets["workspace:target"]["identifier"] = "GEN-51"
+        self.assertNotEqual(
+            MODULE._issue_graph_repair_frontier(
+                snapshot, relation, changed_targets,
+            )["sha256"],
+            relation_baseline["sha256"],
+        )
+
+    def test_repaired_history_joins_before_and_after_source_authentication(self):
+        from test_workstream_linear_events import LinearCommentEventAdapterTests
+        comments, _payload, _checkpoint, _projection, _generation, route, source, _graph = (
+            LinearCommentEventAdapterTests()._repair_fixture()
+        )
+        graph = self.snapshot()
+        graph["children"][1]["status"] = "In Progress"
+        graph["children"][1]["next_action"] = "continue"
+        graph["root"].update({
+            "plan_revision": "a" * 64,
+            "id": route["root_issue_id"],
+            "team": {"id": route["team_id"],
+                     "organization": {"id": route["workspace_id"]}},
+            "project": {"id": route["project_id"]},
+        })
+        graph = self.live_snapshot(graph, route)
+        provisional = MODULE.add_material_history(
+            graph, comments, "GEN-37", authenticated_route=route,
+        )
+        resumed = MODULE.add_material_history(
+            graph, comments, "GEN-37", authenticated_route=route,
+            authenticated_source=source,
+        )
+        self.assertEqual(provisional["root"]["next_action"], "new")
+        self.assertEqual(resumed["root"]["next_action"], "new")
+        compact = MODULE.compact_context(resumed, "GEN-37")
+        full = MODULE.compact_context(resumed, "GEN-37", include_history=True)
+        self.assertEqual(compact["next_action"], "new")
+        self.assertEqual(compact["material_semantic_repair"]["count"], 2)
+        self.assertEqual(len(full["material_semantic_repairs"]), 2)
+        self.assertEqual(
+            [item["event_id"] for item in full["raw_material_events"][:2]],
+            ["flat-a", "flat-b"],
+        )
 
     def test_expected_missing_closures_requires_authority_validation(self):
         with self.assertRaisesRegex(
@@ -831,10 +941,15 @@ class ResumeTests(unittest.TestCase):
             {"boundary_id": "turn-1", "changes": "not-a-list"}, 0,
             "2026-08-21T00:00:00Z",
         )
+        envelope = linear_events_module._canonical_event(event)
+        encoded = base64.urlsafe_b64encode(json.dumps(
+            envelope, sort_keys=True, separators=(",", ":"),
+        ).encode()).decode().rstrip("=")
+        body = f"{linear_events_module.EVENT_PREFIX}{encoded} -->"
         with self.assertRaisesRegex(MODULE.ResumeError, "malformed_material_boundary"):
             MODULE.add_material_history(
                 self.snapshot(),
-                [{"id": "event-boundary", "body": encode_event_comment(event)}],
+                [{"id": "event-boundary", "body": body}],
                 "GEN-37",
             )
 
@@ -850,6 +965,39 @@ class ResumeTests(unittest.TestCase):
         snapshot["material_event_revision"] = 1
         with self.assertRaisesRegex(MODULE.ResumeError, "malformed_material_boundary"):
             MODULE.compact_context(snapshot, "GEN-37")
+
+    def test_compact_and_full_repair_surfaces_preserve_digest_and_originals(self):
+        snapshot = self.snapshot()
+        snapshot["children"] = []
+        snapshot["root"]["revision"] = 2
+        effective = [{
+            "event_id": "flat", "workstream_id": "GEN-37",
+            "kind": "material_boundary", "source": "system",
+            "payload": {"boundary_id": "repair:flat", "changes": [{
+                "kind": "progress", "payload": {"next_action": "normalized"},
+            }]},
+            "expected_revision": 0, "created_at": "2026-08-30T00:00:00Z",
+        }, {
+            "event_id": "repair", "workstream_id": "GEN-37",
+            "kind": "material_semantic_repair", "source": "system",
+            "payload": {}, "expected_revision": 1,
+            "created_at": "2026-08-30T00:01:00Z",
+        }]
+        raw = copy.deepcopy(effective)
+        raw[0]["payload"] = {"next_action": "normalized", "progress": "flat"}
+        binding = {"event_id": "flat", "remote_comment_id": "remote-flat"}
+        snapshot.update({
+            "material_events": effective, "raw_material_events": raw,
+            "material_semantic_repairs": [binding],
+            "material_event_revision": 2,
+        })
+        compact = MODULE.compact_context(snapshot, "GEN-37")
+        self.assertEqual(compact["next_action"], "normalized")
+        self.assertEqual(compact["material_semantic_repair"]["count"], 1)
+        self.assertNotIn("raw_material_events", compact)
+        full = MODULE.compact_context(snapshot, "GEN-37", include_history=True)
+        self.assertEqual(full["raw_material_events"], raw)
+        self.assertEqual(full["material_semantic_repairs"], [binding])
 
     def test_uncheckpointed_requirement_payload_is_not_replaced_by_digest(self):
         snapshot = self.snapshot()

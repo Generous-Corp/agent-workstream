@@ -110,6 +110,19 @@ class WorkstreamCtlTests(unittest.TestCase):
             [MODULE.sys.executable, str(script), "GEN-37", "manifest.json"],
         )
 
+    def test_material_repair_dispatches_reviewed_dry_run_command(self):
+        with mock.patch.object(MODULE.os, "execv") as execute:
+            MODULE.main([
+                "material-repair", "GEN-37", "--manifest", "repair.json",
+                "--plan-source", "PLAN.md",
+            ])
+        script = MODULE.SCRIPTS / "workstream_material_repair.py"
+        execute.assert_called_once_with(
+            MODULE.sys.executable,
+            [MODULE.sys.executable, str(script), "GEN-37", "--manifest",
+             "repair.json", "--plan-source", "PLAN.md"],
+        )
+
     def test_repository_identity_dispatches_fenced_redirect_command(self):
         with mock.patch.object(MODULE.os, "execv") as execute:
             MODULE.main(["repository-identity", "--request", "request.json", "--apply"])

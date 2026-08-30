@@ -175,6 +175,40 @@ class DeltaJournalTests(unittest.TestCase):
         self.assertEqual(adapter.state[0]["boundary_id"], "boundary-1")
         self.assertEqual(len(adapter.state[0]["changes"]), 2)
 
+    def test_malformed_boundary_refuses_before_local_journal_append(self):
+        with self.assertRaisesRegex(ValueError, "malformed_material_boundary"):
+            self.journal.append(
+                "GEN-37", "material_boundary", {"progress": "flat"}, 0,
+            )
+        with self.assertRaisesRegex(ValueError, "malformed_material_boundary"):
+            self.journal.append_boundary(
+                "GEN-37", "boundary", [{"kind": "progress", "payload": {},
+                                           "extra": True}], 0,
+            )
+        self.assertEqual(self.journal.pending(), [])
+
+    def test_repair_control_has_no_business_semantics(self):
+        payload = {
+            "schema_version": 1, "workstream_id": "GEN-37",
+            "target_bindings": [{}], "raw_frontier": {},
+            "checkpoint_frontier": {}, "projection_frontier": {},
+            "generation": {}, "authenticated_route": {},
+            "authenticated_source": {}, "issue_graph_frontier": {},
+            "ledger_serialization_frontier": [], "postwrite_oracle": {},
+            "review_artifact": {},
+        }
+        event = MODULE.Delta(
+            "repair", "GEN-37", MODULE.MATERIAL_REPAIR_KIND, "system",
+            payload, 0, "2026-08-30T00:00:00Z",
+        )
+        self.assertEqual(MODULE.interpret_material_event(event), ())
+        with self.assertRaisesRegex(ValueError, "material_semantic_repair_reserved"):
+            self.journal.append(
+                "GEN-37", MODULE.MATERIAL_REPAIR_KIND, payload, 0,
+                source="system",
+            )
+        self.assertEqual(self.journal.pending(), [])
+
     def test_agent_discovered_delta_survives_process_reopen_before_apply(self):
         event = self.journal.append(
             "GEN-37",
