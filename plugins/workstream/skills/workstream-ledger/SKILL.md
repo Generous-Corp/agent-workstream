@@ -243,6 +243,31 @@ python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_generation.py" \
   --created-at <reviewed-utc-time> --apply
 ```
 
+When the reviewed replacement needs a root checkpoint to keep the ordinary
+resume surface within its default budget, provide that pending checkpoint and
+the authenticated repository head used for disposition:
+
+```sh
+python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_generation.py" \
+  activate GEN-123 --plan-source ./PLAN.md \
+  --plan-identity <canonical-immutable-plan-url> \
+  --retirement-proof ./retirement.json \
+  --activation-checkpoint ./pending-checkpoint.json \
+  --remote-head <authenticated-exact-head> \
+  --created-at <reviewed-utc-time> --apply
+```
+
+The checkpoint must cover the exact current root material revision, name the
+target plan revision, remain pending, and pass the standard 24 KiB resume
+budget; custom resume budgets are refused for this form. The target disposition
+may be prepared first, but the checkpoint is inert until the authenticated
+generation transition is appended last. That same transition becomes its
+remote acknowledgement. A crash before the transition leaves the predecessor
+authoritative; exact replay converges without a second checkpoint or control
+event. Only checkpoints carried by the uniquely selected authenticated
+generation chain are reduced. A forged, forked, off-chain, conflicting, or
+duplicate physical copy fails closed.
+
 The command uses the normal strict full-resume validator against authenticated
 source bytes and route readback, with the resume defaults of 24 KiB and 100
 items unless matching `--max-bytes` / `--max-items` values are supplied. The

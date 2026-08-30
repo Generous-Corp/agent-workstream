@@ -1362,6 +1362,103 @@ class GenerationTransitionTests(unittest.TestCase):
             self.assertEqual(loader_factory.call_args.kwargs["max_bytes"], 24 * 1024)
             self.assertEqual(loader_factory.call_args.kwargs["max_items"], 100)
 
+    def test_strict_activation_checkpoint_keeps_child_obligations_under_default_budget(self):
+        project_full(self.client, NEW)
+        target = adapter(self.client, NEW)
+        state = target.state()
+        prior_scope = next(
+            event for event in state.events
+            if event["kind"] == "scope" and event["key"] == "root"
+        )
+        owned_scope = deepcopy(prior_scope["value"])
+        owned_scope["child_ownership"]["GEN-43"] = "github.com:id:R_repo"
+        target.append(build_projection_event(
+            workstream_id=WORKSTREAM, kind="scope", key="root",
+            value=owned_scope, plan_revision=NEW,
+            expected_revision=state.revision, created_at="4",
+            supersedes_event_id=prior_scope["event_id"], authority=AUTHORITY,
+        ))
+        checkpoint = self.activation_checkpoint()
+        state = target.state()
+        prior_disposition = next(
+            event for event in state.events
+            if event["kind"] == "disposition" and event["key"] == "root"
+        )
+        target.append(build_projection_event(
+            workstream_id=WORKSTREAM, kind="disposition", key="root",
+            value={
+                "disposition": "attach", "remote_head": "e" * 40,
+                "recovered_from_checkpoint": checkpoint["event_id"],
+            },
+            plan_revision=NEW, expected_revision=state.revision,
+            created_at="5", supersedes_event_id=prior_disposition["event_id"],
+            authority=AUTHORITY,
+        ))
+        child_event = Delta(
+            "child-obligation", "GEN-43", "requirement", "agent",
+            {"requirement": "Finish the physical successor canary."},
+            0, "2026-08-29T00:00:00Z",
+        )
+        graph = {
+            "root": {
+                "id": AUTHORITY["root_issue_id"], "identifier": WORKSTREAM,
+                "url": "https://linear.test/GEN-37", "plan_revision": OLD,
+                "revision": 0, "status": "In Progress",
+                "next_action": "Activate the reviewed generation.",
+            },
+            "children": [{
+                "id": "44444444-4444-4444-8444-444444444444",
+                "identifier": "GEN-43", "url": "https://linear.test/GEN-43",
+                "title": "Physical successor canary", "status": "In Progress",
+                "status_type": "started", "next_action": "Run the canary.",
+                "parent": {"id": AUTHORITY["root_issue_id"],
+                           "identifier": WORKSTREAM},
+                "team": {"id": AUTHORITY["team_id"], "organization": {
+                    "id": AUTHORITY["workspace_id"],
+                }},
+                "project": {"id": AUTHORITY["project_id"]},
+            }],
+            "decisions": [],
+            "child_comments": {"GEN-43": [{
+                "id": "child-obligation-comment",
+                "body": encode_event_comment(child_event),
+            }]},
+        }
+        snapshot_transport = MagicMock()
+        snapshot_transport.snapshot_for_root.return_value = deepcopy(graph)
+        observed = {}
+
+        def capture_compact(snapshot, token, **kwargs):
+            result = real_compact_context(snapshot, token, **kwargs)
+            observed["snapshot"] = result
+            return result
+
+        with patch("workstream_generation.plan_payload", return_value={
+            "source": {"identity": f"https://example.test/{NEW}",
+                       "sha256": NEW},
+        }), patch("workstream_generation.LinearGraphQLTransport",
+                  return_value=snapshot_transport), patch(
+            "workstream_generation.compact_context", side_effect=capture_compact,
+        ):
+            receipt = strict_candidate_loader(
+                self.client, token=WORKSTREAM, authority=AUTHORITY,
+                plan_source="plan", plan_identity=None,
+                activation_checkpoint=checkpoint,
+            )(NEW)
+
+        self.assertEqual(receipt["resume_authority"], "full")
+        self.assertIn(checkpoint["event_id"], receipt["checkpoint_event_ids"])
+        self.assertEqual(
+            observed["snapshot"]["children"][0][
+                "uncheckpointed_material_obligations"
+            ][0]["event_id"],
+            child_event.event_id,
+        )
+        self.assertLess(
+            len(json.dumps(observed["snapshot"], sort_keys=True).encode()),
+            24 * 1024,
+        )
+
     def test_production_main_composes_real_bootstrap_activate_and_strict_reread(self):
         def plan_file(text):
             handle = tempfile.NamedTemporaryFile("w", suffix=".md")

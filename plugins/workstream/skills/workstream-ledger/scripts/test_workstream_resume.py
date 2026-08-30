@@ -1,9 +1,7 @@
 import copy
-import importlib.util
 import hashlib
 import io
 import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,14 +14,7 @@ from workstream_linear_events import encode_event_comment
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, projection_slot_id,
 )
-
-
-SCRIPT = Path(__file__).with_name("workstream_resume.py")
-SPEC = importlib.util.spec_from_file_location("workstream_resume", SCRIPT)
-MODULE = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader
-sys.modules["workstream_resume"] = MODULE
-SPEC.loader.exec_module(MODULE)
+import workstream_resume as MODULE
 
 
 class ResumeTests(unittest.TestCase):
