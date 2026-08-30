@@ -155,7 +155,22 @@ def _carried_predecessor_authority(
     ):
         raise ProjectionHistoryError("carried_evidence_predecessor_drift")
     authorized = _closure_bound_single_generation(predecessor, current_scope)
-    if old_evidence.get("event_id") not in authorized:
+    repository_key_value = old_closure["value"].get("repository_key")
+    current_repository = next((
+        repository for repository in current_scope.get("repositories", [])
+        if repository_key(repository) == repository_key_value
+    ), None)
+    current_head_closure = (
+        current_scope.get("child_ownership", {}).get(child_id)
+        == repository_key_value
+        and current_repository is not None
+        and current_repository.get("exact_head")
+        == old_closure["value"].get("exact_head")
+    )
+    if (
+        old_evidence.get("event_id") not in authorized
+        and not current_head_closure
+    ):
         raise ProjectionHistoryError("carried_evidence_not_closure_bound")
     expected = dict(old_evidence["value"])
     expected["plan_revision"] = event.get("plan_revision")

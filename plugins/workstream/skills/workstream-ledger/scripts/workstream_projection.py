@@ -1198,6 +1198,10 @@ def terminal_child_evidence_seed_predecessor_contract(
         authorized = closure_bound_historical_evidence(
             generation, desired_scope,
         )
+        authorized = authorized | _current_head_predecessor_evidence(
+            snapshot, active, desired_scope, seeds,
+            predecessor_plan_revision=predecessor_plan_revision,
+        )
         material = reduce_event_comments(comments, workstream_id=workstream_id)
         checkpoints = reduce_checkpoint_comments(
             comments, workstream_id=workstream_id,
@@ -1296,6 +1300,109 @@ def terminal_child_evidence_seed_predecessor_contract(
         ),
         "evidence_heads": reviewed_heads,
     }, authorities
+
+
+def _current_head_predecessor_evidence(
+    snapshot: dict[str, Any], active: dict[tuple[str, str], dict[str, Any]],
+    current_scope: dict[str, Any], seeds: list[dict[str, Any]], *,
+    predecessor_plan_revision: str,
+) -> frozenset[str]:
+    """Authorize carried evidence whose closed repository head is unchanged.
+
+    Historical-head authority comes from immutable projection order. When the
+    repository has not advanced, bind the same closure to the exact current
+    terminal child readback instead; merely sharing a head is insufficient.
+    """
+    seeds_by_child: dict[str, dict[str, Any]] = {}
+    for seed in seeds:
+        child_id = str(seed.get("child_identifier", "")).upper()
+        if child_id in seeds_by_child:
+            raise LinearProjectionError(
+                f"terminal_seed_predecessor_child_ambiguous:{child_id}"
+            )
+        seeds_by_child[child_id] = seed
+    repositories = {
+        repository_key(repository): repository
+        for repository in current_scope.get("repositories", [])
+    }
+    authorized: set[str] = set()
+    for child_id, seed in seeds_by_child.items():
+        closure = active.get(("child_closure", child_id))
+        if closure is None:
+            continue
+        closure_value = closure["value"]
+        repository_key_value = closure_value.get("repository_key")
+        repository = repositories.get(repository_key_value)
+        if (
+            current_scope.get("child_ownership", {}).get(child_id)
+            != repository_key_value
+            or repository is None
+            or repository.get("exact_head") != closure_value.get("exact_head")
+        ):
+            continue
+        matches = [
+            child for child in snapshot.get("children", [])
+            if str(child.get("identifier", "")).upper() == child_id
+        ]
+        if len(matches) != 1:
+            raise LinearProjectionError(
+                f"terminal_seed_predecessor_child_ambiguous:{child_id}"
+            )
+        try:
+            readback = terminal_child_readback(matches[0])
+        except ChildClosureError as error:
+            raise LinearProjectionError(f"{child_id}:{error}") from error
+        readback_sha256 = canonical_digest(readback)
+        if (
+            readback["child_issue_id"] != seed.get("child_issue_id")
+            or readback["assignee_id"] != seed.get("expected_assignee_id")
+            or readback_sha256 != seed.get("expected_child_readback_sha256")
+            or closure_value.get("child_readback_sha256") != readback_sha256
+            or {
+                field: closure_value.get(field) for field in CHILD_READBACK_FIELDS
+            } != readback
+            or closure_value.get("plan_revision")
+            != predecessor_plan_revision
+        ):
+            continue
+        evidence = sorted(
+            [
+                event for (kind, _key), event in active.items()
+                if kind == "evidence_contract"
+                and event["value"].get("owning_child") == child_id
+            ],
+            key=lambda event: (event["key"], event["event_id"]),
+        )
+        expected_heads = [
+            {
+                "key": event["key"], "event_id": event["event_id"],
+                "value_sha256": canonical_digest(event["value"]),
+            }
+            for event in evidence
+        ]
+        if (
+            not evidence
+            or seed.get("evidence_keys") != [
+                event["key"] for event in evidence
+            ]
+            or expected_heads != closure_value.get("evidence_heads")
+            or evidence_receipts_sha256([
+                event["value"] for event in evidence
+            ]) != closure_value.get("evidence_receipts_sha256")
+            or any(
+                event["value"].get("plan_revision")
+                != predecessor_plan_revision
+                or event["value"].get("repository_key")
+                != repository_key_value
+                or event["value"].get("exact_head")
+                != closure_value.get("exact_head")
+                or evidence_errors(event["value"])
+                for event in evidence
+            )
+        ):
+            continue
+        authorized.update(event["event_id"] for event in evidence)
+    return frozenset(authorized)
 
 
 def _fence_predecessor_projection_history(
