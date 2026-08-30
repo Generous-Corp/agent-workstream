@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -29,6 +30,38 @@ class PluginManagerTests(unittest.TestCase):
 
     def source(self, root: Path, version: str = "1.2.3") -> Path:
         self.plugin(root / "plugins/workstream", version)
+        return root
+
+    def codex_projection(self, root: Path, version: str = "1.2.3",
+                         commit: str = "a" * 40) -> Path:
+        self.plugin(root / "plugins/workstream", version)
+        source_digest = MODULE.tree_digest(root / "plugins/workstream")
+        codex_manifest = root / "plugins/workstream" / MODULE.MANIFESTS["codex"]
+        payload = json.loads(codex_manifest.read_text())
+        payload["name"] = MODULE.CODEX_RUNTIME_PLUGIN
+        codex_manifest.write_text(json.dumps(payload))
+        packaged_digest = MODULE.tree_digest(root / "plugins/workstream")
+        marketplace = root / ".agents/plugins/marketplace.json"
+        marketplace.parent.mkdir(parents=True)
+        marketplace.write_text(json.dumps({
+            "name": MODULE.codex_runtime_marketplace(commit, source_digest),
+            "interface": {"displayName": "Generous Workstream"},
+            "plugins": [{
+                "name": MODULE.CODEX_RUNTIME_PLUGIN,
+                "source": {"source": "local", "path": "./plugins/workstream"},
+                "policy": {"installation": "AVAILABLE", "authentication": "ON_USE"},
+                "category": "Productivity",
+            }],
+        }))
+        (root / ".agent-workstream-source.json").write_text(json.dumps({
+            "schema": MODULE.CODEX_PROJECTION_SCHEMA,
+            "source_commit": commit,
+            "version": version,
+            "source_tree_sha256": source_digest,
+            "packaged_tree_sha256": packaged_digest,
+            "generation": MODULE.codex_runtime_generation(commit, source_digest),
+            "pre_migration_processes": [],
+        }))
         return root
 
     def receipt(self, client: str, target: Path) -> dict:
@@ -378,8 +411,10 @@ class PluginManagerTests(unittest.TestCase):
             MODULE.claude_inventory()
 
     def test_inventory_parsers_accept_current_live_shapes(self):
-        cm = {"name": MODULE.MARKETPLACE, "root": "/codex"}
-        cp = {"pluginId": MODULE.PLUGIN_ID, "enabled": True, "installed": True}
+        runtime_marketplace = MODULE.codex_runtime_marketplace("a" * 40, "d")
+        cm = {"name": runtime_marketplace, "root": "/codex"}
+        cp = {"pluginId": f"{MODULE.CODEX_RUNTIME_PLUGIN}@{runtime_marketplace}",
+              "enabled": True, "installed": True}
         with mock.patch.object(MODULE, "run", side_effect=[{"marketplaces": [cm]}, {"installed": [cp]}]):
             self.assertEqual(MODULE.codex_inventory(), (cm, cp))
         lm = {"name": MODULE.MARKETPLACE, "installLocation": "/claude"}
@@ -387,16 +422,273 @@ class PluginManagerTests(unittest.TestCase):
         with mock.patch.object(MODULE, "run", side_effect=[[lm], [lp]]):
             self.assertEqual(MODULE.claude_inventory(), (lm, lp))
 
-    def test_verify_client_requires_enabled_installed_and_exact_tree(self):
+    def test_delayed_legacy_refresh_cannot_replace_production_inventory(self):
+        runtime_marketplace = MODULE.codex_runtime_marketplace("a" * 40, "d")
+        production_marketplace = {
+            "name": runtime_marketplace, "root": "/production"
+        }
+        legacy_marketplace = {"name": MODULE.MARKETPLACE, "root": "/stale"}
+        production_plugin = {
+            "pluginId": f"{MODULE.CODEX_RUNTIME_PLUGIN}@{runtime_marketplace}",
+            "version": "1.2.3",
+            "enabled": True, "installed": True,
+        }
+        legacy_plugin = {
+            "pluginId": MODULE.PLUGIN_ID, "version": "0.4.4",
+            "enabled": True, "installed": True,
+        }
+        with mock.patch.object(MODULE, "run", side_effect=[
+                {"marketplaces": [legacy_marketplace, production_marketplace]},
+                {"installed": [legacy_plugin, production_plugin]},
+        ]):
+            self.assertEqual(
+                MODULE.codex_inventory(),
+                (production_marketplace, production_plugin),
+            )
+
+    def test_doctor_config_check_rejects_wrong_raw_key_despite_exact_cli_shape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "codex"
+            target.mkdir()
+            source = root / "capsule"
+            expected_marketplace = MODULE.codex_runtime_marketplace("a" * 40, "d")
+            expected_plugin = MODULE.codex_runtime_plugin_id("a" * 40, "d")
+            (target / "config.toml").write_text(
+                "[marketplaces.generous-workstream-runtime-wrong]\n"
+                "source_type = \"local\"\n"
+                f"source = \"{source}\"\n\n"
+                f"[plugins.\"{expected_plugin}\"]\n"
+                "enabled = true\n"
+            )
+            with self.assertRaisesRegex(
+                    MODULE.InstallError,
+                    "codex_config_runtime_marketplace_mismatch"):
+                MODULE.verify_codex_config(
+                    target, expected_source=source,
+                    expected_commit="a" * 40, expected_digest="d",
+                )
+            (target / "config.toml").write_text(
+                f"[marketplaces.{expected_marketplace}]\n"
+                "source_type = \"local\"\n"
+                f"source = \"{source}\"\n\n"
+                f"[plugins.\"{expected_plugin}\"]\n"
+                "enabled = true\n"
+            )
+            receipt = MODULE.verify_codex_config(
+                target, expected_source=source,
+                expected_commit="a" * 40, expected_digest="d",
+            )
+            self.assertEqual(receipt["marketplace"], expected_marketplace)
+
+    def test_arbitrarily_late_legacy_cache_write_cannot_change_runtime_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            projection = self.codex_projection(root / "projection")
+            metadata = json.loads(
+                (projection / ".agent-workstream-source.json").read_text()
+            )
+            source_digest = metadata["source_tree_sha256"]
+            runtime_marketplace = MODULE.codex_runtime_marketplace(
+                "a" * 40, source_digest
+            )
+            target = root / "codex"
+            installed = (target / "plugins/cache" / runtime_marketplace /
+                         MODULE.CODEX_RUNTIME_PLUGIN / "1.2.3")
+            installed.parent.mkdir(parents=True)
+            shutil.copytree(projection / "plugins/workstream", installed)
+            marketplace = {"name": runtime_marketplace, "root": str(projection)}
+            plugin = {
+                "pluginId": f"{MODULE.CODEX_RUNTIME_PLUGIN}@{runtime_marketplace}",
+                "version": "1.2.3", "enabled": True, "installed": True,
+            }
+            with mock.patch.object(MODULE, "active_codex_process_generations",
+                                   return_value=[]), \
+                 mock.patch.object(MODULE, "verify_codex_config",
+                                   return_value={"status": "exact"}):
+                before = MODULE.verify_client(
+                    "codex", marketplace, plugin, expected_commit="a" * 40,
+                    expected_version="1.2.3", expected_source=projection,
+                    expected_digest=source_digest, host_id="M5", target=target,
+                )
+
+                # This callback represents an old app server publishing at any
+                # later logical time. Its generic key cannot address runtime.
+                legacy = self.plugin(
+                    target / "plugins/cache" / MODULE.MARKETPLACE /
+                    "workstream" / "0.4.4", "0.4.4"
+                )
+                (legacy / "skills/demo/SKILL.md").write_text("arbitrarily late")
+
+                after = MODULE.verify_client(
+                    "codex", marketplace, plugin, expected_commit="a" * 40,
+                    expected_version="1.2.3", expected_source=projection,
+                    expected_digest=source_digest, host_id="M5", target=target,
+                )
+            self.assertEqual(after, before)
+            self.assertNotEqual(
+                MODULE.tree_digest(legacy), after["tree_sha256"]
+            )
+
+    def test_codex_projection_is_exact_idempotent_and_reports_old_sessions(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = self.source(root / "source")
+            state = root / "state"
             target = root / "codex"
-            installed = self.plugin(MODULE.expected_install_path(target, "1.2.3"))
-            marketplace = {"root": str(source)}
-            plugin = {"version": "1.2.3", "enabled": True, "installed": True}
             digest = MODULE.tree_digest(source / "plugins/workstream")
-            with mock.patch.object(MODULE, "git_head", return_value="a" * 40):
+            journal = MODULE.TransactionJournal(
+                state, host_id="M5", client="codex", target=target,
+                expected_commit="a" * 40, expected_version="1.2.3",
+            )
+            with mock.patch.object(MODULE, "STATE_ROOT", state), \
+                 mock.patch.object(
+                     MODULE, "active_codex_process_generations",
+                     side_effect=[[{"pid": 10, "started": "A"},
+                                   {"pid": 20, "started": "B"}]] +
+                                 [[{"pid": 20, "started": "B"}]] * 8):
+                projection, changed = MODULE.sync_codex_projection(
+                    source, expected_commit="a" * 40,
+                    expected_version="1.2.3", expected_digest=digest,
+                    journal=journal,
+                )
+                receipt = MODULE.verify_codex_projection(
+                    projection, expected_commit="a" * 40,
+                    expected_version="1.2.3", expected_digest=digest,
+                )
+                same, changed_again = MODULE.sync_codex_projection(
+                    source, expected_commit="a" * 40,
+                    expected_version="1.2.3", expected_digest=digest,
+                    journal=journal,
+                )
+            self.assertTrue(changed)
+            self.assertFalse(changed_again)
+            self.assertEqual(same, projection)
+            self.assertEqual(receipt["pre_migration_processes"], [
+                {"pid": 10, "started": "A"}, {"pid": 20, "started": "B"},
+            ])
+            self.assertEqual(receipt["running_pre_migration_processes"], [
+                {"pid": 20, "started": "B"},
+            ])
+
+    def test_projection_retry_unions_sessions_until_cli_transition_commits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.source(root / "source")
+            state = root / "state"
+            digest = MODULE.tree_digest(source / "plugins/workstream")
+            journal = MODULE.TransactionJournal(
+                state, host_id="M5", client="codex", target=root / "codex",
+                expected_commit="a" * 40, expected_version="1.2.3",
+            )
+            current = [{"pid": 10, "started": "A"}]
+            with mock.patch.object(MODULE, "STATE_ROOT", state), \
+                 mock.patch.object(
+                     MODULE, "active_codex_process_generations",
+                     side_effect=lambda: list(current)):
+                projection, _ = MODULE.sync_codex_projection(
+                    source, expected_commit="a" * 40,
+                    expected_version="1.2.3", expected_digest=digest,
+                    journal=journal,
+                )
+                # A CLI migration failure leaves the journal recoverable; a
+                # new session starts on the still-old configured generation.
+                current.append({"pid": 20, "started": "B"})
+                _, changed = MODULE.sync_codex_projection(
+                    source, expected_commit="a" * 40,
+                    expected_version="1.2.3", expected_digest=digest,
+                    journal=journal, capture_pre_migration=True,
+                )
+                self.assertTrue(changed)
+                current.append({"pid": 30, "started": "C"})
+                _, ordinary_noop = MODULE.sync_codex_projection(
+                    source, expected_commit="a" * 40,
+                    expected_version="1.2.3", expected_digest=digest,
+                    journal=journal, capture_pre_migration=False,
+                )
+                receipt = MODULE.verify_codex_projection(
+                    projection, expected_commit="a" * 40,
+                    expected_version="1.2.3", expected_digest=digest,
+                )
+            self.assertFalse(ordinary_noop)
+            self.assertEqual(receipt["pre_migration_processes"], [
+                {"pid": 10, "started": "A"},
+                {"pid": 20, "started": "B"},
+            ])
+            self.assertEqual(receipt["running_pre_migration_processes"], [
+                {"pid": 10, "started": "A"},
+                {"pid": 20, "started": "B"},
+            ])
+
+    def test_codex_projection_activation_failure_rolls_back_previous(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            target = root / "codex"
+            old_source = self.source(root / "old", "1.2.2")
+            new_source = self.source(root / "new", "1.2.3")
+            journal = MODULE.TransactionJournal(
+                state, host_id="M5", client="codex", target=target,
+                expected_commit="a" * 40, expected_version="1.2.3",
+            )
+            old_journal = MODULE.TransactionJournal(
+                state, host_id="M5", client="codex", target=target,
+                expected_commit="b" * 40, expected_version="1.2.2",
+            )
+            with mock.patch.object(MODULE, "STATE_ROOT", state), \
+                 mock.patch.object(MODULE, "active_codex_process_generations",
+                                   return_value=[]):
+                projection, _ = MODULE.sync_codex_projection(
+                    old_source, expected_commit="b" * 40,
+                    expected_version="1.2.2",
+                    expected_digest=MODULE.tree_digest(old_source / "plugins/workstream"),
+                    journal=old_journal,
+                )
+                new_digest = MODULE.tree_digest(new_source / "plugins/workstream")
+                new_projection = MODULE.codex_projection_root("a" * 40, new_digest)
+                real_replace = MODULE.os.replace
+
+                def fail_activation(source, destination):
+                    if (Path(destination) == new_projection and
+                            ".next-" in Path(source).name):
+                        raise OSError("injected activation failure")
+                    return real_replace(source, destination)
+
+                with mock.patch.object(MODULE.os, "replace", side_effect=fail_activation), \
+                     self.assertRaisesRegex(OSError, "injected activation failure"):
+                    MODULE.sync_codex_projection(
+                        new_source, expected_commit="a" * 40,
+                        expected_version="1.2.3",
+                        expected_digest=new_digest,
+                        journal=journal,
+                    )
+                old_receipt = MODULE.verify_codex_projection(
+                    projection, expected_commit="b" * 40,
+                    expected_version="1.2.2",
+                    expected_digest=MODULE.tree_digest(old_source / "plugins/workstream"),
+                )
+            self.assertEqual(old_receipt["version"], "1.2.2")
+            self.assertFalse(new_projection.exists())
+
+    def test_verify_client_requires_enabled_installed_and_exact_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.codex_projection(root / "source")
+            target = root / "codex"
+            metadata = json.loads((source / ".agent-workstream-source.json").read_text())
+            digest = metadata["source_tree_sha256"]
+            runtime_marketplace = MODULE.codex_runtime_marketplace("a" * 40, digest)
+            installed = (target / "plugins/cache" / runtime_marketplace /
+                         MODULE.CODEX_RUNTIME_PLUGIN / "1.2.3")
+            installed.parent.mkdir(parents=True)
+            shutil.copytree(source / "plugins/workstream", installed)
+            marketplace = {"name": runtime_marketplace, "root": str(source)}
+            plugin = {"pluginId": f"{MODULE.CODEX_RUNTIME_PLUGIN}@{runtime_marketplace}",
+                      "version": "1.2.3", "enabled": True, "installed": True}
+            with mock.patch.object(MODULE, "active_codex_process_generations",
+                                   return_value=[]), \
+                 mock.patch.object(MODULE, "verify_codex_config",
+                                   return_value={"status": "exact"}):
                 receipt = MODULE.verify_client(
                     "codex", marketplace, plugin, expected_commit="a" * 40,
                     expected_version="1.2.3", expected_source=source,
@@ -535,14 +827,17 @@ class PluginManagerTests(unittest.TestCase):
 
     def test_update_client_replaces_stale_codex_plugin_before_add(self):
         journal = mock.Mock()
-        marketplace = {"name": MODULE.MARKETPLACE, "root": "/durable/source"}
+        marketplace = {"name": "generous-workstream-runtime-new",
+                       "root": "/durable/source"}
         stale_plugin = {
-            "pluginId": MODULE.PLUGIN_ID,
+            "pluginId": "agent-workstream-runtime@generous-workstream-runtime-old",
             "version": "1.2.2",
             "installed": True,
             "enabled": True,
         }
         with mock.patch.object(MODULE.shutil, "which", return_value="/bin/codex"), \
+             mock.patch.object(MODULE, "codex_projection_plugin_id",
+                               return_value="agent-workstream-runtime@generous-workstream-runtime-new"), \
              mock.patch.object(MODULE, "inventory",
                                return_value=(marketplace, stale_plugin)), \
              mock.patch.object(MODULE, "run") as run:
@@ -553,8 +848,10 @@ class PluginManagerTests(unittest.TestCase):
 
         commands = [call.args[0] for call in run.call_args_list]
         self.assertEqual(commands, [
-            ["codex", "plugin", "remove", MODULE.PLUGIN_ID, "--json"],
-            ["codex", "plugin", "add", MODULE.PLUGIN_ID, "--json"],
+            ["codex", "plugin", "remove",
+             "agent-workstream-runtime@generous-workstream-runtime-old", "--json"],
+            ["codex", "plugin", "add",
+             "agent-workstream-runtime@generous-workstream-runtime-new", "--json"],
         ])
         self.assertEqual(
             [call.args[0] for call in journal.set_phase.call_args_list[-4:]],
@@ -570,14 +867,17 @@ class PluginManagerTests(unittest.TestCase):
                 expected_version="1.2.3",
             )
             journal.set_phase("preparing")
-            marketplace = {"name": MODULE.MARKETPLACE, "root": "/durable/source"}
+            marketplace = {"name": "generous-workstream-runtime-new",
+                           "root": "/durable/source"}
             stale_plugin = {
-                "pluginId": MODULE.PLUGIN_ID,
+                "pluginId": "agent-workstream-runtime@generous-workstream-runtime-old",
                 "version": "1.2.2",
                 "installed": True,
                 "enabled": True,
             }
             with mock.patch.object(MODULE.shutil, "which", return_value="/bin/codex"), \
+                 mock.patch.object(MODULE, "codex_projection_plugin_id",
+                                   return_value="agent-workstream-runtime@generous-workstream-runtime-new"), \
                  mock.patch.object(MODULE, "inventory",
                                    return_value=(marketplace, stale_plugin)), \
                  mock.patch.object(MODULE, "run",
@@ -598,9 +898,10 @@ class PluginManagerTests(unittest.TestCase):
                 expected_version="1.2.3",
             )
             journal.set_phase("preparing")
-            marketplace = {"name": MODULE.MARKETPLACE, "root": "/durable/source"}
+            marketplace = {"name": "generous-workstream-runtime-new",
+                           "root": "/durable/source"}
             stale_plugin = {
-                "pluginId": MODULE.PLUGIN_ID,
+                "pluginId": "agent-workstream-runtime@generous-workstream-runtime-old",
                 "version": "1.2.2",
                 "installed": True,
                 "enabled": True,
@@ -613,6 +914,8 @@ class PluginManagerTests(unittest.TestCase):
                     raise MODULE.InstallError("injected_add_failure")
 
             with mock.patch.object(MODULE.shutil, "which", return_value="/bin/codex"), \
+                 mock.patch.object(MODULE, "codex_projection_plugin_id",
+                                   return_value="agent-workstream-runtime@generous-workstream-runtime-new"), \
                  mock.patch.object(MODULE, "inventory",
                                    return_value=(marketplace, stale_plugin)), \
                  mock.patch.object(MODULE, "run", side_effect=fail_add), \
@@ -627,6 +930,8 @@ class PluginManagerTests(unittest.TestCase):
 
             commands.clear()
             with mock.patch.object(MODULE.shutil, "which", return_value="/bin/codex"), \
+                 mock.patch.object(MODULE, "codex_projection_plugin_id",
+                                   return_value="agent-workstream-runtime@generous-workstream-runtime-new"), \
                  mock.patch.object(MODULE, "inventory",
                                    return_value=(marketplace, None)), \
                  mock.patch.object(MODULE, "run",
@@ -639,21 +944,40 @@ class PluginManagerTests(unittest.TestCase):
             self.assertEqual([command[2] for command in commands], ["add"])
             self.assertEqual(journal.phase, "plugin_installed")
 
-    def test_post_update_stability_catches_delayed_codex_cache_rollback(self):
+    def test_legacy_codex_registration_is_removed_idempotently_via_cli(self):
+        journal = mock.Mock()
+        legacy_marketplace = {"name": MODULE.MARKETPLACE}
+        legacy_plugin = {"pluginId": MODULE.PLUGIN_ID}
+        with mock.patch.object(
+                MODULE, "codex_legacy_inventory",
+                side_effect=[(legacy_marketplace, legacy_plugin), (None, None)]), \
+             mock.patch.object(MODULE, "run") as run:
+            changed = MODULE.remove_legacy_codex_registration({}, journal)
+        self.assertTrue(changed)
+        self.assertEqual([call.args[0] for call in run.call_args_list], [
+            ["codex", "plugin", "remove", MODULE.PLUGIN_ID, "--json"],
+            ["codex", "plugin", "marketplace", "remove",
+             MODULE.MARKETPLACE, "--json"],
+        ])
+        with mock.patch.object(MODULE, "codex_legacy_inventory",
+                               side_effect=[(None, None), (None, None)]), \
+             mock.patch.object(MODULE, "run") as run:
+            changed = MODULE.remove_legacy_codex_registration({}, journal)
+        self.assertFalse(changed)
+        run.assert_not_called()
+
+    def test_post_update_stability_catches_production_cache_mismatch(self):
         exact_marketplace = {"root": "/durable/source"}
         exact_plugin = {"version": "1.2.3", "installed": True, "enabled": True}
         stale_plugin = {"version": "1.2.2", "installed": True, "enabled": True}
         receipt = self.receipt("codex", Path("/codex"))
         with mock.patch.object(
                 MODULE, "inventory",
-                side_effect=[(exact_marketplace, exact_plugin),
-                             (exact_marketplace, stale_plugin)]), \
+                return_value=(exact_marketplace, stale_plugin)), \
              mock.patch.object(
                  MODULE, "verify_client",
-                 side_effect=[receipt,
-                              MODULE.InstallError(
-                                  "plugin_version_mismatch:codex:1.2.3:1.2.2:1.2.3")]), \
-             mock.patch.object(MODULE.time, "sleep") as sleep, \
+                 side_effect=MODULE.InstallError(
+                     "plugin_version_mismatch:codex:1.2.3:1.2.2:1.2.3")), \
              self.assertRaisesRegex(
                  MODULE.InstallError,
                  "post_update_stability_failed:codex:plugin_version_mismatch"):
@@ -664,12 +988,8 @@ class PluginManagerTests(unittest.TestCase):
                 expected_digest="d", host_id="M5", target=Path("/codex"),
                 env={},
             )
-        self.assertEqual(
-            [call.args[0] for call in sleep.call_args_list],
-            list(MODULE.CODEX_POST_UPDATE_STABILITY_DELAYS_SECONDS),
-        )
 
-    def test_post_update_stability_requires_two_delayed_codex_readbacks(self):
+    def test_post_update_stability_requires_one_exact_production_readback(self):
         marketplace = {"root": "/durable/source"}
         plugin = {"version": "1.2.3", "installed": True, "enabled": True}
         receipt = self.receipt("codex", Path("/codex"))
@@ -677,8 +997,7 @@ class PluginManagerTests(unittest.TestCase):
                 MODULE, "inventory",
                 return_value=(marketplace, plugin)) as inventory, \
              mock.patch.object(
-                 MODULE, "verify_client", return_value=receipt) as verify, \
-             mock.patch.object(MODULE.time, "sleep") as sleep:
+                 MODULE, "verify_client", return_value=receipt) as verify:
             observed = MODULE.verify_post_update_stability(
                 "codex", expected_commit="a" * 40,
                 expected_version="1.2.3",
@@ -687,12 +1006,8 @@ class PluginManagerTests(unittest.TestCase):
                 env={},
             )
         self.assertEqual(observed, receipt)
-        self.assertEqual(inventory.call_count, 2)
-        self.assertEqual(verify.call_count, 2)
-        self.assertEqual(
-            [call.args[0] for call in sleep.call_args_list],
-            list(MODULE.CODEX_POST_UPDATE_STABILITY_DELAYS_SECONDS),
-        )
+        self.assertEqual(inventory.call_count, 1)
+        self.assertEqual(verify.call_count, 1)
 
     def test_update_client_recovery_journal_survives_each_mutation_failure(self):
         expected_phases = [
@@ -744,9 +1059,12 @@ class PluginManagerTests(unittest.TestCase):
             target = Path(directory)
             installed = self.plugin(MODULE.expected_install_path(target, "1.2.3"))
             (installed / "skills/demo/SKILL.md").write_text("old")
+            runtime_marketplace = MODULE.codex_runtime_marketplace("a" * 40, "d")
+            plugin = {"pluginId": f"{MODULE.CODEX_RUNTIME_PLUGIN}@{runtime_marketplace}",
+                      "version": "1.2.3"}
             with self.assertRaisesRegex(MODULE.InstallError, "version_commit_conflict"):
                 MODULE.refuse_version_collision(
-                    "codex", None, target, "1.2.3", "not-the-digest"
+                    "codex", plugin, target, "1.2.3", "not-the-digest"
                 )
 
     def test_claude_version_collision_checks_reported_install_path(self):
@@ -788,6 +1106,10 @@ class PluginManagerTests(unittest.TestCase):
             output = io.StringIO()
             with mock.patch.object(MODULE, "verify_source", return_value=source_proof), \
                  mock.patch.object(MODULE, "target_env", side_effect=env_for), \
+                 mock.patch.object(MODULE, "sync_codex_projection",
+                                   return_value=(Path("/durable/source"), False)), \
+                 mock.patch.object(MODULE, "remove_legacy_codex_registration",
+                                   return_value=False), \
                  mock.patch.object(MODULE, "inventory", return_value=({}, {})), \
                  mock.patch.object(MODULE, "verify_client", side_effect=verify), \
                  mock.patch.object(MODULE, "refuse_version_collision"), \
@@ -844,6 +1166,11 @@ class PluginManagerTests(unittest.TestCase):
 
             with mock.patch.object(MODULE, "verify_source", return_value=proof), \
                  mock.patch.object(MODULE, "target_env", side_effect=env_for), \
+                 mock.patch.object(MODULE, "codex_projection_root",
+                                   return_value=Path("/durable/source")), \
+                 mock.patch.object(MODULE, "verify_codex_projection"), \
+                 mock.patch.object(MODULE, "codex_legacy_inventory",
+                                   return_value=(None, None)), \
                  mock.patch.object(MODULE, "inventory", return_value=({}, {})), \
                  mock.patch.object(MODULE, "verify_client", side_effect=verify), \
                  mock.patch.object(MODULE, "update_client") as update, \
@@ -881,6 +1208,11 @@ class PluginManagerTests(unittest.TestCase):
 
             with mock.patch.object(MODULE, "verify_source", return_value=proof), \
                  mock.patch.object(MODULE, "target_env", side_effect=env_for), \
+                 mock.patch.object(MODULE, "codex_projection_root",
+                                   return_value=Path("/durable/source")), \
+                 mock.patch.object(MODULE, "verify_codex_projection"), \
+                 mock.patch.object(MODULE, "codex_legacy_inventory",
+                                   return_value=(None, None)), \
                  mock.patch.object(MODULE, "inventory", return_value=({}, {})), \
                  mock.patch.object(MODULE, "verify_client", side_effect=verify), \
                  mock.patch.object(MODULE, "sync_skill_mirror",
@@ -976,6 +1308,10 @@ class PluginManagerTests(unittest.TestCase):
             output = io.StringIO()
             with mock.patch.object(MODULE, "verify_source", return_value=proof), \
                  mock.patch.object(MODULE, "target_env", side_effect=env_for), \
+                 mock.patch.object(MODULE, "sync_codex_projection",
+                                   return_value=(Path("/durable/source"), False)), \
+                 mock.patch.object(MODULE, "remove_legacy_codex_registration",
+                                   return_value=False), \
                  mock.patch.object(MODULE, "inventory", side_effect=inventory_results), \
                  mock.patch.object(MODULE, "verify_client",
                                    return_value=self.receipt("claude", targets["claude"])), \
@@ -1009,6 +1345,10 @@ class PluginManagerTests(unittest.TestCase):
             output = io.StringIO()
             with mock.patch.object(MODULE, "verify_source", return_value=proof), \
                  mock.patch.object(MODULE, "target_env", return_value=({}, target)), \
+                 mock.patch.object(MODULE, "sync_codex_projection",
+                                   return_value=(Path("/durable/source"), False)), \
+                 mock.patch.object(MODULE, "remove_legacy_codex_registration",
+                                   return_value=False), \
                  mock.patch.object(MODULE, "inventory", return_value=({}, {})), \
                  mock.patch.object(MODULE, "verify_client",
                                    return_value=self.receipt("claude", target)), \
@@ -1044,6 +1384,10 @@ class PluginManagerTests(unittest.TestCase):
             receipt = self.receipt("codex", target)
             with mock.patch.object(MODULE, "verify_source", return_value=proof), \
                  mock.patch.object(MODULE, "target_env", return_value=({}, target)), \
+                 mock.patch.object(MODULE, "sync_codex_projection",
+                                   return_value=(Path("/durable/source"), False)), \
+                 mock.patch.object(MODULE, "remove_legacy_codex_registration",
+                                   return_value=False), \
                  mock.patch.object(MODULE, "inventory", return_value=({}, {})), \
                  mock.patch.object(MODULE, "verify_client", return_value=receipt), \
                  mock.patch.object(
@@ -1062,6 +1406,49 @@ class PluginManagerTests(unittest.TestCase):
             self.assertEqual(code, 0)
             stable.assert_called_once()
             update.assert_not_called()
+            self.assertFalse(journal.exists)
+
+    def test_codex_recovery_repairs_old_runtime_plugin_after_marketplace_add(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            target = root / "codex"
+            target.mkdir()
+            proof = {"path": "/durable/source", "commit": "a" * 40,
+                     "tree_sha256": "d"}
+            journal = MODULE.TransactionJournal(
+                state, host_id="M5", client="codex", target=target,
+                expected_commit="a" * 40, expected_version="1.2.3",
+            )
+            journal.set_phase("marketplace_added")
+            receipt = self.receipt("codex", target)
+            output = io.StringIO()
+            with mock.patch.object(MODULE, "verify_source", return_value=proof), \
+                 mock.patch.object(MODULE, "target_env", return_value=({}, target)), \
+                 mock.patch.object(MODULE, "sync_codex_projection",
+                                   return_value=(Path("/projection"), False)), \
+                 mock.patch.object(MODULE, "remove_legacy_codex_registration",
+                                   return_value=False), \
+                 mock.patch.object(MODULE, "inventory", return_value=({}, {})), \
+                 mock.patch.object(
+                     MODULE, "verify_client",
+                     side_effect=[MODULE.InstallError(
+                         "codex_runtime_plugin_generation_mismatch"), receipt]), \
+                 mock.patch.object(MODULE, "refuse_version_collision"), \
+                 mock.patch.object(MODULE, "update_client") as update, \
+                 mock.patch.object(MODULE, "verify_post_update_stability",
+                                   return_value=receipt), \
+                 mock.patch.object(MODULE, "STATE_ROOT", state), \
+                 contextlib.redirect_stdout(output):
+                code = MODULE.main([
+                    "update", "--client", "codex",
+                    "--expected-commit", "a" * 40,
+                    "--expected-version", "1.2.3", "--host-id", "M5",
+                    "--source-root", "/durable/source",
+                    "--codex-home", str(target),
+                ])
+            self.assertEqual(code, 0, output.getvalue())
+            update.assert_called_once()
             self.assertFalse(journal.exists)
 
     def test_identity_requires_full_commit_semver_and_host(self):

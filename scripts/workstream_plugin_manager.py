@@ -16,25 +16,40 @@ import stat
 import subprocess
 import sys
 import tempfile
-import time
+import tomllib
 from typing import Any
 
 MARKETPLACE = "generous-workstream"
 PLUGIN_ID = "workstream@generous-workstream"
+CODEX_RUNTIME_PLUGIN = "agent-workstream-runtime"
+CODEX_RUNTIME_MARKETPLACE_PREFIX = "generous-workstream-runtime-"
 CLIENTS = ("codex", "claude")
 COMMAND_TIMEOUT_SECONDS = 180
 TERMINATION_TIMEOUT_SECONDS = 5
-CODEX_POST_UPDATE_STABILITY_DELAYS_SECONDS = (1.0, 2.0)
 STATE_ROOT = Path.home() / ".local/state/agent-workstream"
 MANIFESTS = {"codex": ".codex-plugin/plugin.json", "claude": ".claude-plugin/plugin.json"}
 MIRROR_MARKER = ".agent-workstream-skill-sync.json"
 MIRROR_TRANSACTION_PREFIX = ".agent-workstream-skill-txn-"
 MIRROR_OWNERSHIP = ".agent-workstream-skill-ownership.json"
 MIRROR_SCHEMA = 1
+CODEX_PROJECTION_SCHEMA = 1
 
 
 class InstallError(RuntimeError):
     pass
+
+
+def codex_runtime_generation(commit: str, source_digest: str) -> str:
+    material = f"{CODEX_PROJECTION_SCHEMA}\0{commit}\0{source_digest}".encode()
+    return hashlib.sha256(material).hexdigest()
+
+
+def codex_runtime_marketplace(commit: str, source_digest: str) -> str:
+    return CODEX_RUNTIME_MARKETPLACE_PREFIX + codex_runtime_generation(commit, source_digest)
+
+
+def codex_runtime_plugin_id(commit: str, source_digest: str) -> str:
+    return f"{CODEX_RUNTIME_PLUGIN}@{codex_runtime_marketplace(commit, source_digest)}"
 
 
 def run(command: list[str], *, parse_json: bool = False,
@@ -527,17 +542,296 @@ def exactly_one(items: Any, *, identity_key: str, identity: str,
     return matches[0] if matches else None
 
 
+def codex_projection_root(expected_commit: str, expected_digest: str,
+                          state_root: Path | None = None) -> Path:
+    selected = STATE_ROOT if state_root is None else state_root
+    generation = codex_runtime_generation(expected_commit, expected_digest)
+    return selected.expanduser().resolve() / "codex-marketplaces" / generation
+
+
+def active_codex_process_generations() -> list[dict[str, Any]]:
+    output = run(["ps", "-axo", "pid=,lstart=,comm="])
+    result: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        fields = line.strip().split()
+        if len(fields) >= 3 and Path(fields[-1]).name == "codex":
+            try:
+                pid = int(fields[0])
+            except ValueError:
+                continue
+            result.append({"pid": pid, "started": " ".join(fields[1:-1])})
+    return sorted(result, key=lambda item: (item["pid"], item["started"]))
+
+
+def verify_codex_projection(root: Path, *, expected_commit: str,
+                            expected_version: str,
+                            expected_digest: str) -> dict[str, Any]:
+    metadata_path = root / ".agent-workstream-source.json"
+    try:
+        metadata = json.loads(metadata_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise InstallError(f"codex_projection_metadata_invalid:{metadata_path}") from error
+    expected = {
+        "schema": CODEX_PROJECTION_SCHEMA,
+        "source_commit": expected_commit,
+        "version": expected_version,
+        "source_tree_sha256": expected_digest,
+        "generation": codex_runtime_generation(expected_commit, expected_digest),
+    }
+    pre_migration = metadata.get("pre_migration_processes") if isinstance(metadata, dict) else None
+    if (not isinstance(metadata, dict) or
+            {key: metadata.get(key) for key in expected} != expected or
+            not isinstance(metadata.get("packaged_tree_sha256"), str) or
+            not isinstance(pre_migration, list) or
+            any(not isinstance(item, dict) or not isinstance(item.get("pid"), int) or
+                item["pid"] <= 0 or not isinstance(item.get("started"), str) or
+                not item["started"] for item in pre_migration)):
+        raise InstallError("codex_projection_metadata_mismatch")
+    marketplace_path = root / ".agents/plugins/marketplace.json"
+    try:
+        marketplace = json.loads(marketplace_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise InstallError(f"codex_projection_marketplace_invalid:{marketplace_path}") from error
+    expected_marketplace = {
+        "name": codex_runtime_marketplace(expected_commit, expected_digest),
+        "interface": {"displayName": "Generous Workstream"},
+        "plugins": [{
+            "name": CODEX_RUNTIME_PLUGIN,
+            "source": {"source": "local", "path": "./plugins/workstream"},
+            "policy": {"installation": "AVAILABLE", "authentication": "ON_USE"},
+            "category": "Productivity",
+        }],
+    }
+    if marketplace != expected_marketplace:
+        raise InstallError("codex_projection_marketplace_mismatch")
+    plugin_root = root / "plugins/workstream"
+    if manifest_version(plugin_root, "codex") != expected_version:
+        raise InstallError("codex_projection_version_mismatch")
+    observed_digest = tree_digest(plugin_root)
+    if observed_digest != metadata["packaged_tree_sha256"]:
+        raise InstallError("codex_projection_tree_mismatch")
+    live = active_codex_process_generations()
+    return {
+        "path": str(root), **expected,
+        "packaged_tree_sha256": observed_digest,
+        "pre_migration_processes": pre_migration,
+        "running_pre_migration_processes": [item for item in pre_migration if item in live],
+    }
+
+
+def verify_codex_config(target: Path, *, expected_source: Path,
+                        expected_commit: str,
+                        expected_digest: str) -> dict[str, Any]:
+    config_path = target / "config.toml"
+    try:
+        with config_path.open("rb") as handle:
+            config = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise InstallError(f"codex_config_invalid:{config_path}") from error
+    marketplaces = config.get("marketplaces")
+    plugins = config.get("plugins")
+    if not isinstance(marketplaces, dict) or not isinstance(plugins, dict):
+        raise InstallError("codex_config_plugin_tables_missing")
+    expected_marketplace = codex_runtime_marketplace(expected_commit, expected_digest)
+    expected_plugin = codex_runtime_plugin_id(expected_commit, expected_digest)
+    runtime_marketplaces = sorted(
+        key for key in marketplaces
+        if isinstance(key, str) and key.startswith(CODEX_RUNTIME_MARKETPLACE_PREFIX)
+    )
+    runtime_plugins = sorted(
+        key for key in plugins
+        if isinstance(key, str) and
+        key.startswith(f"{CODEX_RUNTIME_PLUGIN}@{CODEX_RUNTIME_MARKETPLACE_PREFIX}")
+    )
+    if runtime_marketplaces != [expected_marketplace]:
+        raise InstallError(
+            f"codex_config_runtime_marketplace_mismatch:{runtime_marketplaces}"
+        )
+    if runtime_plugins != [expected_plugin]:
+        raise InstallError(f"codex_config_runtime_plugin_mismatch:{runtime_plugins}")
+    marketplace = marketplaces[expected_marketplace]
+    plugin = plugins[expected_plugin]
+    if (not isinstance(marketplace, dict) or
+            marketplace.get("source_type") != "local" or
+            not isinstance(marketplace.get("source"), str) or
+            Path(marketplace["source"]).expanduser().resolve() != expected_source.resolve()):
+        raise InstallError("codex_config_runtime_marketplace_source_mismatch")
+    if not isinstance(plugin, dict) or plugin.get("enabled") is not True:
+        raise InstallError("codex_config_runtime_plugin_not_enabled")
+    if MARKETPLACE in marketplaces or PLUGIN_ID in plugins:
+        raise InstallError("legacy_codex_config_registration_remains")
+    return {
+        "path": str(config_path), "marketplace": expected_marketplace,
+        "plugin": expected_plugin, "source": str(expected_source.resolve()),
+    }
+
+
+def sync_codex_projection(source_root: Path, *, expected_commit: str,
+                          expected_version: str, expected_digest: str,
+                          journal: "TransactionJournal",
+                          capture_pre_migration: bool = False) -> tuple[Path, bool]:
+    """Atomically project an exact plugin under a collision-proof identity."""
+    root = codex_projection_root(expected_commit, expected_digest)
+    root.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(root.parent, 0o700)
+    previous = root.with_name(f".{root.name}.previous")
+    root_exact = False
+    try:
+        verify_codex_projection(
+            root, expected_commit=expected_commit,
+            expected_version=expected_version, expected_digest=expected_digest,
+        )
+        root_exact = True
+    except InstallError:
+        pass
+    if previous.exists() or previous.is_symlink():
+        if root_exact:
+            _remove_tree(previous)
+            _fsync_directory(root.parent)
+            journal.set_phase("projection_recovery_finalized")
+            return root, True
+        if not root.exists():
+            os.replace(previous, root)
+            _fsync_directory(root.parent)
+        else:
+            raise InstallError("codex_projection_recovery_ambiguous")
+    if root_exact:
+        if capture_pre_migration:
+            metadata_path = root / ".agent-workstream-source.json"
+            metadata = json.loads(metadata_path.read_text())
+            observed = active_codex_process_generations()
+            combined = {
+                (item["pid"], item["started"]): item
+                for item in [*metadata["pre_migration_processes"], *observed]
+            }
+            updated = sorted(
+                combined.values(), key=lambda item: (item["pid"], item["started"])
+            )
+            if updated != metadata["pre_migration_processes"]:
+                metadata["pre_migration_processes"] = updated
+                _write_json_atomic(metadata_path, metadata)
+                verify_codex_projection(
+                    root, expected_commit=expected_commit,
+                    expected_version=expected_version,
+                    expected_digest=expected_digest,
+                )
+                journal.set_phase("projection_pre_migration_extended")
+                return root, True
+        return root, False
+    stage = Path(tempfile.mkdtemp(prefix=f".{root.name}.next-", dir=root.parent))
+    activated = False
+    saved_previous = False
+    try:
+        plugin_target = stage / "plugins/workstream"
+        plugin_target.parent.mkdir(parents=True)
+        shutil.copytree(source_root / "plugins/workstream", plugin_target, symlinks=True)
+        runtime_manifest = plugin_target / MANIFESTS["codex"]
+        manifest_payload = json.loads(runtime_manifest.read_text())
+        manifest_payload["name"] = CODEX_RUNTIME_PLUGIN
+        _write_json_atomic(runtime_manifest, manifest_payload)
+        packaged_digest = tree_digest(plugin_target)
+        marketplace_path = stage / ".agents/plugins/marketplace.json"
+        marketplace_path.parent.mkdir(parents=True)
+        _write_json_atomic(marketplace_path, {
+            "name": codex_runtime_marketplace(expected_commit, expected_digest),
+            "interface": {"displayName": "Generous Workstream"},
+            "plugins": [{
+                "name": CODEX_RUNTIME_PLUGIN,
+                "source": {"source": "local", "path": "./plugins/workstream"},
+                "policy": {"installation": "AVAILABLE", "authentication": "ON_USE"},
+                "category": "Productivity",
+            }],
+        })
+        _write_json_atomic(stage / ".agent-workstream-source.json", {
+            "schema": CODEX_PROJECTION_SCHEMA,
+            "source_commit": expected_commit,
+            "version": expected_version,
+            "source_tree_sha256": expected_digest,
+            "packaged_tree_sha256": packaged_digest,
+            "generation": codex_runtime_generation(expected_commit, expected_digest),
+            "pre_migration_processes": active_codex_process_generations(),
+        })
+        verify_codex_projection(
+            stage, expected_commit=expected_commit,
+            expected_version=expected_version, expected_digest=expected_digest,
+        )
+        journal.set_phase("projection_staged")
+        if root.exists():
+            os.replace(root, previous)
+            saved_previous = True
+            _fsync_directory(root.parent)
+            journal.set_phase("projection_previous_saved")
+        os.replace(stage, root)
+        activated = True
+        _fsync_directory(root.parent)
+        journal.set_phase("projection_activated")
+        verify_codex_projection(
+            root, expected_commit=expected_commit,
+            expected_version=expected_version, expected_digest=expected_digest,
+        )
+        if saved_previous:
+            _remove_tree(previous)
+            _fsync_directory(root.parent)
+        journal.set_phase("projection_ready")
+        return root, True
+    except Exception:
+        if activated and root.exists():
+            _remove_tree(root)
+        if saved_previous and previous.exists():
+            os.replace(previous, root)
+            _fsync_directory(root.parent)
+        raise
+    finally:
+        if stage.exists() or stage.is_symlink():
+            _remove_tree(stage)
+
+
 def codex_inventory(env: dict[str, str] | None = None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     marketplaces = run(["codex", "plugin", "marketplace", "list", "--json"], parse_json=True, env=env)
     if not isinstance(marketplaces, dict):
         raise InstallError("invalid_codex_marketplaces_top_level")
-    marketplace = exactly_one(marketplaces.get("marketplaces"), identity_key="name",
-                              identity=MARKETPLACE, error_prefix="codex_marketplace")
+    marketplace_items = marketplaces.get("marketplaces")
+    if not isinstance(marketplace_items, list):
+        raise InstallError("invalid_codex_marketplace_container")
+    if any(not isinstance(item, dict) for item in marketplace_items):
+        raise InstallError("invalid_codex_marketplace_item")
+    runtime_marketplaces = [item for item in marketplace_items if
+                            isinstance(item.get("name"), str) and
+                            item["name"].startswith(CODEX_RUNTIME_MARKETPLACE_PREFIX)]
+    if len(runtime_marketplaces) > 1:
+        raise InstallError("duplicate_codex_runtime_marketplace_records")
+    marketplace = runtime_marketplaces[0] if runtime_marketplaces else None
     plugins = run(["codex", "plugin", "list", "--json"], parse_json=True, env=env)
     if not isinstance(plugins, dict):
         raise InstallError("invalid_codex_plugins_top_level")
-    plugin = exactly_one(plugins.get("installed"), identity_key="pluginId",
-                         identity=PLUGIN_ID, error_prefix="codex_plugin")
+    plugin_items = plugins.get("installed")
+    if not isinstance(plugin_items, list):
+        raise InstallError("invalid_codex_plugin_container")
+    if any(not isinstance(item, dict) for item in plugin_items):
+        raise InstallError("invalid_codex_plugin_item")
+    runtime_plugins = [item for item in plugin_items if
+                       isinstance(item.get("pluginId"), str) and
+                       item["pluginId"].startswith(
+                           f"{CODEX_RUNTIME_PLUGIN}@{CODEX_RUNTIME_MARKETPLACE_PREFIX}")]
+    if len(runtime_plugins) > 1:
+        raise InstallError("duplicate_codex_runtime_plugin_records")
+    plugin = runtime_plugins[0] if runtime_plugins else None
+    return marketplace, plugin
+
+
+def codex_legacy_inventory(env: dict[str, str] | None = None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    marketplaces = run(["codex", "plugin", "marketplace", "list", "--json"], parse_json=True, env=env)
+    plugins = run(["codex", "plugin", "list", "--json"], parse_json=True, env=env)
+    if not isinstance(marketplaces, dict) or not isinstance(plugins, dict):
+        raise InstallError("invalid_codex_legacy_inventory")
+    marketplace = exactly_one(
+        marketplaces.get("marketplaces"), identity_key="name",
+        identity=MARKETPLACE, error_prefix="codex_legacy_marketplace",
+    )
+    plugin = exactly_one(
+        plugins.get("installed"), identity_key="pluginId",
+        identity=PLUGIN_ID, error_prefix="codex_legacy_plugin",
+    )
     return marketplace, plugin
 
 
@@ -602,17 +896,26 @@ def install_path(client: str, plugin: dict[str, Any], version: str,
         except ValueError as error:
             raise InstallError("claude_install_path_outside_target") from error
         return path
-    return target / "plugins/cache" / MARKETPLACE / "workstream" / version
+    plugin_id = plugin.get("pluginId")
+    if not isinstance(plugin_id, str) or "@" not in plugin_id:
+        raise InstallError("codex_plugin_identity_unavailable")
+    plugin_name, marketplace_name = plugin_id.split("@", 1)
+    return target / "plugins/cache" / marketplace_name / plugin_name / version
 
 
-def expected_install_path(target: Path, version: str) -> Path:
-    return target / "plugins/cache" / MARKETPLACE / "workstream" / version
+def expected_install_path(target: Path, version: str, *, expected_commit: str = "a" * 40,
+                          expected_digest: str = "d") -> Path:
+    return (target / "plugins/cache" /
+            codex_runtime_marketplace(expected_commit, expected_digest) /
+            CODEX_RUNTIME_PLUGIN / version)
 
 
 def refuse_version_collision(client: str, plugin: dict[str, Any] | None,
                              target: Path, version: str,
                              expected_digest: str) -> None:
-    candidates = {expected_install_path(target, version)}
+    candidates: set[Path] = set()
+    if client == "codex" and plugin is not None and plugin.get("version") == version:
+        candidates.add(install_path(client, plugin, version, target=target))
     if (client == "claude" and plugin is not None and
             plugin.get("version") == version):
         value = plugin.get("installPath")
@@ -629,6 +932,8 @@ def repairable_verification_error(error: InstallError) -> bool:
         "plugin_not_installed:", "marketplace_source_mismatch:",
         "marketplace_commit_mismatch:", "plugin_version_mismatch:",
         "installed_manifest_version_mismatch:",
+        "codex_runtime_marketplace_generation_mismatch",
+        "codex_runtime_plugin_generation_mismatch",
     ))
 
 
@@ -649,9 +954,30 @@ def verify_client(client: str, marketplace: dict[str, Any] | None,
     marketplace_root = Path(root_value).resolve()
     if marketplace_root != expected_source.resolve():
         raise InstallError(f"marketplace_source_mismatch:{client}:{marketplace_root}:{expected_source.resolve()}")
-    observed_commit = git_head(marketplace_root)
-    if observed_commit != expected_commit:
-        raise InstallError(f"marketplace_commit_mismatch:{client}:{observed_commit}:{expected_commit}")
+    projection = None
+    codex_config = None
+    if client == "codex":
+        projection = verify_codex_projection(
+            marketplace_root, expected_commit=expected_commit,
+            expected_version=expected_version, expected_digest=expected_digest,
+        )
+        observed_commit = projection["source_commit"]
+        expected_marketplace_name = codex_runtime_marketplace(
+            expected_commit, expected_digest
+        )
+        if marketplace.get("name") != expected_marketplace_name:
+            raise InstallError("codex_runtime_marketplace_generation_mismatch")
+        if plugin.get("pluginId") != codex_runtime_plugin_id(
+                expected_commit, expected_digest):
+            raise InstallError("codex_runtime_plugin_generation_mismatch")
+        codex_config = verify_codex_config(
+            target, expected_source=expected_source,
+            expected_commit=expected_commit, expected_digest=expected_digest,
+        )
+    else:
+        observed_commit = git_head(marketplace_root)
+        if observed_commit != expected_commit:
+            raise InstallError(f"marketplace_commit_mismatch:{client}:{observed_commit}:{expected_commit}")
     source_root = marketplace_root / "plugins/workstream"
     source_version = manifest_version(source_root, client)
     observed_version = plugin.get("version")
@@ -661,44 +987,52 @@ def verify_client(client: str, marketplace: dict[str, Any] | None,
     if manifest_version(installed_root, client) != expected_version:
         raise InstallError(f"installed_manifest_version_mismatch:{client}")
     installed_digest = tree_digest(installed_root)
-    if installed_digest != expected_digest:
+    expected_installed_digest = (
+        projection["packaged_tree_sha256"] if projection is not None else expected_digest
+    )
+    if installed_digest != expected_installed_digest:
         raise InstallError(f"installed_tree_mismatch:{client}")
-    return {"client": client, "host_id": host_id, "target": str(target),
+    receipt = {"client": client, "host_id": host_id, "target": str(target),
             "commit": observed_commit, "version": expected_version,
             "tree_sha256": installed_digest, "enabled": True,
             "status": "verified"}
+    if projection is not None:
+        receipt["codex_projection"] = projection
+        receipt["codex_config"] = codex_config
+        receipt["source_tree_sha256"] = expected_digest
+    return receipt
 
 
 def verify_post_update_stability(client: str, *, expected_commit: str,
                                  expected_version: str, expected_source: Path,
                                  expected_digest: str, host_id: str,
                                  target: Path, env: dict[str, str]) -> dict[str, Any]:
-    """Fence delayed client cache writers before publishing update success."""
-    receipt: dict[str, Any] | None = None
-    delays = CODEX_POST_UPDATE_STABILITY_DELAYS_SECONDS if client == "codex" else (0.0,)
-    for delay in delays:
-        if delay:
-            time.sleep(delay)
-        marketplace, plugin = inventory(client, env)
-        try:
-            receipt = verify_client(
-                client, marketplace, plugin,
-                expected_commit=expected_commit,
-                expected_version=expected_version,
-                expected_source=expected_source,
-                expected_digest=expected_digest,
-                host_id=host_id, target=target,
-            )
-        except InstallError as error:
-            raise InstallError(
-                f"post_update_stability_failed:{client}:{error}"
-            ) from error
-    assert receipt is not None
-    return receipt
+    """Verify the collision-proof production identity after all mutations."""
+    marketplace, plugin = inventory(client, env)
+    try:
+        return verify_client(
+            client, marketplace, plugin,
+            expected_commit=expected_commit,
+            expected_version=expected_version,
+            expected_source=expected_source,
+            expected_digest=expected_digest,
+            host_id=host_id, target=target,
+        )
+    except InstallError as error:
+        raise InstallError(
+            f"post_update_stability_failed:{client}:{error}"
+        ) from error
 
 
 def inventory(client: str, env: dict[str, str]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     return codex_inventory(env) if client == "codex" else claude_inventory(env)
+
+
+def codex_projection_plugin_id(source_root: Path) -> str:
+    projection_manifest = json.loads(
+        (source_root / ".agents/plugins/marketplace.json").read_text()
+    )
+    return f"{projection_manifest['plugins'][0]['name']}@{projection_manifest['name']}"
 
 
 def update_client(client: str, *, source_root: Path, expected_version: str,
@@ -706,6 +1040,11 @@ def update_client(client: str, *, source_root: Path, expected_version: str,
     if shutil.which(client, path=env.get("PATH")) is None:
         raise InstallError(f"client_unavailable:{client}")
     marketplace, plugin = inventory(client, env)
+    codex_plugin_id = None
+    codex_marketplace_name = None
+    if client == "codex":
+        codex_plugin_id = codex_projection_plugin_id(source_root)
+        codex_marketplace_name = codex_plugin_id.split("@", 1)[1]
     marketplace_ready = False
     if marketplace is not None:
         root_key = "root" if client == "codex" else "installLocation"
@@ -713,10 +1052,14 @@ def update_client(client: str, *, source_root: Path, expected_version: str,
         if not isinstance(root_value, str) or not root_value:
             raise InstallError(f"marketplace_root_unavailable:{client}")
         marketplace_ready = Path(root_value).resolve() == source_root.resolve()
+        if client == "codex":
+            marketplace_ready = (
+                marketplace_ready and marketplace.get("name") == codex_marketplace_name
+            )
     if marketplace is not None and not marketplace_ready:
         journal.set_phase("removing_marketplace")
         if client == "codex":
-            run(["codex", "plugin", "marketplace", "remove", MARKETPLACE, "--json"], env=env)
+            run(["codex", "plugin", "marketplace", "remove", marketplace["name"], "--json"], env=env)
         else:
             run(["claude", "plugin", "marketplace", "remove", MARKETPLACE, "--scope", "user"], env=env)
         journal.set_phase("marketplace_removed")
@@ -748,7 +1091,7 @@ def update_client(client: str, *, source_root: Path, expected_version: str,
         # selected, so replace that registration through the supported CLI
         # before installing the exact marketplace version.
         journal.set_phase("removing_plugin")
-        run(["codex", "plugin", "remove", PLUGIN_ID, "--json"], env=env)
+        run(["codex", "plugin", "remove", plugin["pluginId"], "--json"], env=env)
         journal.set_phase("plugin_removed")
     journal.set_phase("installing_plugin")
     if client == "claude" and plugin is not None and plugin.get("version") == expected_version:
@@ -758,8 +1101,29 @@ def update_client(client: str, *, source_root: Path, expected_version: str,
     elif client == "claude":
         run(["claude", "plugin", "install", PLUGIN_ID, "--scope", "user", "--yes"], env=env)
     else:
-        run(["codex", "plugin", "add", PLUGIN_ID, "--json"], env=env)
+        assert codex_plugin_id is not None
+        run(["codex", "plugin", "add", codex_plugin_id, "--json"], env=env)
     journal.set_phase("plugin_installed")
+
+
+def remove_legacy_codex_registration(env: dict[str, str],
+                                     journal: "TransactionJournal") -> bool:
+    marketplace, plugin = codex_legacy_inventory(env)
+    changed = False
+    if plugin is not None:
+        journal.set_phase("removing_legacy_plugin")
+        run(["codex", "plugin", "remove", PLUGIN_ID, "--json"], env=env)
+        journal.set_phase("legacy_plugin_removed")
+        changed = True
+    if marketplace is not None:
+        journal.set_phase("removing_legacy_marketplace")
+        run(["codex", "plugin", "marketplace", "remove", MARKETPLACE, "--json"], env=env)
+        journal.set_phase("legacy_marketplace_removed")
+        changed = True
+    remaining_marketplace, remaining_plugin = codex_legacy_inventory(env)
+    if remaining_marketplace is not None or remaining_plugin is not None:
+        raise InstallError("legacy_codex_registration_remains")
+    return changed
 
 
 class TransactionJournal:
@@ -904,6 +1268,35 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     recovering = journal.exists
                     changed = False
+                    client_source = source_root
+                    if client == "codex":
+                        if args.mode == "update":
+                            if not recovering:
+                                journal.set_phase("preparing_projection")
+                            client_source, projection_changed = sync_codex_projection(
+                                source_root,
+                                expected_commit=args.expected_commit,
+                                expected_version=args.expected_version,
+                                expected_digest=source["tree_sha256"],
+                                journal=journal,
+                            )
+                            changed |= projection_changed
+                            changed |= remove_legacy_codex_registration(env, journal)
+                        else:
+                            client_source = codex_projection_root(
+                                args.expected_commit, source["tree_sha256"]
+                            )
+                            verify_codex_projection(
+                                client_source,
+                                expected_commit=args.expected_commit,
+                                expected_version=args.expected_version,
+                                expected_digest=source["tree_sha256"],
+                            )
+                            previous = client_source.with_name(
+                                f".{client_source.name}.previous"
+                            )
+                            if previous.exists() or previous.is_symlink():
+                                raise InstallError("codex_projection_recovery_required")
                     if args.mode == "update":
                         marketplace, plugin = inventory(client, env)
                         try:
@@ -911,21 +1304,30 @@ def main(argv: list[str] | None = None) -> int:
                                 client, marketplace, plugin,
                                 expected_commit=args.expected_commit,
                                 expected_version=args.expected_version,
-                                expected_source=source_root,
+                                expected_source=client_source,
                                 expected_digest=source["tree_sha256"],
                                 host_id=args.host_id, target=target,
                             )
                         except InstallError as verification_error:
                             if not repairable_verification_error(verification_error):
                                 raise
+                            if client == "codex" and recovering:
+                                client_source, capture_changed = sync_codex_projection(
+                                    source_root,
+                                    expected_commit=args.expected_commit,
+                                    expected_version=args.expected_version,
+                                    expected_digest=source["tree_sha256"],
+                                    journal=journal, capture_pre_migration=True,
+                                )
+                                changed |= capture_changed
                             refuse_version_collision(
                                 client, plugin, target, args.expected_version,
                                 source["tree_sha256"],
                             )
-                            if not recovering:
+                            if not recovering and not journal.exists:
                                 journal.set_phase("preparing")
                             update_client(
-                                client, source_root=source_root, env=env,
+                                client, source_root=client_source, env=env,
                                 journal=journal,
                                 expected_version=args.expected_version,
                             )
@@ -935,17 +1337,17 @@ def main(argv: list[str] | None = None) -> int:
                                 client, marketplace, plugin,
                                 expected_commit=args.expected_commit,
                                 expected_version=args.expected_version,
-                                expected_source=source_root,
+                                expected_source=client_source,
                                 expected_digest=source["tree_sha256"],
                                 host_id=args.host_id, target=target,
                             )
-                        if client == "codex" and (changed or recovering):
+                        if client == "codex":
                             journal.set_phase("verifying_stability")
                             receipt = verify_post_update_stability(
                                 client,
                                 expected_commit=args.expected_commit,
                                 expected_version=args.expected_version,
-                                expected_source=source_root,
+                                expected_source=client_source,
                                 expected_digest=source["tree_sha256"],
                                 host_id=args.host_id, target=target, env=env,
                             )
@@ -956,11 +1358,15 @@ def main(argv: list[str] | None = None) -> int:
                                 f"recovery_required:{client}:{journal.phase}"
                             )
                         marketplace, plugin = inventory(client, env)
+                        if client == "codex":
+                            legacy_marketplace, legacy_plugin = codex_legacy_inventory(env)
+                            if legacy_marketplace is not None or legacy_plugin is not None:
+                                raise InstallError("legacy_codex_registration_remains")
                         receipt = verify_client(
                             client, marketplace, plugin,
                             expected_commit=args.expected_commit,
                             expected_version=args.expected_version,
-                            expected_source=source_root,
+                            expected_source=client_source,
                             expected_digest=source["tree_sha256"],
                             host_id=args.host_id, target=target,
                         )
