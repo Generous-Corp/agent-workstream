@@ -693,10 +693,19 @@ class LinearTransportTests(unittest.TestCase):
             key=child_id, value=value, plan_revision="sha-demo",
             expected_revision=7, created_at="legacy", authority=route,
         )
-        def reserve(**_values):
+        def replay(**_values):
             return {"event": legacy.event, "remote_id": "legacy-comment",
                     "revision": 8, "disposition": "legacy_existing"}
-        legacy.reserve_child_extension = reserve
+        legacy.replay_legacy_child_extension = replay
+        legacy.reserve_child_extension = lambda **_values: self.fail(
+            "legacy replay must bypass normal reservation"
+        )
+        original_execute = fake.execute
+        def deleted_providers(query, variables):
+            if "WorkstreamNativeState" in query or "WorkstreamNativeAssignee" in query:
+                self.fail("legacy replay must not validate deleted native providers")
+            return original_execute(query, variables)
+        fake.execute = deleted_providers
         fake.calls.clear()
 
         result = self.extend_legacy(transport, authorization_adapter=legacy)
@@ -711,7 +720,7 @@ class LinearTransportTests(unittest.TestCase):
     def test_legacy_authorization_without_child_refuses_before_create(self):
         fake = FakeClient(); fake.issues.append(self.legacy_root())
         class LegacyLost(FakeChildAuthorization):
-            def reserve_child_extension(self, **values):
+            def replay_legacy_child_extension(self, **values):
                 raise LinearTransportError(
                     "legacy_authorization_requires_existing_child"
                 )

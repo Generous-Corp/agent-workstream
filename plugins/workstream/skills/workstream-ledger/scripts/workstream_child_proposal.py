@@ -113,7 +113,7 @@ def append_proposal(client: Any, value: dict[str, Any]) -> dict[str, Any]:
     existing = existing_pair[1] if existing_pair is not None else None
     body = encode_proposal(value)
     if existing is not None:
-        if existing.get("body") != body:
+        if existing.get("body") != body or existing.get("id") != remote_id:
             raise LinearTransportError("child_proposal_slot_conflict")
         return {"proposal": value, "remote_id": remote_id, "disposition": "existing"}
     fields = ((client.execute(COMMENT_CREATE_CAPABILITY_QUERY, {}).get("__type") or {})
@@ -179,6 +179,40 @@ def activated_comments(comments: list[dict[str, Any]],
                 else encode_checkpoint_comment(proposal["record"]))
         synthetic.append({**comment, "body": body})
     return [*comments, *synthetic]
+
+
+def pending_proposal_obligations(
+    comments: list[dict[str, Any]], authorizations: list[dict[str, Any]], *,
+    child_workstream_id: str, child_issue_id: str, plan_revision: str,
+) -> list[dict[str, Any]]:
+    """Expose inert recovery handles without treating proposal payload as state."""
+    activated = {
+        event["value"]["proposal_id"] for event in authorizations
+        if event["value"].get("child_workstream_id") == child_workstream_id
+        and event["value"].get("child_issue_id") == child_issue_id
+    }
+    result = []
+    for proposal, comment in proposal_index(comments).values():
+        if (
+            proposal["child_workstream_id"] != child_workstream_id
+            or proposal["child_issue_id"] != child_issue_id
+            or proposal["plan_revision"] != plan_revision
+        ):
+            raise LinearTransportError("foreign_child_proposal")
+        expected_remote = proposal_slot_id(child_issue_id, proposal["proposal_id"])
+        if comment.get("id") != expected_remote:
+            raise LinearTransportError("child_proposal_slot_mismatch")
+        if proposal["proposal_id"] in activated:
+            continue
+        result.append({
+            "proposal_id": proposal["proposal_id"],
+            "proposal_remote_id": expected_remote,
+            "kind": proposal["kind"],
+            "record_sha256": proposal["record_sha256"],
+            "child_workstream_id": child_workstream_id,
+            "child_issue_id": child_issue_id,
+        })
+    return sorted(result, key=lambda item: item["proposal_id"])
 
 
 def proposal_index(

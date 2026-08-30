@@ -1680,13 +1680,16 @@ class GenerationTransitionTests(unittest.TestCase):
         })
         snapshot_transport = MagicMock()
         snapshot_transport.snapshot_for_root.return_value = deepcopy(graph)
+        child_history = MagicMock(
+            side_effect=lambda value, *_args, **_kwargs: value,
+        )
         with patch("workstream_generation.plan_payload", return_value={
             "source": {"identity": f"https://example.test/{OLD}",
                        "sha256": OLD},
         }), patch("workstream_generation.LinearGraphQLTransport",
                   return_value=snapshot_transport), patch(
             "workstream_generation.add_child_material_history",
-            side_effect=lambda value, *_args, **_kwargs: value,
+            child_history,
         ), patch("workstream_generation.add_material_history",
                  side_effect=lambda value, *_args, **_kwargs: value), patch(
             "workstream_generation.compact_context", compact,
@@ -1698,6 +1701,9 @@ class GenerationTransitionTests(unittest.TestCase):
         self.assertEqual(receipt["resume_authority"], "full")
         self.assertEqual(compact.call_args.kwargs["max_bytes"], 24 * 1024)
         self.assertEqual(compact.call_args.kwargs["max_items"], 100)
+        self.assertEqual(
+            child_history.call_args.kwargs["root_comments"], self.client.comments,
+        )
 
         with tempfile.NamedTemporaryFile("w", suffix=".md") as plan_file, \
                 tempfile.NamedTemporaryFile("w", suffix=".json") as proof_file:

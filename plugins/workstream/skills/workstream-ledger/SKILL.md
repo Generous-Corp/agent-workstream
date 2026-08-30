@@ -601,11 +601,27 @@ token/UUID, child token/UUID, route, selected plan generation, and live
 revision/predecessor fences. Each first writes a deterministic inert proposal
 containing the full child record, then root projection CAS activates only its
 exact ID/digest after fresh generation, scope-owner, child-parent, and route
-authentication. Resume ignores unactivated proposals. Root metadata contains
-no child business payload. Crash before activation leaves a recoverable inert
-proposal; crash after activation makes that exact proposal authoritative.
+authentication. That native child check is a drift preflight, not the ownership
+proof or an atomicity claim. Mutation authority is bound to immutable root-side child origin:
+the exact `child_extension_authorization` event/digest and deterministic
+root/route/candidate child UUID, or deterministic initial-intake root/child
+markers and IDs. Native parent/team/project fields are only a cache; drift never
+transfers ownership and is reported as a separate reconciliation blocker.
+Resume excludes unactivated proposal business payload from status, blocker, and
+next action, but emits bounded pending handles containing child token/UUID,
+proposal ID/remote ID, kind, and record digest. Root metadata contains no child
+business payload. Crash before activation leaves a recoverable inert proposal;
+`workstreamctl child-proposal-activate` reads that exact proposal by its pending
+handle and root-CAS activates it without the original payload or checkpoint
+file. Crash after activation makes that exact proposal authoritative.
 Exact replay is zero-write, including after sealed generation retirement or a
 later scope removal; an unowned new or mismatched child refuses.
+
+Legacy 0.4.29 `child_extension_authorization` replay validates the exact
+deterministic existing child and writes nothing without consulting current
+workflow-state or assignee providers. Deleted provider identities therefore do
+not invalidate an old completed creation; a missing legacy child still refuses
+before any create.
 
 The direct resume helper is full-authority by default and fetches the projected
 source identity. `--plan-source` overrides the fetch location for an

@@ -11,6 +11,7 @@ issue identities are deterministic; mutable updates still require remote CAS.
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import hashlib
 import re
@@ -129,6 +130,23 @@ query WorkstreamResumeComments($issueId: String!, $after: String) {
     team { id organization { id } }
     project { id }
     comments(first: 250, after: $after) {
+      nodes { id body createdAt updatedAt }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
+
+RESUME_AUTHORIZED_CHILD_QUERY = """
+query WorkstreamResumeAuthorizedChild($issueId: String!) {
+  issue(id: $issueId) {
+    id identifier title description url updatedAt
+    parent { id identifier }
+    project { id }
+    team { id organization { id } }
+    assignee { id }
+    state { id name type }
+    comments(first: 250) {
       nodes { id body createdAt updatedAt }
       pageInfo { hasNextPage endCursor }
     }
@@ -438,6 +456,7 @@ class LinearGraphQLTransport:
 
     def _remaining_resume_comments(
         self, issue: dict[str, Any], page_info: dict[str, Any],
+        *, allow_route_drift: bool = False,
     ) -> list[dict[str, Any]]:
         if not isinstance(page_info, dict) or not isinstance(
             page_info.get("hasNextPage"), bool,
@@ -462,7 +481,10 @@ class LinearGraphQLTransport:
                 or observed.get("identifier") != issue.get("identifier")
             ):
                 raise LinearTransportError("workstream_child_identity_mismatch")
-            if self.workspace_id and self.team_id and self.project_id:
+            if (
+                not allow_route_drift
+                and self.workspace_id and self.team_id and self.project_id
+            ):
                 validate_issue_route(
                     observed, workspace_id=self.workspace_id, team_id=self.team_id,
                     project_id=self.project_id,
@@ -593,6 +615,61 @@ class LinearGraphQLTransport:
             result["child_comments"] = child_comments
         if include_description:
             result["root"]["description"] = description
+        return result
+
+    def recover_authorized_children(
+        self, snapshot: dict[str, Any], authorizations: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Fetch activated children by immutable ID even if native reparent hid them."""
+        result = deepcopy(snapshot)
+        children = result.setdefault("children", [])
+        child_comments = result.setdefault("child_comments", {})
+        existing = {item.get("id") for item in children}
+        expected: dict[str, str] = {}
+        for event in authorizations:
+            value = event["value"]
+            issue_id = value["child_issue_id"]
+            token = value["child_workstream_id"]
+            previous = expected.get(issue_id)
+            if previous is not None and previous != token:
+                raise LinearTransportError("authorized_child_identity_ambiguous")
+            expected[issue_id] = token
+        for issue_id, token in sorted(expected.items()):
+            if issue_id in existing:
+                continue
+            issue = self.client.execute(
+                RESUME_AUTHORIZED_CHILD_QUERY, {"issueId": issue_id},
+            ).get("issue")
+            if (
+                not isinstance(issue, dict) or issue.get("id") != issue_id
+                or str(issue.get("identifier", "")).upper() != token
+            ):
+                raise LinearTransportError("authorized_child_readback_missing")
+            child = dict(issue)
+            state = child.pop("state", None) or {}
+            child["state_id"] = state.get("id")
+            child["status"] = state.get("name") or state.get("type") or "Todo"
+            child["status_type"] = state.get("type")
+            child["next_action"] = parse_next_action(child.get("description"))
+            connection = child.pop("comments", None)
+            if not isinstance(connection, dict):
+                raise LinearTransportError("missing Linear child comment connection")
+            nodes = connection.get("nodes")
+            page_info = connection.get("pageInfo")
+            if not isinstance(nodes, list) or not isinstance(page_info, dict):
+                raise LinearTransportError("invalid Linear child comment connection")
+            terminal = {
+                str(child.get("status", "")).lower(),
+                str(child.get("status_type", "")).lower(),
+            } & {"done", "completed", "cancelled", "canceled", "superseded"}
+            if not terminal:
+                child_comments[token] = [
+                    *nodes, *self._remaining_resume_comments(
+                        child, page_info, allow_route_drift=True,
+                    ),
+                ]
+            children.append(child)
+            existing.add(issue_id)
         return result
 
     def _intake_route(self) -> dict[str, str]:
@@ -1004,25 +1081,59 @@ class LinearGraphQLTransport:
                 raise ValueError("native child assignee ID must be a canonical UUID")
         else:
             canonical_assignee_id = None
-        if not isinstance(state_id, str) or not state_id.strip():
-            raise ValueError("native child state ID is required")
         if (
             not isinstance(unassigned, bool)
             or (unassigned and assignee_id is not None)
-            or (not unassigned and (
-                not isinstance(assignee_id, str) or not assignee_id.strip()
-            ))
+            or (not unassigned and canonical_assignee_id is None)
         ):
             raise ValueError(
                 "exactly one native assignee ID or explicit unassigned is required"
             )
+        route = self._intake_route()
+        self._ensure_route()
+        current = self.snapshot()["issues"]
+        root = next((item for item in current if item.get("id") == root_issue_id), None)
+        if not isinstance(root, dict):
+            raise LinearTransportError("existing_workstream_root_not_found")
+        if root.get("parent") is not None:
+            raise LinearTransportError("existing_workstream_root_is_child")
+        validate_issue_route(root, **route)
+        child_id = deterministic_existing_root_child_id(
+            **route, root_issue_id=root_issue_id,
+            child_stable_key=reviewed_candidate_key,
+        )
+        child = next((item for item in current if item.get("id") == child_id), None)
+        if child is not None:
+            self._validate_intake_issue(
+                child, issue_id=child_id, stable_key=reviewed_candidate_key,
+                title=candidate["title"], plan_revision=plan_revision,
+                parent_id=root_issue_id,
+            )
+        legacy = authorization_adapter.replay_legacy_child_extension(
+            source={"identity": source["identity"], "sha256": source_revision},
+            reviewed_candidate_key=reviewed_candidate_key,
+            child_issue_id=child_id, require_existing=child is not None,
+        ) if callable(getattr(
+            authorization_adapter, "replay_legacy_child_extension", None,
+        )) else None
+        if legacy is not None:
+            return {
+                "schema_version": 1, "source": source,
+                "plan_revision": plan_revision, "route": route, "root": root,
+                "issues": [],
+                "receipt": self._intake_receipt(
+                    child, stable_key=reviewed_candidate_key,
+                    disposition="existing",
+                ),
+                "frontier": dict(expected_frontier),
+                "authorization": legacy,
+                "initial_state": "planned_pending_projection",
+            }
         native_initialization = {
             "state_id": canonical_state_id,
             "assignee_id": None if unassigned else canonical_assignee_id,
         }
 
-        route = self._intake_route()
-        self._ensure_route()
         state_result = self.client.execute(NATIVE_STATE_QUERY, {
             "teamId": route["team_id"], "stateId": canonical_state_id,
         })

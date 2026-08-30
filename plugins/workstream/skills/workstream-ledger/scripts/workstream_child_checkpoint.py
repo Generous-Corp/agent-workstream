@@ -81,6 +81,7 @@ def run(
         scope_event_id=selected["scope_event_id"],
         scope_value_sha256=selected["scope_value_sha256"],
         repository_owner=selected["child_repository_owner"],
+        child_origin=selected["child_origin"],
         expected_projection_revision=selected["projection_revision"],
     )
     comments = LinearCheckpointAdapter(

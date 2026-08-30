@@ -4,16 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import re
 import uuid
 from typing import Any, Callable
 
 from workstream_config import load_linear_api_key, resolve_linear_route
 from workstream_linear import (
-    HttpGraphQLClient, LinearTransportError, parse_plan_revision,
+    deterministic_issue_id, HttpGraphQLClient, issue_key,
+    LinearTransportError, parse_plan_revision,
     validate_issue_route,
 )
-from workstream_linear_projection import LinearProjectionAdapter
+from workstream_linear_projection import LinearProjectionAdapter, LinearProjectionError
 
 
 TOKEN = re.compile(r"[A-Z][A-Z0-9]*-\d+")
@@ -25,7 +28,7 @@ query WorkstreamChildTarget($rootId: String!, $childId: String!) {
     project { id }
   }
   child: issue(id: $childId) {
-    id identifier parent { id identifier }
+    id identifier description parent { id identifier }
     team { id organization { id } }
     project { id }
   }
@@ -104,30 +107,85 @@ def authenticate_child_target(
     ):
         raise LinearTransportError("child_target_root_identity_mismatch")
     validate_issue_route(root, **route)
-    if (
-        child.get("id") != child_issue_id
-        or str(child.get("identifier", "")).upper() != child_token
-        or (child.get("parent") or {}).get("id") != root_issue_id
-        or str((child.get("parent") or {}).get("identifier", "")).upper()
-        != root_token
-    ):
+    if (child.get("id") != child_issue_id
+            or str(child.get("identifier", "")).upper() != child_token):
         raise LinearTransportError("child_target_identity_mismatch")
-    validate_issue_route(child, **route)
     projection = LinearProjectionAdapter(
         client, issue_id=root_token, workstream_id=root_token,
         plan_revision=args.plan_revision, **route, root_issue_id=root_issue_id,
     )
-    generation = projection.select_owned_child_generation(
-        description_plan_revision=parse_plan_revision(root.get("description")),
-        child_workstream_id=child_token,
-        proposal_id=proposal_id,
-    )
+    description_revision = parse_plan_revision(root.get("description"))
+    try:
+        generation = projection.select_owned_child_generation(
+            description_plan_revision=description_revision,
+            child_workstream_id=child_token, child_issue_id=child_issue_id,
+            proposal_id=proposal_id,
+        )
+    except LinearProjectionError as origin_error:
+        if str(origin_error) != "child_origin_provenance_missing":
+            raise
+        root_key = issue_key(root)
+        child_key = issue_key(child)
+        marker = {"root_stable_key": root_key, "child_stable_key": child_key}
+        if (
+            not root_key or not child_key
+            or deterministic_issue_id(**route, root_stable_key=root_key)
+            != root_issue_id
+            or deterministic_issue_id(
+                **route, root_stable_key=root_key, child_stable_key=child_key,
+            ) != child_issue_id
+        ):
+            raise LinearTransportError(
+                "child_origin_provenance_missing"
+            ) from origin_error
+        selected = projection.select_generation_authority(
+            description_plan_revision=description_revision,
+        )
+        state = projection.state()
+        scope_events = [
+            event for event in state.events
+            if event["kind"] == "scope" and event["key"] == "root"
+        ]
+        scope = scope_events[-1] if scope_events else None
+        owner = (state.snapshot.get("scope") or {}).get(
+            "child_ownership", {}
+        ).get(child_token)
+        if scope is None or not isinstance(owner, str) or not owner:
+            raise LinearTransportError(f"child_target_not_owned:{child_token}")
+        authority = {**route, "root_issue_id": root_issue_id}
+        generation = {
+            **selected, "workstream_id": root_token, "authority": authority,
+            "source": state.snapshot.get("source"),
+            "child_repository_owner": owner,
+            "scope_event_id": scope["event_id"],
+            "scope_value_sha256": hashlib.sha256(json.dumps(
+                scope["value"], sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest(),
+            "projection_revision": state.revision,
+            "child_origin": {
+                "kind": "deterministic_intake_marker", **marker,
+                "marker_sha256": hashlib.sha256(json.dumps(
+                    marker, sort_keys=True, separators=(",", ":"),
+                ).encode()).hexdigest(),
+            },
+        }
+    try:
+        validate_issue_route(child, **route)
+    except LinearTransportError as error:
+        raise LinearTransportError("child_native_cache_drift") from error
+    if (
+        (child.get("parent") or {}).get("id") != root_issue_id
+        or str((child.get("parent") or {}).get("identifier", "")).upper()
+        != root_token
+    ):
+        raise LinearTransportError("child_native_cache_drift")
     return {
         "client": client, "root_workstream_id": root_token,
         "root_issue_id": root_issue_id, "child_workstream_id": child_token,
         "child_issue_id": child_issue_id, "plan_revision": args.plan_revision,
         "route": route, "generation_authority": generation,
         "projection": projection,
+        "child_origin": generation["child_origin"],
         "child_identity": {
             "identifier": child_token, "id": child_issue_id,
             "parent_issue_id": root_issue_id, "route": route,

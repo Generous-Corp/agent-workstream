@@ -192,6 +192,15 @@ class WorkstreamCtlTests(unittest.TestCase):
             [MODULE.sys.executable, str(script), "GEN-37", "--help"],
         )
 
+    def test_child_proposal_activate_dispatches_recovery_writer(self):
+        with mock.patch.object(MODULE.os, "execv") as execute:
+            MODULE.main(["child-proposal-activate", "GEN-37", "--help"])
+        script = MODULE.SCRIPTS / "workstream_child_proposal_activate.py"
+        execute.assert_called_once_with(
+            MODULE.sys.executable,
+            [MODULE.sys.executable, str(script), "GEN-37", "--help"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

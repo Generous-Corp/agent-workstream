@@ -1496,6 +1496,7 @@ def strict_candidate_loader(
             )
         graph = add_child_material_history(
             graph, child_comments, authenticated_route=authority,
+            root_comments=comments,
         )
         if activation_checkpoint is not None:
             validate_checkpoint(activation_checkpoint)
