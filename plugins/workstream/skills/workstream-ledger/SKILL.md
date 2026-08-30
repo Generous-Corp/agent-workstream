@@ -201,15 +201,19 @@ python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_extend_child.py" ./PLAN.md \
   --candidate-key <reviewed-stable-key> \
   --material-revision <live-material-revision> \
   --projection-revision <live-projection-revision> \
+  --state-id <linear-state-uuid> \
+  --assignee-id <linear-user-uuid> \
   --workspace-id <uuid> --team-id <uuid> --project-id <uuid> --apply
 ```
 
 The command requires exact plan bytes, route, root identity, reviewed candidate,
-and both live frontiers. It can create only the deterministic child beneath the
-existing root, leaves it `planned_pending_projection`, and returns an
-authorization plus readback receipt. A replay converges; it never creates or
-updates a root or project. Project the child's ownership, status, evidence, and
-dependencies before treating it as executable.
+both live frontiers, a native state, and exactly one of `--assignee-id` or
+`--unassigned`. The append-only grant binds the current generation selection
+proof and native setup before one atomic deterministic child create. A sealed
+retirement prefix preserves an exact granted create/replay while refusing new
+retired-generation grants. Readback must match state and assignee. A replay
+converges; it never updates an issue, root, or project. Project the child's
+repository ownership before treating it as executable.
 
 ### Append-only plan-generation authority
 
@@ -583,6 +587,12 @@ an ambiguous placeholder is not executable. An empty surface is reported as
 empty rather than fabricated.
 When no local config is available, authenticated token-only bootstrap resolves
 the root's exact workspace/team/project route before the fenced read.
+
+After scope owns the exact child, `workstreamctl child-event` and
+`workstreamctl child-checkpoint` append child-local state. Both require the root
+token/UUID, child token/UUID, route, selected plan generation, and live
+revision/predecessor fences. They write only child comments; exact replay is
+zero-write and an unowned or mismatched child refuses.
 
 The direct resume helper is full-authority by default and fetches the projected
 source identity. `--plan-source` overrides the fetch location for an
