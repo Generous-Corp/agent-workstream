@@ -1939,6 +1939,66 @@ class LinearProjectionAdapter:
             } if all((self.workspace_id, self.team_id, self.project_id, self.root_issue_id)) else None,
         )
 
+    def select_child_extension_generation(
+        self, *, description_plan_revision: str | None,
+        source: dict[str, str],
+    ) -> dict[str, Any]:
+        """Authenticate the one generation allowed to extend this root."""
+        return self._select_child_extension_generation(
+            self._comments(),
+            description_plan_revision=description_plan_revision,
+            source=source,
+        )
+
+    def _select_child_extension_generation(
+        self, comments: list[dict[str, Any]], *,
+        description_plan_revision: str | None, source: dict[str, str],
+    ) -> dict[str, Any]:
+        selected = select_plan_generation(
+            comments, workstream_id=self.workstream_id,
+            description_plan_revision=description_plan_revision,
+            authenticated_route=self.authority,
+        )
+        if selected["plan_revision"] != self.plan_revision:
+            raise LinearProjectionError(
+                "child_extension_plan_generation_not_selected"
+            )
+
+        selected_source = deepcopy(source)
+        tip_id = selected["transition_tip_event_id"]
+        if tip_id is not None:
+            controls: list[dict[str, Any]] = []
+            for comment in comments:
+                body = comment.get("body") or ""
+                if not isinstance(body, str) or PROJECTION_PREFIX not in body:
+                    continue
+                matches = PROJECTION_RE.findall(body)
+                if len(matches) != 1 or body.count(PROJECTION_PREFIX) != 1:
+                    raise LinearProjectionError("malformed_projection_marker")
+                event = _decode_projection(matches[0])
+                if event["event_id"] == tip_id:
+                    controls.append(event)
+            if len(controls) != 1:
+                raise LinearProjectionError(
+                    "child_extension_generation_tip_ambiguous"
+                )
+            selected_source = controls[0].get("value", {}).get("source")
+            if selected_source != source:
+                raise LinearProjectionError(
+                    "child_extension_generation_source_mismatch"
+                )
+        elif source.get("sha256") != description_plan_revision:
+            raise LinearProjectionError(
+                "child_extension_legacy_source_mismatch"
+            )
+
+        return {
+            **selected,
+            "workstream_id": self.workstream_id,
+            "authority": deepcopy(self.authority),
+            "source": deepcopy(selected_source),
+        }
+
     def append(
         self, event: dict[str, Any], *,
         expected_quarantine_count: int | None = None,
@@ -2133,6 +2193,15 @@ class LinearProjectionAdapter:
     def _assert_child_extension_authorization(
         self, event: dict[str, Any], comments: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        value = event.get("value")
+        if not isinstance(value, dict) or not isinstance(value.get("source"), dict):
+            raise LinearProjectionError(
+                "child_extension_authorization_source_invalid"
+            )
+        self._select_child_extension_generation(
+            comments, description_plan_revision=self.plan_revision,
+            source=value["source"],
+        )
         state = reduce_projection_comments(
             comments, workstream_id=self.workstream_id,
             expected_plan_revision=self.plan_revision,
@@ -2175,6 +2244,11 @@ class LinearProjectionAdapter:
             raise LinearProjectionError("invalid_child_extension_projection_frontier")
         before_comments = self._comments()
         from workstream_linear_events import reduce_event_comments
+
+        self._select_child_extension_generation(
+            before_comments, description_plan_revision=self.plan_revision,
+            source=source,
+        )
 
         material_before = reduce_event_comments(
             before_comments, workstream_id=self.workstream_id

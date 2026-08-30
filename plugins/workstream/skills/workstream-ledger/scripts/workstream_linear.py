@@ -930,6 +930,7 @@ class LinearGraphQLTransport:
         if not all(
             callable(getattr(authorization_adapter, method, None))
             for method in (
+                "select_child_extension_generation",
                 "reserve_child_extension", "assert_child_extension_authorized",
             )
         ):
@@ -947,8 +948,29 @@ class LinearGraphQLTransport:
         if root.get("parent") is not None:
             raise LinearTransportError("existing_workstream_root_is_child")
         validate_issue_route(root, **route)
-        if parse_plan_revision(root.get("description")) != plan_revision:
-            raise LinearTransportError("existing_root_plan_revision_changed")
+        description_plan_revision = parse_plan_revision(root.get("description"))
+        authorization_route = {**route, "root_issue_id": root_issue_id}
+        selected_generation = authorization_adapter.select_child_extension_generation(
+            description_plan_revision=description_plan_revision,
+            source={
+                "identity": source["identity"], "sha256": source_revision,
+            },
+        )
+        if (
+            not isinstance(selected_generation, dict)
+            or selected_generation.get("plan_revision") != plan_revision
+            or selected_generation.get("description_plan_revision")
+            != description_plan_revision
+            or selected_generation.get("workstream_id")
+            != str(root.get("identifier", "")).upper()
+            or selected_generation.get("authority") != authorization_route
+            or selected_generation.get("source") != {
+                "identity": source["identity"], "sha256": source_revision,
+            }
+        ):
+            raise LinearTransportError(
+                "existing_root_plan_generation_authority_mismatch"
+            )
 
         child_id = deterministic_existing_root_child_id(
             **route,
@@ -1002,7 +1024,6 @@ class LinearGraphQLTransport:
         authorization_event = authorization.get("event")
         if not isinstance(authorization_event, dict):
             raise LinearTransportError("child_extension_authorization_receipt_invalid")
-        authorization_route = {**route, "root_issue_id": root_issue_id}
         expected_authorization_static = {
             "root_issue_id": root_issue_id,
             "route": authorization_route,
@@ -1087,7 +1108,8 @@ class LinearGraphQLTransport:
         if (
             not isinstance(final_root, dict)
             or final_root.get("parent") is not None
-            or parse_plan_revision(final_root.get("description")) != plan_revision
+            or parse_plan_revision(final_root.get("description"))
+            != description_plan_revision
         ):
             raise LinearTransportError("existing_root_readback_changed")
         validate_issue_route(final_root, **route)

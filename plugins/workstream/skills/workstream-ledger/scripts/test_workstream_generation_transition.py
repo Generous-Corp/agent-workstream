@@ -289,6 +289,79 @@ class GenerationTransitionTests(unittest.TestCase):
         values.update(changes)
         return build_checkpoint(**values)
 
+    def test_child_extension_selection_preserves_legacy_description_authority(self):
+        selected = adapter(self.client, OLD).select_child_extension_generation(
+            description_plan_revision=OLD,
+            source={
+                "identity": f"https://example.test/{OLD}", "sha256": OLD,
+            },
+        )
+
+        self.assertEqual(selected["plan_revision"], OLD)
+        self.assertEqual(selected["authority_origin"], "legacy_description")
+        self.assertEqual(selected["authority"], AUTHORITY)
+
+    def test_child_extension_selection_uses_active_generation_not_description(self):
+        self.activate()
+        selected = adapter(self.client, NEW).select_child_extension_generation(
+            description_plan_revision=OLD,
+            source={
+                "identity": f"https://example.test/{NEW}", "sha256": NEW,
+            },
+        )
+
+        self.assertEqual(selected["plan_revision"], NEW)
+        self.assertEqual(selected["description_plan_revision"], OLD)
+        self.assertEqual(selected["authority_origin"], "generation_transition")
+
+    def test_child_extension_selection_refuses_inactive_or_wrong_source(self):
+        self.activate()
+        with self.assertRaisesRegex(
+            LinearProjectionError, "plan_generation_not_selected",
+        ):
+            adapter(self.client, OLD).select_child_extension_generation(
+                description_plan_revision=OLD,
+                source={
+                    "identity": f"https://example.test/{OLD}", "sha256": OLD,
+                },
+            )
+        with self.assertRaisesRegex(
+            LinearProjectionError, "generation_source_mismatch",
+        ):
+            adapter(self.client, NEW).select_child_extension_generation(
+                description_plan_revision=OLD,
+                source={"identity": "https://wrong.test/plan", "sha256": NEW},
+            )
+
+    def test_active_generation_child_authorization_replays_exactly(self):
+        self.activate()
+        target = adapter(self.client, NEW)
+        source = {
+            "identity": f"https://example.test/{NEW}", "sha256": NEW,
+        }
+        material = reduce_event_comments(
+            self.client.comments, workstream_id=WORKSTREAM,
+        ).revision
+        first = target.reserve_child_extension(
+            source=source, reviewed_candidate_key="new-child",
+            child_issue_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            expected_material_revision=material,
+            expected_projection_revision=target.state().revision,
+        )
+        mutation_count = len(self.client.mutations)
+
+        second = target.reserve_child_extension(
+            source=source, reviewed_candidate_key="new-child",
+            child_issue_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            expected_material_revision=material,
+            expected_projection_revision=target.state().revision,
+        )
+
+        self.assertEqual(first["event"], second["event"])
+        self.assertEqual(first["disposition"], "created")
+        self.assertEqual(second["disposition"], "existing")
+        self.assertEqual(len(self.client.mutations), mutation_count)
+
     def test_activation_checkpoint_is_inert_until_transition_and_replays(self):
         project_full(self.client, NEW)
         checkpoint = self.activation_checkpoint()
