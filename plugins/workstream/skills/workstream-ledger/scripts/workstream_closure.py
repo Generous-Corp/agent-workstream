@@ -117,6 +117,7 @@ def review(snapshot: dict[str, Any], *, expected_plan_revision: str,
         try:
             historical_evidence_event_ids = closure_bound_historical_evidence(
                 projection_events, scope,
+                snapshot.get("projection_history") or [],
             )
         except ProjectionHistoryError as error:
             errors.append(str(error))

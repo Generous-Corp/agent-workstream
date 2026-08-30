@@ -1171,7 +1171,7 @@ def validate_snapshot(
             try:
                 historical_evidence_event_ids = (
                     closure_bound_historical_evidence(
-                        projection_events, scope,
+                        projection_events, scope, projection_history,
                     )
                 )
             except ProjectionHistoryError as error:

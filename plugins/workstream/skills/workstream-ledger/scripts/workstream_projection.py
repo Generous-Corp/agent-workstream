@@ -19,8 +19,12 @@ from workstream_linear import (
     HttpGraphQLClient, LinearGraphQLTransport, LinearTransportError,
     resolve_authenticated_issue_route,
 )
-from workstream_linear_events import LinearCommentEventAdapter
-from workstream_linear_checkpoints import reduce_checkpoint_comments
+from workstream_linear_events import (
+    LinearCommentEventAdapter, LinearEventError, reduce_event_comments,
+)
+from workstream_linear_checkpoints import (
+    LinearCheckpointError, reduce_checkpoint_comments,
+)
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
     LinearProjectionError, projection_slot_id, TOMBSTONE,
@@ -33,11 +37,17 @@ from workstream_resume import (
 )
 from workstream_scope import repository_key, ScopeError, validate_relation_graph
 from workstream_successor import choose_disposition, SuccessorError
-from workstream_checkpoint import CheckpointError, recover_latest
+from workstream_checkpoint import (
+    CheckpointError, recover_generations, recover_latest,
+)
 from workstream_evidence import evidence_errors
 from workstream_child_closure import (
     canonical_digest, evidence_receipts_sha256, terminal_child_readback,
     CHILD_READBACK_FIELDS, ChildClosureError,
+)
+from workstream_projection_history import (
+    carried_predecessor_evidence_authority,
+    closure_bound_historical_evidence, ProjectionHistoryError,
 )
 
 
@@ -48,6 +58,13 @@ REVIEW_CONTRACT_FIELDS = (
     "expected_projection_quarantine_count",
     "expected_projection_quarantine_sha256",
 )
+PREDECESSOR_SEED_BINDING_FIELDS = {
+    "schema_version", "plan_revision", "projection_revision",
+    "projection_events_sha256", "projection_frontier_event_id",
+    "projection_frontier_sha256", "projection_history_sha256",
+    "material_revision", "material_events_sha256", "checkpoint_event_id",
+    "checkpoint_events_sha256", "input_frontier_sha256", "evidence_heads",
+}
 
 
 def _value_digest(value: Any) -> str:
@@ -317,6 +334,55 @@ def _contract_from_heads(
     }
 
 
+def _exact_empty_review_contract(contract: dict[str, Any]) -> bool:
+    """Recognize only the authenticated, never-written generation frontier."""
+    return contract == _contract_from_heads(
+        0, {}, legacy_event_ids=[], legacy_events_sha256=None,
+        quarantine_count=0, quarantine_sha256=_value_digest([]),
+    )
+
+
+def _terminal_seed_bootstrap_prefix(
+    contract: dict[str, Any], state: Any, desired: list[dict[str, Any]], *,
+    remote_head: str | None,
+) -> bool:
+    """Recognize only a canonical prefix that began at the empty frontier."""
+    if not state.events or projection_review_contract(state) != contract:
+        return False
+    evidence = [
+        (item["kind"], item["key"]) for item in desired
+        if item["kind"] == "evidence_contract"
+    ]
+    ordinary = [
+        (item["kind"], item["key"]) for item in desired
+        if item["kind"] not in {"evidence_contract", "scope"}
+    ]
+    expected = [
+        *evidence, *ordinary, ("disposition", "root"), ("scope", "root"),
+    ]
+    observed = [(event["kind"], event["key"]) for event in state.events]
+    if observed != expected[:len(observed)] or ("scope", "root") in observed:
+        return False
+    desired_values = {
+        (item["kind"], item["key"]): item["value"] for item in desired
+    }
+    for event, identity in zip(state.events, observed):
+        if identity == ("disposition", "root"):
+            if (
+                not isinstance(event["value"], dict)
+                or event["value"].get("remote_head") != remote_head
+                or event["value"].get("disposition")
+                not in {"attach", "create_successor"}
+                or set(event["value"]) != {
+                    "disposition", "remote_head", "recovered_from_checkpoint",
+                }
+            ):
+                return False
+        elif event["value"] != desired_values.get(identity):
+            return False
+    return True
+
+
 def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     required = {
         "projection", "retirements", "expected_projection_revision",
@@ -326,13 +392,17 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
     }
     repairs_allowed = required | {"terminal_child_repairs"}
     seeds_allowed = required | {"terminal_child_evidence_seeds"}
+    predecessor_seeds_allowed = seeds_allowed | {
+        "terminal_child_evidence_seed_predecessor"
+    }
     seed_transition_allowed = seeds_allowed | {
         "terminal_child_evidence_seed_head_transition"
     }
     source_transition_allowed = required | {"terminal_child_source_transition"}
     if not isinstance(manifest, dict) or frozenset(manifest) not in {
         frozenset(required), frozenset(repairs_allowed),
-        frozenset(seeds_allowed), frozenset(seed_transition_allowed),
+        frozenset(seeds_allowed), frozenset(predecessor_seeds_allowed),
+        frozenset(seed_transition_allowed),
         frozenset(source_transition_allowed),
     }:
         raise LinearProjectionError("manifest_review_contract_required")
@@ -514,6 +584,79 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         seed_evidence_keys.update(keys)
     if seeds != sorted(seeds, key=lambda item: item["child_identifier"].upper()):
         raise LinearProjectionError("terminal_child_evidence_seeds_not_canonical")
+    predecessor = manifest.get("terminal_child_evidence_seed_predecessor")
+    if predecessor is not None:
+        evidence_heads = predecessor.get("evidence_heads") if isinstance(
+            predecessor, dict
+        ) else None
+        valid_heads = (
+            isinstance(evidence_heads, list)
+            and bool(evidence_heads)
+            and evidence_heads == sorted(
+                evidence_heads,
+                key=lambda item: (
+                    str(item.get("child_identifier", "")),
+                    str(item.get("key", "")),
+                ),
+            )
+            and all(
+                isinstance(item, dict)
+                and set(item) == {
+                    "child_identifier", "key", "evidence_event_id",
+                    "evidence_value_sha256", "closure_event_id",
+                    "closure_value_sha256",
+                }
+                and re.fullmatch(
+                    r"[A-Z][A-Z0-9]*-\d+",
+                    str(item.get("child_identifier", "")),
+                )
+                and all(
+                    isinstance(item.get(field), str) and item[field]
+                    for field in ("key", "evidence_event_id", "closure_event_id")
+                )
+                and all(
+                    re.fullmatch(r"[0-9a-f]{64}", str(item.get(field, "")))
+                    for field in (
+                        "evidence_value_sha256", "closure_value_sha256",
+                    )
+                )
+                for item in evidence_heads
+            )
+        )
+        if (
+            not seeds
+            or not isinstance(predecessor, dict)
+            or set(predecessor) != PREDECESSOR_SEED_BINDING_FIELDS
+            or predecessor.get("schema_version") != 1
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(predecessor.get("plan_revision", "")),
+            )
+            or not isinstance(predecessor.get("projection_revision"), int)
+            or isinstance(predecessor.get("projection_revision"), bool)
+            or predecessor["projection_revision"] <= 0
+            or not all(
+                re.fullmatch(r"[0-9a-f]{64}", str(predecessor.get(field, "")))
+                for field in (
+                    "projection_events_sha256", "projection_frontier_sha256",
+                    "projection_history_sha256", "material_events_sha256",
+                    "checkpoint_events_sha256", "input_frontier_sha256",
+                )
+            )
+            or not isinstance(predecessor.get("projection_frontier_event_id"), str)
+            or not predecessor["projection_frontier_event_id"]
+            or not isinstance(predecessor.get("material_revision"), int)
+            or isinstance(predecessor.get("material_revision"), bool)
+            or predecessor["material_revision"] < 0
+            or not (
+                predecessor.get("checkpoint_event_id") is None
+                or isinstance(predecessor.get("checkpoint_event_id"), str)
+                and bool(predecessor["checkpoint_event_id"])
+            )
+            or not valid_heads
+        ):
+            raise LinearProjectionError(
+                "invalid_terminal_child_evidence_seed_predecessor"
+            )
     seed_head_transition = manifest.get(
         "terminal_child_evidence_seed_head_transition"
     )
@@ -782,16 +925,21 @@ def _with_validation_only_seed_closures(
         )
         contracts = [event["value"] for event in contracts_with_events]
         owner = scope_event["value"]["child_ownership"][child_id]
-        repository = next(
-            item for item in scope_event["value"]["repositories"]
-            if repository_key(item) == owner
-        )
+        contract_heads = {
+            (contract.get("repository_key"), contract.get("exact_head"))
+            for contract in contracts
+        }
+        if len(contract_heads) != 1 or next(iter(contract_heads))[0] != owner:
+            raise LinearProjectionError(
+                f"terminal_child_evidence_seed_owner_ambiguous:{child_id}"
+            )
+        _contract_owner, contract_head = next(iter(contract_heads))
         closure = {
             "schema_version": 2,
             **readback,
             "plan_revision": adapter.plan_revision,
             "repository_key": owner,
-            "exact_head": repository["exact_head"],
+            "exact_head": contract_head,
             "evidence_heads": [
                 {
                     "key": event["key"], "event_id": event["event_id"],
@@ -821,9 +969,230 @@ def _with_validation_only_seed_closures(
     return candidate
 
 
+def terminal_child_evidence_seed_predecessor_contract(
+    snapshot: dict[str, Any], state: Any, comments: list[dict[str, Any]], *,
+    workstream_id: str, predecessor_plan_revision: str,
+    desired_scope: dict[str, Any], seeds: list[dict[str, Any]],
+    desired_contracts: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Derive the exact predecessor authority for carried terminal evidence."""
+    history = state.snapshot.get("projection_history") or []
+    if not isinstance(history, list):
+        raise LinearProjectionError("terminal_seed_predecessor_history_invalid")
+    generation = sorted(
+        [
+            event for event in history
+            if event.get("plan_revision") == predecessor_plan_revision
+        ],
+        key=lambda event: (
+            event.get("expected_revision"), event.get("created_at"),
+            event.get("event_id"),
+        ),
+    )
+    linear = desired_scope.get("linear") or {}
+    if (
+        not generation
+        or any(
+            event.get("schema_version") != 2
+            or event.get("expected_revision") != index
+            or event.get("authority") != {
+                field: linear.get(field)
+                for field in (
+                    "workspace_id", "team_id", "project_id", "root_issue_id",
+                )
+            }
+            for index, event in enumerate(generation)
+        )
+    ):
+        raise LinearProjectionError(
+            "terminal_seed_predecessor_projection_invalid"
+        )
+    heads: dict[tuple[str, str], dict[str, Any]] = {}
+    active: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in generation:
+        identity = (event["kind"], event["key"])
+        previous = heads.get(identity)
+        if event.get("supersedes_event_id") != (
+            previous.get("event_id") if previous else None
+        ):
+            raise LinearProjectionError(
+                "terminal_seed_predecessor_projection_invalid"
+            )
+        heads[identity] = event
+        if event["value"] == TOMBSTONE:
+            active.pop(identity, None)
+        else:
+            active[identity] = event
+    try:
+        authorized = closure_bound_historical_evidence(
+            generation, desired_scope,
+        )
+        material = reduce_event_comments(comments, workstream_id=workstream_id)
+        checkpoints = reduce_checkpoint_comments(
+            comments, workstream_id=workstream_id,
+        )
+        recovered = recover_generations(
+            list(checkpoints.checkpoints), workstream_id,
+        )
+    except (
+        ProjectionHistoryError, LinearEventError, LinearCheckpointError,
+        CheckpointError,
+    ) as error:
+        raise LinearProjectionError(str(error)) from error
+    material_values = [
+        {
+            "event_id": event.event_id, "workstream_id": event.workstream_id,
+            "kind": event.kind, "source": event.source,
+            "payload": event.payload,
+            "expected_revision": event.expected_revision,
+            "created_at": event.created_at,
+        }
+        for event in material.events
+    ]
+    predecessor_checkpoints = [
+        checkpoint for checkpoint in checkpoints.checkpoints
+        if checkpoint.get("plan_revision") == predecessor_plan_revision
+    ]
+    checkpoint = recovered.get(predecessor_plan_revision)
+    reviewed_heads: list[dict[str, Any]] = []
+    authorities: dict[str, dict[str, Any]] = {}
+    expected_keys = {
+        key for seed in seeds for key in seed["evidence_keys"]
+    }
+    if set(desired_contracts) != expected_keys:
+        raise LinearProjectionError(
+            "terminal_seed_predecessor_contract_set_incomplete"
+        )
+    for seed in seeds:
+        child_id = seed["child_identifier"].upper()
+        closure = active.get(("child_closure", child_id))
+        if closure is None:
+            raise LinearProjectionError(
+                f"terminal_seed_predecessor_closure_missing:{child_id}"
+            )
+        for key in seed["evidence_keys"]:
+            evidence = active.get(("evidence_contract", key))
+            desired = desired_contracts[key]
+            if evidence is None or evidence["event_id"] not in authorized:
+                raise LinearProjectionError(
+                    f"terminal_seed_predecessor_evidence_not_authorized:"
+                    f"{child_id}:{key}"
+                )
+            expected = deepcopy(evidence["value"])
+            expected["plan_revision"] = desired.get("plan_revision")
+            expected.pop("predecessor_closure_authority", None)
+            candidate = deepcopy(desired)
+            candidate.pop("predecessor_closure_authority", None)
+            if (
+                evidence["value"].get("plan_revision")
+                != predecessor_plan_revision
+                or candidate != expected
+                or closure["value"].get("repository_key")
+                != desired.get("repository_key")
+                or closure["value"].get("exact_head")
+                != desired.get("exact_head")
+            ):
+                raise LinearProjectionError(
+                    f"terminal_seed_predecessor_contract_mutated:{child_id}:{key}"
+                )
+            reviewed = {
+                "child_identifier": child_id, "key": key,
+                "evidence_event_id": evidence["event_id"],
+                "evidence_value_sha256": canonical_digest(evidence["value"]),
+                "closure_event_id": closure["event_id"],
+                "closure_value_sha256": canonical_digest(closure["value"]),
+            }
+            reviewed_heads.append(reviewed)
+            authorities[key] = reviewed
+    reviewed_heads.sort(key=lambda item: (item["child_identifier"], item["key"]))
+    frontier = generation[-1]
+    return {
+        "schema_version": 1,
+        "plan_revision": predecessor_plan_revision,
+        "projection_revision": len(generation),
+        "projection_events_sha256": canonical_digest(generation),
+        "projection_frontier_event_id": frontier["event_id"],
+        "projection_frontier_sha256": canonical_digest(frontier),
+        "projection_history_sha256": canonical_digest(history),
+        "material_revision": material.revision,
+        "material_events_sha256": canonical_digest(material_values),
+        "checkpoint_event_id": (
+            checkpoint.get("checkpoint_event_id") if checkpoint else None
+        ),
+        "checkpoint_events_sha256": canonical_digest(predecessor_checkpoints),
+        "input_frontier_sha256": projection_input_frontier_sha256(
+            snapshot, comments,
+        ),
+        "evidence_heads": reviewed_heads,
+    }, authorities
+
+
+def _fence_predecessor_projection_history(
+    state: Any, binding: dict[str, Any],
+) -> None:
+    """Refuse any predecessor projection append after the reviewed carry."""
+    history = state.snapshot.get("projection_history") or []
+    if not isinstance(history, list):
+        raise LinearProjectionError(
+            "terminal_seed_predecessor_history_changed_reload_required"
+        )
+    generation = sorted(
+        [
+            event for event in history
+            if event.get("plan_revision") == binding["plan_revision"]
+        ],
+        key=lambda event: (
+            event.get("expected_revision"), event.get("created_at"),
+            event.get("event_id"),
+        ),
+    )
+    frontier = generation[-1] if generation else None
+    if (
+        canonical_digest(history) != binding["projection_history_sha256"]
+        or len(generation) != binding["projection_revision"]
+        or canonical_digest(generation) != binding[
+            "projection_events_sha256"
+        ]
+        or frontier is None
+        or frontier.get("event_id") != binding[
+            "projection_frontier_event_id"
+        ]
+        or canonical_digest(frontier) != binding[
+            "projection_frontier_sha256"
+        ]
+    ):
+        raise LinearProjectionError(
+            "terminal_seed_predecessor_history_changed_reload_required"
+        )
+
+
+def _predecessor_binding_from_carried_authority(
+    authority: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "plan_revision": authority["predecessor_plan_revision"],
+        "projection_revision": authority[
+            "predecessor_projection_revision"
+        ],
+        "projection_events_sha256": authority[
+            "predecessor_projection_events_sha256"
+        ],
+        "projection_frontier_event_id": authority[
+            "predecessor_projection_frontier_event_id"
+        ],
+        "projection_frontier_sha256": authority[
+            "predecessor_projection_frontier_sha256"
+        ],
+        "projection_history_sha256": authority[
+            "projection_history_sha256"
+        ],
+    }
+
+
 def prepare_terminal_child_evidence_seeds(
     manifest: dict[str, Any], snapshot: dict[str, Any], state: Any, *,
     remote_head: str | None = None,
+    comments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Validate an add-only evidence prefix before terminal closure repair."""
     result = deepcopy(manifest)
@@ -838,9 +1207,7 @@ def prepare_terminal_child_evidence_seeds(
     }
     active = _active_heads(state)
     scope_event = active.get(("scope", "root"))
-    if scope_event is None:
-        raise LinearProjectionError("terminal_child_evidence_seed_scope_missing")
-    scope_value = scope_event["value"]
+    bootstrap = _exact_empty_review_contract(original_contract)
     desired = result["projection"]
     desired_by_identity = {
         (item["kind"], item["key"]): item for item in desired
@@ -849,6 +1216,117 @@ def prepare_terminal_child_evidence_seeds(
     if desired_scope_item is None:
         raise LinearProjectionError("terminal_child_evidence_seed_scope_missing")
     desired_scope = desired_scope_item["value"]
+    predecessor_binding = result.get(
+        "terminal_child_evidence_seed_predecessor"
+    )
+    predecessor_authorities: dict[str, dict[str, Any]] = {}
+    if predecessor_binding is not None:
+        if comments is None:
+            raise LinearProjectionError(
+                "terminal_seed_predecessor_comments_required"
+            )
+        desired_contracts = {
+            item["key"]: item["value"] for item in desired
+            if item["kind"] == "evidence_contract"
+        }
+        observed_binding, predecessor_authorities = (
+            terminal_child_evidence_seed_predecessor_contract(
+                snapshot, state, comments,
+                workstream_id=str(snapshot.get("root", {}).get("identifier", "")),
+                predecessor_plan_revision=predecessor_binding["plan_revision"],
+                desired_scope=desired_scope, seeds=seeds,
+                desired_contracts=desired_contracts,
+            )
+        )
+        if observed_binding != predecessor_binding:
+            raise LinearProjectionError(
+                "terminal_seed_predecessor_binding_changed_reload_required"
+            )
+        common_authority = {
+            "schema_version": 1,
+            "predecessor_plan_revision": predecessor_binding["plan_revision"],
+            "predecessor_projection_revision": predecessor_binding[
+                "projection_revision"
+            ],
+            "predecessor_projection_events_sha256": predecessor_binding[
+                "projection_events_sha256"
+            ],
+            "predecessor_projection_frontier_event_id": predecessor_binding[
+                "projection_frontier_event_id"
+            ],
+            "predecessor_projection_frontier_sha256": predecessor_binding[
+                "projection_frontier_sha256"
+            ],
+            "projection_history_sha256": predecessor_binding[
+                "projection_history_sha256"
+            ],
+            "material_revision": predecessor_binding["material_revision"],
+            "material_events_sha256": predecessor_binding[
+                "material_events_sha256"
+            ],
+            "checkpoint_event_id": predecessor_binding["checkpoint_event_id"],
+            "checkpoint_events_sha256": predecessor_binding[
+                "checkpoint_events_sha256"
+            ],
+            "input_frontier_sha256": predecessor_binding[
+                "input_frontier_sha256"
+            ],
+        }
+        for item in desired:
+            if item["kind"] != "evidence_contract":
+                continue
+            reviewed = predecessor_authorities[item["key"]]
+            item["value"]["predecessor_closure_authority"] = {
+                **common_authority,
+                "predecessor_evidence_event_id": reviewed[
+                    "evidence_event_id"
+                ],
+                "predecessor_evidence_value_sha256": reviewed[
+                    "evidence_value_sha256"
+                ],
+                "predecessor_closure_event_id": reviewed["closure_event_id"],
+                "predecessor_closure_value_sha256": reviewed[
+                    "closure_value_sha256"
+                ],
+            }
+    bootstrap = bootstrap or _terminal_seed_bootstrap_prefix(
+        original_contract, state, desired, remote_head=remote_head,
+    )
+    if (
+        bootstrap
+        and state.snapshot.get("projection_history")
+        and predecessor_binding is None
+    ):
+        raise LinearProjectionError(
+            "terminal_seed_predecessor_binding_required"
+        )
+    if scope_event is None and not bootstrap:
+        raise LinearProjectionError("terminal_child_evidence_seed_scope_missing")
+    scope_value = (
+        scope_event["value"] if scope_event is not None else desired_scope
+    )
+    seed_key_set = {
+        key for seed in seeds for key in seed["evidence_keys"]
+    }
+    if bootstrap:
+        allowed = {
+            ("scope", "root"), ("source", "root"),
+            *[("evidence_contract", key) for key in seed_key_set],
+            *[
+                (item["kind"], item["key"])
+                for item in desired if item["kind"] == "provenance"
+            ],
+        }
+        desired_identities = set(desired_by_identity)
+        if (
+            result.get("retirements")
+            or result.get("terminal_child_evidence_seed_head_transition")
+            or desired_identities != allowed
+            or any(item["kind"] == "relation" for item in desired)
+        ):
+            raise LinearProjectionError(
+                "terminal_child_evidence_seed_bootstrap_unrelated_change"
+            )
     primary_key = scope_value.get("primary_repository")
     current_primary = next((
         repository for repository in scope_value.get("repositories", [])
@@ -883,7 +1361,7 @@ def prepare_terminal_child_evidence_seeds(
             raise LinearProjectionError(
                 "terminal_child_evidence_seed_reviewed_predecessor_missing"
             )
-    scope_head_transition = desired_scope != scope_value
+    scope_head_transition = scope_event is not None and desired_scope != scope_value
     if scope_head_transition:
         if (
             transition is None
@@ -984,10 +1462,16 @@ def prepare_terminal_child_evidence_seeds(
                     f"terminal_child_evidence_seed_contract_missing:{child_id}:{key}"
                 )
             contract = item["value"]
+            historical_authority = contract.get(
+                "predecessor_closure_authority"
+            )
             if (
                 contract.get("owning_child") != child_id
                 or contract.get("repository_key") != owner
-                or contract.get("exact_head") != repository.get("exact_head")
+                or (
+                    contract.get("exact_head") != repository.get("exact_head")
+                    and historical_authority is None
+                )
                 or evidence_errors(contract)
             ):
                 raise LinearProjectionError(
@@ -1002,6 +1486,8 @@ def prepare_terminal_child_evidence_seeds(
     allowed_changes = set(seed_keys)
     if scope_head_transition:
         allowed_changes.add(("scope", "root"))
+    if bootstrap:
+        allowed_changes.update(desired_by_identity)
     for item in desired:
         identity = (item["kind"], item["key"])
         current = active.get(identity)
@@ -1021,6 +1507,71 @@ def prepare_terminal_child_evidence_seeds(
         raise LinearProjectionError("terminal_child_evidence_seed_projection_not_canonical")
     current_contract = projection_review_contract(state)
     if current_contract != original_contract:
+        if bootstrap:
+            evidence_progress = [
+                (item["kind"], item["key"]) for item in desired
+                if item["kind"] == "evidence_contract"
+            ]
+            ordinary_progress = [
+                (item["kind"], item["key"]) for item in desired
+                if item["kind"] not in {"evidence_contract", "scope"}
+            ]
+            expected_progress = [
+                *evidence_progress, *ordinary_progress,
+                ("disposition", "root"), ("scope", "root"),
+            ]
+            progress_events = list(state.events)
+            progress = [
+                (event["kind"], event["key"]) for event in progress_events
+            ]
+            desired_values = {
+                identity: item["value"]
+                for identity, item in desired_by_identity.items()
+            }
+
+            def valid_progress_event(
+                event: dict[str, Any], identity: tuple[str, str],
+            ) -> bool:
+                if identity == ("disposition", "root"):
+                    return (
+                        isinstance(event["value"], dict)
+                        and event["value"].get("remote_head") == remote_head
+                        and event["value"].get("disposition")
+                        in {"attach", "create_successor"}
+                        and set(event["value"]) == {
+                            "disposition", "remote_head",
+                            "recovered_from_checkpoint",
+                        }
+                    )
+                return (
+                    identity in desired_values
+                    and event["value"] == desired_values[identity]
+                )
+
+            valid_values = all(
+                valid_progress_event(event, identity)
+                for event, identity in zip(progress_events, progress)
+            )
+            if (
+                progress != expected_progress[:len(progress)]
+                or len(active) != len(progress)
+                or set(active) != set(progress)
+                or not valid_values
+                or any(
+                    current_contract[field] != original_contract[field]
+                    for field in (
+                        "expected_legacy_v1_event_ids",
+                        "expected_legacy_v1_events_sha256",
+                        "expected_projection_quarantine_count",
+                        "expected_projection_quarantine_sha256",
+                    )
+                )
+            ):
+                raise LinearProjectionError(
+                    "projection_review_stale_reload_required"
+                )
+            result.update(current_contract)
+            return result
         expected_heads = {
             (head["kind"], head["key"]): head
             for head in original_contract["expected_active_heads"]
@@ -1171,6 +1722,7 @@ def prepare_terminal_child_repairs(
                 f"{child_id}"
             )
         contracts: list[dict[str, Any]] = []
+        carried_authorities: list[dict[str, Any] | None] = []
         for expected in repair["approved_evidence_heads"]:
             event = active.get(("evidence_contract", expected["key"]))
             if (
@@ -1190,6 +1742,16 @@ def prepare_terminal_child_repairs(
                     + ",".join(errors or ["wrong_owner"])
                 )
             contracts.append(contract)
+            try:
+                carried_authorities.append(
+                    carried_predecessor_evidence_authority(
+                        event,
+                        state.snapshot.get("projection_history") or [],
+                        current_scope,
+                    )
+                )
+            except ProjectionHistoryError as error:
+                raise LinearProjectionError(str(error)) from error
         owners = {
             (contract["repository_key"], contract["exact_head"])
             for contract in contracts
@@ -1203,7 +1765,17 @@ def prepare_terminal_child_repairs(
             item for item in current_scope["repositories"]
             if repository_key(item) == owner
         ), None)
-        if repository is None or repository.get("exact_head") != exact_head:
+        historical_head_authorized = bool(carried_authorities) and all(
+            authority is not None
+            and authority["child_identifier"] == child_id
+            and authority["repository_key"] == owner
+            and authority["exact_head"] == exact_head
+            for authority in carried_authorities
+        )
+        if repository is None or (
+            repository.get("exact_head") != exact_head
+            and not historical_head_authorized
+        ):
             raise LinearProjectionError(
                 f"terminal_child_repair_repository_head_mismatch:{child_id}"
             )
@@ -1441,6 +2013,7 @@ def _require_repairs_for_changed_child_closures(
     desired: list[dict[str, Any]],
     active: dict[tuple[str, str], dict[str, Any]],
     repairs: list[dict[str, Any]],
+    projection_history: list[dict[str, Any]],
 ) -> None:
     """Bind every closure creation/replacement to its reviewed live fence."""
     repairs_by_child = {
@@ -1502,8 +2075,33 @@ def _require_repairs_for_changed_child_closures(
             item for item in desired_scope.get("repositories", [])
             if repository_key(item) == closure.get("repository_key")
         ), None)
-        if repository is None or repository.get("exact_head") != closure.get(
+        carried_head_authorized = False
+        if repository is not None and repository.get("exact_head") != closure.get(
             "exact_head"
+        ):
+            carried_head_authorized = True
+            for (kind, _key), event in active.items():
+                if (
+                    kind != "evidence_contract"
+                    or event["value"].get("owning_child") != child_id
+                ):
+                    continue
+                try:
+                    authority = carried_predecessor_evidence_authority(
+                        event, projection_history, desired_scope,
+                    )
+                except ProjectionHistoryError as error:
+                    raise LinearProjectionError(str(error)) from error
+                if (
+                    authority is None
+                    or authority["repository_key"] != closure.get("repository_key")
+                    or authority["exact_head"] != closure.get("exact_head")
+                ):
+                    carried_head_authorized = False
+                    break
+        if repository is None or (
+            repository.get("exact_head") != closure.get("exact_head")
+            and not carried_head_authorized
         ):
             raise LinearProjectionError(
                 f"terminal_child_closure_repository_mismatch:{child_id}"
@@ -1588,6 +2186,7 @@ def load_material_history_for_projection_reconcile(
     active = _active_heads(initial)
     _require_repairs_for_changed_child_closures(
         desired, active, manifest.get("terminal_child_repairs") or [],
+        list(initial.snapshot.get("projection_history") or []),
     )
     desired_by_identity = {
         (item["kind"], item["key"]): item["value"] for item in desired
@@ -1724,8 +2323,8 @@ def load_material_history_for_projection_reconcile(
 
         seeds = manifest.get("terminal_child_evidence_seeds") or []
         seed_scope_transition = bool(seeds) and (
-            current_scope_event is not None
-            and current_scope_event["value"] != desired_scope
+            current_scope_event is None
+            or current_scope_event["value"] != desired_scope
         )
         provisional = prospective(_ordered_write_items(
             [*desired, *retirement_items], unresolved,
@@ -1827,6 +2426,8 @@ def reconcile_required_projection(
     terminal_child_fence: Callable[[list[str]], dict[str, str]] | None = None,
     projection_input_fence: Callable[[], str] | None = None,
     checkpoint_fence: Callable[[], str | None] | None = None,
+    projection_comments: list[dict[str, Any]] | None = None,
+    projection_input_snapshot: dict[str, Any] | None = None,
     legacy_unresolved_relation_heads: frozenset[tuple[str, str]] = frozenset(),
 ) -> dict[str, Any]:
     """Append only missing/changed values and verify the complete current view."""
@@ -1904,6 +2505,7 @@ def reconcile_required_projection(
     active_heads = _active_heads(initial)
     _require_repairs_for_changed_child_closures(
         desired, active_heads, manifest.get("terminal_child_repairs") or [],
+        list(initial.snapshot.get("projection_history") or []),
     )
     repairs = manifest.get("terminal_child_repairs") or []
     seeds = manifest.get("terminal_child_evidence_seeds") or []
@@ -1911,6 +2513,52 @@ def reconcile_required_projection(
         "terminal_child_evidence_seed_head_transition"
     )
     source_transition = manifest.get("terminal_child_source_transition")
+    seed_predecessor = manifest.get(
+        "terminal_child_evidence_seed_predecessor"
+    )
+    repaired_child_ids = {
+        repair["child_identifier"].upper() for repair in repairs
+    }
+    repair_predecessor_frontiers = {
+        event["value"]["predecessor_closure_authority"][
+            "input_frontier_sha256"
+        ]
+        for (kind, _key), event in active_heads.items()
+        if kind == "evidence_contract"
+        and event["value"].get("owning_child") in repaired_child_ids
+        and isinstance(
+            event["value"].get("predecessor_closure_authority"), dict,
+        )
+    }
+    if len(repair_predecessor_frontiers) > 1:
+        raise LinearProjectionError(
+            "terminal_child_repair_predecessor_frontier_ambiguous"
+        )
+    repair_predecessor_frontier = next(
+        iter(repair_predecessor_frontiers), None,
+    )
+    repair_predecessor_projection_bindings = {
+        canonical_digest(
+            _predecessor_binding_from_carried_authority(
+                event["value"]["predecessor_closure_authority"]
+            )
+        ): _predecessor_binding_from_carried_authority(
+            event["value"]["predecessor_closure_authority"]
+        )
+        for (kind, _key), event in active_heads.items()
+        if kind == "evidence_contract"
+        and event["value"].get("owning_child") in repaired_child_ids
+        and isinstance(
+            event["value"].get("predecessor_closure_authority"), dict,
+        )
+    }
+    if len(repair_predecessor_projection_bindings) > 1:
+        raise LinearProjectionError(
+            "terminal_child_repair_predecessor_history_ambiguous"
+        )
+    repair_predecessor_projection_binding = next(
+        iter(repair_predecessor_projection_bindings.values()), None,
+    )
     if source_transition:
         if initial.events and all(
             event["schema_version"] == 1 for event in initial.events
@@ -1935,8 +2583,16 @@ def reconcile_required_projection(
                     f"{identity[0]}:{identity[1]}"
                 )
     if seeds:
+        seed_bootstrap = (
+            not active_heads
+            and _exact_empty_review_contract(reviewed_contract)
+        ) or _terminal_seed_bootstrap_prefix(
+            reviewed_contract, initial, desired, remote_head=remote_head,
+        )
         if prepare_terminal_child_evidence_seeds(
-            manifest, snapshot, initial, remote_head=remote_head,
+            manifest, projection_input_snapshot or snapshot, initial,
+            remote_head=remote_head,
+            comments=projection_comments,
         ) != manifest:
             raise LinearProjectionError(
                 "terminal_child_evidence_seed_review_stale_reload_required"
@@ -1945,14 +2601,15 @@ def reconcile_required_projection(
             raise LinearProjectionError(
                 "terminal_child_evidence_seed_forbids_retirements"
             )
-        if seed_head_transition is not None:
+        seed_input_frontier = (
+            seed_head_transition or seed_predecessor or {}
+        ).get("input_frontier_sha256") or repair_predecessor_frontier
+        if seed_input_frontier is not None:
             if projection_input_fence is None:
                 raise LinearProjectionError(
                     "terminal_child_evidence_seed_input_fence_required"
                 )
-            if projection_input_fence() != seed_head_transition[
-                "input_frontier_sha256"
-            ]:
+            if projection_input_fence() != seed_input_frontier:
                 raise LinearProjectionError(
                     "terminal_child_evidence_seed_input_frontier_changed"
                 )
@@ -1984,6 +2641,8 @@ def reconcile_required_projection(
             if identity[0] == "disposition":
                 current = active_heads.get(identity)
                 if current is not None and current["value"] == item["value"]:
+                    continue
+                if seed_bootstrap:
                     continue
                 current_scope = active_heads.get(("scope", "root"))
                 desired_scope = scope_item["value"]
@@ -2018,6 +2677,8 @@ def reconcile_required_projection(
             if identity == ("scope", "root"):
                 if current is not None and current["value"] == item["value"]:
                     continue
+                if seed_bootstrap:
+                    continue
                 exact_scope = deepcopy((current or {"value": {}})["value"])
                 primary_key = exact_scope.get("primary_repository")
                 primary = next((
@@ -2033,6 +2694,8 @@ def reconcile_required_projection(
                     raise LinearProjectionError(
                         "terminal_child_evidence_seed_scope_head_only_required"
                     )
+                continue
+            if seed_bootstrap and identity[0] in {"source", "provenance"}:
                 continue
             if current is None or current["value"] != item["value"]:
                 raise LinearProjectionError(
@@ -2210,14 +2873,23 @@ def reconcile_required_projection(
                 )
 
     def fence_projection_inputs() -> None:
-        if seed_head_transition is None:
+        expected_frontier = (
+            seed_head_transition or seed_predecessor or {}
+        ).get("input_frontier_sha256") or repair_predecessor_frontier
+        if expected_frontier is None:
             return
-        if projection_input_fence is None or projection_input_fence() != (
-            seed_head_transition["input_frontier_sha256"]
+        if (
+            projection_input_fence is None
+            or projection_input_fence() != expected_frontier
         ):
             raise LinearProjectionError(
                 "terminal_child_evidence_seed_input_frontier_changed"
             )
+
+    def fence_predecessor_projection_history() -> None:
+        binding = seed_predecessor or repair_predecessor_projection_binding
+        if binding is not None:
+            _fence_predecessor_projection_history(adapter.state(), binding)
 
     def fence_checkpoint_authority() -> None:
         if checkpoint_fence is None:
@@ -2233,6 +2905,7 @@ def reconcile_required_projection(
 
     fence_terminal_repairs()
     fence_projection_inputs()
+    fence_predecessor_projection_history()
     fence_checkpoint_authority()
 
     activation_receipt = None
@@ -2273,6 +2946,7 @@ def reconcile_required_projection(
     expected_latest_heads = dict(latest_heads)
     for item in write_items:
         fence_projection_inputs()
+        fence_predecessor_projection_history()
         fence_checkpoint_authority()
         state = adapter.state()
         if projection_review_contract(state) != _contract_from_heads(
@@ -2296,6 +2970,7 @@ def reconcile_required_projection(
         latest_current = expected_latest_heads.get(identity)
         fence_terminal_repairs()
         fence_projection_inputs()
+        fence_predecessor_projection_history()
         fence_checkpoint_authority()
         event = build_projection_event(
             workstream_id=adapter.workstream_id,
@@ -2336,10 +3011,13 @@ def reconcile_required_projection(
             ],
         ):
             raise LinearProjectionError("projection_changed_during_reconcile")
+        fence_projection_inputs()
+        fence_predecessor_projection_history()
         fence_checkpoint_authority()
 
     fence_terminal_repairs()
     fence_projection_inputs()
+    fence_predecessor_projection_history()
     fence_checkpoint_authority()
     final = adapter.state()
     if projection_review_contract(final) != _contract_from_heads(
@@ -2356,6 +3034,8 @@ def reconcile_required_projection(
         ],
     ):
         raise LinearProjectionError("projection_final_contract_mismatch")
+    fence_projection_inputs()
+    fence_predecessor_projection_history()
     fence_checkpoint_authority()
     active: dict[tuple[str, str], dict[str, Any]] = {}
     for event in final.events:
@@ -2440,21 +3120,27 @@ def main() -> int:
         manifest = prepare_terminal_child_source_transition(
             manifest, graph, projection_state,
         )
+        comments = comment_adapter.comments()
         manifest = prepare_terminal_child_evidence_seeds(
             manifest, graph, projection_state, remote_head=args.remote_head,
+            comments=comments,
         )
         manifest = prepare_terminal_child_repairs(
             manifest, graph, projection_state,
         )
         graph = deepcopy(graph)
         graph["root"].pop("description", None)
-        comments = comment_adapter.comments()
         seed_head_transition = manifest.get(
             "terminal_child_evidence_seed_head_transition"
         )
-        if seed_head_transition is not None and (
+        seed_input_frontier = (
+            seed_head_transition
+            or manifest.get("terminal_child_evidence_seed_predecessor")
+            or {}
+        ).get("input_frontier_sha256")
+        if seed_input_frontier is not None and (
             projection_input_frontier_sha256(graph, comments)
-            != seed_head_transition["input_frontier_sha256"]
+            != seed_input_frontier
         ):
             raise LinearProjectionError(
                 "terminal_child_evidence_seed_input_frontier_changed"
@@ -2523,6 +3209,8 @@ def main() -> int:
             terminal_child_fence=terminal_child_fence,
             projection_input_fence=projection_input_fence,
             checkpoint_fence=checkpoint_fence,
+            projection_comments=comments,
+            projection_input_snapshot=graph,
             legacy_unresolved_relation_heads=legacy_unresolved_relation_heads,
         )
         # Double-collect graph and comments so a concurrent root/child/checkpoint
