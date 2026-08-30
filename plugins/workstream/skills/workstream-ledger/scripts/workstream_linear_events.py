@@ -537,6 +537,41 @@ def encode_reviewed_repair_comment(delta: Delta) -> str:
     return f"{EVENT_PREFIX}{encoded} -->"
 
 
+def assert_exact_pinned_repair_comment(
+    comments: list[dict[str, Any]], delta: Delta, *, remote_slot_id: str,
+    comment_body_sha256: str,
+) -> None:
+    """Authenticate the complete immutable repair comment, not only its marker."""
+    expected_body = encode_reviewed_repair_comment(delta)
+    if (
+        not isinstance(comment_body_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", comment_body_sha256) is None
+        or hashlib.sha256(expected_body.encode()).hexdigest()
+        != comment_body_sha256
+    ):
+        raise LinearEventError("material_repair_manifest_comment_body_digest_mismatch")
+    matches = [comment for comment in comments if comment.get("id") == remote_slot_id]
+    if len(matches) != 1 or not isinstance(matches[0].get("body"), str):
+        raise LinearEventError("material_repair_pinned_comment_cardinality_mismatch")
+    body = matches[0]["body"]
+    if (
+        body != expected_body
+        or hashlib.sha256(body.encode()).hexdigest() != comment_body_sha256
+    ):
+        raise LinearEventError("material_repair_pinned_comment_body_mismatch")
+    encoded = EVENT_RE.findall(body)
+    if len(encoded) != 1:
+        raise LinearEventError("material_repair_pinned_comment_marker_mismatch")
+    try:
+        observed = _decode_event(encoded[0])
+    except ValueError as error:
+        raise LinearEventError(
+            "material_repair_pinned_comment_event_mismatch"
+        ) from error
+    if _canonical_event(observed) != _canonical_event(delta):
+        raise LinearEventError("material_repair_pinned_comment_event_mismatch")
+
+
 def _decode_event(encoded: str) -> Delta:
     try:
         padding = "=" * (-len(encoded) % 4)
@@ -1138,6 +1173,7 @@ class LinearCommentEventAdapter:
     def apply_pinned_repair(
         self, delta: Delta, *, expected_remote_slot: str,
         expected_serialization_frontier: list[str],
+        expected_comment_body_sha256: str,
     ) -> MutationReceipt:
         """Append one repair only at its reviewed slot after one final read."""
         if delta.workstream_id != self.issue_id or delta.kind != MATERIAL_REPAIR_KIND:
@@ -1177,6 +1213,10 @@ class LinearCommentEventAdapter:
                 raise PinnedRepairPreconditionError(
                     f"conflicting_pinned_repair:{delta.event_id}"
                 )
+            assert_exact_pinned_repair_comment(
+                comments, delta, remote_slot_id=expected_remote_slot,
+                comment_body_sha256=expected_comment_body_sha256,
+            )
             return MutationReceipt(
                 delta.event_id, _event_applied_revision(before, delta.event_id),
                 existing_id,
@@ -1277,7 +1317,7 @@ class LinearCommentEventAdapter:
                 }},
             )
         except LinearTransportError:
-            after, after_checkpoints, _ = self._combined_state()
+            after, after_checkpoints, after_comments = self._combined_state()
             self._validate_checkpoint_prefix(after, after_checkpoints)
             existing_id = after.remote_ids.get(delta.event_id)
             existing = next(
@@ -1289,6 +1329,10 @@ class LinearCommentEventAdapter:
                 and existing is not None
                 and _canonical_event(existing) == _canonical_event(delta)
             ):
+                assert_exact_pinned_repair_comment(
+                    after_comments, delta, remote_slot_id=expected_remote_slot,
+                    comment_body_sha256=expected_comment_body_sha256,
+                )
                 return MutationReceipt(
                     delta.event_id,
                     _event_applied_revision(after, delta.event_id),
@@ -1304,10 +1348,14 @@ class LinearCommentEventAdapter:
             raise LinearEventError(
                 "Linear comment creation returned no durable receipt"
             )
-        after, after_checkpoints, _ = self._combined_state()
+        after, after_checkpoints, after_comments = self._combined_state()
         self._validate_checkpoint_prefix(after, after_checkpoints)
         if after.remote_ids.get(delta.event_id) != expected_remote_slot:
             raise LinearEventError("event_append_not_observed")
+        assert_exact_pinned_repair_comment(
+            after_comments, delta, remote_slot_id=expected_remote_slot,
+            comment_body_sha256=expected_comment_body_sha256,
+        )
         return MutationReceipt(
             delta.event_id, _event_applied_revision(after, delta.event_id),
             expected_remote_slot,

@@ -149,6 +149,11 @@ identity, then retrieves that identity through the authenticated plan-source
 byte loader (token with private-GitHub SSH fallback). Fetched bytes, local bytes, and the
 bound SHA-256 must all match before any Linear read or write.
 
+Replay and post-write readback authenticate the complete pinned Linear comment
+body against `control.comment_body_sha256` and the exact canonical encoding.
+Added prose, whitespace, extra markers, body edits, or slot ambiguity refuse;
+decoding the same embedded event marker is not sufficient.
+
 The normalized replacement retains the target event ID, workstream, source,
 expected revision, and creation time at its original zero-based index. The
 only accepted transformation is boundary ID `repair:<target-event-id>` with

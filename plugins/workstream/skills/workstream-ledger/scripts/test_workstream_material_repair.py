@@ -475,6 +475,48 @@ class MaterialRepairCliTests(unittest.TestCase):
             )
             self.assertEqual(len(successor.mutations), mutations_before)
 
+    def test_exact_manifest_replay_rejects_any_remote_control_body_edit_zero_write(self):
+        for mutation in (
+            "prefix_prose", "suffix_prose", "leading_whitespace",
+            "trailing_newline", "second_marker",
+        ):
+            client = self._client()
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                manifest_path, artifact_path, outer = self._prepare(directory, client)
+                argv = [
+                    "workstream_material_repair.py", "GEN-37",
+                    "--manifest", str(manifest_path),
+                    "--review-artifact", str(artifact_path),
+                    "--plan-source", "plan", "--apply",
+                ]
+                code, _output, error = self._invoke(argv, client)
+                self.assertEqual((code, error), (0, ""))
+                slot = outer["control"]["remote_slot_id"]
+                pinned = [item for item in client.comments if item["id"] == slot]
+                self.assertEqual(len(pinned), 1)
+                original = pinned[0]["body"]
+                pinned[0]["body"] = {
+                    "prefix_prose": "reviewed prose\n" + original,
+                    "suffix_prose": original + "\nreviewed prose",
+                    "leading_whitespace": " " + original,
+                    "trailing_newline": original + "\n",
+                    "second_marker": original + "\n" + original,
+                }[mutation]
+                writes = len([
+                    call for call in client.calls if "commentCreate" in call[0]
+                ])
+                code, output, error = self._invoke(argv, client)
+                self.assertEqual((code, output), (2, ""))
+                self.assertTrue(
+                    "material_repair_pinned_comment_body_mismatch" in error
+                    or "exactly one v1 marker" in error
+                    or "malformed_event_marker" in error,
+                    error,
+                )
+                self.assertEqual(len([
+                    call for call in client.calls if "commentCreate" in call[0]
+                ]), writes)
+
     def test_lost_response_is_classified_and_exact_manifest_reconciles(self):
         prepare_client = self._client()
         with tempfile.TemporaryDirectory() as directory:

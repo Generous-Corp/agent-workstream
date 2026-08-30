@@ -413,6 +413,8 @@ The reviewed target file requires a canonical lowercase GitHub repository key,
 40-lowercase-hex commit URL, and normalized artifact path. It is authenticated
 locally by immutable commit/path and SHA-256 and fetched through the
 authenticated source-byte loader; fetched and local bytes must match before Linear access.
+Exact replay also hashes the complete pinned remote comment body, so surrounding
+prose, whitespace, extra markers, or another comment at that slot refuse.
 Normalization is mechanically lossless: exactly two incident targets,
 `repair:<event-id>`, and one `progress` change containing the complete original
 payload. The material comment uses one deterministic slot; the complete

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import threading
 import tempfile
 import unittest
@@ -603,6 +604,36 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
             ).apply_pinned_repair(
                 candidate, expected_remote_slot=comments[-1]["id"],
                 expected_serialization_frontier=[],
+                expected_comment_body_sha256=hashlib.sha256(
+                    encode_reviewed_repair_comment(candidate).encode()
+                ).hexdigest(),
+            )
+        self.assertFalse(any("commentCreate" in query for query, _ in client.calls))
+
+    def test_pinned_repair_existing_receipt_requires_exact_complete_remote_body(self):
+        comments, _payload, *_rest, route, _source, _graph = self._repair_fixture()
+        control = reduce_event_comments(
+            comments, workstream_id="GEN-37",
+        ).events[-1]
+        expected_body = encode_reviewed_repair_comment(control)
+        client = FakeCommentClient()
+        client.comments = copy.deepcopy(comments)
+        client.comments[-1]["body"] = "review prose\n" + expected_body
+        client.workspace_id = route["workspace_id"]
+        client.team_id = route["team_id"]
+        client.project_id = route["project_id"]
+        client.root_issue_id = route["root_issue_id"]
+        with self.assertRaisesRegex(
+            LinearEventError, "material_repair_pinned_comment_body_mismatch",
+        ):
+            LinearCommentEventAdapter(
+                client, issue_id="GEN-37", plan_revision="a" * 64, **route,
+            ).apply_pinned_repair(
+                control, expected_remote_slot=comments[-1]["id"],
+                expected_serialization_frontier=[],
+                expected_comment_body_sha256=hashlib.sha256(
+                    expected_body.encode()
+                ).hexdigest(),
             )
         self.assertFalse(any("commentCreate" in query for query, _ in client.calls))
 

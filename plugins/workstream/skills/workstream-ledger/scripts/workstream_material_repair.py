@@ -16,6 +16,7 @@ from workstream_linear import (
 from workstream_linear_checkpoints import reduce_checkpoint_comments
 from workstream_linear_events import (
     LinearCommentEventAdapter, apply_material_semantic_repairs,
+    assert_exact_pinned_repair_comment,
     encode_reviewed_repair_comment, ledger_boundary_slot_id,
     ledger_serialization_frontier, material_frontier,
     PinnedRepairPreconditionError, reduce_event_comments,
@@ -340,6 +341,11 @@ def main() -> int:
             ).hexdigest()
         ):
             raise ValueError("material_repair_control_digest_mismatch")
+        if replay:
+            assert_exact_pinned_repair_comment(
+                comments, candidate, remote_slot_id=expected_slot,
+                comment_body_sha256=control["comment_body_sha256"],
+            )
         # Preview through the exact same two-pass validator by adding an inert
         # synthetic envelope. No remote capability or mutation is attempted.
         synthetic = comments if replay else [*comments, {
@@ -448,6 +454,9 @@ def main() -> int:
                     expected_serialization_frontier=(
                         payload["ledger_serialization_frontier"]
                     ),
+                    expected_comment_body_sha256=control[
+                        "comment_body_sha256"
+                    ],
                 )
             except PinnedRepairPreconditionError:
                 raise
@@ -466,6 +475,11 @@ def main() -> int:
                         or _canonical_event(observed) != _canonical_event(candidate)
                     ):
                         raise ValueError("repair_control_observation_mismatch")
+                    assert_exact_pinned_repair_comment(
+                        uncertain_comments, candidate,
+                        remote_slot_id=expected_slot,
+                        comment_body_sha256=control["comment_body_sha256"],
+                    )
                     receipt = MutationReceipt(
                         candidate.event_id,
                         next(index for index, event in enumerate(
@@ -526,6 +540,10 @@ def main() -> int:
                 post_comments = adapter.comments()
                 post_raw = reduce_event_comments(
                     post_comments, workstream_id=args.workstream,
+                )
+                assert_exact_pinned_repair_comment(
+                    post_comments, candidate, remote_slot_id=expected_slot,
+                    comment_body_sha256=control["comment_body_sha256"],
                 )
                 post_generation = select_plan_generation(
                     post_comments, workstream_id=args.workstream,
