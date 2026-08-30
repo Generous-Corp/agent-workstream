@@ -4214,6 +4214,57 @@ class ProjectionTests(unittest.TestCase):
                 projection_module._canonical(twice_proof)
             ).hexdigest(),
         }
+        planted_value = {
+            **twice_seal_value,
+            "sealed_scope_event_id": second["event_id"],
+            "sealed_scope_value_sha256": hashlib.sha256(
+                projection_module._canonical(backfilled_value)
+            ).hexdigest(),
+            "repositories": proof,
+            "repositories_sha256": hashlib.sha256(
+                projection_module._canonical(proof)
+            ).hexdigest(),
+        }
+        planted = self.event(
+            "identity_history_seal", second["event_id"], planted_value, 4,
+        )
+        planted_comment = {
+            **projection_comment(planted),
+            "createdAt": "2026-08-29T12:01:30.000Z",
+            "updatedAt": "2026-08-29T12:01:30.000Z",
+        }
+        with self.assertRaisesRegex(
+            LinearProjectionError, "identity_history_seal_frontier_mismatch",
+        ):
+            reduce_projection_comments(
+                [first_comment, source_comment, second_comment, third_comment,
+                 planted_comment],
+                workstream_id="GEN-37", expected_plan_revision=PLAN,
+                authenticated_route=AUTHORITY,
+                authenticated_source={"identity": "plan:test", "sha256": PLAN},
+            )
+        incomplete_value = deepcopy(twice_seal_value)
+        incomplete_value["legacy_transitions"] = incomplete_value[
+            "legacy_transitions"
+        ][:1]
+        incomplete = self.event(
+            "identity_history_seal", third["event_id"], incomplete_value, 4,
+        )
+        incomplete_comment = {
+            **projection_comment(incomplete),
+            "createdAt": "2026-08-29T12:01:45.000Z",
+            "updatedAt": "2026-08-29T12:01:45.000Z",
+        }
+        with self.assertRaisesRegex(
+            LinearProjectionError, "identity_history_seal_transition_mismatch",
+        ):
+            reduce_projection_comments(
+                [first_comment, source_comment, second_comment, third_comment,
+                 incomplete_comment],
+                workstream_id="GEN-37", expected_plan_revision=PLAN,
+                authenticated_route=AUTHORITY,
+                authenticated_source={"identity": "plan:test", "sha256": PLAN},
+            )
         twice_seal = self.event(
             "identity_history_seal", third["event_id"], twice_seal_value, 4,
         )

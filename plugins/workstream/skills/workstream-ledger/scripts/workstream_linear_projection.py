@@ -131,6 +131,10 @@ def _validated_identity_history_seals(
         )
         frontier_position = positions[event["event_id"]] - 1
         frontier = events[frontier_position] if frontier_position >= 0 else None
+        scope_frontier = [
+            item for item in scope_events
+            if positions[item["event_id"]] < positions[event["event_id"]]
+        ]
         source_event = next((
             item for item in reversed(events[:positions[event["event_id"]]])
             if item["kind"] == "source" and item["key"] == "root"
@@ -139,6 +143,8 @@ def _validated_identity_history_seals(
         if (
             target is None
             or not transition_ids
+            or not scope_frontier
+            or target["event_id"] != scope_frontier[-1]["event_id"]
             or positions[event["event_id"]] <= positions[target_id]
             or any(transition_id in seals for transition_id in transition_ids)
             or source_event is None
@@ -158,22 +164,9 @@ def _validated_identity_history_seals(
             )
         ):
             raise LinearProjectionError("identity_history_seal_frontier_mismatch")
-        for transition_value, transition_id in zip(transitions, transition_ids):
-            predecessor = previous_scope.get(transition_id)
-            transition = next((
-                item for item in scope_events
-                if item["event_id"] == transition_id
-            ), None)
-            if (
-                predecessor is None or transition is None
-                or transition_value["predecessor_scope_event_id"]
-                != predecessor["event_id"]
-                or transition_value["predecessor_scope_value_sha256"]
-                != hashlib.sha256(_canonical(predecessor["value"])).hexdigest()
-                or transition_value["transition_scope_value_sha256"]
-                != hashlib.sha256(_canonical(transition["value"])).hexdigest()
-            ):
-                raise LinearProjectionError("identity_history_seal_transition_mismatch")
+        expected_transitions: list[dict[str, str]] = []
+        for transition in scope_frontier[1:]:
+            predecessor = previous_scope[transition["event_id"]]
             try:
                 validate_repository_identity_transition(
                     predecessor["value"], transition["value"],
@@ -187,10 +180,20 @@ def _validated_identity_history_seals(
                     raise LinearProjectionError(
                         "identity_history_seal_transition_mismatch"
                     ) from error
+                expected_transitions.append({
+                    "predecessor_scope_event_id": predecessor["event_id"],
+                    "predecessor_scope_value_sha256": hashlib.sha256(
+                        _canonical(predecessor["value"])
+                    ).hexdigest(),
+                    "transition_scope_event_id": transition["event_id"],
+                    "transition_scope_value_sha256": hashlib.sha256(
+                        _canonical(transition["value"])
+                    ).hexdigest(),
+                })
             else:
-                raise LinearProjectionError(
-                    "identity_history_seal_transition_not_legacy"
-                )
+                continue
+        if transitions != expected_transitions:
+            raise LinearProjectionError("identity_history_seal_transition_mismatch")
         repositories = value["repositories"]
         proofs = {item["repository_key"]: item for item in repositories}
         scoped: dict[str, dict[str, Any]] = {}
