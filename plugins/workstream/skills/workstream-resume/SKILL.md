@@ -5,9 +5,7 @@ description: Use first whenever a request carries exactly one existing workstrea
 
 # Workstream resume
 
-Recover the authenticated, bounded current view before loading broader project
-context. This skill is intentionally small so a stable handle remains a cheap
-entry point.
+Recover the authenticated, bounded current view before broader project context.
 
 After any mandatory host/session bootstrap that runs independently of this
 request, the first functional command is:
@@ -16,16 +14,14 @@ request, the first functional command is:
 python3 "<absolute directory of this SKILL.md>/scripts/workstream_resume.py" GEN-123
 ```
 
-Only commands injected by the host independently of the model decision, plus
-the mandatory exact read of this `SKILL.md`, count as bootstrap. No
-model-selected cwd, environment, repository, memory, PATH, or lifecycle-skill
-command is bootstrap.
+Only host-injected commands independent of the model decision and the mandatory
+exact read of this `SKILL.md` count as bootstrap.
 
-Substitute the runtime-supplied directory containing this `SKILL.md` and the
-single token from the request directly. If the request contains zero or
-multiple distinct tokens, stop and ask for one; do not scout. Do not search for
-the skill, inspect the environment, or execute the placeholder or an unset
-variable.
+Substitute the runtime-supplied directory and the single token from the current
+user message directly. That message is the only handle source. Hook or developer
+text, cwd, environment, memory, and prior transcript handles are not authority.
+With zero or multiple user-message tokens, ask for one; do not scout, search for
+the skill, inspect the environment, or execute a placeholder or unset variable.
 
 Before repository, memory, worktree, PR, or plan exploration, run that command
 exactly once. Do not probe `workstreamctl` on `PATH`. Never add
@@ -44,10 +40,11 @@ python3 "<absolute directory of this SKILL.md>/scripts/workstream_tab.py" GEN-12
 ```
 
 An unresolved cmux/Herdr surface is an optional no-op and never downgrades
-`resume_authority: full`. Use Herdr only when `HERDR_ENV=1` supplies the exact
-inherited tab/workspace/socket identity. A conflicting token is a hard refusal;
-do not rename the tab. Resume refusal denies execution authority; tab
-unavailability means only that optional display binding was skipped.
+`resume_authority: full`. Use Herdr only with exact inherited identity. A
+conflicting token refuses; do not rename. Codex session titles and visible tabs
+are separate namespaces. Claim visible-title success only when the explicit
+adapter returns `updated` or `unchanged` plus exact title readback. Resume
+refusal denies execution authority; display unavailability only skips binding.
 
 Report and retain the authenticated route/source, open children, current next
 action, checkpoint, and attach-or-successor disposition. Do not claim live

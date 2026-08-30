@@ -24,7 +24,7 @@ def fail(message: str) -> int:
 
 def usage() -> int:
     print(
-        "usage: workstreamctl {plan|intake|resume|projection|repository-identity|repository-identity-seal|reconcile|shipyard-profile|ingress|tab-title} [args...]\n"
+        "usage: workstreamctl {plan|intake|resume|projection|repository-identity|repository-identity-seal|reconcile|shipyard-profile|ingress|tab-title|child-event|child-checkpoint|child-proposal-activate} [args...]\n"
         "       workstreamctl linear inspect [--config PATH] [--team-id ID --project-id ID]\n"
         "       workstreamctl config validate [path]\n\n"
         "These commands expose existing deterministic helpers. They do not claim a hosted live-status service."
@@ -47,6 +47,9 @@ def main(argv: list[str]) -> int:
         "shipyard-profile": "workstream_shipyard_profile.py",
         "ingress": "workstream_ingress.py",
         "tab-title": "workstream_tab.py",
+        "child-event": "workstream_child_event.py",
+        "child-checkpoint": "workstream_child_checkpoint.py",
+        "child-proposal-activate": "workstream_child_proposal_activate.py",
     }
     if command in scripts:
         script = SCRIPTS / scripts[command]

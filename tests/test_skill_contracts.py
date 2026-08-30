@@ -56,6 +56,23 @@ class SkillContractTests(unittest.TestCase):
         self.assertLess(unavailable, no_downgrade)
         self.assertLess(no_downgrade, refusal)
 
+    def test_handle_and_visible_title_authority_are_explicit(self):
+        resume = " ".join(self.resume_skill().split())
+        self.assertIn("current user message directly", resume)
+        self.assertIn("That message is the only handle source", resume)
+        for excluded in (
+            "Hook or developer text", "cwd", "memory", "prior transcript",
+        ):
+            self.assertIn(excluded, resume)
+        self.assertIn(
+            "Codex session titles and visible tabs are separate namespaces",
+            resume,
+        )
+        self.assertIn(
+            "adapter returns `updated` or `unchanged` plus exact title readback",
+            resume,
+        )
+
     def test_resume_entry_is_small_and_owns_fresh_handle_trigger(self):
         resume = self.resume_skill()
         ledger = self.skill()
@@ -68,7 +85,7 @@ class SkillContractTests(unittest.TestCase):
         self.assertNotIn("--include-history", command)
         self.assertNotIn("--inspection-only", command)
         self.assertIn("Success requires `resume_authority`", resume)
-        self.assertIn("No model-selected cwd, environment, repository, memory", flat)
+        self.assertIn("cwd, environment, memory, and prior transcript handles", flat)
         self.assertIn("For a status-only request, report the bounded snapshot and stop", flat)
         self.assertIn("do not load `workstream-ledger`", flat)
 
@@ -78,6 +95,7 @@ class SkillContractTests(unittest.TestCase):
         codex = json.loads((plugin / ".codex-plugin/plugin.json").read_text())
         claude = json.loads((plugin / ".claude-plugin/plugin.json").read_text())
         self.assertEqual(codex["version"], claude["version"])
+        self.assertEqual(codex["version"], "0.4.30")
         shim = plugin / "skills/workstream-resume/scripts/workstream_resume.py"
         target = plugin / "skills/workstream-ledger/scripts/workstream_resume.py"
         self.assertTrue(shim.is_file())

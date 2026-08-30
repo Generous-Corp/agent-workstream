@@ -201,15 +201,26 @@ python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_extend_child.py" ./PLAN.md \
   --candidate-key <reviewed-stable-key> \
   --material-revision <live-material-revision> \
   --projection-revision <live-projection-revision> \
+  --state-id <linear-state-uuid> \
+  --assignee-id <linear-user-uuid> \
   --workspace-id <uuid> --team-id <uuid> --project-id <uuid> --apply
 ```
 
 The command requires exact plan bytes, route, root identity, reviewed candidate,
-and both live frontiers. It can create only the deterministic child beneath the
-existing root, leaves it `planned_pending_projection`, and returns an
-authorization plus readback receipt. A replay converges; it never creates or
-updates a root or project. Project the child's ownership, status, evidence, and
-dependencies before treating it as executable.
+both live frontiers, a canonical native state UUID, and exactly one of
+`--assignee-id` or `--unassigned`. Before the grant, authenticated Linear
+readback proves the state belongs to the exact team and an active assignee
+belongs to the workspace/team; the grant binds that validation digest. The
+append-only grant binds the current generation selection proof and native setup
+before one atomic deterministic child create. A sealed
+retirement prefix preserves an exact granted create/replay while refusing new
+retired-generation grants. Readback must match state and assignee. A replay
+converges; it never updates an issue, root, or project. Project the child's
+repository ownership before treating it as executable.
+If a validated provider identity disappears after the grant, automatic
+correction is unsafe without a provider conditional or positive writer-death
+fence. Restore the exact identity and replay; otherwise stop for explicit
+review. Never supersede merely because the deterministic child is absent.
 
 ### Append-only plan-generation authority
 
@@ -571,7 +582,9 @@ collects the first comment page for every nonterminal child and paginates only
 continuations; each child is route/identity validated and independently reduces
 its own material events and checkpoints. Child state never inherits root events
 or another child's events, and malformed, conflicting, or incomplete child logs
-refuse the whole resume. A newer material-event
+refuse the whole resume. Root-authorized children hidden from native
+`root.children` by reparent/project drift are recovered by immutable ID before
+both ordinary resume and strict generation-candidate validation. A newer material-event
 `next_action` supersedes stale root description prose. The projection restores
 scope, relations, choices, evidence contracts, source, provenance, and the
 recorded attach/successor disposition. An acknowledged checkpoint restores its
@@ -583,6 +596,37 @@ an ambiguous placeholder is not executable. An empty surface is reported as
 empty rather than fabricated.
 When no local config is available, authenticated token-only bootstrap resolves
 the root's exact workspace/team/project route before the fenced read.
+
+After scope owns the exact child, `workstreamctl child-event` and
+`workstreamctl child-checkpoint` append child-local state. Both require the root
+token/UUID, child token/UUID, route, selected plan generation, and live
+revision/predecessor fences. Each first writes a deterministic inert proposal
+containing the full child record, then root projection CAS activates only its
+exact ID/digest after fresh generation, scope-owner, child-parent, and route
+authentication. That native child check is a drift preflight, not the ownership
+proof or an atomicity claim. Mutation authority is bound to immutable root-side child origin:
+the exact `child_extension_authorization` event/digest and deterministic
+root/route/candidate child UUID, or deterministic initial-intake root/child
+markers and IDs. Native parent/team/project fields are only a cache; drift never
+transfers ownership and is reported as a separate reconciliation blocker.
+Resume excludes unactivated proposal business payload from status, blocker, and
+next action, but emits bounded pending handles containing child token/UUID,
+proposal ID/remote ID, kind, and record digest. Root metadata contains no child
+business payload. Crash before activation leaves a recoverable inert proposal;
+`workstreamctl child-proposal-activate` reads that exact proposal by its pending
+handle and root-CAS activates it without the original payload or checkpoint
+file. Crash after activation makes that exact proposal authoritative.
+Proposal decoding validates the supported kind and complete canonical event or
+checkpoint record before exposing even a pending handle. Every activated grant
+revalidates its immutable child origin before its business record is reduced.
+Exact replay is zero-write, including after sealed generation retirement or a
+later scope removal; an unowned new or mismatched child refuses.
+
+Legacy 0.4.29 `child_extension_authorization` replay validates the exact
+deterministic existing child and writes nothing without consulting current
+workflow-state or assignee providers. Deleted provider identities therefore do
+not invalidate an old completed creation; a missing legacy child still refuses
+before any create.
 
 The direct resume helper is full-authority by default and fetches the projected
 source identity. `--plan-source` overrides the fetch location for an

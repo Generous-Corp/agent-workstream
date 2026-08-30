@@ -33,6 +33,22 @@ class FakeClient:
 
     def execute(self, query, variables):
         self.calls.append((query, variables))
+        if "query WorkstreamNativeState" in query:
+            return {
+                "team": {"id": variables["teamId"],
+                         "organization": {"id": "workspace"}},
+                "workflowState": {"id": variables["stateId"],
+                                  "team": {"id": variables["teamId"]}},
+            }
+        if "query WorkstreamNativeAssignee" in query:
+            return {"user": {
+                "id": variables["assigneeId"],
+                "active": True,
+                "organization": {"id": "workspace"},
+                "teams": {"nodes": [{"id": "team"}], "pageInfo": {
+                    "hasNextPage": False, "endCursor": None,
+                }},
+            }}
         if "query WorkstreamRoute" in query:
             return {
                 "team": {"id": variables["teamId"], "organization": {"id": "workspace"}},
@@ -48,7 +64,28 @@ class FakeClient:
             issue_id = data.get("id", f"id-{self.next_id}")
             if any(issue["id"] == issue_id for issue in self.issues):
                 raise LinearTransportError("duplicate issue id")
-            issue = {"id": issue_id, "identifier": f"GEN-{self.next_id}", "title": data["title"], "description": data["description"], "url": f"https://linear.test/{self.next_id}", "updatedAt": "now", "state": {"name": "Todo", "type": "unstarted"}, "parent": {"id": data.get("parentId")} if data.get("parentId") else None, "project": {"id": data["projectId"]} if data.get("projectId") else None, "team": {"id": data["teamId"], "organization": {"id": "workspace"}}}
+            issue = {
+                "id": issue_id, "identifier": f"GEN-{self.next_id}",
+                "title": data["title"], "description": data["description"],
+                "url": f"https://linear.test/{self.next_id}", "updatedAt": "now",
+                "state": {
+                    "id": data.get("stateId", "default-state"),
+                    "name": "Todo", "type": "unstarted",
+                },
+                "assignee": (
+                    {"id": data["assigneeId"]}
+                    if data.get("assigneeId") else None
+                ),
+                "parent": (
+                    {"id": data.get("parentId")} if data.get("parentId") else None
+                ),
+                "project": (
+                    {"id": data["projectId"]} if data.get("projectId") else None
+                ),
+                "team": {
+                    "id": data["teamId"], "organization": {"id": "workspace"},
+                },
+            }
             self.next_id += 1
             self.issues.append(issue)
             return {"issueCreate": {"success": True, "issue": issue}}
@@ -83,6 +120,29 @@ class FakeChildAuthorization:
         self.reserve_calls = 0
         self.assert_calls = 0
 
+    def select_child_extension_generation(
+        self, *, description_plan_revision, source, **_context,
+    ):
+        legacy = description_plan_revision == source["sha256"]
+        return {
+            "plan_revision": source["sha256"],
+            "description_plan_revision": description_plan_revision,
+            "transition_tip_event_id": (
+                None if legacy else "wsp_" + "f" * 32
+            ),
+            "activation_epoch": None if legacy else 1,
+            "authority_origin": (
+                "legacy_description" if legacy else "generation_transition"
+            ),
+            "workstream_id": "GEN-37",
+            "authority": {
+                "workspace_id": "workspace", "team_id": "team",
+                "project_id": "project",
+                "root_issue_id": "409c1423-f949-4655-9f5f-d3213d7b434f",
+            },
+            "source": source,
+        }
+
     def reserve_child_extension(self, **values):
         self.reserve_calls += 1
         if self.failure:
@@ -104,6 +164,9 @@ class FakeChildAuthorization:
             "reviewed_candidate_key": values["reviewed_candidate_key"],
             "child_issue_id": values["child_issue_id"],
             "initial_state": "planned_pending_projection",
+            "native_initialization": values["native_initialization"],
+            "generation_authority": values["generation_authority"],
+            "native_validation_sha256": values["native_validation_sha256"],
         }
         if self.event is None:
             value = {
@@ -232,6 +295,7 @@ class LinearTransportTests(unittest.TestCase):
 
     def extend_legacy(
         self, transport, *, authorization_adapter=None, expected_frontier=None,
+        state_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", assignee_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", unassigned=False,
     ):
         frontier = expected_frontier or {
             "material_revision": 3, "projection_revision": 7,
@@ -243,6 +307,7 @@ class LinearTransportTests(unittest.TestCase):
             source_revision="sha-demo",
             plan_revision="sha-demo",
             expected_frontier=frontier,
+            state_id=state_id, assignee_id=assignee_id, unassigned=unassigned,
             authorization_adapter=authorization_adapter or FakeChildAuthorization(),
         )
 
@@ -343,8 +408,217 @@ class LinearTransportTests(unittest.TestCase):
             variables["input"] for query, variables in fake.calls
             if "issueCreate" in query
         )
-        self.assertNotIn("stateId", create_input)
+        self.assertEqual(create_input["stateId"], "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        self.assertEqual(create_input["assigneeId"], "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        self.assertEqual(result["receipt"]["state_id"], "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        self.assertEqual(result["receipt"]["assignee_id"], "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+
+    def test_existing_root_extension_atomically_creates_unassigned_child(self):
+        fake = UUIDv4ValidatingFakeClient()
+        fake.issues.append(self.legacy_root())
+
+        result = self.extend_legacy(
+            self.routed_transport(fake), assignee_id=None, unassigned=True,
+        )
+
+        create_input = next(
+            variables["input"] for query, variables in fake.calls
+            if "issueCreate" in query
+        )
+        self.assertEqual(create_input["stateId"], "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
         self.assertNotIn("assigneeId", create_input)
+        self.assertIsNone(result["receipt"]["assignee_id"])
+
+    def test_existing_root_extension_refuses_native_drift_on_replay(self):
+        fake = UUIDv4ValidatingFakeClient()
+        fake.issues.append(self.legacy_root())
+        authorization = FakeChildAuthorization()
+        self.extend_legacy(
+            self.routed_transport(fake), authorization_adapter=authorization,
+        )
+        fake.issues[-1]["state"]["id"] = "wrong-state"
+        fake.calls.clear()
+
+        with self.assertRaisesRegex(
+            LinearTransportError, "intake_identity_collision:.*:state_id",
+        ):
+            self.extend_legacy(
+                self.routed_transport(fake),
+                authorization_adapter=authorization,
+                expected_frontier={
+                    "material_revision": 3, "projection_revision": 8,
+                },
+            )
+
+        self.assertFalse(any(
+            "issueCreate" in query or "issueUpdate" in query
+            for query, _variables in fake.calls
+        ))
+
+    def test_native_authority_mismatches_are_zero_grant_zero_create(self):
+        cases = {
+            "state_missing": lambda query, result: (
+                result.__setitem__("workflowState", None)
+                if "WorkstreamNativeState" in query else None
+            ),
+            "state_wrong_team": lambda query, result: (
+                result["workflowState"]["team"].__setitem__("id", "other")
+                if "WorkstreamNativeState" in query else None
+            ),
+            "assignee_wrong_org": lambda query, result: (
+                result["user"]["organization"].__setitem__("id", "other")
+                if "WorkstreamNativeAssignee" in query else None
+            ),
+            "assignee_inactive": lambda query, result: (
+                result["user"].__setitem__("active", False)
+                if "WorkstreamNativeAssignee" in query else None
+            ),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                class NativeMismatch(FakeClient):
+                    def execute(inner_self, query, variables):
+                        result = super(NativeMismatch, inner_self).execute(query, variables)
+                        mutate(query, result)
+                        return result
+
+                fake = NativeMismatch(); fake.issues.append(self.legacy_root())
+                authorization = FakeChildAuthorization()
+                with self.assertRaises(LinearTransportError):
+                    self.extend_legacy(
+                        self.routed_transport(fake),
+                        authorization_adapter=authorization,
+                    )
+                self.assertEqual(authorization.reserve_calls, 0)
+                self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
+
+    def test_invalid_native_uuid_refuses_before_network(self):
+        fake = FakeClient(); fake.issues.append(self.legacy_root())
+        with self.assertRaisesRegex(ValueError, "canonical UUID"):
+            self.extend_legacy(self.routed_transport(fake), state_id="not-a-uuid")
+        self.assertEqual(fake.calls, [])
+
+    def test_post_validation_provider_drift_retries_exact_grant(self):
+        class DriftOnce(FakeClient):
+            def __init__(inner_self):
+                super().__init__(); inner_self.drift = True
+            def execute(inner_self, query, variables):
+                if "issueCreate" in query and inner_self.drift:
+                    inner_self.drift = False
+                    raise LinearTransportError("workflow state disappeared")
+                return super(DriftOnce, inner_self).execute(query, variables)
+
+        fake = DriftOnce(); fake.issues.append(self.legacy_root())
+        authorization = FakeChildAuthorization()
+        with self.assertRaisesRegex(LinearTransportError, "intake_create_unconfirmed"):
+            self.extend_legacy(
+                self.routed_transport(fake), authorization_adapter=authorization,
+            )
+        result = self.extend_legacy(
+            self.routed_transport(fake), authorization_adapter=authorization,
+            expected_frontier={"material_revision": 3, "projection_revision": 8},
+        )
+        self.assertEqual(result["receipt"]["disposition"], "created")
+
+    def test_unassigned_missing_assignee_field_refuses_readback(self):
+        class MissingAssignee(FakeClient):
+            def execute(inner_self, query, variables):
+                result = super(MissingAssignee, inner_self).execute(query, variables)
+                if "issueCreate" in query:
+                    result["issueCreate"]["issue"].pop("assignee", None)
+                return result
+
+        fake = MissingAssignee(); fake.issues.append(self.legacy_root())
+        with self.assertRaisesRegex(LinearTransportError, "native_readback_missing"):
+            self.extend_legacy(
+                self.routed_transport(fake), assignee_id=None, unassigned=True,
+            )
+
+    def test_assignee_pagination_empty_or_repeated_cursor_refuses(self):
+        for cursor in ("", "same"):
+            with self.subTest(cursor=cursor):
+                class BadCursor(FakeClient):
+                    def execute(inner_self, query, variables):
+                        result = super(BadCursor, inner_self).execute(query, variables)
+                        if "WorkstreamNativeAssignee" in query:
+                            result["user"]["teams"]["pageInfo"] = {
+                                "hasNextPage": True, "endCursor": cursor,
+                            }
+                        return result
+                fake = BadCursor(); fake.issues.append(self.legacy_root())
+                authorization = FakeChildAuthorization()
+                with self.assertRaisesRegex(
+                    LinearTransportError, "assignee_authority_mismatch",
+                ):
+                    self.extend_legacy(
+                        self.routed_transport(fake),
+                        authorization_adapter=authorization,
+                    )
+                self.assertEqual(authorization.reserve_calls, 0)
+
+    def test_activated_generation_extends_with_stale_diagnostic_description(self):
+        fake = FakeClient()
+        root = self.legacy_root()
+        root["description"] = "Plan revision: sha-predecessor\nLedger revision: 3"
+        fake.issues.append(root)
+        authorization = FakeChildAuthorization()
+
+        result = self.extend_legacy(
+            self.routed_transport(fake), authorization_adapter=authorization,
+        )
+
+        self.assertEqual(result["plan_revision"], "sha-demo")
+        self.assertEqual(result["receipt"]["disposition"], "created")
+        self.assertEqual(root["description"], (
+            "Plan revision: sha-predecessor\nLedger revision: 3"
+        ))
+        self.assertFalse(any("issueUpdate" in query for query, _ in fake.calls))
+
+    def test_unselected_target_generation_refuses_before_grant_or_create(self):
+        class InactiveAuthorization(FakeChildAuthorization):
+            def select_child_extension_generation(self, **values):
+                selected = super().select_child_extension_generation(**values)
+                selected["plan_revision"] = "sha-predecessor"
+                return selected
+
+        fake = FakeClient()
+        fake.issues.append(self.legacy_root())
+        authorization = InactiveAuthorization()
+
+        with self.assertRaisesRegex(
+            LinearTransportError,
+            "existing_root_plan_generation_authority_mismatch",
+        ):
+            self.extend_legacy(
+                self.routed_transport(fake), authorization_adapter=authorization,
+            )
+
+        self.assertEqual(authorization.reserve_calls, 0)
+        self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
+
+    def test_generation_authority_route_mismatch_refuses_before_grant_or_create(self):
+        class WrongGenerationRoute(FakeChildAuthorization):
+            def select_child_extension_generation(self, **values):
+                selected = super().select_child_extension_generation(**values)
+                selected["authority"] = {
+                    **selected["authority"], "project_id": "wrong-project",
+                }
+                return selected
+
+        fake = FakeClient()
+        fake.issues.append(self.legacy_root())
+        authorization = WrongGenerationRoute()
+
+        with self.assertRaisesRegex(
+            LinearTransportError,
+            "existing_root_plan_generation_authority_mismatch",
+        ):
+            self.extend_legacy(
+                self.routed_transport(fake), authorization_adapter=authorization,
+            )
+
+        self.assertEqual(authorization.reserve_calls, 0)
+        self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
 
     def test_existing_root_extension_replay_is_a_zero_write_no_op(self):
         fake = FakeClient()
@@ -366,6 +640,96 @@ class LinearTransportTests(unittest.TestCase):
         self.assertEqual(first["receipt"]["id"], second["receipt"]["id"])
         self.assertEqual(second["receipt"]["disposition"], "existing")
         self.assertEqual(second["issues"], [])
+        self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
+
+    def test_activated_generation_replay_is_a_zero_write_no_op(self):
+        fake = FakeClient()
+        root = self.legacy_root()
+        root["description"] = "Plan revision: sha-predecessor"
+        fake.issues.append(root)
+        transport = self.routed_transport(fake)
+        authorization = FakeChildAuthorization()
+        first = self.extend_legacy(
+            transport, authorization_adapter=authorization,
+        )
+        fake.calls.clear()
+
+        second = self.extend_legacy(
+            transport, authorization_adapter=authorization,
+            expected_frontier={
+                "material_revision": 3, "projection_revision": 8,
+            },
+        )
+
+        self.assertEqual(first["receipt"]["id"], second["receipt"]["id"])
+        self.assertEqual(second["receipt"]["disposition"], "existing")
+        self.assertEqual(second["issues"], [])
+        self.assertFalse(any(
+            "issueCreate" in query or "issueUpdate" in query
+            for query, _ in fake.calls
+        ))
+
+    def test_legacy_authorization_replays_existing_child_without_native_binding(self):
+        fake = FakeClient(); fake.issues.append(self.legacy_root())
+        transport = self.routed_transport(fake)
+        self.extend_legacy(transport, authorization_adapter=FakeChildAuthorization())
+        child = fake.issues[-1]
+        child["state"]["id"] = "legacy-state"
+        child["assignee"] = None
+        legacy = FakeChildAuthorization()
+        child_id = child["id"]
+        route = {"workspace_id": "workspace", "team_id": "team",
+                 "project_id": "project", "root_issue_id": self.legacy_root()["id"]}
+        value = {
+            "root_issue_id": route["root_issue_id"], "route": route,
+            "source": {"identity": "plan:legacy", "sha256": "sha-demo"},
+            "plan_revision": "sha-demo", "reviewed_candidate_key": "a",
+            "child_issue_id": child_id, "expected_material_revision": 3,
+            "expected_projection_revision": 7,
+            "initial_state": "planned_pending_projection",
+        }
+        legacy.event = build_projection_event(
+            workstream_id="GEN-37", kind="child_extension_authorization",
+            key=child_id, value=value, plan_revision="sha-demo",
+            expected_revision=7, created_at="legacy", authority=route,
+        )
+        def replay(**_values):
+            return {"event": legacy.event, "remote_id": "legacy-comment",
+                    "revision": 8, "disposition": "legacy_existing"}
+        legacy.replay_legacy_child_extension = replay
+        legacy.reserve_child_extension = lambda **_values: self.fail(
+            "legacy replay must bypass normal reservation"
+        )
+        original_execute = fake.execute
+        def deleted_providers(query, variables):
+            if "WorkstreamNativeState" in query or "WorkstreamNativeAssignee" in query:
+                self.fail("legacy replay must not validate deleted native providers")
+            return original_execute(query, variables)
+        fake.execute = deleted_providers
+        fake.calls.clear()
+
+        result = self.extend_legacy(transport, authorization_adapter=legacy)
+
+        self.assertEqual(result["receipt"]["disposition"], "existing")
+        self.assertEqual(result["receipt"]["state_id"], "legacy-state")
+        self.assertFalse(any(
+            "issueCreate" in query or "issueUpdate" in query
+            for query, _ in fake.calls
+        ))
+
+    def test_legacy_authorization_without_child_refuses_before_create(self):
+        fake = FakeClient(); fake.issues.append(self.legacy_root())
+        class LegacyLost(FakeChildAuthorization):
+            def replay_legacy_child_extension(self, **values):
+                raise LinearTransportError(
+                    "legacy_authorization_requires_existing_child"
+                )
+        with self.assertRaisesRegex(
+            LinearTransportError, "legacy_authorization_requires_existing_child",
+        ):
+            self.extend_legacy(
+                self.routed_transport(fake), authorization_adapter=LegacyLost(),
+            )
         self.assertFalse(any("issueCreate" in query for query, _ in fake.calls))
 
     def test_preexisting_exact_child_without_prior_grant_refuses(self):
@@ -618,6 +982,9 @@ class LinearTransportTests(unittest.TestCase):
                 expected_frontier={
                     "material_revision": 3, "projection_revision": 7,
                 },
+                state_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                assignee_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                unassigned=False,
                 authorization_adapter=FakeChildAuthorization(),
             )
 
@@ -902,6 +1269,42 @@ class LinearTransportTests(unittest.TestCase):
             ["comment-b", "comment-c"],
         )
         self.assertEqual(client.execute.call_count, 2)
+
+    def test_recover_authorized_reparented_child_preserves_exact_state(self):
+        child_id = "22222222-2222-4222-8222-222222222222"
+        client = mock.Mock()
+        client.execute.return_value = {"issue": {
+            "id": child_id, "identifier": "GEN-43", "title": "Authorized",
+            "description": "Next action: preserve exact child state",
+            "url": "https://linear/GEN-43", "updatedAt": "now",
+            "parent": {"id": "other-root", "identifier": "GEN-99"},
+            "project": {"id": "other-project"},
+            "team": {"id": "other-team", "organization": {"id": "workspace"}},
+            "assignee": {"id": "owner"},
+            "state": {"id": "state", "name": "In Progress", "type": "started"},
+            "comments": {
+                "nodes": [{"id": "child-comment", "body": "plain"}],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            },
+        }}
+        snapshot = {"root": {"identifier": "GEN-37"}, "children": [],
+                    "child_comments": {}}
+        authorization = {"value": {
+            "child_issue_id": child_id, "child_workstream_id": "GEN-43",
+        }}
+        recovered = LinearGraphQLTransport(
+            client, team_id="team", workspace_id="workspace",
+            project_id="project",
+        ).recover_authorized_children(snapshot, [authorization])
+        child = recovered["children"][0]
+        self.assertEqual(child["parent"]["id"], "other-root")
+        self.assertEqual(child["project"]["id"], "other-project")
+        self.assertEqual(child["state_id"], "state")
+        self.assertEqual(child["status"], "In Progress")
+        self.assertEqual(child["next_action"], "preserve exact child state")
+        self.assertEqual(
+            recovered["child_comments"]["GEN-43"][0]["id"], "child-comment",
+        )
 
     def test_resume_refuses_null_child_connection(self):
         client = mock.Mock()

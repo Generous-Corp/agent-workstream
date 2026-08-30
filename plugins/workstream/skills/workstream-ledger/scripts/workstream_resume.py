@@ -257,21 +257,28 @@ def _resolved_blocker(
 
 def _validate_child_route(
     child: dict[str, Any], *, token: str, authenticated_route: dict[str, str],
-) -> None:
+) -> list[dict[str, Any]]:
     if str(child.get("identifier", "")).upper() != token:
         raise ResumeError(f"child_identity_mismatch:{token}")
     if not isinstance(child.get("id"), str) or not child["id"]:
         raise ResumeError(f"child_identity_missing:{token}")
-    parent = child.get("parent") or {}
-    if parent.get("id") != authenticated_route.get("root_issue_id"):
-        raise ResumeError(f"child_parent_route_mismatch:{token}")
-    team = child.get("team") or {}
-    if team.get("id") != authenticated_route.get("team_id"):
-        raise ResumeError(f"child_route_mismatch:{token}:team_id")
-    if (team.get("organization") or {}).get("id") != authenticated_route.get("workspace_id"):
-        raise ResumeError(f"child_route_mismatch:{token}:workspace_id")
-    if (child.get("project") or {}).get("id") != authenticated_route.get("project_id"):
-        raise ResumeError(f"child_route_mismatch:{token}:project_id")
+    observed = {
+        "parent_issue_id": (child.get("parent") or {}).get("id"),
+        "team_id": (child.get("team") or {}).get("id"),
+        "workspace_id": ((child.get("team") or {}).get("organization") or {}).get("id"),
+        "project_id": (child.get("project") or {}).get("id"),
+    }
+    expected = {
+        "parent_issue_id": authenticated_route.get("root_issue_id"),
+        "team_id": authenticated_route.get("team_id"),
+        "workspace_id": authenticated_route.get("workspace_id"),
+        "project_id": authenticated_route.get("project_id"),
+    }
+    return [{
+        "kind": "native_child_cache_drift", "field": field,
+        "expected": expected[field], "observed": observed[field],
+        "reconciliation_required": True,
+    } for field in expected if observed[field] != expected[field]]
 
 
 def _recover_checkpoint_generations(
@@ -298,6 +305,7 @@ def _recover_checkpoint_generations(
 def add_child_material_history(
     snapshot: dict[str, Any], child_comments: dict[str, list[dict[str, Any]]],
     *, authenticated_route: dict[str, str],
+    root_comments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Reduce every nonterminal child log without mixing child/root authority."""
     if not isinstance(child_comments, dict):
@@ -312,16 +320,47 @@ def add_child_material_history(
     if set(child_comments) != nonterminal_tokens:
         raise ResumeError("incomplete_child_comment_collection")
     plan_revision = (snapshot.get("root") or {}).get("plan_revision")
+    authorizations: list[dict[str, Any]] = []
+    if root_comments is not None:
+        from workstream_linear_projection import (
+            child_mutation_authorizations_from_comments,
+        )
+        authorizations = child_mutation_authorizations_from_comments(
+            root_comments,
+            workstream_id=(snapshot.get("root") or {})["identifier"],
+            description_plan_revision=(snapshot.get("root") or {}).get(
+                "description_plan_revision", plan_revision
+            ), authenticated_route=authenticated_route,
+        )
     for source_child in snapshot.get("children", []):
         child = dict(source_child)
         token = str(child.get("identifier", "")).upper()
-        _validate_child_route(child, token=token, authenticated_route=authenticated_route)
+        cache_drift = _validate_child_route(
+            child, token=token, authenticated_route=authenticated_route,
+        )
+        if cache_drift:
+            child["reconciliation_blockers"] = cache_drift
         if _is_terminal(child):
             result["children"].append(child)
             continue
         comments = child_comments[token]
         if not isinstance(comments, list):
             raise ResumeError(f"invalid_child_comment_collection:{token}")
+        from workstream_child_proposal import (
+            activated_comments, pending_proposal_obligations,
+        )
+        pending_proposals = pending_proposal_obligations(
+            comments, authorizations, child_workstream_id=token,
+            child_issue_id=child["id"], plan_revision=plan_revision,
+        )
+        if pending_proposals:
+            child["pending_child_proposals"] = pending_proposals
+        if authorizations:
+
+            comments = activated_comments(
+                comments, authorizations, child_workstream_id=token,
+                child_issue_id=child["id"],
+            )
         event_log = reduce_event_comments(comments, workstream_id=token)
         checkpoint_log = reduce_checkpoint_comments(comments, workstream_id=token)
         if not event_log.events and not checkpoint_log.checkpoints:
@@ -370,6 +409,7 @@ def add_child_material_history(
 
 def add_live_child_material_history(
     snapshot: dict[str, Any], *, authenticated_route: dict[str, str],
+    root_comments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Join the transport's complete nonterminal-child comment collection.
 
@@ -381,7 +421,7 @@ def add_live_child_material_history(
     """
     return add_child_material_history(
         snapshot, snapshot.get("child_comments"),
-        authenticated_route=authenticated_route,
+        authenticated_route=authenticated_route, root_comments=root_comments,
     )
 
 
@@ -638,6 +678,7 @@ def _compact_child(child: dict[str, Any]) -> dict[str, Any]:
             "state_id", "assignee", "owner", "updatedAt", "next_action",
             "blocker", "review_condition", "material_event_revision",
             "checkpoint_recovery", "uncheckpointed_material_obligations",
+            "pending_child_proposals", "reconciliation_blockers",
         )
         if key in child
     }
@@ -1449,6 +1490,7 @@ def compact_context(
         if _is_terminal(child):
             continue
         compact_child = dict(child) if include_history else _compact_child(child)
+        child_material_item_count += len(child.get("pending_child_proposals", []))
         if "material_events" in child:
             checkpoint_revision = (
                 child["latest_checkpoint"]["root_revision"]
@@ -1699,8 +1741,22 @@ def main() -> int:
             live_graph_snapshot["root"]["generation_authority_origin"] = (
                 generation["authority_origin"]
             )
+            from workstream_linear_projection import (
+                child_mutation_authorizations_from_comments,
+            )
+            mutation_authorizations = child_mutation_authorizations_from_comments(
+                comments, workstream_id=token,
+                description_plan_revision=generation[
+                    "description_plan_revision"
+                ], authenticated_route=route,
+            )
+            if mutation_authorizations:
+                live_graph_snapshot = transport.recover_authorized_children(
+                    live_graph_snapshot, mutation_authorizations,
+                )
             live_graph_snapshot = add_live_child_material_history(
                 live_graph_snapshot, authenticated_route=route,
+                root_comments=comments,
             )
             # This first join discovers the projected plan source before its
             # bytes can be authenticated. Lifecycle validation is necessarily

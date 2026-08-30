@@ -209,6 +209,7 @@ class LinearCheckpointAdapter:
         workspace_id: str | None = None,
         team_id: str | None = None,
         project_id: str | None = None,
+        issue_uuid: str | None = None,
     ):
         if not issue_id:
             raise ValueError("Linear issue ID is required")
@@ -220,6 +221,7 @@ class LinearCheckpointAdapter:
         self.workspace_id = workspace_id
         self.team_id = team_id
         self.project_id = project_id
+        self.issue_uuid = issue_uuid
         self._observed_authority: dict[str, str] | None = None
         self._comment_id_capability_verified = False
         if any((workspace_id, team_id, project_id)) and not all((workspace_id, team_id, project_id)):
@@ -265,6 +267,8 @@ class LinearCheckpointAdapter:
                 raise LinearCheckpointError("Linear workstream issue not found")
             if issue.get("identifier") != self.workstream_id:
                 raise LinearCheckpointError("workstream_id_mismatch")
+            if self.issue_uuid and issue.get("id") != self.issue_uuid:
+                raise LinearCheckpointError("issue_uuid_mismatch")
             try:
                 validate_issue_route(
                     issue, workspace_id=self.workspace_id, team_id=self.team_id,

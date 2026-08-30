@@ -322,17 +322,24 @@ class ResumeTests(unittest.TestCase):
                 snapshot, snapshot["child_comments"], authenticated_route=route,
             )
 
-    def test_child_route_mismatch_refuses_before_state_reduction(self):
+    def test_child_route_mismatch_is_separate_reconciliation_blocker(self):
         route = {
             "workspace_id": "workspace", "team_id": "team",
             "project_id": "project", "root_issue_id": "root-uuid",
         }
         snapshot = self.live_snapshot(self.snapshot(), route)
         snapshot["children"][0]["project"] = {"id": "attacker-project"}
-        with self.assertRaisesRegex(MODULE.ResumeError, "child_route_mismatch:GEN-38"):
-            MODULE.add_child_material_history(
-                snapshot, snapshot["child_comments"], authenticated_route=route,
-            )
+        before_action = snapshot["children"][0]["next_action"]
+        enriched = MODULE.add_child_material_history(
+            snapshot, snapshot["child_comments"], authenticated_route=route,
+        )
+        child = enriched["children"][0]
+        self.assertEqual(child["next_action"], before_action)
+        self.assertEqual(child["reconciliation_blockers"], [{
+            "kind": "native_child_cache_drift", "field": "project_id",
+            "expected": "project", "observed": "attacker-project",
+            "reconciliation_required": True,
+        }])
 
     def test_child_collection_must_cover_every_nonterminal_child(self):
         route = {
