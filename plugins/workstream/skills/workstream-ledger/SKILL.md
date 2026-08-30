@@ -267,6 +267,10 @@ authoritative; exact replay converges without a second checkpoint or control
 event. Only checkpoints carried by the uniquely selected authenticated
 generation chain are reduced. A forged, forked, off-chain, conflicting, or
 duplicate physical copy fails closed.
+Keep the pending checkpoint file until the command returns its successful
+authority-bound post-read receipt. If execution stops after preparing the
+target disposition, resume with that exact file; a plain or regenerated
+checkpoint retry refuses rather than activating an unrecoverable disposition.
 
 The command uses the normal strict full-resume validator against authenticated
 source bytes and route readback, with the resume defaults of 24 KiB and 100
