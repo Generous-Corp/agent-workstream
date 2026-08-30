@@ -641,7 +641,7 @@ def apply_material_semantic_repairs(
     checkpoint_frontier: dict[str, Any], projection_frontier: dict[str, Any],
     generation: dict[str, Any], authenticated_route: dict[str, str],
     authenticated_source: dict[str, Any], issue_graph_frontier: dict[str, Any],
-    ledger_serialization_frontier_value: list[str],
+    ledger_serialization_frontier_value: list[str], validate_live_fences: bool = True,
 ) -> ReducedEventLog:
     """Validate repair controls, then overlay replacements at raw positions."""
     controls = [event for event in raw.events if event.kind == MATERIAL_REPAIR_KIND]
@@ -670,12 +670,19 @@ def apply_material_semantic_repairs(
         "schema_version", "workstream_id", "target_bindings", "raw_frontier",
         "checkpoint_frontier", "projection_frontier", "generation",
         "authenticated_route", "authenticated_source", "issue_graph_frontier",
-        "ledger_serialization_frontier", "review_artifact",
+        "ledger_serialization_frontier", "postwrite_oracle", "review_artifact",
     }
     if set(payload) != required or payload.get("schema_version") != 1:
         raise LinearEventError("malformed_material_semantic_repair")
     if payload["workstream_id"] != raw.workstream_id:
         raise LinearEventError("material_semantic_repair_workstream_mismatch")
+    for field in (
+        "raw_frontier", "checkpoint_frontier", "projection_frontier",
+        "generation", "authenticated_route", "authenticated_source",
+        "issue_graph_frontier", "postwrite_oracle", "review_artifact",
+    ):
+        if not isinstance(payload[field], dict):
+            raise LinearEventError(f"malformed_material_semantic_repair_{field}")
     prefix = ReducedEventLog(
         raw.workstream_id, control.expected_revision,
         tuple(raw.events[:control.expected_revision]),
@@ -692,29 +699,40 @@ def apply_material_semantic_repairs(
         or not all(isinstance(item, str) and item for item in ledger_frontier)
     ):
         raise LinearEventError("malformed_material_semantic_repair_ledger_frontier")
-    if not set(ledger_frontier).issubset(ledger_serialization_frontier_value):
+    if validate_live_fences and not set(ledger_frontier).issubset(
+        ledger_serialization_frontier_value
+    ):
         raise LinearEventError("material_semantic_repair_ledger_frontier_drift")
     # The bound serialization frontier is historical. Later checkpoints may
     # extend the live frontier, but cannot change the deterministic base slot
-    # occupied by this control. The caller still supplies the current value so
-    # a pre-write preview can require equality; resume validates the occupied
-    # base slot and the separately bound checkpoint prefix.
+    # occupied by this control. A pre-write preview requires equality with the
+    # current complete surface; historical resume instead trusts the immutable
+    # control envelope plus its occupied slot and separately bound comment
+    # proofs, allowing authorized successor surfaces to advance.
     expected_control_slot = ledger_boundary_slot_id(
         raw.workstream_id, control.expected_revision, ledger_frontier,
-        authenticated_route,
+        payload["authenticated_route"],
     )
     if raw.remote_ids.get(control.event_id) != expected_control_slot:
         raise LinearEventError("material_semantic_repair_non_base_slot")
-    for name, actual in (
-        ("checkpoint_frontier", checkpoint_frontier),
-        ("projection_frontier", projection_frontier),
-        ("generation", generation),
-        ("authenticated_route", authenticated_route),
-        ("authenticated_source", authenticated_source),
-        ("issue_graph_frontier", issue_graph_frontier),
+    historical_route = payload["authenticated_route"]
+    if (
+        not isinstance(historical_route, dict)
+        or historical_route.get("workspace_id") != authenticated_route.get("workspace_id")
+        or historical_route.get("root_issue_id") != authenticated_route.get("root_issue_id")
     ):
-        if payload[name] != actual:
-            raise LinearEventError(f"material_semantic_repair_{name}_drift")
+        raise LinearEventError("material_semantic_repair_root_authority_drift")
+    if validate_live_fences:
+        for name, actual in (
+            ("checkpoint_frontier", checkpoint_frontier),
+            ("projection_frontier", projection_frontier),
+            ("generation", generation),
+            ("authenticated_route", authenticated_route),
+            ("authenticated_source", authenticated_source),
+            ("issue_graph_frontier", issue_graph_frontier),
+        ):
+            if payload[name] != actual:
+                raise LinearEventError(f"material_semantic_repair_{name}_drift")
     artifact = payload["review_artifact"]
     if (
         not isinstance(artifact, dict)
@@ -725,13 +743,83 @@ def apply_material_semantic_repairs(
                    for k in artifact)
         or re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"]) is None
         or re.fullmatch(r"[0-9a-f]{40}", artifact["commit"]) is None
-        or artifact["commit"] not in artifact["identity"]
+        or artifact["identity"] != (
+            f"https://{artifact['repository']}/blob/{artifact['commit']}/"
+            f"{artifact['path']}"
+        )
+        or re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z",
+            artifact["reviewed_at"],
+        ) is None
     ):
         raise LinearEventError("malformed_material_semantic_repair_artifact")
     bindings = payload["target_bindings"]
     if not isinstance(bindings, list) or not bindings:
         raise LinearEventError("malformed_material_semantic_repair_targets")
+    oracle = payload["postwrite_oracle"]
+    oracle_fields = {
+        "schema_version", "target_binding_count", "target_bindings_sha256",
+        "strict_target_candidate_sha256", "source_identity", "source_sha256",
+        "source_event_id", "source_remote_comment_id",
+        "source_comment_body_sha256", "source_event_sha256",
+        "projection_seal_event_id", "projection_seal_remote_comment_id",
+        "projection_seal_comment_body_sha256", "projection_seal_event_sha256",
+        "generation_tip_event_id", "fences_sha256",
+    }
     bodies = _body_by_remote_id(comments)
+    fence_values = {
+        key: payload[key] for key in (
+            "checkpoint_frontier", "projection_frontier", "generation",
+            "authenticated_route", "authenticated_source", "issue_graph_frontier",
+        )
+    }
+    source_body = bodies.get(oracle.get("source_remote_comment_id"))
+    seal_body = bodies.get(oracle.get("projection_seal_remote_comment_id"))
+    try:
+        from workstream_linear_projection import (
+            PROJECTION_RE, _decode_projection,
+        )
+        source_matches = PROJECTION_RE.findall(source_body or "")
+        seal_matches = PROJECTION_RE.findall(seal_body or "")
+        if len(source_matches) != 1 or len(seal_matches) != 1:
+            raise ValueError("projection proof marker count")
+        source_event = _decode_projection(source_matches[0])
+        seal_event = _decode_projection(seal_matches[0])
+    except Exception:
+        source_event = seal_event = None
+    if (
+        set(oracle) != oracle_fields
+        or oracle.get("schema_version") != 1
+        or oracle.get("target_binding_count") != 2
+        or len(bindings) != 2
+        or oracle.get("target_bindings_sha256") != canonical_sha256(bindings)
+        or re.fullmatch(r"[0-9a-f]{64}", str(
+            oracle.get("strict_target_candidate_sha256", "")
+        )) is None
+        or oracle.get("source_identity")
+        != payload["authenticated_source"].get("identity")
+        or oracle.get("source_sha256")
+        != payload["authenticated_source"].get("sha256")
+        or not isinstance(source_event, dict)
+        or source_event.get("event_id") != oracle.get("source_event_id")
+        or source_event.get("kind") != "source"
+        or source_event.get("value") != payload["authenticated_source"]
+        or hashlib.sha256((source_body or "").encode()).hexdigest()
+        != oracle.get("source_comment_body_sha256")
+        or canonical_sha256(source_event) != oracle.get("source_event_sha256")
+        or oracle.get("projection_seal_event_id")
+        != payload["projection_frontier"].get("frontier_event_id")
+        or not isinstance(seal_event, dict)
+        or seal_event.get("event_id") != oracle.get("projection_seal_event_id")
+        or canonical_sha256(seal_event) != oracle.get("projection_seal_event_sha256")
+        or oracle.get("generation_tip_event_id")
+        != payload["generation"].get("transition_tip_event_id")
+        or oracle.get("fences_sha256") != canonical_sha256(fence_values)
+        or seal_body is None
+        or hashlib.sha256(seal_body.encode()).hexdigest()
+        != oracle.get("projection_seal_comment_body_sha256")
+    ):
+        raise LinearEventError("malformed_material_semantic_repair_postwrite_oracle")
     malformed_ids = {event.event_id for event in malformed}
     bound: dict[str, dict[str, Any]] = {}
     positions = {event.event_id: index for index, event in enumerate(raw.events)}
@@ -765,6 +853,13 @@ def apply_material_semantic_repairs(
             or binding["original_applied_revision"] != positions[event_id] + 1
         ):
             raise LinearEventError("material_semantic_repair_target_drift")
+        if binding["replacement"] != {
+            "boundary_id": f"repair:{event.event_id}",
+            "changes": [{"kind": "progress", "payload": event.payload}],
+        }:
+            raise LinearEventError(
+                "material_semantic_repair_non_lossless_replacement"
+            )
         replacement = Delta(
             event.event_id, event.workstream_id, "material_boundary", event.source,
             binding["replacement"], event.expected_revision, event.created_at,

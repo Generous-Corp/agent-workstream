@@ -194,7 +194,8 @@ class DeltaJournalTests(unittest.TestCase):
             "checkpoint_frontier": {}, "projection_frontier": {},
             "generation": {}, "authenticated_route": {},
             "authenticated_source": {}, "issue_graph_frontier": {},
-            "ledger_serialization_frontier": [], "review_artifact": {},
+            "ledger_serialization_frontier": [], "postwrite_oracle": {},
+            "review_artifact": {},
         }
         event = MODULE.Delta(
             "repair", "GEN-37", MODULE.MATERIAL_REPAIR_KIND, "system",

@@ -42,7 +42,7 @@ def validate_material_event_semantics(delta: "Delta") -> None:
             "schema_version", "workstream_id", "target_bindings", "raw_frontier",
             "checkpoint_frontier", "projection_frontier", "generation",
             "authenticated_route", "authenticated_source", "issue_graph_frontier",
-            "ledger_serialization_frontier", "review_artifact",
+            "ledger_serialization_frontier", "postwrite_oracle", "review_artifact",
         }
         payload = delta.payload
         if (

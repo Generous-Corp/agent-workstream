@@ -43,6 +43,68 @@ class ResumeTests(unittest.TestCase):
         }
         return snapshot
 
+    def test_repair_graph_frontier_binds_native_status_and_state_identity(self):
+        snapshot = self.snapshot()
+        snapshot["root"].update({
+            "id": "root", "status": "In Progress", "status_type": "started",
+            "state_id": "state-1", "state": {
+                "id": "state-1", "name": "In Progress", "type": "started",
+            },
+        })
+        baseline = MODULE._issue_graph_repair_frontier(snapshot, [], {})
+        self.assertEqual(baseline["issues"]["root"]["state_id"], "state-1")
+        for field, value in (
+            ("status", "Blocked"), ("status_type", "canceled"),
+            ("state_id", "state-2"),
+        ):
+            changed = copy.deepcopy(snapshot)
+            changed["root"][field] = value
+            if field == "status":
+                changed["root"]["state"]["name"] = value
+            elif field == "status_type":
+                changed["root"]["state"]["type"] = value
+            else:
+                changed["root"]["state"]["id"] = value
+            self.assertNotEqual(
+                MODULE._issue_graph_repair_frontier(changed, [], {})["sha256"],
+                baseline["sha256"], field,
+            )
+
+    def test_repaired_history_joins_before_and_after_source_authentication(self):
+        from test_workstream_linear_events import LinearCommentEventAdapterTests
+        comments, _payload, _checkpoint, _projection, _generation, route, source, _graph = (
+            LinearCommentEventAdapterTests()._repair_fixture()
+        )
+        graph = self.snapshot()
+        graph["children"][1]["status"] = "In Progress"
+        graph["children"][1]["next_action"] = "continue"
+        graph["root"].update({
+            "plan_revision": "a" * 64,
+            "id": route["root_issue_id"],
+            "team": {"id": route["team_id"],
+                     "organization": {"id": route["workspace_id"]}},
+            "project": {"id": route["project_id"]},
+        })
+        graph = self.live_snapshot(graph, route)
+        provisional = MODULE.add_material_history(
+            graph, comments, "GEN-37", authenticated_route=route,
+        )
+        resumed = MODULE.add_material_history(
+            graph, comments, "GEN-37", authenticated_route=route,
+            authenticated_source=source,
+        )
+        self.assertEqual(provisional["root"]["next_action"], "new")
+        self.assertEqual(resumed["root"]["next_action"], "new")
+        compact = MODULE.compact_context(resumed, "GEN-37")
+        full = MODULE.compact_context(resumed, "GEN-37", include_history=True)
+        self.assertEqual(compact["next_action"], "new")
+        self.assertEqual(compact["material_semantic_repair"]["count"], 2)
+        self.assertEqual(len(full["material_semantic_repairs"]), 2)
+        self.assertEqual(
+            [item["event_id"] for item in full["raw_material_events"][:2]],
+            ["flat-a", "flat-b"],
+        )
+
     def test_expected_missing_closures_requires_authority_validation(self):
         with self.assertRaisesRegex(
             MODULE.ResumeError,

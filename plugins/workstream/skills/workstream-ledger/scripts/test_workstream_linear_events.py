@@ -4,6 +4,7 @@ from __future__ import annotations
 import threading
 import tempfile
 import unittest
+import json
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -22,6 +23,9 @@ from workstream_linear_events import (
     ledger_boundary_slot_id,
     material_frontier,
     reduce_event_comments,
+)
+from workstream_linear_projection import (
+    build_projection_event, encode_projection_comment, projection_slot_id,
 )
 
 
@@ -112,18 +116,82 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
                              f"{linear_events_module.EVENT_PREFIX}{encoded} -->"})
         raw = reduce_event_comments(comments, workstream_id="GEN-37")
         route = {"workspace_id": "w", "team_id": "t", "project_id": "p",
-                 "root_issue_id": "r"}
+                 "root_issue_id": "33333333-3333-4333-8333-333333333333"}
         repair_slot = ledger_boundary_slot_id("GEN-37", 2, [], route)
         source = {"identity": "plan", "sha256": "a" * 64}
         checkpoint = {"count": 0, "revision": 0, "event_ids_sha256": "c",
                       "checkpoints_sha256": "d"}
-        projection = {"revision": 1, "frontier_event_id": "projection",
+        projection_source = build_projection_event(
+            workstream_id="GEN-37", kind="source", key="root", value=source,
+            plan_revision="a" * 64, expected_revision=0,
+            created_at="2026-08-30T00:00:02Z", authority=route,
+        )
+        scope = {
+            "namespace": "repair-test",
+            "linear": {**route, "route_verification": {
+                **route, "observed_at": "2026-08-30T00:00:00Z",
+                "evidence": [{"kind": "authenticated_linear_readback",
+                              "authenticated": True, **route}],
+            }},
+            "primary_repository": "github.com:id:R_test",
+            "repositories": [{
+                "slug": "github.com/generous-corp/test", "exact_head": "1" * 40,
+                "provider_repository_id": "R_test", "aliases": [],
+                "identity_resolution": {
+                    "provider_repository_id": "R_test",
+                    "resolved_slug": "github.com/generous-corp/test",
+                    "observed_at": "2026-08-30T00:00:00Z",
+                    "evidence": [{"kind": "authenticated_provider_readback",
+                                  "authenticated": True,
+                                  "provider_repository_id": "R_test",
+                                  "resolved_slug": "github.com/generous-corp/test"}],
+                },
+                "identity_updates": [], "evidence": [],
+            }],
+            "child_ownership": {"GEN-38": "github.com:id:R_test",
+                                "GEN-39": "github.com:id:R_test"},
+        }
+        projection_scope = build_projection_event(
+            workstream_id="GEN-37", kind="scope", key="root", value=scope,
+            plan_revision="a" * 64, expected_revision=1,
+            created_at="2026-08-30T00:00:03Z", authority=route,
+        )
+        projection_provenance = build_projection_event(
+            workstream_id="GEN-37", kind="provenance", key="repair-seal",
+            value={"agent": "reviewer", "machine": "test",
+                   "session_id": "repair-seal"}, plan_revision="a" * 64,
+            expected_revision=2, created_at="2026-08-30T00:00:04Z",
+            authority=route,
+        )
+        projection_seal = build_projection_event(
+            workstream_id="GEN-37", kind="disposition", key="root",
+            value={"disposition": "attach", "remote_head": "1" * 40,
+                   "recovered_from_checkpoint": None},
+            plan_revision="a" * 64, expected_revision=3,
+            created_at="2026-08-30T00:00:05Z", authority=route,
+        )
+        projection = {"revision": 4,
+                      "frontier_event_id": projection_seal["event_id"],
                       "events_sha256": "e"}
         generation = {"plan_revision": "a" * 64,
                       "transition_tip_event_id": None, "activation_epoch": None,
                       "authority_origin": "legacy_description"}
         graph = {"algorithm": "authenticated-root-children-relations-v1",
                  "sha256": "9" * 64}
+        source_body = encode_projection_comment(projection_source)
+        scope_body = encode_projection_comment(projection_scope)
+        provenance_body = encode_projection_comment(projection_provenance)
+        seal_body = encode_projection_comment(projection_seal)
+        source_remote = projection_slot_id("GEN-37", "a" * 64, 0, route)
+        scope_remote = projection_slot_id("GEN-37", "a" * 64, 1, route)
+        provenance_remote = projection_slot_id("GEN-37", "a" * 64, 2, route)
+        seal_remote = projection_slot_id("GEN-37", "a" * 64, 3, route)
+        comments.extend([
+            {"id": source_remote, "body": source_body},
+            {"id": scope_remote, "body": scope_body},
+            {"id": provenance_remote, "body": provenance_body},
+            {"id": seal_remote, "body": seal_body},
+        ])
         bindings = []
         for position, event in enumerate(invalid):
             body = comments[position]["body"]
@@ -136,10 +204,39 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
                 "original_expected_revision": event.expected_revision,
                 "original_index_zero_based": position,
                 "original_applied_revision": position + 1,
-                "replacement": {"boundary_id": f"repair-{event.event_id}", "changes": [{
+                "replacement": {"boundary_id": f"repair:{event.event_id}", "changes": [{
                     "kind": "progress", "payload": dict(event.payload),
                 }]},
             })
+        fences = {
+            "checkpoint_frontier": checkpoint, "projection_frontier": projection,
+            "generation": generation, "authenticated_route": route,
+            "authenticated_source": source, "issue_graph_frontier": graph,
+        }
+        oracle = {
+            "schema_version": 1, "target_binding_count": 2,
+            "target_bindings_sha256": linear_events_module.canonical_sha256(bindings),
+            "strict_target_candidate_sha256": "2" * 64,
+            "source_identity": source["identity"], "source_sha256": source["sha256"],
+            "source_event_id": projection_source["event_id"],
+            "source_remote_comment_id": source_remote,
+            "source_comment_body_sha256": hashlib.sha256(
+                source_body.encode()
+            ).hexdigest(),
+            "source_event_sha256": linear_events_module.canonical_sha256(
+                projection_source
+            ),
+            "projection_seal_event_id": projection["frontier_event_id"],
+            "projection_seal_remote_comment_id": seal_remote,
+            "projection_seal_comment_body_sha256": hashlib.sha256(
+                seal_body.encode()
+            ).hexdigest(),
+            "projection_seal_event_sha256": linear_events_module.canonical_sha256(
+                projection_seal
+            ),
+            "generation_tip_event_id": generation["transition_tip_event_id"],
+            "fences_sha256": linear_events_module.canonical_sha256(fences),
+        }
         payload = {
             "schema_version": 1, "workstream_id": "GEN-37",
             "target_bindings": bindings, "raw_frontier": material_frontier(raw),
@@ -148,9 +245,10 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
             "authenticated_source": source,
             "issue_graph_frontier": graph,
             "ledger_serialization_frontier": [],
+            "postwrite_oracle": oracle,
             "review_artifact": {
-                "identity": "https://github/review/blob/" + "1" * 40 + "/repair.json",
-                "repository": "github:review", "commit": "1" * 40,
+                "identity": "https://github.com/review/repo/blob/" + "1" * 40 + "/repair.json",
+                "repository": "github.com/review/repo", "commit": "1" * 40,
                 "path": "repair.json", "sha256": "f" * 64,
                 "reviewed_at": "2026-08-30T00:01:00Z",
             },
@@ -178,6 +276,64 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
         self.assertEqual(effective.events[1].payload["changes"][0]["payload"]["next_action"], "new")
         self.assertEqual(len(effective.repair_bindings), 2)
 
+    def test_historical_repair_proof_allows_authorized_successor_evolution(self):
+        comments, _payload, checkpoint, projection, generation, route, source, graph = self._repair_fixture()
+        raw = reduce_event_comments(comments, workstream_id="GEN-37")
+        evolved_route = dict(route, team_id="new-team", project_id="new-project")
+        effective = apply_material_semantic_repairs(
+            raw, comments,
+            checkpoint_frontier=dict(checkpoint, revision=99),
+            projection_frontier=dict(projection, revision=99),
+            generation=dict(generation, plan_revision="b" * 64,
+                            transition_tip_event_id="successor"),
+            authenticated_route=evolved_route,
+            authenticated_source={"identity": "successor", "sha256": "b" * 64},
+            issue_graph_frontier={"algorithm": "successor", "sha256": "8" * 64},
+            ledger_serialization_frontier_value=["later-checkpoint"],
+            validate_live_fences=False,
+        )
+        self.assertEqual(len(effective.repair_bindings), 2)
+        with self.assertRaisesRegex(
+            LinearEventError, "material_semantic_repair_.*_drift",
+        ):
+            apply_material_semantic_repairs(
+                raw, comments, checkpoint_frontier=checkpoint,
+                projection_frontier=projection, generation=generation,
+                authenticated_route=evolved_route,
+                authenticated_source=source, issue_graph_frontier=graph,
+                ledger_serialization_frontier_value=[], validate_live_fences=True,
+            )
+
+    def test_repair_rejects_semantic_rewrite_and_noncanonical_boundary_id(self):
+        for mutation in ("payload", "boundary"):
+            comments, payload, checkpoint, projection, generation, route, source, graph = self._repair_fixture()
+            changed = json.loads(json.dumps(payload))
+            if mutation == "payload":
+                changed["target_bindings"][0]["replacement"]["changes"][0]["payload"] = {
+                    "progress": "edited"
+                }
+            else:
+                changed["target_bindings"][0]["replacement"]["boundary_id"] = "reviewer-choice"
+            changed["postwrite_oracle"]["target_bindings_sha256"] = (
+                linear_events_module.canonical_sha256(changed["target_bindings"])
+            )
+            control = Delta(
+                "repair", "GEN-37", "material_semantic_repair", "system",
+                changed, 2, "2026-08-30T00:01:00Z",
+            )
+            comments[-1] = {"id": comments[-1]["id"],
+                            "body": encode_event_comment(control)}
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(
+                LinearEventError, "non_lossless_replacement",
+            ):
+                apply_material_semantic_repairs(
+                    reduce_event_comments(comments, workstream_id="GEN-37"), comments,
+                    checkpoint_frontier=checkpoint, projection_frontier=projection,
+                    generation=generation, authenticated_route=route,
+                    authenticated_source=source, issue_graph_frontier=graph,
+                    ledger_serialization_frontier_value=[],
+                )
+
     def test_repair_refuses_incomplete_drift_valid_and_forward_targets(self):
         cases = []
         comments, payload, checkpoint, projection, generation, route, source, graph = self._repair_fixture()
@@ -186,7 +342,8 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
         control = Delta("repair", "GEN-37", "material_semantic_repair", "system", p, 2,
                         "2026-08-30T00:01:00Z")
         incomplete[-1] = {"id": comments[-1]["id"], "body": encode_event_comment(control)}
-        cases.append((incomplete, checkpoint, "incomplete_target_set"))
+        cases.append((incomplete, checkpoint,
+                      "malformed_material_semantic_repair_postwrite_oracle"))
         drift = dict(checkpoint); drift["revision"] = 1
         cases.append((comments, drift, "checkpoint_frontier_drift"))
         for candidate, checkpoint_value, reason in cases:
@@ -201,7 +358,7 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
                 )
 
         drift_inputs = {
-            "projection_frontier": (dict(projection, revision=2),
+            "projection_frontier": (dict(projection, revision=3),
                                     "projection_frontier_drift"),
             "generation": (dict(generation, activation_epoch="other"),
                            "generation_drift"),

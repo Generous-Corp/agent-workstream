@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from workstream_config import load_linear_api_key, resolve_linear_route
-from workstream_delta import Delta, event_id_for
+from workstream_delta import Delta, MutationReceipt, canonical_sha256, event_id_for
 from workstream_linear import (
     HttpGraphQLClient, LinearGraphQLTransport, resolve_authenticated_issue_route,
 )
@@ -35,12 +35,52 @@ def _load_manifest(path: str) -> dict:
     return value
 
 
+def _verify_review_artifact(payload: dict, path: str | None) -> None:
+    """Authenticate the exact locally reviewed normalization artifact."""
+    if not path:
+        raise ValueError("material_repair_review_artifact_file_required")
+    material = Path(path).read_bytes()
+    artifact = payload.get("review_artifact")
+    if not isinstance(artifact, dict):
+        raise ValueError("material_repair_review_artifact_missing")
+    import hashlib
+    if hashlib.sha256(material).hexdigest() != artifact.get("sha256"):
+        raise ValueError("material_repair_review_artifact_digest_mismatch")
+    try:
+        reviewed = json.loads(material)
+    except json.JSONDecodeError as error:
+        raise ValueError("material_repair_review_artifact_malformed") from error
+    if reviewed != {
+        "schema_version": 1,
+        "workstream_id": payload.get("workstream_id"),
+        "target_bindings": payload.get("target_bindings"),
+    }:
+        raise ValueError("material_repair_review_artifact_content_mismatch")
+    commit = artifact.get("commit")
+    artifact_path = artifact.get("path")
+    identity = artifact.get("identity")
+    repository = artifact.get("repository")
+    if (
+        not isinstance(commit, str) or len(commit) != 40
+        or any(ch not in "0123456789abcdef" for ch in commit)
+        or not isinstance(artifact_path, str) or not artifact_path
+        or not isinstance(identity, str)
+        or not isinstance(repository, str) or not repository
+        or identity != f"https://{repository}/blob/{commit}/{artifact_path}"
+    ):
+        raise ValueError("material_repair_review_artifact_identity_mismatch")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("workstream")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--plan-source", required=True)
     parser.add_argument("--plan-identity")
+    parser.add_argument(
+        "--review-artifact",
+        help="local copy of the immutable reviewed target-binding artifact",
+    )
     parser.add_argument("--config")
     parser.add_argument("--linear-endpoint", default="https://api.linear.app/graphql")
     parser.add_argument(
@@ -54,7 +94,14 @@ def main() -> int:
         if args.prepare:
             if args.apply:
                 raise ValueError("material_repair_prepare_cannot_apply")
-            payload, control = manifest, None
+            seed_fields = {
+                "schema_version", "workstream_id", "target_bindings",
+                "authenticated_route", "authenticated_source", "generation",
+                "review_artifact", "strict_target_candidate_sha256",
+            }
+            if set(manifest) != seed_fields or manifest.get("schema_version") != 1:
+                raise ValueError("malformed_material_repair_reviewed_seed")
+            payload, control = dict(manifest), None
         elif set(manifest) == {"schema_version", "control", "payload"} and manifest.get("schema_version") == 1:
             payload, control = manifest["payload"], manifest["control"]
         else:
@@ -63,6 +110,7 @@ def main() -> int:
             raise ValueError("malformed_material_repair_manifest")
         if payload.get("workstream_id") != args.workstream.upper():
             raise ValueError("material_semantic_repair_workstream_mismatch")
+        _verify_review_artifact(payload, args.review_artifact)
         token = load_linear_api_key()
         if not token:
             raise ValueError("linear_auth_unavailable")
@@ -111,6 +159,81 @@ def main() -> int:
             graph_snapshot, relations,
             read_relation_targets(client, relations) if relations else {},
         )
+        if args.prepare:
+            strict_candidate = payload.pop("strict_target_candidate_sha256", None)
+            if (
+                not isinstance(strict_candidate, str)
+                or len(strict_candidate) != 64
+                or any(ch not in "0123456789abcdef" for ch in strict_candidate)
+                or len(payload.get("target_bindings", [])) != 2
+                or not projection.events
+            ):
+                raise ValueError("material_repair_strict_target_candidate_required")
+            if generation_binding != payload["generation"]:
+                raise ValueError("material_semantic_repair_generation_drift")
+            payload.update({
+                "raw_frontier": material_frontier(raw),
+                "checkpoint_frontier": _checkpoint_repair_frontier(checkpoints),
+                "projection_frontier": _projection_repair_frontier(projection),
+                "issue_graph_frontier": graph_frontier,
+                "ledger_serialization_frontier": [],
+            })
+            seal_event = projection.events[-1]
+            seal_remote_id = projection.remote_ids[seal_event["event_id"]]
+            seal_comments = [
+                item for item in comments if item.get("id") == seal_remote_id
+            ]
+            if len(seal_comments) != 1 or not isinstance(
+                seal_comments[0].get("body"), str
+            ):
+                raise ValueError("material_repair_projection_seal_missing")
+            source_events = [
+                event for event in projection.events
+                if event.get("kind") == "source"
+                and event.get("value") == source
+            ]
+            if len(source_events) != 1:
+                raise ValueError("material_repair_projection_source_missing")
+            source_event = source_events[0]
+            source_remote_id = projection.remote_ids[source_event["event_id"]]
+            source_comments = [
+                item for item in comments if item.get("id") == source_remote_id
+            ]
+            if len(source_comments) != 1 or not isinstance(
+                source_comments[0].get("body"), str
+            ):
+                raise ValueError("material_repair_projection_source_missing")
+            fences = {
+                key: payload[key] for key in (
+                    "checkpoint_frontier", "projection_frontier", "generation",
+                    "authenticated_route", "authenticated_source",
+                    "issue_graph_frontier",
+                )
+            }
+            import hashlib
+            payload["postwrite_oracle"] = {
+                "schema_version": 1, "target_binding_count": 2,
+                "target_bindings_sha256": canonical_sha256(
+                    payload["target_bindings"]
+                ),
+                "strict_target_candidate_sha256": strict_candidate,
+                "source_identity": source["identity"],
+                "source_sha256": source["sha256"],
+                "source_event_id": source_event["event_id"],
+                "source_remote_comment_id": source_remote_id,
+                "source_comment_body_sha256": hashlib.sha256(
+                    source_comments[0]["body"].encode()
+                ).hexdigest(),
+                "source_event_sha256": canonical_sha256(source_event),
+                "projection_seal_event_id": seal_event["event_id"],
+                "projection_seal_remote_comment_id": seal_remote_id,
+                "projection_seal_comment_body_sha256": hashlib.sha256(
+                    seal_comments[0]["body"].encode()
+                ).hexdigest(),
+                "projection_seal_event_sha256": canonical_sha256(seal_event),
+                "generation_tip_event_id": generation["transition_tip_event_id"],
+                "fences_sha256": canonical_sha256(fences),
+            }
         replay = control is not None and control.get("event_id") in raw.remote_ids
         base_revision = control.get("expected_revision") if control is not None else raw.revision
         expected_id = event_id_for(
@@ -223,8 +346,113 @@ def main() -> int:
             sys.stdout.write("\n")
             return 0
         receipt = None
+        reobserved_after_apply_error = False
         if args.apply:
-            receipt = adapter.apply(candidate)
+            if not replay:
+                final_route = resolve_authenticated_issue_route(
+                    client, args.workstream, declared,
+                )
+                final_source = plan_payload(
+                    args.plan_source,
+                    args.plan_identity or source.get("identity"),
+                )["source"]
+                final_comments = adapter.comments()
+                final_raw = reduce_event_comments(
+                    final_comments, workstream_id=args.workstream,
+                )
+                final_generation = select_plan_generation(
+                    final_comments, workstream_id=args.workstream,
+                    description_plan_revision=generation["description_plan_revision"],
+                    authenticated_route=final_route,
+                )
+                final_projection = reduce_projection_comments(
+                    final_comments, workstream_id=args.workstream,
+                    expected_plan_revision=final_generation["plan_revision"],
+                    authenticated_route=final_route,
+                    authenticated_source=final_source,
+                )
+                final_checkpoints = reduce_checkpoint_comments(
+                    final_comments, workstream_id=args.workstream,
+                )
+                final_relations = final_projection.snapshot.get("relations") or []
+                final_graph = _issue_graph_repair_frontier(
+                    LinearGraphQLTransport(
+                        client, team_id=final_route["team_id"],
+                        workspace_id=final_route["workspace_id"],
+                        project_id=final_route["project_id"],
+                    ).snapshot_for_root(args.workstream, include_child_comments=False),
+                    final_relations,
+                    read_relation_targets(client, final_relations)
+                    if final_relations else {},
+                )
+                final_generation_binding = {
+                    "plan_revision": final_generation["plan_revision"],
+                    "transition_tip_event_id": final_generation["transition_tip_event_id"],
+                    "activation_epoch": final_generation["activation_epoch"],
+                    "authority_origin": final_generation["authority_origin"],
+                }
+                final_ledger = ledger_serialization_frontier(
+                    sorted(item["event_id"] for item in final_checkpoints.checkpoints),
+                    final_comments, workstream_id=args.workstream,
+                    authenticated_route=final_route,
+                    current_plan_revision=final_generation["plan_revision"],
+                    material_revision=base_revision,
+                )
+                if (
+                    final_route != payload["authenticated_route"]
+                    or final_source != payload["authenticated_source"]
+                    or material_frontier(final_raw) != payload["raw_frontier"]
+                    or final_generation_binding != payload["generation"]
+                    or _checkpoint_repair_frontier(final_checkpoints)
+                    != payload["checkpoint_frontier"]
+                    or _projection_repair_frontier(final_projection)
+                    != payload["projection_frontier"]
+                    or final_graph != payload["issue_graph_frontier"]
+                    or final_ledger != payload["ledger_serialization_frontier"]
+                ):
+                    raise ValueError("material_repair_final_prewrite_fence_drift")
+            try:
+                receipt = adapter.apply(candidate)
+            except Exception as apply_error:
+                try:
+                    uncertain_comments = adapter.comments()
+                    uncertain_raw = reduce_event_comments(
+                        uncertain_comments, workstream_id=args.workstream,
+                    )
+                    observed = next(
+                        event for event in uncertain_raw.events
+                        if event.event_id == candidate.event_id
+                    )
+                    if (
+                        uncertain_raw.remote_ids[candidate.event_id] != expected_slot
+                        or _canonical_event(observed) != _canonical_event(candidate)
+                    ):
+                        raise ValueError("repair_control_observation_mismatch")
+                    receipt = MutationReceipt(
+                        candidate.event_id,
+                        next(index for index, event in enumerate(
+                            uncertain_raw.events, start=1,
+                        ) if event.event_id == candidate.event_id),
+                        expected_slot,
+                    )
+                    reobserved_after_apply_error = True
+                except Exception:
+                    json.dump({
+                        "applied": None, "replay": replay,
+                        "event_id": candidate_id, "remote_slot_id": expected_slot,
+                        "receipt": None,
+                        "recovery_state": "outcome_unknown_replay_required",
+                        "postwrite_validation": {
+                            "repair_reducer": "not_observed",
+                            "production_compact_resume": "external_gate_required",
+                            "production_full_resume": "external_gate_required",
+                            "strict_generation_candidate": "external_gate_required",
+                            "exact_manifest_replay": "required",
+                        },
+                        "error": str(apply_error),
+                    }, sys.stdout, sort_keys=True, indent=2)
+                    sys.stdout.write("\n")
+                    return 3
             try:
                 post_route = resolve_authenticated_issue_route(
                     client, args.workstream, declared,
@@ -294,8 +522,31 @@ def main() -> int:
                     "applied": True, "replay": replay,
                     "event_id": candidate_id, "remote_slot_id": expected_slot,
                     "receipt": receipt.__dict__,
-                    "post_resume_validation": "durable_partial_replay_required",
+                    "recovery_state": "durable_partial_replay_required",
+                    "postwrite_validation": {
+                        "repair_reducer": "failed",
+                        "production_compact_resume": "external_gate_required",
+                        "production_full_resume": "external_gate_required",
+                        "strict_generation_candidate": "external_gate_required",
+                        "exact_manifest_replay": "required",
+                    },
                     "error": str(post_error),
+                }, sys.stdout, sort_keys=True, indent=2)
+                sys.stdout.write("\n")
+                return 3
+            if reobserved_after_apply_error:
+                json.dump({
+                    "applied": True, "replay": replay,
+                    "event_id": candidate_id, "remote_slot_id": expected_slot,
+                    "receipt": receipt.__dict__,
+                    "recovery_state": "durable_partial_replay_required",
+                    "postwrite_validation": {
+                        "repair_reducer": "valid",
+                        "production_compact_resume": "external_gate_required",
+                        "production_full_resume": "external_gate_required",
+                        "strict_generation_candidate": "external_gate_required",
+                        "exact_manifest_replay": "required",
+                    },
                 }, sys.stdout, sort_keys=True, indent=2)
                 sys.stdout.write("\n")
                 return 3
@@ -306,7 +557,20 @@ def main() -> int:
             "raw_frontier": material_frontier(raw),
             "repair_count": len(validated.repair_bindings),
             "receipt": (receipt.__dict__ if receipt is not None else None),
-            "post_resume_validation": "valid",
+            "recovery_state": "complete" if args.apply else "preview_only",
+            "postwrite_validation": {
+                "repair_reducer": "valid" if args.apply else "preview_valid",
+                "production_compact_resume": "external_gate_required",
+                "production_full_resume": "external_gate_required",
+                "strict_generation_candidate": "external_gate_required",
+                "exact_manifest_replay": (
+                    "valid" if args.apply and replay else "external_gate_required"
+                ),
+            },
+            "mutation_atomicity": {
+                "material_checkpoint_boundary": "deterministic_remote_slot",
+                "cross_surface": "preflight_and_postcheck_non_transactional",
+            },
         }
         json.dump(output, sys.stdout, sort_keys=True, indent=2)
         sys.stdout.write("\n")

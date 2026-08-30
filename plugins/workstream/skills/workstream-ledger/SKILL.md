@@ -402,10 +402,20 @@ deletes the original comments. Preview the reviewed manifest first, then apply:
 
 ```sh
 workstreamctl material-repair GEN-123 --manifest repair.json \
+  --review-artifact reviewed-targets.json \
   --plan-source ./PLAN.md --plan-identity <canonical-url>
 workstreamctl material-repair GEN-123 --manifest repair.json \
+  --review-artifact reviewed-targets.json \
   --plan-source ./PLAN.md --plan-identity <canonical-url> --apply
 ```
+
+The reviewed target file is authenticated locally by immutable commit/path and
+SHA-256. Normalization is mechanically lossless: exactly two incident targets,
+`repair:<event-id>`, and one `progress` change containing the complete original
+payload. The material comment uses one deterministic slot; the complete
+cross-surface readback is a preflight/postcheck fence, not transactional CAS.
+Later authorized generation, source, or child evolution does not invalidate the
+immutable historical repair proof.
 
 ### Durable choice events
 

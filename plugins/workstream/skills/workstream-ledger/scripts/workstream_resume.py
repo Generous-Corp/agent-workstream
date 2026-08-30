@@ -198,12 +198,18 @@ def _issue_graph_repair_frontier(
     def native(issue: Any) -> dict[str, Any]:
         if not isinstance(issue, dict):
             return {}
+        state = issue.get("state")
+        if not isinstance(state, dict):
+            state = {
+                "id": issue.get("state_id"), "name": issue.get("status"),
+                "type": issue.get("status_type"),
+            }
         return {
             key: issue.get(key) for key in (
-                "id", "identifier", "parent", "team", "project", "state",
-                "assignee", "archivedAt",
+                "id", "identifier", "url", "title", "parent", "team", "project",
+                "assignee", "archivedAt", "status", "status_type", "state_id",
             )
-        }
+        } | {"state": state}
     graph = {
         "root": native(snapshot.get("root")),
         "children": sorted(
@@ -215,6 +221,7 @@ def _issue_graph_repair_frontier(
     }
     return {
         "algorithm": "authenticated-root-children-relations-v1",
+        "issues": graph,
         "sha256": hashlib.sha256(json.dumps(
             graph, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ).encode()).hexdigest(),
@@ -861,7 +868,7 @@ def add_material_history(
         result, projected_relations, repair_relation_targets,
     )
     if any(event.kind == "material_semantic_repair" for event in event_log.events):
-        if authenticated_route is None or authenticated_source is None:
+        if authenticated_route is None:
             raise ResumeError("material_semantic_repair_authority_missing")
         try:
             repair_control = next(
@@ -892,9 +899,10 @@ def add_material_history(
                 ),
                 generation=_generation_repair_binding(result["root"]),
                 authenticated_route=authenticated_route,
-                authenticated_source=authenticated_source,
+                authenticated_source=authenticated_source or {},
                 issue_graph_frontier=issue_graph_frontier,
                 ledger_serialization_frontier_value=ledger_frontier,
+                validate_live_fences=False,
             )
         except LinearEventError as error:
             raise ResumeError(str(error)) from error
