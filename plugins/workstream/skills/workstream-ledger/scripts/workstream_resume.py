@@ -38,7 +38,7 @@ from workstream_linear_events import (
 from workstream_linear_projection import (
     _inspect_unsealed_identity_history, inspect_unsealed_identity_history,
     LinearProjectionError,
-    reduce_projection_comments, TOMBSTONE,
+    reduce_projection_comments, select_plan_generation, TOMBSTONE,
     validate_projection_event,
 )
 from workstream_plan import plan_payload
@@ -102,6 +102,8 @@ def closure_snapshot_digest(snapshot: dict[str, Any]) -> str:
         issue_status = root.pop("issue_status", root.get("status"))
         root["status"] = issue_status
         root.pop("closure_receipt", None)
+        root.pop("description_plan_revision", None)
+        root.pop("generation_transition_tip_event_id", None)
     events = material.get("projection_events")
     if isinstance(events, list):
         material["projection_events"] = [
@@ -1471,6 +1473,12 @@ def compact_context(
         "workstream_id": root["identifier"].upper(),
         "context_url": root["url"],
         "plan_revision": root["plan_revision"],
+        "description_plan_revision": root.get(
+            "description_plan_revision", root["plan_revision"],
+        ),
+        "generation_transition_tip_event_id": root.get(
+            "generation_transition_tip_event_id"
+        ),
         "root_revision": root["revision"],
         "issue_revision": root.get("issue_revision"),
         "status": root.get("status"),
@@ -1626,6 +1634,18 @@ def main() -> int:
                 workspace_id=complete_route.get("workspace_id"),
                 project_id=complete_route.get("project_id"),
             ).comments()
+            generation = select_plan_generation(
+                comments, workstream_id=token,
+                description_plan_revision=live_graph_snapshot["root"]["plan_revision"],
+                authenticated_route=route,
+            )
+            live_graph_snapshot["root"]["plan_revision"] = generation["plan_revision"]
+            live_graph_snapshot["root"]["description_plan_revision"] = generation[
+                "description_plan_revision"
+            ]
+            live_graph_snapshot["root"]["generation_transition_tip_event_id"] = (
+                generation["transition_tip_event_id"]
+            )
             child_comments = live_graph_snapshot.pop("child_comments", None)
             live_graph_snapshot = add_child_material_history(
                 live_graph_snapshot, child_comments,
