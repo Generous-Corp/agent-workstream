@@ -33,8 +33,8 @@ from workstream_linear_projection import (
 from workstream_plan import canonical_plan_url, plan_payload, same_plan_document
 from workstream_relation_readback import RelationReadbackError, read_relation_targets
 from workstream_resume import (
-    DEFAULT_RESUME_MAX_BYTES, ResumeError, add_material_history, compact_context,
-    extract_token,
+    DEFAULT_RESUME_MAX_BYTES, ResumeError, add_live_child_material_history,
+    add_material_history, compact_context, extract_token,
 )
 from workstream_scope import repository_key, ScopeError, validate_relation_graph
 from workstream_successor import choose_disposition, SuccessorError
@@ -2223,18 +2223,22 @@ def stable_live_readback(
     transport: LinearGraphQLTransport,
     comments: LinearCommentEventAdapter,
     token: str, *, include_description: bool = False,
+    include_child_comments: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Double-collect both surfaces and refuse a mixed concurrent snapshot."""
     graph_before = transport.snapshot_for_root(
         token, include_description=include_description,
+        include_child_comments=include_child_comments,
     )
     comments_before = comments.comments()
     graph_after = transport.snapshot_for_root(
         token, include_description=include_description,
+        include_child_comments=include_child_comments,
     )
     comments_after = comments.comments()
     graph_fence = transport.snapshot_for_root(
         token, include_description=include_description,
+        include_child_comments=include_child_comments,
     )
     if (
         graph_before != graph_after
@@ -3376,7 +3380,6 @@ def main() -> int:
             client, team_id=route["team_id"], workspace_id=route["workspace_id"],
             project_id=route["project_id"],
         )
-        graph = transport.snapshot_for_root(token, include_description=True)
         comment_adapter = LinearCommentEventAdapter(
             client, issue_id=token, workspace_id=route["workspace_id"],
             team_id=route["team_id"], project_id=route["project_id"],
@@ -3387,7 +3390,10 @@ def main() -> int:
             team_id=route["team_id"], project_id=route["project_id"],
             root_issue_id=route["root_issue_id"],
         )
-        comments = comment_adapter.comments()
+        graph, comments = stable_live_readback(
+            transport, comment_adapter, token, include_description=True,
+            include_child_comments=True,
+        )
         description = graph["root"].get("description")
         description_fence = canonical_source_diagnostic_fence(description)
         generation_binding = projection_generation_source_binding(
@@ -3400,6 +3406,9 @@ def main() -> int:
             graph, comments, workstream_id=token,
             requested_plan_revision=plan_revision,
             authenticated_route=route,
+        )
+        graph = add_live_child_material_history(
+            graph, authenticated_route=route,
         )
         projection_state = adapter.state()
         manifest, authenticated_source = synchronize_manifest_source(
@@ -3477,6 +3486,15 @@ def main() -> int:
         def projection_input_fence() -> str:
             live_graph, live_comments = stable_live_readback(
                 transport, comment_adapter, token,
+                include_child_comments=True,
+            )
+            live_graph = bind_projection_plan_generation(
+                live_graph, live_comments, workstream_id=token,
+                requested_plan_revision=plan_revision,
+                authenticated_route=route,
+            )
+            live_graph = add_live_child_material_history(
+                live_graph, authenticated_route=route,
             )
             return projection_input_frontier_sha256(
                 live_graph, live_comments,
@@ -3521,6 +3539,7 @@ def main() -> int:
         )
         graph_after, comments_after = stable_live_readback(
             transport, final_comments, token, include_description=True,
+            include_child_comments=True,
         )
         validate_canonical_source_readback(
             graph_after["root"].get("description"), description_fence,
@@ -3529,6 +3548,9 @@ def main() -> int:
             graph_after, comments_after, workstream_id=token,
             requested_plan_revision=plan_revision,
             authenticated_route=route,
+        )
+        graph_after = add_live_child_material_history(
+            graph_after, authenticated_route=route,
         )
         graph_after = deepcopy(graph_after)
         graph_after["root"].pop("description", None)

@@ -33,7 +33,8 @@ from workstream_linear_projection import (
     LinearProjectionError, projection_slot_id, reduce_projection_comments, TOMBSTONE,
 )
 from workstream_resume import (
-    add_child_material_history, add_material_history, compact_context, ResumeError,
+    add_child_material_history, add_live_child_material_history,
+    add_material_history, compact_context, ResumeError,
 )
 from workstream_relation_readback import RelationReadbackError
 import workstream_projection
@@ -76,6 +77,28 @@ AUTHORITY = {
     "workspace_id": "workspace", "team_id": "team", "project_id": "project",
     "root_issue_id": ROOT_UUID,
 }
+
+
+def live_graph_with_empty_child_comments(graph):
+    """Shape a mocked transport response like include_child_comments=True."""
+    result = deepcopy(graph)
+    for index, child in enumerate(result.get("children", [])):
+        child.setdefault("id", f"mock-child-{index}")
+        child.setdefault("parent", {
+            "id": ROOT_UUID, "identifier": "GEN-37",
+        })
+        child.setdefault("team", {
+            "id": AUTHORITY["team_id"],
+            "organization": {"id": AUTHORITY["workspace_id"]},
+        })
+        child.setdefault("project", {"id": AUTHORITY["project_id"]})
+    result["child_comments"] = {
+        str(child.get("identifier", "")).upper(): []
+        for child in result.get("children", [])
+        if str(child.get("status_type") or child.get("status") or "").lower()
+        not in {"done", "completed", "cancelled", "canceled", "superseded"}
+    }
+    return result
 
 
 def projection_comment(event):
@@ -1525,6 +1548,92 @@ class ProjectionTests(unittest.TestCase):
                 compact["projection_head"]["event_id"],
                 r"^wsp_[0-9a-f]{32}$",
             )
+
+    def test_projection_budget_preflight_includes_child_history_and_checkpoint_relief(self):
+        """A GEN-37-like root-only preview must not undercount open children."""
+        strict, _contracts = self.gen37_production_shaped_fixture()
+        raw = deepcopy(strict)
+        for child in raw["children"]:
+            if child["identifier"] not in {"GEN-43", "GEN-85"}:
+                continue
+            for key in (
+                "issue_next_action", "material_events", "material_event_revision",
+                "checkpoint_history", "latest_checkpoint", "checkpoint_recovery",
+                "blocker",
+            ):
+                child.pop(key, None)
+            child["next_action"] = "Continue the open child."
+
+        events = [
+            Delta(
+                f"gen43-uncheckpointed-{index}", "GEN-43", "requirement",
+                "agent", {"requirement": f"Requirement {index}: " + "x" * 900},
+                index, f"2026-08-29T20:{index:02d}:00Z",
+            )
+            for index in range(16)
+        ]
+        event_comments = [
+            {"id": f"gen43-event-{index}", "body": encode_event_comment(event)}
+            for index, event in enumerate(events)
+        ]
+        raw["child_comments"] = {"GEN-43": event_comments, "GEN-85": []}
+
+        root_only = deepcopy(raw)
+        root_only.pop("child_comments")
+        root_context = compact_context(
+            root_only, "GEN-37", max_bytes=1024 * 1024, max_items=500,
+            require_projection_authority=True,
+        )
+        child_aware = add_live_child_material_history(
+            raw, authenticated_route=AUTHORITY,
+        )
+        child_context = compact_context(
+            child_aware, "GEN-37", max_bytes=1024 * 1024, max_items=500,
+            require_projection_authority=True,
+        )
+        encode = lambda value: json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()
+        root_bytes = len(encode(root_context))
+        child_bytes = len(encode(child_context))
+        cap = (root_bytes + child_bytes) // 2
+        self.assertLess(root_bytes, cap)
+        self.assertGreater(child_bytes, cap)
+
+        comments_before = deepcopy(raw["child_comments"])
+        with self.assertRaisesRegex(ResumeError, "resume_context_over_budget"):
+            compact_context(
+                child_aware, "GEN-37", max_bytes=cap, max_items=500,
+                require_projection_authority=True,
+            )
+        self.assertEqual(raw["child_comments"], comments_before)
+
+        checkpoint = build_checkpoint(
+            workstream_id="GEN-43", boundary_id="gen43-after-requirements",
+            root_revision=len(events), plan_revision=PLAN,
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai",
+                "session_id": "session-after-checkpoint", "machine": "M5",
+                "worktree": {"state": "unavailable"},
+            },
+            exact_head=None, evidence=[], blocker=None,
+            next_action="Implement the checkpointed requirements.",
+        )
+        checkpointed = deepcopy(raw)
+        checkpointed["child_comments"]["GEN-43"].append({
+            "id": "gen43-checkpoint-after-requirements",
+            "body": encode_checkpoint_comment(checkpoint),
+        })
+        checkpointed = add_live_child_material_history(
+            checkpointed, authenticated_route=AUTHORITY,
+        )
+        resumed = compact_context(
+            checkpointed, "GEN-37", max_bytes=cap, max_items=500,
+            require_projection_authority=True,
+        )
+        self.assertEqual(resumed["resume_authority"], "full")
+        self.assertLessEqual(len(encode(resumed)), cap)
 
     def test_compact_resume_builds_launch_profile_without_authority_rehydration(self):
         strict, _contracts = self.gen37_production_shaped_fixture()
@@ -6815,7 +6924,9 @@ class ProjectionTests(unittest.TestCase):
             dict(item) for item in client.comments
         ]
         transport = mock.Mock()
-        transport.snapshot_for_root.return_value = graph
+        transport.snapshot_for_root.return_value = (
+            live_graph_with_empty_child_comments(graph)
+        )
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = Path(directory) / "source-transition.json"
             manifest_path.write_text(json.dumps(manifest))
@@ -6856,8 +6967,11 @@ class ProjectionTests(unittest.TestCase):
                 "id": "81818181-8181-4181-8181-818181818181"
             }
             transport.snapshot_for_root.side_effect = [
-                graph, graph, graph,
-                changed_graph, changed_graph, changed_graph,
+                *[live_graph_with_empty_child_comments(graph) for _ in range(3)],
+                *[
+                    live_graph_with_empty_child_comments(changed_graph)
+                    for _ in range(3)
+                ],
             ]
             error = io.StringIO()
             with mock.patch.object(workstream_projection.sys, "argv", argv), \
@@ -7132,9 +7246,14 @@ class ProjectionTests(unittest.TestCase):
             ]
             transport = mock.Mock()
             if graph_side_effect is None:
-                transport.snapshot_for_root.return_value = live_graph
+                transport.snapshot_for_root.return_value = (
+                    live_graph_with_empty_child_comments(live_graph)
+                )
             else:
-                transport.snapshot_for_root.side_effect = graph_side_effect
+                transport.snapshot_for_root.side_effect = [
+                    live_graph_with_empty_child_comments(item)
+                    for item in graph_side_effect
+                ]
             with tempfile.TemporaryDirectory() as directory:
                 plan_path = Path(directory) / "plan.md"
                 manifest_path = Path(directory) / "manifest.json"
@@ -7237,7 +7356,10 @@ class ProjectionTests(unittest.TestCase):
         count = len(failed.comments)
         code, _output, error = invoke(
             failed, manifest_for(failed), graph(description), target_identity,
-            graph_side_effect=[graph(description), changed],
+            graph_side_effect=[
+                graph(description), graph(description), graph(description),
+                changed,
+            ],
         )
         self.assertEqual(code, 2)
         self.assertIn("canonical_plan_changed_during_projection", error)
@@ -7515,7 +7637,9 @@ class ProjectionTests(unittest.TestCase):
         client.comments.append(dict(historical_comment))
         comments.comments.side_effect = lambda: [dict(item) for item in client.comments]
         transport = mock.Mock()
-        transport.snapshot_for_root.return_value = graph
+        transport.snapshot_for_root.return_value = (
+            live_graph_with_empty_child_comments(graph)
+        )
         with tempfile.TemporaryDirectory() as directory:
             plan_path = Path(directory) / "plan.md"
             manifest_path = Path(directory) / "manifest.json"
@@ -7576,7 +7700,9 @@ class ProjectionTests(unittest.TestCase):
             dict(item) for item in client.comments
         ]
         transport = mock.Mock()
-        transport.snapshot_for_root.return_value = graph
+        transport.snapshot_for_root.return_value = (
+            live_graph_with_empty_child_comments(graph)
+        )
         expected_writes = len(client.comments) + 2
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = Path(directory) / "manifest.json"
