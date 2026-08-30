@@ -1539,6 +1539,71 @@ class GenerationTransitionTests(unittest.TestCase):
         )["plan_revision"], new_digest)
         self.assertTrue(compact.called)
 
+        checkpoint_client = FakeClient()
+        checkpoint_client.description = (
+            f"Plan revision: {old_digest}\nNext action: Continue."
+        )
+        project_full(checkpoint_client, old_digest, identity=old_plan.name)
+        project_full(checkpoint_client, new_digest, identity=new_plan.name)
+        checkpoint_old = adapter(checkpoint_client, old_digest).state()
+        checkpoint_retirement = build_retirement_proof(
+            predecessor_plan_revision=old_digest, retired_at="checkpoint",
+            retired_writer_epoch=0,
+            provenance_event_ids=[
+                event["event_id"] for event in checkpoint_old.events
+                if event["kind"] == "provenance"
+            ],
+            checkpoint_event_ids=[],
+        )
+        activation_checkpoint = build_checkpoint(
+            workstream_id=WORKSTREAM, boundary_id="production-main-activation",
+            root_revision=0, plan_revision=new_digest,
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai",
+                "session_id": "production-main", "machine": "M5",
+                "worktree": {
+                    "state": "safe", "path": "/tmp/production-main",
+                    "branch": "activation", "head": "e" * 40,
+                },
+            },
+            exact_head="e" * 40, evidence=[], blocker=None,
+            next_action="Continue after atomic activation.",
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as proof, \
+                tempfile.NamedTemporaryFile("w", suffix=".json") as checkpoint_file:
+            json.dump(checkpoint_retirement, proof)
+            proof.flush()
+            json.dump(activation_checkpoint, checkpoint_file)
+            checkpoint_file.flush()
+            code, raw, error, compact = invoke(checkpoint_client, [
+                "activate", WORKSTREAM, "--plan-source", new_plan.name,
+                "--plan-identity", new_plan.name,
+                "--retirement-proof", proof.name,
+                "--activation-checkpoint", checkpoint_file.name,
+                "--remote-head", "e" * 40,
+                "--created-at", "checkpoint", "--apply",
+            ])
+        self.assertEqual((code, error), (0, ""))
+        checkpoint_output = json.loads(raw)
+        self.assertEqual(checkpoint_output["final_active_plan_revision"], new_digest)
+        transition = adapter(checkpoint_client, old_digest).state().events[-1]
+        self.assertEqual(transition["value"]["schema_version"], 3)
+        selected = select_plan_generation(
+            checkpoint_client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=old_digest, authenticated_route=AUTHORITY,
+        )
+        carried = selected_activation_checkpoints(
+            checkpoint_client.comments, workstream_id=WORKSTREAM,
+            transition_event_id=selected["transition_tip_event_id"],
+            active_plan_revision=new_digest, authenticated_route=AUTHORITY,
+        )
+        self.assertEqual(carried[0][0]["event_id"], activation_checkpoint["event_id"])
+        self.assertTrue(all(
+            call.kwargs["max_bytes"] == 24 * 1024
+            for call in compact.call_args_list
+        ))
+
         later_plan, later_digest = plan_file("# Later plan\n")
         self.addCleanup(later_plan.close)
         project_full(activate_client, later_digest, identity=later_plan.name)
