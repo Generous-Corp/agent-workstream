@@ -78,6 +78,10 @@ GENERATION_CONTROL_FIELDS = {
     *GENERATION_SEAL_FIELDS, "candidate_seal_event_id",
     "candidate_seal_sha256",
 }
+GENERATION_CONTROL_V3_FIELDS = {
+    *GENERATION_CONTROL_FIELDS,
+    "activation_checkpoint", "activation_checkpoint_sha256",
+}
 
 
 class LinearProjectionError(LinearTransportError):
@@ -370,7 +374,7 @@ def validate_projection_event(event: dict[str, Any]) -> None:
                 "intervening_event_ids", "intervening_events_sha256",
                 "original_occupant_event_id",
             }
-            or value.get("schema_version") != 2
+            or value.get("schema_version") != schema_version
             or not re.fullmatch(
                 r"wsgr_[0-9a-f]{32}", str(value.get("reservation_id", ""))
             )
@@ -405,13 +409,21 @@ def validate_projection_event(event: dict[str, Any]) -> None:
         required_fields = (
             GENERATION_SEAL_FIELDS
             if event["kind"] == "generation_candidate_seal"
-            else GENERATION_CONTROL_FIELDS
+            else (
+                GENERATION_CONTROL_V3_FIELDS
+                if event["kind"] == "generation_transition"
+                and value.get("schema_version") == 3
+                else GENERATION_CONTROL_FIELDS
+            )
         )
         if (
-            schema_version != 2 or tombstone
+            schema_version != 2
+            or tombstone
             or event["supersedes_event_id"] is not None
             or set(value) != required_fields
-            or value.get("schema_version") != 2
+            or value.get("schema_version") not in (
+                {2, 3} if event["kind"] == "generation_transition" else {2}
+            )
             or not isinstance(value.get("from"), dict)
             or not isinstance(value.get("to"), dict)
             or set(value["from"]) != GENERATION_FRONTIER_FIELDS
@@ -513,6 +525,32 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("candidate_seal_sha256", "")))
         ):
             raise LinearProjectionError(error_name)
+        if (
+            event["kind"] == "generation_transition"
+            and value.get("schema_version") == 3
+        ):
+            from workstream_checkpoint import validate_checkpoint
+
+            checkpoint = value.get("activation_checkpoint")
+            try:
+                if not isinstance(checkpoint, dict):
+                    raise ValueError("checkpoint missing")
+                validate_checkpoint(checkpoint)
+            except (ValueError, TypeError) as error:
+                raise LinearProjectionError(error_name) from error
+            if (
+                checkpoint["workstream_id"] != event["workstream_id"]
+                or checkpoint["plan_revision"] != value["to"]["plan_revision"]
+                or checkpoint["root_revision"] != value["to"]["material_revision"]
+                or checkpoint["acknowledgement"] != {
+                    "state": "pending", "remote_id": None,
+                    "applied_revision": None,
+                }
+                or checkpoint["event_id"] not in value["to"]["checkpoint_event_ids"]
+                or value["activation_checkpoint_sha256"]
+                != hashlib.sha256(_canonical(checkpoint)).hexdigest()
+            ):
+                raise LinearProjectionError(error_name)
     if event["kind"] == "cas_activation":
         historical_fields = {"legacy_event_ids", "legacy_events_sha256"}
         tagged_fields = {*historical_fields, "legacy_digest_kind"}
@@ -1394,22 +1432,44 @@ def reduce_projection_comments(
 
 def _generation_checkpoint_ids(
     comments: list[dict[str, Any]], *, workstream_id: str, plan_revision: str,
+    authorized_activation_event_ids: frozenset[str] = frozenset(),
 ) -> list[str]:
     from workstream_linear_checkpoints import reduce_checkpoint_comments
 
     checkpoints = reduce_checkpoint_comments(
         comments, workstream_id=workstream_id,
     ).checkpoints
-    return sorted(
+    result = {
         item["event_id"] for item in checkpoints
         if item["plan_revision"] == plan_revision
-    )
+    }
+    if authorized_activation_event_ids:
+        for comment in comments:
+            body = comment.get("body") or ""
+            if not isinstance(body, str) or PROJECTION_PREFIX not in body:
+                continue
+            matches = PROJECTION_RE.findall(body)
+            if len(matches) != 1 or body.count(PROJECTION_PREFIX) != 1:
+                raise LinearProjectionError("malformed_projection_marker")
+            event = _decode_projection(matches[0])
+            if event["event_id"] not in authorized_activation_event_ids:
+                continue
+            checkpoint = event.get("value", {}).get("activation_checkpoint")
+            if (
+                event.get("kind") != "generation_transition"
+                or checkpoint is None
+                or checkpoint.get("plan_revision") != plan_revision
+            ):
+                continue
+            result.add(checkpoint["event_id"])
+    return sorted(result)
 
 
 def _generation_frontier(
     state: ReducedProjection, comments: list[dict[str, Any]], *,
     plan_revision: str, projection_revision: int | None = None,
     material_revision: int,
+    authorized_activation_event_ids: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     revision = state.revision if projection_revision is None else projection_revision
     if revision <= 0 or revision > state.revision:
@@ -1442,6 +1502,7 @@ def _generation_frontier(
     checkpoint_event_ids = _generation_checkpoint_ids(
         comments, workstream_id=state.workstream_id,
         plan_revision=plan_revision,
+        authorized_activation_event_ids=authorized_activation_event_ids,
     )
     return {
         "plan_revision": plan_revision,
@@ -1463,6 +1524,7 @@ def _assert_generation_frontier(
     expected: dict[str, Any], state: ReducedProjection,
     comments: list[dict[str, Any]], *, material_revision: int,
     exact_checkpoints: bool,
+    authorized_activation_event_ids: frozenset[str] = frozenset(),
 ) -> None:
     if expected["material_revision"] > material_revision:
         raise LinearProjectionError("generation_transition_frontier_mismatch")
@@ -1470,6 +1532,7 @@ def _assert_generation_frontier(
         state, comments, plan_revision=expected["plan_revision"],
         projection_revision=expected["projection_revision"],
         material_revision=expected["material_revision"],
+        authorized_activation_event_ids=authorized_activation_event_ids,
     )
     observed_checkpoints = observed.pop("checkpoint_event_ids")
     observed.pop("checkpoint_events_sha256")
@@ -1578,6 +1641,7 @@ def select_plan_generation(
         raise LinearProjectionError("generation_control_orphan_or_cycle")
 
     previous = None
+    authorized_activation_event_ids: set[str] = set()
     for event in ordered:
         value = event["value"]
         if previous is not None and (
@@ -1609,6 +1673,9 @@ def select_plan_generation(
             value["from"], from_state, comments,
             material_revision=material_revision,
             exact_checkpoints=(event["kind"] != "generation_genesis"),
+            authorized_activation_event_ids=frozenset(
+                authorized_activation_event_ids
+            ),
         )
         if event["kind"] == "generation_genesis":
             position = value["from"]["projection_revision"]
@@ -1623,6 +1690,9 @@ def select_plan_generation(
         _assert_generation_frontier(
             value["to"], to_state, comments,
             material_revision=material_revision, exact_checkpoints=False,
+            authorized_activation_event_ids=frozenset({
+                *authorized_activation_event_ids, event["event_id"],
+            }),
         )
         position = value["from"]["projection_revision"]
         if (
@@ -1650,8 +1720,12 @@ def select_plan_generation(
         if _generation_checkpoint_ids(
             comments, workstream_id=workstream_id,
             plan_revision=value["from"]["plan_revision"],
+            authorized_activation_event_ids=frozenset({
+                *authorized_activation_event_ids, event["event_id"],
+            }),
         ) != value["from"]["checkpoint_event_ids"]:
             raise LinearProjectionError("generation_transition_predecessor_checkpoint_changed")
+        authorized_activation_event_ids.add(event["event_id"])
         previous = event
 
     tip = ordered[-1]

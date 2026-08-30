@@ -14,7 +14,9 @@ from workstream_delta import Delta
 from workstream_generation import (
     GenerationTransport, WorkstreamGenerationError, _digest,
     build_retirement_proof, generation_quarantine_metadata, main, parser,
-    pending_generation_reservations, strict_candidate_loader,
+    pending_generation_reservations, reduce_generation_checkpoint_comments,
+    selected_activation_checkpoints,
+    strict_candidate_loader,
 )
 from workstream_checkpoint import build_checkpoint
 from workstream_linear import LinearTransportError
@@ -186,7 +188,10 @@ class Loader:
             authenticated_route=AUTHORITY,
         )
         source = state.snapshot["source"]
-        checkpoints = reduce_checkpoint_comments(comments, workstream_id=WORKSTREAM)
+        checkpoints = reduce_generation_checkpoint_comments(
+            comments, workstream_id=WORKSTREAM,
+            authenticated_route=AUTHORITY,
+        )
         checkpoint_ids = sorted(item["event_id"] for item in checkpoints.checkpoints
                                 if item["plan_revision"] == plan)
         material = reduce_event_comments(comments, workstream_id=WORKSTREAM)
@@ -211,6 +216,25 @@ class Loader:
         }
 
 
+class ActivationCheckpointLoader(Loader):
+    def __init__(self, client, checkpoint):
+        super().__init__(client)
+        self.checkpoint = checkpoint
+
+    def __call__(self, plan):
+        receipt = super().__call__(plan)
+        ids = sorted(set([
+            *receipt["checkpoint_event_ids"], self.checkpoint["event_id"],
+        ])) if plan == self.checkpoint["plan_revision"] else receipt[
+            "checkpoint_event_ids"
+        ]
+        receipt["checkpoint_event_ids"] = ids
+        receipt["snapshot_sha256"] = _digest({
+            "base": receipt["snapshot_sha256"], "checkpoint_event_ids": ids,
+        })
+        return receipt
+
+
 class GenerationTransitionTests(unittest.TestCase):
     def setUp(self):
         self.client = FakeClient()
@@ -224,8 +248,9 @@ class GenerationTransitionTests(unittest.TestCase):
 
     def retirement(self, predecessor=OLD, epoch=0):
         state = adapter(self.client, predecessor).state()
-        checkpoints = reduce_checkpoint_comments(
+        checkpoints = reduce_generation_checkpoint_comments(
             self.client.comments, workstream_id=WORKSTREAM,
+            authenticated_route=AUTHORITY,
         )
         return build_retirement_proof(
             predecessor_plan_revision=predecessor, retired_at="now",
@@ -245,6 +270,366 @@ class GenerationTransitionTests(unittest.TestCase):
             target_plan_revision=target, created_at="now",
             retirement=self.retirement(predecessor, epoch),
         )
+
+    def activation_checkpoint(self, **changes):
+        values = {
+            "workstream_id": WORKSTREAM, "boundary_id": "activate-new",
+            "root_revision": 0, "plan_revision": NEW,
+            "before_status": "In Progress", "after_status": "In Progress",
+            "execution": {
+                "agent": "codex", "provider": "openai", "session_id": "new",
+                "machine": "M5", "worktree": {
+                    "state": "safe", "path": "/tmp/new", "branch": "new",
+                    "head": "e" * 40,
+                },
+            },
+            "exact_head": "e" * 40, "evidence": [], "blocker": None,
+            "next_action": "Continue the activated target generation.",
+        }
+        values.update(changes)
+        return build_checkpoint(**values)
+
+    def test_activation_checkpoint_is_inert_until_transition_and_replays(self):
+        project_full(self.client, NEW)
+        checkpoint = self.activation_checkpoint()
+        self.loader = ActivationCheckpointLoader(self.client, checkpoint)
+        self.transport.candidate_loader = self.loader
+        receipt = self.transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(), activation_checkpoint=checkpoint,
+            remote_head="e" * 40,
+        )
+        transition = adapter(self.client, OLD).state().events[-1]
+        self.assertEqual(transition["kind"], "generation_transition")
+        self.assertEqual(transition["value"]["schema_version"], 3)
+        self.assertEqual(
+            transition["value"]["activation_checkpoint"]["event_id"],
+            checkpoint["event_id"],
+        )
+        selected = select_plan_generation(
+            self.client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=OLD, authenticated_route=AUTHORITY,
+        )
+        carried = selected_activation_checkpoints(
+            self.client.comments, workstream_id=WORKSTREAM,
+            transition_event_id=selected["transition_tip_event_id"],
+            active_plan_revision=NEW, authenticated_route=AUTHORITY,
+        )
+        recovered = reduce_checkpoint_comments(
+            self.client.comments, workstream_id=WORKSTREAM,
+            selected_activation_checkpoints=carried,
+        )
+        self.assertIn(checkpoint["event_id"], {
+            item["event_id"] for item in recovered.checkpoints
+        })
+        target = adapter(self.client, NEW).state()
+        self.assertEqual(target.snapshot["disposition"], {
+            "disposition": "attach", "remote_head": "e" * 40,
+            "recovered_from_checkpoint": checkpoint["event_id"],
+        })
+        count = len(self.client.mutations)
+        replay = self.transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(), activation_checkpoint=checkpoint,
+            remote_head="e" * 40,
+        )
+        self.assertEqual(replay["event_id"], receipt["event_id"])
+        self.assertEqual(len(self.client.mutations), count)
+
+    def test_activation_checkpoint_crash_after_disposition_keeps_old_active(self):
+        project_full(self.client, NEW)
+        checkpoint = self.activation_checkpoint()
+        self.loader = ActivationCheckpointLoader(self.client, checkpoint)
+        self.transport.candidate_loader = self.loader
+        original = self.transport._append_reservation
+        self.transport._append_reservation = lambda _value: (_ for _ in ()).throw(
+            WorkstreamGenerationError("crash after disposition")
+        )
+        with self.assertRaisesRegex(WorkstreamGenerationError, "crash after"):
+            self.transport.activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=self.retirement(), activation_checkpoint=checkpoint,
+                remote_head="e" * 40,
+            )
+        self.assertEqual(select_plan_generation(
+            self.client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=OLD, authenticated_route=AUTHORITY,
+        )["plan_revision"], OLD)
+        self.assertFalse(any(
+            item["event_id"] == checkpoint["event_id"]
+            for item in reduce_checkpoint_comments(
+                self.client.comments, workstream_id=WORKSTREAM,
+            ).checkpoints
+        ))
+        self.transport._append_reservation = original
+        self.transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(), activation_checkpoint=checkpoint,
+            remote_head="e" * 40,
+        )
+
+    def test_activation_checkpoint_crash_then_plain_retry_refuses(self):
+        project_full(self.client, NEW)
+        checkpoint = self.activation_checkpoint()
+        self.transport.candidate_loader = ActivationCheckpointLoader(
+            self.client, checkpoint,
+        )
+        original = self.transport._append_reservation
+        self.transport._append_reservation = lambda _value: (_ for _ in ()).throw(
+            WorkstreamGenerationError("crash after disposition")
+        )
+        with self.assertRaisesRegex(WorkstreamGenerationError, "crash after"):
+            self.transport.activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=self.retirement(), activation_checkpoint=checkpoint,
+                remote_head="e" * 40,
+            )
+        self.transport._append_reservation = original
+        self.transport.candidate_loader = Loader(self.client)
+        count = len(self.client.mutations)
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_prepared_activation_checkpoint_required",
+        ):
+            self.transport.activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=self.retirement(),
+            )
+        self.assertEqual(len(self.client.mutations), count)
+        self.assertEqual(select_plan_generation(
+            self.client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=OLD, authenticated_route=AUTHORITY,
+        )["plan_revision"], OLD)
+
+    def test_activation_checkpoint_historical_replay_requires_exact_inputs(self):
+        project_full(self.client, NEW)
+        checkpoint = self.activation_checkpoint()
+        self.transport.candidate_loader = ActivationCheckpointLoader(
+            self.client, checkpoint,
+        )
+        retirement = self.retirement()
+        self.transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=retirement, activation_checkpoint=checkpoint,
+            remote_head="e" * 40,
+        )
+        count = len(self.client.mutations)
+        different = self.activation_checkpoint(boundary_id="different")
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_historical_replay_checkpoint_mismatch",
+        ):
+            self.transport.activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=retirement, activation_checkpoint=different,
+                remote_head="f" * 40,
+            )
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_historical_replay_remote_head_mismatch",
+        ):
+            self.transport.activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=retirement, activation_checkpoint=checkpoint,
+                remote_head="f" * 40,
+            )
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_historical_replay_checkpoint_mismatch",
+        ):
+            self.transport.activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=retirement,
+            )
+        self.assertEqual(len(self.client.mutations), count)
+        target = adapter(self.client, NEW)
+        target_state = target.state()
+        prior_disposition = next(
+            event for event in reversed(target_state.events)
+            if event["kind"] == "disposition" and event["key"] == "root"
+        )
+        target.append(build_projection_event(
+            workstream_id=WORKSTREAM, kind="disposition", key="root",
+            value={
+                "disposition": "create_successor", "remote_head": "a" * 40,
+                "recovered_from_checkpoint": checkpoint["event_id"],
+            },
+            plan_revision=NEW, expected_revision=target_state.revision,
+            created_at="later", supersedes_event_id=prior_disposition["event_id"],
+            authority=AUTHORITY,
+        ))
+        count = len(self.client.mutations)
+        replay = self.transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=retirement, activation_checkpoint=checkpoint,
+            remote_head="e" * 40,
+        )
+        self.assertTrue(replay["replay"])
+        self.assertEqual(len(self.client.mutations), count)
+
+    def test_activation_checkpoint_contradiction_refuses_without_mutation(self):
+        project_full(self.client, NEW)
+        checkpoint = self.activation_checkpoint(plan_revision=OTHER)
+        count = len(self.client.mutations)
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError, "activation_checkpoint_mismatch",
+        ):
+            self.transport.activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=self.retirement(), activation_checkpoint=checkpoint,
+                remote_head="e" * 40,
+            )
+        self.assertEqual(len(self.client.mutations), count)
+
+    def test_activation_checkpoint_requires_authenticated_selected_chain(self):
+        project_full(self.client, NEW)
+        checkpoint = self.activation_checkpoint()
+        self.transport.candidate_loader = ActivationCheckpointLoader(
+            self.client, checkpoint,
+        )
+        self.transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(), activation_checkpoint=checkpoint,
+            remote_head="e" * 40,
+        )
+        selected = select_plan_generation(
+            self.client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=OLD, authenticated_route=AUTHORITY,
+        )
+        transition = adapter(self.client, OLD).state().events[-1]
+
+        # A syntactically valid sibling is not a second checkpoint authority.
+        fork = build_projection_event(
+            workstream_id=WORKSTREAM, kind="generation_transition", key="root",
+            value=transition["value"], plan_revision=OLD,
+            expected_revision=transition["expected_revision"],
+            created_at="fork", authority=AUTHORITY,
+        )
+        self.client.comments.append({
+            "id": "fork", "body": encode_projection_comment(fork),
+        })
+        with self.assertRaisesRegex(
+            LinearProjectionError, "fork|conflict|slot_identity_mismatch",
+        ):
+            selected_activation_checkpoints(
+                self.client.comments, workstream_id=WORKSTREAM,
+                transition_event_id=selected["transition_tip_event_id"],
+                active_plan_revision=NEW, authenticated_route=AUTHORITY,
+            )
+        self.client.comments.pop()
+
+        # A route-forged transition also closes authority rather than injecting.
+        forged_authority = {**AUTHORITY, "project_id": "forged"}
+        forged = build_projection_event(
+            workstream_id=WORKSTREAM, kind="generation_transition", key="root",
+            value=transition["value"], plan_revision=OLD,
+            expected_revision=transition["expected_revision"],
+            created_at="forged", authority=forged_authority,
+        )
+        self.client.comments.append({
+            "id": "forged", "body": encode_projection_comment(forged),
+        })
+        with self.assertRaisesRegex(LinearProjectionError, "route_mismatch"):
+            selected_activation_checkpoints(
+                self.client.comments, workstream_id=WORKSTREAM,
+                transition_event_id=selected["transition_tip_event_id"],
+                active_plan_revision=NEW, authenticated_route=AUTHORITY,
+            )
+
+    def test_activation_checkpoint_duplicate_physical_copy_refuses(self):
+        project_full(self.client, NEW)
+        checkpoint = self.activation_checkpoint()
+        self.transport.candidate_loader = ActivationCheckpointLoader(
+            self.client, checkpoint,
+        )
+        self.transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(), activation_checkpoint=checkpoint,
+            remote_head="e" * 40,
+        )
+        selected = select_plan_generation(
+            self.client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=OLD, authenticated_route=AUTHORITY,
+        )
+        carried = selected_activation_checkpoints(
+            self.client.comments, workstream_id=WORKSTREAM,
+            transition_event_id=selected["transition_tip_event_id"],
+            active_plan_revision=NEW, authenticated_route=AUTHORITY,
+        )
+        duplicate = [*self.client.comments, {
+            "id": "physical-copy", "body": encode_checkpoint_comment(checkpoint),
+        }]
+        with self.assertRaisesRegex(Exception, "duplicate_checkpoint_event_id"):
+            reduce_checkpoint_comments(
+                duplicate, workstream_id=WORKSTREAM,
+                selected_activation_checkpoints=carried,
+            )
+
+    def test_superseded_activation_checkpoint_remains_predecessor_history(self):
+        project_full(self.client, NEW)
+        first = self.activation_checkpoint()
+        self.transport.candidate_loader = ActivationCheckpointLoader(
+            self.client, first,
+        )
+        self.transport.activate(
+            target_plan_revision=NEW, created_at="first",
+            retirement=self.retirement(), activation_checkpoint=first,
+            remote_head="e" * 40,
+        )
+        project_full(self.client, LATER)
+        second = self.activation_checkpoint(
+            plan_revision=LATER, boundary_id="activate-later",
+            predecessor_event_id=None,
+        )
+        self.transport.candidate_loader = ActivationCheckpointLoader(
+            self.client, second,
+        )
+        self.transport.activate(
+            target_plan_revision=LATER, created_at="second",
+            retirement=self.retirement(NEW, 1), activation_checkpoint=second,
+            remote_head="e" * 40,
+        )
+        selected = select_plan_generation(
+            self.client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=OLD, authenticated_route=AUTHORITY,
+        )
+        carried = selected_activation_checkpoints(
+            self.client.comments, workstream_id=WORKSTREAM,
+            transition_event_id=selected["transition_tip_event_id"],
+            active_plan_revision=LATER, authenticated_route=AUTHORITY,
+        )
+        self.assertEqual(
+            {item[0]["event_id"] for item in carried},
+            {first["event_id"], second["event_id"]},
+        )
+
+    def test_ordinary_checkpoint_can_follow_activation_checkpoint(self):
+        project_full(self.client, NEW)
+        activation = self.activation_checkpoint()
+        self.transport.candidate_loader = ActivationCheckpointLoader(
+            self.client, activation,
+        )
+        self.transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(), activation_checkpoint=activation,
+            remote_head="e" * 40,
+        )
+        LinearCommentEventAdapter(
+            self.client, issue_id=WORKSTREAM, plan_revision=NEW, **AUTHORITY,
+        ).apply(Delta(
+            "after-activation", WORKSTREAM, "requirement", "successor",
+            {"requirement": "successor checkpoint material"}, 0, "after",
+        ))
+        successor = self.activation_checkpoint(
+            boundary_id="ordinary-successor",
+            root_revision=1,
+            predecessor_event_id=activation["event_id"],
+        )
+        persisted = LinearCheckpointAdapter(
+            self.client, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
+            workspace_id="workspace", team_id="team", project_id="project",
+        ).persist(successor)
+        self.assertEqual(persisted["event_id"], successor["event_id"])
 
     def test_legacy_description_compatibility_and_missing_description_bootstrap_gate(self):
         selected = select_plan_generation(
@@ -1076,6 +1461,135 @@ class GenerationTransitionTests(unittest.TestCase):
             self.assertEqual(loader_factory.call_args.kwargs["max_bytes"], 24 * 1024)
             self.assertEqual(loader_factory.call_args.kwargs["max_items"], 100)
 
+    def test_strict_activation_checkpoint_keeps_child_obligations_under_default_budget(self):
+        project_full(self.client, NEW)
+        target = adapter(self.client, NEW)
+        state = target.state()
+        prior_scope = next(
+            event for event in state.events
+            if event["kind"] == "scope" and event["key"] == "root"
+        )
+        owned_scope = deepcopy(prior_scope["value"])
+        owned_scope["child_ownership"]["GEN-43"] = "github.com:id:R_repo"
+        target.append(build_projection_event(
+            workstream_id=WORKSTREAM, kind="scope", key="root",
+            value=owned_scope, plan_revision=NEW,
+            expected_revision=state.revision, created_at="4",
+            supersedes_event_id=prior_scope["event_id"], authority=AUTHORITY,
+        ))
+        checkpoint = self.activation_checkpoint()
+        state = target.state()
+        prior_disposition = next(
+            event for event in state.events
+            if event["kind"] == "disposition" and event["key"] == "root"
+        )
+        target.append(build_projection_event(
+            workstream_id=WORKSTREAM, kind="disposition", key="root",
+            value={
+                "disposition": "attach", "remote_head": "e" * 40,
+                "recovered_from_checkpoint": checkpoint["event_id"],
+            },
+            plan_revision=NEW, expected_revision=state.revision,
+            created_at="5", supersedes_event_id=prior_disposition["event_id"],
+            authority=AUTHORITY,
+        ))
+        child_event = Delta(
+            "child-obligation", "GEN-43", "requirement", "agent",
+            {"requirement": "Finish the physical successor canary."},
+            0, "2026-08-29T00:00:00Z",
+        )
+        graph = {
+            "root": {
+                "id": AUTHORITY["root_issue_id"], "identifier": WORKSTREAM,
+                "url": "https://linear.test/GEN-37", "plan_revision": OLD,
+                "revision": 0, "status": "In Progress",
+                "next_action": "Activate the reviewed generation.",
+            },
+            "children": [{
+                "id": "44444444-4444-4444-8444-444444444444",
+                "identifier": "GEN-43", "url": "https://linear.test/GEN-43",
+                "title": "Physical successor canary", "status": "In Progress",
+                "status_type": "started", "next_action": "Run the canary.",
+                "parent": {"id": AUTHORITY["root_issue_id"],
+                           "identifier": WORKSTREAM},
+                "team": {"id": AUTHORITY["team_id"], "organization": {
+                    "id": AUTHORITY["workspace_id"],
+                }},
+                "project": {"id": AUTHORITY["project_id"]},
+            }],
+            "decisions": [],
+            "child_comments": {"GEN-43": [{
+                "id": "child-obligation-comment",
+                "body": encode_event_comment(child_event),
+            }]},
+        }
+        snapshot_transport = MagicMock()
+        snapshot_transport.snapshot_for_root.return_value = deepcopy(graph)
+        observed = {}
+
+        def capture_compact(snapshot, token, **kwargs):
+            result = real_compact_context(snapshot, token, **kwargs)
+            observed["snapshot"] = result
+            return result
+
+        with patch("workstream_generation.plan_payload", return_value={
+            "source": {"identity": f"https://example.test/{NEW}",
+                       "sha256": NEW},
+        }), patch("workstream_generation.LinearGraphQLTransport",
+                  return_value=snapshot_transport), patch(
+            "workstream_generation.compact_context", side_effect=capture_compact,
+        ):
+            receipt = strict_candidate_loader(
+                self.client, token=WORKSTREAM, authority=AUTHORITY,
+                plan_source="plan", plan_identity=None,
+                activation_checkpoint=checkpoint,
+            )(NEW)
+
+        self.assertEqual(receipt["resume_authority"], "full")
+        self.assertIn(checkpoint["event_id"], receipt["checkpoint_event_ids"])
+        self.assertEqual(
+            observed["snapshot"]["children"][0][
+                "uncheckpointed_material_obligations"
+            ][0]["event_id"],
+            child_event.event_id,
+        )
+        self.assertLess(
+            len(json.dumps(observed["snapshot"], sort_keys=True).encode()),
+            24 * 1024,
+        )
+
+    def test_activation_checkpoint_cli_refuses_custom_item_budget(self):
+        checkpoint = self.activation_checkpoint()
+        with tempfile.NamedTemporaryFile("w", suffix=".md") as plan_file, \
+                tempfile.NamedTemporaryFile("w", suffix=".json") as proof_file, \
+                tempfile.NamedTemporaryFile("w", suffix=".json") as checkpoint_file:
+            plan_file.write("# plan\n")
+            plan_file.flush()
+            json.dump(self.retirement(), proof_file)
+            proof_file.flush()
+            json.dump(checkpoint, checkpoint_file)
+            checkpoint_file.flush()
+            argv = [
+                "workstream_generation.py", "activate", WORKSTREAM,
+                "--plan-source", plan_file.name,
+                "--retirement-proof", proof_file.name,
+                "--activation-checkpoint", checkpoint_file.name,
+                "--remote-head", "e" * 40,
+                "--max-items", "101", "--created-at", "now", "--apply",
+            ]
+            stderr = io.StringIO()
+            count = len(self.client.mutations)
+            with patch.object(sys, "argv", argv), patch(
+                "workstream_generation._route_and_client",
+                return_value=(self.client, AUTHORITY),
+            ), patch.object(sys, "stderr", stderr):
+                self.assertEqual(main(), 2)
+        self.assertIn(
+            "generation_activation_checkpoint_requires_default_resume_budget",
+            stderr.getvalue(),
+        )
+        self.assertEqual(len(self.client.mutations), count)
+
     def test_production_main_composes_real_bootstrap_activate_and_strict_reread(self):
         def plan_file(text):
             handle = tempfile.NamedTemporaryFile("w", suffix=".md")
@@ -1155,6 +1669,71 @@ class GenerationTransitionTests(unittest.TestCase):
             description_plan_revision=old_digest, authenticated_route=AUTHORITY,
         )["plan_revision"], new_digest)
         self.assertTrue(compact.called)
+
+        checkpoint_client = FakeClient()
+        checkpoint_client.description = (
+            f"Plan revision: {old_digest}\nNext action: Continue."
+        )
+        project_full(checkpoint_client, old_digest, identity=old_plan.name)
+        project_full(checkpoint_client, new_digest, identity=new_plan.name)
+        checkpoint_old = adapter(checkpoint_client, old_digest).state()
+        checkpoint_retirement = build_retirement_proof(
+            predecessor_plan_revision=old_digest, retired_at="checkpoint",
+            retired_writer_epoch=0,
+            provenance_event_ids=[
+                event["event_id"] for event in checkpoint_old.events
+                if event["kind"] == "provenance"
+            ],
+            checkpoint_event_ids=[],
+        )
+        activation_checkpoint = build_checkpoint(
+            workstream_id=WORKSTREAM, boundary_id="production-main-activation",
+            root_revision=0, plan_revision=new_digest,
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai",
+                "session_id": "production-main", "machine": "M5",
+                "worktree": {
+                    "state": "safe", "path": "/tmp/production-main",
+                    "branch": "activation", "head": "e" * 40,
+                },
+            },
+            exact_head="e" * 40, evidence=[], blocker=None,
+            next_action="Continue after atomic activation.",
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as proof, \
+                tempfile.NamedTemporaryFile("w", suffix=".json") as checkpoint_file:
+            json.dump(checkpoint_retirement, proof)
+            proof.flush()
+            json.dump(activation_checkpoint, checkpoint_file)
+            checkpoint_file.flush()
+            code, raw, error, compact = invoke(checkpoint_client, [
+                "activate", WORKSTREAM, "--plan-source", new_plan.name,
+                "--plan-identity", new_plan.name,
+                "--retirement-proof", proof.name,
+                "--activation-checkpoint", checkpoint_file.name,
+                "--remote-head", "e" * 40,
+                "--created-at", "checkpoint", "--apply",
+            ])
+        self.assertEqual((code, error), (0, ""))
+        checkpoint_output = json.loads(raw)
+        self.assertEqual(checkpoint_output["final_active_plan_revision"], new_digest)
+        transition = adapter(checkpoint_client, old_digest).state().events[-1]
+        self.assertEqual(transition["value"]["schema_version"], 3)
+        selected = select_plan_generation(
+            checkpoint_client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=old_digest, authenticated_route=AUTHORITY,
+        )
+        carried = selected_activation_checkpoints(
+            checkpoint_client.comments, workstream_id=WORKSTREAM,
+            transition_event_id=selected["transition_tip_event_id"],
+            active_plan_revision=new_digest, authenticated_route=AUTHORITY,
+        )
+        self.assertEqual(carried[0][0]["event_id"], activation_checkpoint["event_id"])
+        self.assertTrue(all(
+            call.kwargs["max_bytes"] == 24 * 1024
+            for call in compact.call_args_list
+        ))
 
         later_plan, later_digest = plan_file("# Later plan\n")
         self.addCleanup(later_plan.close)
