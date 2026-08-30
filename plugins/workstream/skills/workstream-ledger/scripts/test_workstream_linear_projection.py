@@ -39,6 +39,7 @@ from workstream_projection import (
     prepare_terminal_child_evidence_seeds, prepare_terminal_child_repairs,
     reconcile_required_projection,
     stable_live_readback,
+    terminal_child_evidence_seed_predecessor_contract,
 )
 from workstream_successor import choose_disposition
 from workstream_scope import repository_key
@@ -47,7 +48,8 @@ from workstream_projection_history import (
 )
 from workstream_closure import review as closure_review
 from workstream_child_closure import (
-    canonical_digest, ChildClosureError, terminal_child_readback,
+    canonical_digest, ChildClosureError, evidence_receipts_sha256,
+    terminal_child_readback,
 )
 
 
@@ -554,6 +556,340 @@ class ProjectionTests(unittest.TestCase):
             },
             "children": [],
         }
+
+    def mixed_head_plan_generation_fixture(self):
+        predecessor_plan = "b" * 64
+        first_head = "1" * 40
+        second_head = "2" * 40
+        client = FakeProjectionClient()
+        predecessor = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=predecessor_plan, **AUTHORITY,
+        )
+        identifiers = ["GEN-38", "GEN-39", "GEN-40", "GEN-41", "GEN-85"]
+        children = []
+        for offset, identifier in enumerate(identifiers, start=1):
+            children.append({
+                "id": f"{offset:08d}-0000-4000-8000-{offset:012d}",
+                "identifier": identifier, "title": f"terminal {identifier}",
+                "parent": {"id": ROOT_UUID, "identifier": "GEN-37"},
+                "team": {"id": "team", "organization": {"id": "workspace"}},
+                "project": {"id": "project"},
+                "assignee": {"id": f"owner-{identifier}"},
+                "state_id": f"done-{identifier}", "status": "Done",
+                "status_type": "completed",
+            })
+        predecessor_scope = scope()
+        predecessor_scope["repositories"][0]["exact_head"] = first_head
+        predecessor_scope["child_ownership"] = {
+            identifier: predecessor_scope["primary_repository"]
+            for identifier in identifiers
+        }
+
+        def append(kind, key, value):
+            previous = next((
+                event for event in reversed(predecessor.state().events)
+                if (event["kind"], event["key"]) == (kind, key)
+            ), None)
+            return predecessor.append(build_projection_event(
+                workstream_id="GEN-37", kind=kind, key=key, value=value,
+                plan_revision=predecessor_plan,
+                expected_revision=predecessor.state().revision,
+                created_at=(
+                    f"2026-08-29T20:{predecessor.state().revision:02d}:00Z"
+                ),
+                supersedes_event_id=(previous or {}).get("event_id"),
+                authority=AUTHORITY,
+            ))
+
+        append("scope", "root", predecessor_scope)
+        append("source", "root", {
+            "identity": "https://example.test/previous-plan",
+            "sha256": predecessor_plan,
+        })
+        append("provenance", "previous", {
+            "agent": "codex", "machine": "M5", "session_id": "previous",
+            "worktree": {"state": "safe", "head": second_head},
+        })
+        contracts = {}
+        for child in children[:4]:
+            contract = evidence_contract()
+            contract["slice_id"] = f"{child['identifier'].lower()}-terminal"
+            contract["owning_child"] = child["identifier"]
+            contract["plan_revision"] = predecessor_plan
+            contract["exact_head"] = first_head
+            for layer in contract["layers"].values():
+                for receipt in layer.get("receipts", []):
+                    receipt["exact_head"] = first_head
+            append("evidence_contract", contract["slice_id"], contract)
+            evidence_event = predecessor.state().events[-1]
+            readback = terminal_child_readback(child)
+            closure = {
+                "schema_version": 2, **readback,
+                "plan_revision": predecessor_plan,
+                "repository_key": contract["repository_key"],
+                "exact_head": first_head,
+                "evidence_heads": [{
+                    "key": evidence_event["key"],
+                    "event_id": evidence_event["event_id"],
+                    "value_sha256": canonical_digest(evidence_event["value"]),
+                }],
+                "evidence_receipts_sha256": evidence_receipts_sha256([contract]),
+                "child_readback_sha256": canonical_digest(readback),
+            }
+            append("child_closure", child["identifier"], closure)
+            contracts[contract["slice_id"]] = contract
+        second_scope = deepcopy(predecessor_scope)
+        second_scope["repositories"][0]["exact_head"] = second_head
+        append("scope", "root", second_scope)
+        child = children[-1]
+        contract = evidence_contract()
+        contract["slice_id"] = "gen-85-terminal"
+        contract["owning_child"] = "GEN-85"
+        contract["plan_revision"] = predecessor_plan
+        contract["exact_head"] = second_head
+        for layer in contract["layers"].values():
+            for receipt in layer.get("receipts", []):
+                receipt["exact_head"] = second_head
+        append("evidence_contract", contract["slice_id"], contract)
+        evidence_event = predecessor.state().events[-1]
+        readback = terminal_child_readback(child)
+        append("child_closure", "GEN-85", {
+            "schema_version": 2, **readback,
+            "plan_revision": predecessor_plan,
+            "repository_key": contract["repository_key"],
+            "exact_head": second_head,
+            "evidence_heads": [{
+                "key": evidence_event["key"],
+                "event_id": evidence_event["event_id"],
+                "value_sha256": canonical_digest(evidence_event["value"]),
+            }],
+            "evidence_receipts_sha256": evidence_receipts_sha256([contract]),
+            "child_readback_sha256": canonical_digest(readback),
+        })
+        contracts[contract["slice_id"]] = contract
+
+        material = Delta(
+            "plan-transition", "GEN-37", "requirement", "agent",
+            {"text": "Reconcile the new plan generation."}, 0,
+            "2026-08-29T21:00:00Z",
+        )
+        checkpoint = build_checkpoint(
+            workstream_id="GEN-37", boundary_id="predecessor", root_revision=1,
+            plan_revision=predecessor_plan, before_status="In Progress",
+            after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai",
+                "session_id": "predecessor", "machine": "M5",
+                "worktree": {
+                    "state": "safe", "path": "/worktree", "branch": "previous",
+                    "head": second_head,
+                },
+            },
+            exact_head=second_head, evidence=[], blocker=None,
+            next_action="Reconcile the new plan generation.",
+        )
+        client.comments.extend([
+            {"id": "material-plan-transition", "body": encode_event_comment(material)},
+            {"id": "checkpoint-predecessor", "body": encode_checkpoint_comment(checkpoint)},
+        ])
+        graph = self.graph_snapshot()
+        graph["root"]["revision"] = 1
+        graph["children"] = children
+        current = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        desired_scope = deepcopy(second_scope)
+        desired_scope["repositories"][0]["exact_head"] = HEAD
+        desired_contracts = {}
+        for key, previous_contract in contracts.items():
+            desired_contracts[key] = deepcopy(previous_contract)
+            desired_contracts[key]["plan_revision"] = PLAN
+        source = {"identity": "https://example.test/plan", "sha256": PLAN}
+        projection = [
+            {"kind": "scope", "key": "root", "value": desired_scope},
+            {"kind": "source", "key": "root", "value": source},
+            {"kind": "provenance", "key": "current", "value": {
+                "agent": "codex", "machine": "M5", "session_id": "current",
+                "worktree": {"state": "safe", "head": HEAD},
+            }},
+            *[
+                {"kind": "evidence_contract", "key": key, "value": value}
+                for key, value in sorted(desired_contracts.items())
+            ],
+        ]
+        seeds = [
+            {
+                "child_identifier": child["identifier"],
+                "child_issue_id": child["id"],
+                "expected_child_readback_sha256": canonical_digest(
+                    terminal_child_readback(child)
+                ),
+                "expected_assignee_id": child["assignee"]["id"],
+                "evidence_keys": [f"{child['identifier'].lower()}-terminal"],
+            }
+            for child in children
+        ]
+        binding, _authorities = terminal_child_evidence_seed_predecessor_contract(
+            graph, current.state(), client.comments, workstream_id="GEN-37",
+            predecessor_plan_revision=predecessor_plan,
+            desired_scope=desired_scope, seeds=seeds,
+            desired_contracts=desired_contracts,
+        )
+        manifest = {
+            **reviewed_manifest(current, projection),
+            "terminal_child_evidence_seeds": seeds,
+            "terminal_child_evidence_seed_predecessor": binding,
+        }
+        return client, current, source, graph, children, manifest, binding
+
+    def install_late_predecessor_projection_append(
+        self, client, adapter, *, after_append, suffix,
+    ):
+        predecessor_plan = "b" * 64
+        generation = sorted(
+            [
+                event for event in adapter.state().snapshot["projection_history"]
+                if event["plan_revision"] == predecessor_plan
+            ],
+            key=lambda event: event["expected_revision"],
+        )
+        late = build_projection_event(
+            workstream_id="GEN-37", kind="provenance",
+            key=f"late-{suffix}",
+            value={
+                "agent": "codex", "machine": "M5",
+                "session_id": f"late-{suffix}",
+                "worktree": {"state": "safe", "head": "2" * 40},
+            },
+            plan_revision=predecessor_plan,
+            expected_revision=len(generation),
+            created_at=f"2026-08-29T23:{suffix:02d}:00Z",
+            authority=AUTHORITY,
+        )
+        original_execute = client.execute
+        append_count = 0
+
+        def execute(query, variables):
+            nonlocal append_count
+            result = original_execute(query, variables)
+            if "commentCreate" in query:
+                append_count += 1
+                if append_count == after_append:
+                    client.comments.append({
+                        "id": f"late-predecessor-{suffix}",
+                        "body": encode_projection_comment(late),
+                        "createdAt": "2026-08-29T23:59:00Z",
+                        "updatedAt": "2026-08-29T23:59:00Z",
+                    })
+            return result
+
+        client.execute = execute
+
+    def run_mixed_head_seed_reconcile(
+        self, client, adapter, source, graph, manifest, binding,
+    ):
+        prepared = prepare_terminal_child_evidence_seeds(
+            manifest, graph, adapter.state(), remote_head=HEAD,
+            comments=client.comments,
+        )
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", prepared, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        readbacks = {
+            seed["child_identifier"]: seed["expected_child_readback_sha256"]
+            for seed in manifest["terminal_child_evidence_seeds"]
+        }
+        return reconcile_required_projection(
+            adapter, preview, prepared, remote_head=HEAD,
+            created_at="2026-08-29T23:30:00Z",
+            authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda child_ids: {
+                child_id: readbacks[child_id] for child_id in child_ids
+            },
+            projection_input_fence=lambda: binding["input_frontier_sha256"],
+            checkpoint_fence=lambda: None,
+            projection_comments=client.comments,
+            projection_input_snapshot=graph,
+            legacy_unresolved_relation_heads=unresolved,
+        )
+
+    def mixed_head_repair_reconcile_fixture(self):
+        client, adapter, source, graph, children, manifest, binding = (
+            self.mixed_head_plan_generation_fixture()
+        )
+        self.run_mixed_head_seed_reconcile(
+            client, adapter, source, graph, manifest, binding,
+        )
+        active = workstream_projection._active_heads(adapter.state())
+        readbacks = {
+            seed["child_identifier"]: seed["expected_child_readback_sha256"]
+            for seed in manifest["terminal_child_evidence_seeds"]
+        }
+        repairs = []
+        for child in children:
+            event = next(
+                event for (kind, _key), event in active.items()
+                if kind == "evidence_contract"
+                and event["value"]["owning_child"] == child["identifier"]
+            )
+            repairs.append({
+                "child_identifier": child["identifier"],
+                "child_issue_id": child["id"],
+                "expected_child_readback_sha256": readbacks[
+                    child["identifier"]
+                ],
+                "expected_assignee_id": child["assignee"]["id"],
+                "approved_evidence_heads": [{
+                    "key": event["key"], "event_id": event["event_id"],
+                    "value_sha256": canonical_digest(event["value"]),
+                }],
+            })
+        projection = [
+            {"kind": kind, "key": key, "value": deepcopy(event["value"])}
+            for (kind, key), event in sorted(active.items())
+            if kind != "disposition"
+        ]
+        repair_manifest = {
+            **reviewed_manifest(adapter, projection),
+            "terminal_child_repairs": repairs,
+        }
+        prepared = prepare_terminal_child_repairs(
+            repair_manifest, graph, adapter.state(),
+        )
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", prepared, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        return (
+            client, adapter, source, graph, prepared, binding, readbacks,
+            preview, unresolved,
+        )
+
+    def run_mixed_head_repair_reconcile(self, fixture):
+        (
+            _client, adapter, source, _graph, prepared, binding, readbacks,
+            preview, unresolved,
+        ) = fixture
+        return reconcile_required_projection(
+            adapter, preview, prepared, remote_head=HEAD,
+            created_at="2026-08-29T23:45:00Z",
+            authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda child_ids: {
+                child_id: readbacks[child_id] for child_id in child_ids
+            },
+            projection_input_fence=lambda: binding["input_frontier_sha256"],
+            checkpoint_fence=lambda: None,
+            legacy_unresolved_relation_heads=unresolved,
+        )
 
     def legacy_relation_fixture(self):
         client = FakeProjectionClient()
@@ -1459,6 +1795,555 @@ class ProjectionTests(unittest.TestCase):
         )
         self.assertEqual(replay_result["writes"], [])
         self.assertEqual(len(client.comments), comments_before)
+
+    def test_new_plan_generation_bootstraps_terminal_evidence_then_repairs(self):
+        (_old_client, _old_adapter, source, graph, children,
+         existing_generation_manifest) = self.multi_terminal_repair_fixture(
+            evidence_active=False,
+        )
+        client = FakeProjectionClient()
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        manifest = {
+            **reviewed_manifest(
+                adapter, deepcopy(existing_generation_manifest["projection"]),
+            ),
+            "terminal_child_evidence_seeds": deepcopy(
+                existing_generation_manifest["terminal_child_evidence_seeds"]
+            ),
+        }
+        self.assertEqual(manifest["expected_projection_revision"], 0)
+        self.assertEqual(manifest["expected_active_heads"], [])
+
+        prepared = prepare_terminal_child_evidence_seeds(
+            manifest, graph, adapter.state(), remote_head=HEAD,
+        )
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", prepared, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        expected_readbacks = {
+            seed["child_identifier"]: seed["expected_child_readback_sha256"]
+            for seed in manifest["terminal_child_evidence_seeds"]
+        }
+        first = reconcile_required_projection(
+            adapter, preview, prepared, remote_head=HEAD,
+            created_at="2026-08-29T22:00:00Z",
+            authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda child_ids: {
+                child_id: expected_readbacks[child_id]
+                for child_id in child_ids
+            },
+            legacy_unresolved_relation_heads=unresolved,
+        )
+        self.assertEqual(
+            [(event["kind"], event["key"]) for event in adapter.state().events],
+            [
+                ("evidence_contract", "gen-70-terminal"),
+                ("evidence_contract", "gen-72-terminal"),
+                ("source", "root"),
+                ("provenance", "session"),
+                ("disposition", "root"),
+                ("scope", "root"),
+            ],
+        )
+        self.assertFalse(first["resume_authority_verified"])
+
+        replay = prepare_terminal_child_evidence_seeds(
+            manifest, graph, adapter.state(), remote_head=HEAD,
+        )
+        replay_preview, replay_unresolved = (
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37", replay, adapter,
+                authenticated_route=AUTHORITY, authenticated_source=source,
+                remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        )
+        comments_before = len(client.comments)
+        replay_result = reconcile_required_projection(
+            adapter, replay_preview, replay, remote_head=HEAD,
+            created_at="2026-08-29T22:01:00Z",
+            authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda child_ids: {
+                child_id: expected_readbacks[child_id]
+                for child_id in child_ids
+            },
+            legacy_unresolved_relation_heads=replay_unresolved,
+        )
+        self.assertEqual(replay_result["writes"], [])
+        self.assertEqual(len(client.comments), comments_before)
+
+        active = workstream_projection._active_heads(adapter.state())
+        repairs = []
+        for child in children:
+            child_id = child["identifier"]
+            evidence_event = next(
+                event for (kind, _key), event in active.items()
+                if kind == "evidence_contract"
+                and event["value"]["owning_child"] == child_id
+            )
+            repairs.append({
+                "child_identifier": child_id,
+                "child_issue_id": child["id"],
+                "expected_child_readback_sha256": canonical_digest(
+                    terminal_child_readback(child)
+                ),
+                "expected_assignee_id": child["assignee"]["id"],
+                "approved_evidence_heads": [{
+                    "key": evidence_event["key"],
+                    "event_id": evidence_event["event_id"],
+                    "value_sha256": canonical_digest(evidence_event["value"]),
+                }],
+            })
+        repair_manifest = {
+            **reviewed_manifest(
+                adapter, deepcopy(existing_generation_manifest["projection"]),
+            ),
+            "terminal_child_repairs": repairs,
+        }
+        repair_prepared = prepare_terminal_child_repairs(
+            repair_manifest, graph, adapter.state(),
+        )
+        repair_preview, repair_unresolved = (
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37", repair_prepared, adapter,
+                authenticated_route=AUTHORITY, authenticated_source=source,
+                remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        )
+        second = reconcile_required_projection(
+            adapter, repair_preview, repair_prepared, remote_head=HEAD,
+            created_at="2026-08-29T22:02:00Z",
+            authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda child_ids: {
+                child_id: expected_readbacks[child_id]
+                for child_id in child_ids
+            },
+            legacy_unresolved_relation_heads=repair_unresolved,
+        )
+        self.assertTrue(second["resume_authority_verified"])
+        context = compact_context(
+            add_material_history(
+                graph, client.comments, "GEN-37",
+                authenticated_route=AUTHORITY, authenticated_source=source,
+            ),
+            "GEN-37", require_projection_authority=True,
+        )
+        self.assertEqual(context["resume_authority"], "full")
+
+    def test_new_plan_generation_terminal_seed_bootstrap_refuses_widening(self):
+        def fixture():
+            (_old_client, _old_adapter, source, graph, _children,
+             existing_generation_manifest) = self.multi_terminal_repair_fixture(
+                evidence_active=False,
+            )
+            client = FakeProjectionClient()
+            adapter = LinearProjectionAdapter(
+                client, issue_id="GEN-37", workstream_id="GEN-37",
+                plan_revision=PLAN, **AUTHORITY,
+            )
+            manifest = {
+                **reviewed_manifest(
+                    adapter,
+                    deepcopy(existing_generation_manifest["projection"]),
+                ),
+                "terminal_child_evidence_seeds": deepcopy(
+                    existing_generation_manifest[
+                        "terminal_child_evidence_seeds"
+                    ]
+                ),
+            }
+            return client, adapter, source, graph, manifest
+
+        mutations = {
+            "nonempty_review_contract": (
+                lambda manifest: manifest.__setitem__(
+                    "expected_projection_revision", 1,
+                ),
+                "terminal_child_evidence_seed_scope_missing",
+            ),
+            "incomplete_seed_set": (
+                lambda manifest: manifest[
+                    "terminal_child_evidence_seeds"
+                ].pop(),
+                "terminal_child_evidence_seed_bootstrap_unrelated_change",
+            ),
+            "relation": (
+                lambda manifest: manifest["projection"].append({
+                    "kind": "relation", "key": "related:GEN-99",
+                    "value": {"type": "related", "target": {
+                        "workspace_id": "workspace",
+                        "issue_id": TARGET_UUID,
+                        "identifier": "GEN-99",
+                    }},
+                }),
+                "terminal_child_evidence_seed_bootstrap_unrelated_change",
+            ),
+            "route": (
+                lambda manifest: next(
+                    item for item in manifest["projection"]
+                    if item["kind"] == "scope"
+                )["value"]["linear"].__setitem__("project_id", "wrong"),
+                "terminal_child_evidence_seed_route_mismatch:project_id",
+            ),
+            "evidence_head": (
+                lambda manifest: next(
+                    item for item in manifest["projection"]
+                    if item["kind"] == "evidence_contract"
+                )["value"].__setitem__("exact_head", "b" * 40),
+                "terminal_child_evidence_seed_contract_invalid",
+            ),
+        }
+        for name, (mutate, message) in mutations.items():
+            with self.subTest(name=name):
+                client, adapter, _source, graph, manifest = fixture()
+                mutate(manifest)
+                with self.assertRaisesRegex(LinearProjectionError, message):
+                    prepare_terminal_child_evidence_seeds(
+                        manifest, graph, adapter.state(), remote_head=HEAD,
+                    )
+                self.assertEqual(client.comments, [])
+
+    def test_new_plan_generation_carries_mixed_historical_heads_then_repairs(self):
+        client, adapter, source, graph, children, manifest, binding = (
+            self.mixed_head_plan_generation_fixture()
+        )
+        prepared = prepare_terminal_child_evidence_seeds(
+            manifest, graph, adapter.state(), remote_head=HEAD,
+            comments=client.comments,
+        )
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", prepared, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        readbacks = {
+            seed["child_identifier"]: seed["expected_child_readback_sha256"]
+            for seed in manifest["terminal_child_evidence_seeds"]
+        }
+        first = reconcile_required_projection(
+            adapter, preview, prepared, remote_head=HEAD,
+            created_at="2026-08-29T22:30:00Z",
+            authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda child_ids: {
+                child_id: readbacks[child_id] for child_id in child_ids
+            },
+            projection_input_fence=lambda: binding["input_frontier_sha256"],
+            checkpoint_fence=lambda: None,
+            projection_comments=client.comments,
+            projection_input_snapshot=graph,
+            legacy_unresolved_relation_heads=unresolved,
+        )
+        self.assertFalse(first["resume_authority_verified"])
+        self.assertEqual(
+            {
+                event["value"]["exact_head"]
+                for event in adapter.state().events
+                if event["kind"] == "evidence_contract"
+            },
+            {"1" * 40, "2" * 40},
+        )
+
+        replay = prepare_terminal_child_evidence_seeds(
+            manifest, graph, adapter.state(), remote_head=HEAD,
+            comments=client.comments,
+        )
+        replay_preview, replay_unresolved = (
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37", replay, adapter,
+                authenticated_route=AUTHORITY, authenticated_source=source,
+                remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        )
+        before_replay = len(client.comments)
+        replay_result = reconcile_required_projection(
+            adapter, replay_preview, replay, remote_head=HEAD,
+            created_at="2026-08-29T22:31:00Z",
+            authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda child_ids: {
+                child_id: readbacks[child_id] for child_id in child_ids
+            },
+            projection_input_fence=lambda: binding["input_frontier_sha256"],
+            checkpoint_fence=lambda: None,
+            projection_comments=client.comments,
+            projection_input_snapshot=graph,
+            legacy_unresolved_relation_heads=replay_unresolved,
+        )
+        self.assertEqual(replay_result["writes"], [])
+        self.assertEqual(len(client.comments), before_replay)
+
+        active = workstream_projection._active_heads(adapter.state())
+        repairs = []
+        for child in children:
+            event = next(
+                event for (kind, _key), event in active.items()
+                if kind == "evidence_contract"
+                and event["value"]["owning_child"] == child["identifier"]
+            )
+            repairs.append({
+                "child_identifier": child["identifier"],
+                "child_issue_id": child["id"],
+                "expected_child_readback_sha256": readbacks[child["identifier"]],
+                "expected_assignee_id": child["assignee"]["id"],
+                "approved_evidence_heads": [{
+                    "key": event["key"], "event_id": event["event_id"],
+                    "value_sha256": canonical_digest(event["value"]),
+                }],
+            })
+        repair_projection = [
+            {"kind": kind, "key": key, "value": deepcopy(event["value"])}
+            for (kind, key), event in sorted(active.items())
+            if kind != "disposition"
+        ]
+        repair_manifest = {
+            **reviewed_manifest(adapter, repair_projection),
+            "terminal_child_repairs": repairs,
+        }
+        repair_prepared = prepare_terminal_child_repairs(
+            repair_manifest, graph, adapter.state(),
+        )
+        repair_preview, repair_unresolved = (
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37", repair_prepared, adapter,
+                authenticated_route=AUTHORITY, authenticated_source=source,
+                remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        )
+        second = reconcile_required_projection(
+            adapter, repair_preview, repair_prepared, remote_head=HEAD,
+            created_at="2026-08-29T22:32:00Z",
+            authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda child_ids: {
+                child_id: readbacks[child_id] for child_id in child_ids
+            },
+            projection_input_fence=lambda: binding["input_frontier_sha256"],
+            checkpoint_fence=lambda: None,
+            legacy_unresolved_relation_heads=repair_unresolved,
+        )
+        self.assertTrue(second["resume_authority_verified"])
+        context = compact_context(
+            add_material_history(
+                graph, client.comments, "GEN-37",
+                authenticated_route=AUTHORITY, authenticated_source=source,
+            ),
+            "GEN-37", require_projection_authority=True,
+        )
+        self.assertEqual(context["resume_authority"], "full")
+        self.assertEqual(len(context["child_closures"]), 5)
+
+    def test_mixed_head_predecessor_binding_refuses_omission_and_drift(self):
+        def omit_child(manifest):
+            manifest["terminal_child_evidence_seeds"].pop()
+            manifest["projection"] = [
+                item for item in manifest["projection"]
+                if item.get("key") != "gen-85-terminal"
+            ]
+
+        def mutate_contract(manifest):
+            contract = next(
+                item["value"] for item in manifest["projection"]
+                if item.get("key") == "gen-38-terminal"
+            )
+            contract["layers"]["logic"]["receipts"][0]["proof"] = "mutated"
+
+        mutations = {
+            "omission": omit_child,
+            "contract": mutate_contract,
+            "projection": lambda manifest: manifest[
+                "terminal_child_evidence_seed_predecessor"
+            ].__setitem__("projection_events_sha256", "f" * 64),
+            "history": lambda manifest: manifest[
+                "terminal_child_evidence_seed_predecessor"
+            ].__setitem__("projection_history_sha256", "f" * 64),
+            "material": lambda manifest: manifest[
+                "terminal_child_evidence_seed_predecessor"
+            ].__setitem__("material_events_sha256", "f" * 64),
+            "checkpoint": lambda manifest: manifest[
+                "terminal_child_evidence_seed_predecessor"
+            ].__setitem__("checkpoint_event_id", "wrong-checkpoint"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                client, adapter, _source, graph, _children, manifest, _binding = (
+                    self.mixed_head_plan_generation_fixture()
+                )
+                before = len(client.comments)
+                mutate(manifest)
+                with self.assertRaises(LinearProjectionError):
+                    prepare_terminal_child_evidence_seeds(
+                        manifest, graph, adapter.state(), remote_head=HEAD,
+                        comments=client.comments,
+                    )
+                self.assertEqual(len(client.comments), before)
+
+    def test_mixed_head_bootstrap_refuses_bare_seeds_with_stale_history(self):
+        client, adapter, _source, graph, _children, manifest, _binding = (
+            self.mixed_head_plan_generation_fixture()
+        )
+        manifest.pop("terminal_child_evidence_seed_predecessor")
+        before = len(client.comments)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_seed_predecessor_binding_required",
+        ):
+            prepare_terminal_child_evidence_seeds(
+                manifest, graph, adapter.state(), remote_head=HEAD,
+                comments=client.comments,
+            )
+        self.assertEqual(len(client.comments), before)
+
+    def test_mixed_head_seed_fences_late_predecessor_append_at_every_prefix(self):
+        baseline = self.mixed_head_plan_generation_fixture()
+        baseline_result = self.run_mixed_head_seed_reconcile(
+            baseline[0], baseline[1], baseline[2], baseline[3],
+            baseline[5], baseline[6],
+        )
+        append_count = len(baseline_result["writes"])
+        self.assertGreater(append_count, 1)
+        for prefix in range(1, append_count + 1):
+            with self.subTest(prefix=prefix):
+                client, adapter, source, graph, _children, manifest, binding = (
+                    self.mixed_head_plan_generation_fixture()
+                )
+                self.install_late_predecessor_projection_append(
+                    client, adapter, after_append=prefix, suffix=prefix,
+                )
+                with self.assertRaisesRegex(
+                    LinearProjectionError,
+                    "terminal_seed_predecessor_history_changed_reload_required",
+                ):
+                    self.run_mixed_head_seed_reconcile(
+                        client, adapter, source, graph, manifest, binding,
+                    )
+
+    def test_mixed_head_repair_fences_late_predecessor_append_at_every_prefix(self):
+        baseline = self.mixed_head_repair_reconcile_fixture()
+        baseline_result = self.run_mixed_head_repair_reconcile(baseline)
+        append_count = len(baseline_result["writes"])
+        self.assertEqual(append_count, 5)
+        for prefix in range(1, append_count + 1):
+            with self.subTest(prefix=prefix):
+                fixture = self.mixed_head_repair_reconcile_fixture()
+                client, adapter = fixture[:2]
+                self.install_late_predecessor_projection_append(
+                    client, adapter, after_append=prefix,
+                    suffix=20 + prefix,
+                )
+                with self.assertRaisesRegex(
+                    LinearProjectionError,
+                    "terminal_seed_predecessor_history_changed_reload_required",
+                ):
+                    self.run_mixed_head_repair_reconcile(fixture)
+
+    def test_mixed_head_predecessor_frontier_drift_refuses_before_write(self):
+        client, adapter, source, graph, _children, manifest, _binding = (
+            self.mixed_head_plan_generation_fixture()
+        )
+        prepared = prepare_terminal_child_evidence_seeds(
+            manifest, graph, adapter.state(), remote_head=HEAD,
+            comments=client.comments,
+        )
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", prepared, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        readbacks = {
+            seed["child_identifier"]: seed["expected_child_readback_sha256"]
+            for seed in manifest["terminal_child_evidence_seeds"]
+        }
+        before_revision = adapter.state().revision
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_evidence_seed_input_frontier_changed",
+        ):
+            reconcile_required_projection(
+                adapter, preview, prepared, remote_head=HEAD,
+                created_at="2026-08-29T22:40:00Z",
+                authenticated_source=source,
+                relation_target_resolver=self.relation_target_resolver,
+                terminal_child_fence=lambda child_ids: {
+                    child_id: readbacks[child_id] for child_id in child_ids
+                },
+                projection_input_fence=lambda: "f" * 64,
+                checkpoint_fence=lambda: None,
+                projection_comments=client.comments,
+                projection_input_snapshot=graph,
+                legacy_unresolved_relation_heads=unresolved,
+            )
+        self.assertEqual(adapter.state().revision, before_revision)
+
+    def test_mixed_head_predecessor_seed_recovers_from_crash_prefix(self):
+        client, adapter, source, graph, _children, manifest, binding = (
+            self.mixed_head_plan_generation_fixture()
+        )
+        prepared = prepare_terminal_child_evidence_seeds(
+            manifest, graph, adapter.state(), remote_head=HEAD,
+            comments=client.comments,
+        )
+        evidence_items = [
+            item for item in prepared["projection"]
+            if item["kind"] == "evidence_contract"
+        ]
+        for item in evidence_items[:2]:
+            adapter.append(build_projection_event(
+                workstream_id="GEN-37", kind=item["kind"], key=item["key"],
+                value=item["value"], plan_revision=PLAN,
+                expected_revision=adapter.state().revision,
+                created_at="2026-08-29T22:45:00Z", authority=AUTHORITY,
+            ))
+        resumed = prepare_terminal_child_evidence_seeds(
+            manifest, graph, adapter.state(), remote_head=HEAD,
+            comments=client.comments,
+        )
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", resumed, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        readbacks = {
+            seed["child_identifier"]: seed["expected_child_readback_sha256"]
+            for seed in manifest["terminal_child_evidence_seeds"]
+        }
+        result = reconcile_required_projection(
+            adapter, preview, resumed, remote_head=HEAD,
+            created_at="2026-08-29T22:46:00Z",
+            authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda child_ids: {
+                child_id: readbacks[child_id] for child_id in child_ids
+            },
+            projection_input_fence=lambda: binding["input_frontier_sha256"],
+            checkpoint_fence=lambda: None,
+            projection_comments=client.comments,
+            projection_input_snapshot=graph,
+            legacy_unresolved_relation_heads=unresolved,
+        )
+        self.assertFalse(result["resume_authority_verified"])
+        self.assertEqual(
+            len([
+                event for event in adapter.state().events
+                if event["kind"] == "evidence_contract"
+            ]),
+            5,
+        )
 
     def terminal_seed_head_transition_fixture(self):
         client, adapter, source, graph, children, manifest = (

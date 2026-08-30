@@ -350,6 +350,16 @@ but were never projected as evidence contracts, use a separately reviewed
 valid contracts whose repository and exact head already match scope. It remains
 non-authoritative until the subsequent closure-repair batch succeeds; the two
 phases cannot be combined, and either phase is revision-checked and idempotent.
+When a new plan generation begins at an exactly empty projection frontier, a
+reviewed `terminal_child_evidence_seed_predecessor` may instead carry only
+contracts that an exact predecessor-generation closure authorizes. The binding
+fences the complete stale projection history, predecessor projection and tip,
+material log, predecessor checkpoint chain, and graph/material/checkpoint input
+frontier. The carried contract may change only its plan revision; its historical
+head, receipts, owner, and repository remain immutable. The carry proof is
+persisted on the new evidence event, so the later closure repair and ordinary
+resume can revalidate it against the predecessor history. Missing, ambiguous,
+mutated, unclosed, late, or frontier-drifted evidence refuses before mutation.
 When the reviewed seed also advances the primary repository head, every seed
 must belong to that primary repository and bind the new head. The manifest
 records the exact predecessor/new heads, computed disposition, checkpoint
