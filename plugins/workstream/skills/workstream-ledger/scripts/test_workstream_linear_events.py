@@ -20,6 +20,7 @@ from workstream_linear_events import (
     LinearEventError,
     apply_material_semantic_repairs,
     encode_event_comment,
+    encode_reviewed_repair_comment,
     ledger_boundary_slot_id,
     material_frontier,
     reduce_event_comments,
@@ -115,7 +116,8 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
             comments.append({"id": f"remote-{index}", "body":
                              f"{linear_events_module.EVENT_PREFIX}{encoded} -->"})
         raw = reduce_event_comments(comments, workstream_id="GEN-37")
-        route = {"workspace_id": "w", "team_id": "t", "project_id": "p",
+        route = {"workspace_id": "workspace", "team_id": "team",
+                 "project_id": "project",
                  "root_issue_id": "33333333-3333-4333-8333-333333333333"}
         repair_slot = ledger_boundary_slot_id("GEN-37", 2, [], route)
         source = {"identity": "plan", "sha256": "a" * 64}
@@ -255,7 +257,7 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
         }
         control = Delta("repair", "GEN-37", "material_semantic_repair", "system",
                         payload, 2, "2026-08-30T00:01:00Z")
-        comments.append({"id": repair_slot, "body": encode_event_comment(control)})
+        comments.append({"id": repair_slot, "body": encode_reviewed_repair_comment(control)})
         return comments, payload, checkpoint, projection, generation, route, source, graph
 
     def test_two_pass_repair_preserves_raw_positions_and_overlays_boundaries(self):
@@ -322,7 +324,7 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
                 changed, 2, "2026-08-30T00:01:00Z",
             )
             comments[-1] = {"id": comments[-1]["id"],
-                            "body": encode_event_comment(control)}
+                            "body": encode_reviewed_repair_comment(control)}
             with self.subTest(mutation=mutation), self.assertRaisesRegex(
                 LinearEventError, "non_lossless_replacement",
             ):
@@ -341,7 +343,7 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
         p = dict(payload); p["target_bindings"] = payload["target_bindings"][:1]
         control = Delta("repair", "GEN-37", "material_semantic_repair", "system", p, 2,
                         "2026-08-30T00:01:00Z")
-        incomplete[-1] = {"id": comments[-1]["id"], "body": encode_event_comment(control)}
+        incomplete[-1] = {"id": comments[-1]["id"], "body": encode_reviewed_repair_comment(control)}
         cases.append((incomplete, checkpoint,
                       "malformed_material_semantic_repair_postwrite_oracle"))
         drift = dict(checkpoint); drift["revision"] = 1
@@ -392,6 +394,48 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
         client = FakeCommentClient()
         with self.assertRaisesRegex(LinearEventError, "malformed_material_boundary"):
             LinearCommentEventAdapter(client, issue_id="GEN-37").apply(bad)
+        self.assertFalse(any("commentCreate" in query for query, _ in client.calls))
+
+    def test_repair_control_is_reserved_from_generic_encoder_and_adapter(self):
+        comments, payload, *_ = self._repair_fixture()
+        control = reduce_event_comments(
+            comments, workstream_id="GEN-37",
+        ).events[-1]
+        with self.assertRaisesRegex(ValueError, "material_semantic_repair_reserved"):
+            encode_event_comment(control)
+        client = FakeCommentClient()
+        with self.assertRaisesRegex(
+            LinearEventError, "material_semantic_repair_reserved",
+        ):
+            LinearCommentEventAdapter(client, issue_id="GEN-37").apply(control)
+        self.assertFalse(any("commentCreate" in query for query, _ in client.calls))
+
+    def test_pinned_repair_runs_full_two_pass_validation_before_write(self):
+        comments, _payload, *_rest, route, _source, _graph = self._repair_fixture()
+        control = reduce_event_comments(
+            comments, workstream_id="GEN-37",
+        ).events[-1]
+        payload = json.loads(json.dumps(control.payload))
+        payload["target_bindings"][0]["replacement"]["boundary_id"] = "rewrite"
+        payload["postwrite_oracle"]["target_bindings_sha256"] = (
+            linear_events_module.canonical_sha256(payload["target_bindings"])
+        )
+        candidate = replace(control, payload=payload)
+        client = FakeCommentClient()
+        client.comments = comments[:-1]
+        client.workspace_id = route["workspace_id"]
+        client.team_id = route["team_id"]
+        client.project_id = route["project_id"]
+        client.root_issue_id = route["root_issue_id"]
+        with self.assertRaisesRegex(
+            LinearEventError, "pinned_repair_full_validation_failed",
+        ):
+            LinearCommentEventAdapter(
+                client, issue_id="GEN-37", plan_revision="a" * 64, **route,
+            ).apply_pinned_repair(
+                candidate, expected_remote_slot=comments[-1]["id"],
+                expected_serialization_frontier=[],
+            )
         self.assertFalse(any("commentCreate" in query for query, _ in client.calls))
 
     def test_historical_invalid_exact_replay_is_receipt_only(self):

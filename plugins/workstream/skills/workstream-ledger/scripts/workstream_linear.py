@@ -83,7 +83,7 @@ query WorkstreamIssues($teamId: String!, $after: String) {
   team(id: $teamId) {
     issues(first: 250, after: $after) {
       nodes {
-        id identifier title description url updatedAt
+        id identifier title description url updatedAt archivedAt
         parent { id identifier }
         project { id }
         team { id organization { id } }
@@ -99,14 +99,14 @@ query WorkstreamIssues($teamId: String!, $after: String) {
 RESUME_ROOT_QUERY = """
 query WorkstreamResumeRoot($issueId: String!, $after: String) {
   issue(id: $issueId) {
-    id identifier title description url updatedAt
+    id identifier title description url updatedAt archivedAt
     project { id }
     team { id organization { id } }
     assignee { id }
     state { id name type }
     children(first: 250, after: $after) {
       nodes {
-        id identifier title description url updatedAt
+        id identifier title description url updatedAt archivedAt
         parent { id identifier }
         project { id }
         team { id organization { id } }
@@ -599,15 +599,22 @@ class LinearGraphQLTransport:
                 ]
             children.append(child)
         root_state = root.get("state") or {}
+        normalized_root = {
+            key: root.get(key) for key in (
+                "id", "identifier", "title", "url", "updatedAt", "archivedAt",
+                "parent", "project", "team", "assignee",
+            )
+        }
+        normalized_root.update({
+            "state": dict(root_state), "state_id": root_state.get("id"),
+            "plan_revision": plan_revision,
+            "revision": parse_root_revision(description),
+            "status": root_state.get("name") or root_state.get("type"),
+            "status_type": root_state.get("type"),
+            "next_action": parse_next_action(description),
+        })
         result = {
-            "root": {
-                "identifier": root["identifier"], "url": root.get("url"),
-                "plan_revision": plan_revision,
-                "revision": parse_root_revision(description),
-                "status": root_state.get("name") or root_state.get("type"),
-                "status_type": root_state.get("type"),
-                "next_action": parse_next_action(description),
-            },
+            "root": normalized_root,
             "children": children,
             "decisions": [], "provenance": [],
         }

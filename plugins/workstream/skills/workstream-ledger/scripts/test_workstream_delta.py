@@ -202,6 +202,12 @@ class DeltaJournalTests(unittest.TestCase):
             payload, 0, "2026-08-30T00:00:00Z",
         )
         self.assertEqual(MODULE.interpret_material_event(event), ())
+        with self.assertRaisesRegex(ValueError, "material_semantic_repair_reserved"):
+            self.journal.append(
+                "GEN-37", MODULE.MATERIAL_REPAIR_KIND, payload, 0,
+                source="system",
+            )
+        self.assertEqual(self.journal.pending(), [])
 
     def test_agent_discovered_delta_survives_process_reopen_before_apply(self):
         event = self.journal.append(

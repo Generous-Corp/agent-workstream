@@ -142,8 +142,10 @@ an ordering convention from being mistaken for the frontier identity.
 The reviewed target artifact is a separate exact JSON object containing only
 `schema_version`, `workstream_id`, and the two target bindings. The CLI reads
 those local bytes, verifies their SHA-256, verifies their content against the
-payload, and checks that the immutable identity contains the bound commit and
-path before any remote read or write.
+payload, checks the exact immutable GitHub repository/commit/path identity,
+then retrieves that identity through the authenticated plan-source byte loader
+(token with private-GitHub SSH fallback). Fetched bytes, local bytes, and the
+bound SHA-256 must all match before any Linear read or write.
 
 The normalized replacement retains the target event ID, workstream, source,
 expected revision, and creation time at its original zero-based index. The
@@ -166,12 +168,23 @@ reservation appearing after the CLI preflight therefore causes a known
 zero-write precondition refusal; a writer starting after that internal read
 still contends for the same shared slot.
 
+The repair graph fence captures the full returned root/child identity and
+native state, including descriptions, next actions, revisions, plan revisions,
+relations, and relation targets. `updatedAt` is an append/prewrite fence only:
+historical replay and resume validate the immutable target/source/seal/slot
+proof and allow later authorized graph, source, projection, generation, and
+child evolution.
+
 If apply returns `durable_partial_replay_required`, the control comment was
 reobserved with its exact receipt. If it returns
 `outcome_unknown_replay_required`, no receipt was observable after the failed
 request. In either case, do not build another manifest or advance its revision. Rerun the exact
 same command and bytes: the pinned event ID and remote slot take the receipt-only
 replay path and repeat full post-read validation without another write.
+
+`material_semantic_repair` is reserved from generic journals, the ordinary
+comment encoder, and ordinary adapter apply. Only the reviewed pinned path can
+encode and append it after full two-pass validation.
 
 Successful output deliberately reports production compact resume, full resume,
 strict generation-candidate loading, and exact replay as `external_gate_required`

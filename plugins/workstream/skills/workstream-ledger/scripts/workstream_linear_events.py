@@ -24,6 +24,7 @@ from workstream_checkpoint import CheckpointError, recover_generations
 from workstream_delta import (
     MATERIAL_REPAIR_KIND, Delta, MutationReceipt, RevisionConflict,
     canonical_sha256, validate_material_event_semantics,
+    validate_reviewed_repair_event_shape,
 )
 from workstream_linear import (
     GraphQLClient, HttpGraphQLClient, LinearTransportError, validate_issue_route,
@@ -518,6 +519,18 @@ def encode_event_comment(delta: Delta) -> str:
             _canonical_event(delta),
             ensure_ascii=False,
             sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"{EVENT_PREFIX}{encoded} -->"
+
+
+def encode_reviewed_repair_comment(delta: Delta) -> str:
+    """Encode only for the fully validated dedicated repair workflow."""
+    validate_reviewed_repair_event_shape(delta)
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(
+            _canonical_event(delta), ensure_ascii=False, sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
     ).decode("ascii").rstrip("=")
@@ -1068,8 +1081,18 @@ class LinearCommentEventAdapter:
             )
         ):
             raise PinnedRepairPreconditionError("invalid_pinned_repair_frontier")
-        before, checkpoints, comments = self._combined_state()
-        self._validate_checkpoint_prefix(before, checkpoints)
+        try:
+            before, checkpoints, comments = self._combined_state()
+        except (OSError, LinearTransportError) as error:
+            raise PinnedRepairPreconditionError(
+                "pinned_repair_prewrite_unavailable"
+            ) from error
+        try:
+            self._validate_checkpoint_prefix(before, checkpoints)
+        except (OSError, LinearTransportError) as error:
+            raise PinnedRepairPreconditionError(
+                "pinned_repair_prewrite_unavailable"
+            ) from error
         existing_id = before.remote_ids.get(delta.event_id)
         if existing_id:
             existing = next(
@@ -1087,7 +1110,7 @@ class LinearCommentEventAdapter:
                 existing_id,
             )
         try:
-            validate_material_event_semantics(delta)
+            validate_reviewed_repair_event_shape(delta)
         except ValueError as error:
             raise PinnedRepairPreconditionError(str(error)) from error
         if delta.expected_revision != before.revision:
@@ -1121,13 +1144,18 @@ class LinearCommentEventAdapter:
             raise PinnedRepairPreconditionError(
                 "pinned_repair_serialization_authority_drift"
             ) from error
-        actual_frontier = ledger_serialization_frontier(
-            self._checkpoint_frontier(checkpoints), comments,
-            workstream_id=self.issue_id,
-            authenticated_route=self._observed_authority,
-            current_plan_revision=self.plan_revision,
-            material_revision=before.revision,
-        )
+        try:
+            actual_frontier = ledger_serialization_frontier(
+                self._checkpoint_frontier(checkpoints), comments,
+                workstream_id=self.issue_id,
+                authenticated_route=self._observed_authority,
+                current_plan_revision=self.plan_revision,
+                material_revision=before.revision,
+            )
+        except (OSError, LinearTransportError) as error:
+            raise PinnedRepairPreconditionError(
+                "pinned_repair_prewrite_unavailable"
+            ) from error
         if actual_frontier != expected_serialization_frontier:
             raise PinnedRepairPreconditionError(
                 "pinned_repair_serialization_frontier_drift"
@@ -1137,14 +1165,43 @@ class LinearCommentEventAdapter:
             self._observed_authority,
         ) != expected_remote_slot:
             raise PinnedRepairPreconditionError("pinned_repair_remote_slot_drift")
-        self._assert_comment_id_capability()
+        candidate_body = encode_reviewed_repair_comment(delta)
+        synthetic_comments = [*comments, {
+            "id": expected_remote_slot, "body": candidate_body,
+            "createdAt": delta.created_at, "updatedAt": delta.created_at,
+        }]
+        try:
+            synthetic_raw = reduce_event_comments(
+                synthetic_comments, workstream_id=self.issue_id,
+            )
+            apply_material_semantic_repairs(
+                synthetic_raw, synthetic_comments,
+                checkpoint_frontier=delta.payload["checkpoint_frontier"],
+                projection_frontier=delta.payload["projection_frontier"],
+                generation=delta.payload["generation"],
+                authenticated_route=self._observed_authority,
+                authenticated_source=delta.payload["authenticated_source"],
+                issue_graph_frontier=delta.payload["issue_graph_frontier"],
+                ledger_serialization_frontier_value=actual_frontier,
+                validate_live_fences=False,
+            )
+        except (KeyError, TypeError, ValueError, LinearEventError) as error:
+            raise PinnedRepairPreconditionError(
+                "pinned_repair_full_validation_failed"
+            ) from error
+        try:
+            self._assert_comment_id_capability()
+        except (OSError, LinearTransportError) as error:
+            raise PinnedRepairPreconditionError(
+                "pinned_repair_prewrite_unavailable"
+            ) from error
         try:
             response = self.client.execute(
                 COMMENT_CREATE_MUTATION,
                 {"input": {
                     "id": expected_remote_slot,
                     "issueId": self.issue_id,
-                    "body": encode_event_comment(delta),
+                    "body": candidate_body,
                 }},
             )
         except LinearTransportError:
@@ -1187,6 +1244,8 @@ class LinearCommentEventAdapter:
     def apply(self, delta: Delta) -> MutationReceipt:
         if delta.workstream_id != self.issue_id:
             raise LinearEventError("workstream_id_mismatch")
+        if delta.kind == MATERIAL_REPAIR_KIND:
+            raise LinearEventError("material_semantic_repair_reserved")
         for _attempt in range(8):
             before, checkpoints, comments = self._combined_state()
             self._validate_checkpoint_prefix(before, checkpoints)

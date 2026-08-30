@@ -38,23 +38,7 @@ def validate_material_event_semantics(delta: "Delta") -> None:
     to be repaired without allowing another writer to reproduce the bug.
     """
     if delta.kind == MATERIAL_REPAIR_KIND:
-        required = {
-            "schema_version", "workstream_id", "target_bindings", "raw_frontier",
-            "checkpoint_frontier", "projection_frontier", "generation",
-            "authenticated_route", "authenticated_source", "issue_graph_frontier",
-            "ledger_serialization_frontier", "postwrite_oracle", "review_artifact",
-        }
-        payload = delta.payload
-        if (
-            not isinstance(payload, dict)
-            or set(payload) != required
-            or payload.get("schema_version") != 1
-            or payload.get("workstream_id") != delta.workstream_id
-            or not isinstance(payload.get("target_bindings"), list)
-            or not payload["target_bindings"]
-        ):
-            raise ValueError("malformed_material_semantic_repair")
-        return
+        raise ValueError("material_semantic_repair_reserved")
     if delta.kind != "material_boundary":
         return
     payload = delta.payload
@@ -79,13 +63,33 @@ def validate_material_event_semantics(delta: "Delta") -> None:
 
 def interpret_material_event(delta: "Delta") -> tuple[tuple[str, dict[str, Any]], ...]:
     """Return the semantic changes represented by one validated event."""
-    validate_material_event_semantics(delta)
     if delta.kind == MATERIAL_REPAIR_KIND:
         return ()
+    validate_material_event_semantics(delta)
     if delta.kind != "material_boundary":
         return ((delta.kind, delta.payload),)
     return tuple((change["kind"], change["payload"])
                  for change in delta.payload["changes"])
+
+
+def validate_reviewed_repair_event_shape(delta: "Delta") -> None:
+    """Validate the outer repair shape for the dedicated pinned path only."""
+    required = {
+        "schema_version", "workstream_id", "target_bindings", "raw_frontier",
+        "checkpoint_frontier", "projection_frontier", "generation",
+        "authenticated_route", "authenticated_source", "issue_graph_frontier",
+        "ledger_serialization_frontier", "postwrite_oracle", "review_artifact",
+    }
+    payload = delta.payload
+    if (
+        delta.kind != MATERIAL_REPAIR_KIND
+        or not isinstance(payload, dict) or set(payload) != required
+        or payload.get("schema_version") != 1
+        or payload.get("workstream_id") != delta.workstream_id
+        or not isinstance(payload.get("target_bindings"), list)
+        or not payload["target_bindings"]
+    ):
+        raise ValueError("malformed_material_semantic_repair")
 
 
 def now() -> str:

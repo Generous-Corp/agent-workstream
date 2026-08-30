@@ -207,7 +207,9 @@ def _issue_graph_repair_frontier(
         return {
             key: issue.get(key) for key in (
                 "id", "identifier", "url", "title", "parent", "team", "project",
-                "assignee", "archivedAt", "status", "status_type", "state_id",
+                "assignee", "archivedAt", "updatedAt", "description",
+                "next_action", "revision", "plan_revision", "status",
+                "status_type", "state_id",
             )
         } | {"state": state}
     graph = {

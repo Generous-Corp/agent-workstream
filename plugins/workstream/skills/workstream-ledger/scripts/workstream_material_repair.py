@@ -16,11 +16,12 @@ from workstream_linear import (
 from workstream_linear_checkpoints import reduce_checkpoint_comments
 from workstream_linear_events import (
     LinearCommentEventAdapter, apply_material_semantic_repairs,
-    ledger_boundary_slot_id, ledger_serialization_frontier, material_frontier,
+    encode_reviewed_repair_comment, ledger_boundary_slot_id,
+    ledger_serialization_frontier, material_frontier,
     PinnedRepairPreconditionError, reduce_event_comments,
 )
 from workstream_linear_projection import reduce_projection_comments, select_plan_generation
-from workstream_plan import plan_payload
+from workstream_plan import plan_payload, source_bytes
 from workstream_resume import (
     _checkpoint_repair_frontier, _generation_repair_binding,
     _issue_graph_repair_frontier, _projection_repair_frontier,
@@ -69,6 +70,12 @@ def _verify_review_artifact(payload: dict, path: str | None) -> None:
         or identity != f"https://{repository}/blob/{commit}/{artifact_path}"
     ):
         raise ValueError("material_repair_review_artifact_identity_mismatch")
+    try:
+        fetched, fetched_identity = source_bytes(identity, identity)
+    except Exception as error:
+        raise ValueError("material_repair_review_artifact_fetch_failed") from error
+    if fetched_identity != identity or fetched != material:
+        raise ValueError("material_repair_review_artifact_remote_mismatch")
 
 
 def main() -> int:
@@ -117,8 +124,6 @@ def main() -> int:
         client = HttpGraphQLClient(token, args.linear_endpoint)
         declared, _ = resolve_linear_route(config_path=args.config)
         route = resolve_authenticated_issue_route(client, args.workstream, declared)
-        if payload.get("authenticated_route") != route:
-            raise ValueError("material_semantic_repair_authenticated_route_drift")
         source = plan_payload(
             args.plan_source,
             args.plan_identity or payload.get("authenticated_source", {}).get("identity"),
@@ -133,32 +138,56 @@ def main() -> int:
         )
         comments = adapter.comments()
         raw = reduce_event_comments(comments, workstream_id=args.workstream)
-        generation = select_plan_generation(
-            comments, workstream_id=args.workstream,
-            description_plan_revision=payload["generation"]["plan_revision"],
-            authenticated_route=route,
-        )
-        generation_binding = {
-            "plan_revision": generation["plan_revision"],
-            "transition_tip_event_id": generation["transition_tip_event_id"],
-            "activation_epoch": generation["activation_epoch"],
-            "authority_origin": generation["authority_origin"],
-        }
-        projection = reduce_projection_comments(
-            comments, workstream_id=args.workstream,
-            expected_plan_revision=generation["plan_revision"],
-            authenticated_route=route, authenticated_source=source,
-        )
-        checkpoints = reduce_checkpoint_comments(comments, workstream_id=args.workstream)
-        graph_snapshot = LinearGraphQLTransport(
-            client, team_id=route["team_id"], workspace_id=route["workspace_id"],
-            project_id=route["project_id"],
-        ).snapshot_for_root(args.workstream, include_child_comments=False)
-        relations = projection.snapshot.get("relations") or []
-        graph_frontier = _issue_graph_repair_frontier(
-            graph_snapshot, relations,
-            read_relation_targets(client, relations) if relations else {},
-        )
+        replay = control is not None and control.get("event_id") in raw.remote_ids
+        historical_route = payload.get("authenticated_route", {})
+        if replay:
+            if any(
+                historical_route.get(field) != route.get(field)
+                for field in ("workspace_id", "root_issue_id")
+            ):
+                raise ValueError("material_semantic_repair_root_authority_drift")
+            generation = {
+                **payload["generation"],
+                "description_plan_revision": payload["generation"]["plan_revision"],
+            }
+            generation_binding = payload["generation"]
+            projection = None
+            checkpoints = None
+            graph_frontier = payload["issue_graph_frontier"]
+        else:
+            if historical_route != route:
+                raise ValueError("material_semantic_repair_authenticated_route_drift")
+            generation = select_plan_generation(
+                comments, workstream_id=args.workstream,
+                description_plan_revision=payload["generation"]["plan_revision"],
+                authenticated_route=route,
+            )
+            generation_binding = {
+                "plan_revision": generation["plan_revision"],
+                "transition_tip_event_id": generation["transition_tip_event_id"],
+                "activation_epoch": generation["activation_epoch"],
+                "authority_origin": generation["authority_origin"],
+            }
+            projection = reduce_projection_comments(
+                comments, workstream_id=args.workstream,
+                expected_plan_revision=generation["plan_revision"],
+                authenticated_route=route, authenticated_source=source,
+            )
+            checkpoints = reduce_checkpoint_comments(
+                comments, workstream_id=args.workstream,
+            )
+            graph_snapshot = LinearGraphQLTransport(
+                client, team_id=route["team_id"], workspace_id=route["workspace_id"],
+                project_id=route["project_id"],
+            ).snapshot_for_root(
+                args.workstream, include_child_comments=False,
+                include_description=True,
+            )
+            relations = projection.snapshot.get("relations") or []
+            graph_frontier = _issue_graph_repair_frontier(
+                graph_snapshot, relations,
+                read_relation_targets(client, relations) if relations else {},
+            )
         if args.prepare:
             strict_candidate = payload.pop("strict_target_candidate_sha256", None)
             if (
@@ -234,7 +263,6 @@ def main() -> int:
                 "generation_tip_event_id": generation["transition_tip_event_id"],
                 "fences_sha256": canonical_sha256(fences),
             }
-        replay = control is not None and control.get("event_id") in raw.remote_ids
         base_revision = control.get("expected_revision") if control is not None else raw.revision
         expected_id = event_id_for(
             args.workstream, "material_semantic_repair", payload, base_revision,
@@ -245,11 +273,14 @@ def main() -> int:
             "remote_slot_id", "payload_sha256", "canonical_event_sha256",
             "comment_body_sha256",
         }
-        frontier = ledger_serialization_frontier(
-            sorted(item["event_id"] for item in checkpoints.checkpoints), comments,
-            workstream_id=args.workstream, authenticated_route=route,
-            current_plan_revision=generation["plan_revision"],
-            material_revision=base_revision,
+        frontier = payload["ledger_serialization_frontier"] if replay else (
+            ledger_serialization_frontier(
+                sorted(item["event_id"] for item in checkpoints.checkpoints),
+                comments, workstream_id=args.workstream,
+                authenticated_route=route,
+                current_plan_revision=generation["plan_revision"],
+                material_revision=base_revision,
+            )
         )
         slot_frontier = (
             payload.get("ledger_serialization_frontier") if replay else frontier
@@ -265,7 +296,7 @@ def main() -> int:
             )
         elif not replay and payload.get("ledger_serialization_frontier") != frontier:
             raise ValueError("material_repair_ledger_frontier_drift")
-        from workstream_linear_events import _canonical_event, encode_event_comment
+        from workstream_linear_events import _canonical_event
         import hashlib
         if control is None:
             created_at = payload.get("review_artifact", {}).get("reviewed_at")
@@ -273,7 +304,7 @@ def main() -> int:
                 expected_id, args.workstream, "material_semantic_repair", "system",
                 payload, base_revision, created_at,
             )
-            body = encode_event_comment(provisional)
+            body = encode_reviewed_repair_comment(provisional)
             control = {
                 "kind": "material_semantic_repair", "source": "system",
                 "event_id": expected_id, "expected_revision": base_revision,
@@ -308,7 +339,7 @@ def main() -> int:
             candidate_id, args.workstream, "material_semantic_repair", "system",
             payload, base_revision, control["created_at"],
         )
-        candidate_body = encode_event_comment(candidate)
+        candidate_body = encode_reviewed_repair_comment(candidate)
         if (
             control["payload_sha256"] != hashlib.sha256(json.dumps(
                 payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -328,16 +359,23 @@ def main() -> int:
         preview_raw = reduce_event_comments(synthetic, workstream_id=args.workstream)
         validated = apply_material_semantic_repairs(
             preview_raw, synthetic,
-            checkpoint_frontier=_checkpoint_repair_frontier(
-                checkpoints, count=payload["checkpoint_frontier"]["count"],
+            checkpoint_frontier=(
+                payload["checkpoint_frontier"] if replay
+                else _checkpoint_repair_frontier(
+                    checkpoints, count=payload["checkpoint_frontier"]["count"],
+                )
             ),
-            projection_frontier=_projection_repair_frontier(
-                projection, revision=payload["projection_frontier"]["revision"],
+            projection_frontier=(
+                payload["projection_frontier"] if replay
+                else _projection_repair_frontier(
+                    projection, revision=payload["projection_frontier"]["revision"],
+                )
             ),
             generation=generation_binding, authenticated_route=route,
             authenticated_source=source,
             issue_graph_frontier=graph_frontier,
             ledger_serialization_frontier_value=frontier,
+            validate_live_fences=not replay,
         )
         if args.prepare:
             json.dump({
@@ -380,7 +418,10 @@ def main() -> int:
                         client, team_id=final_route["team_id"],
                         workspace_id=final_route["workspace_id"],
                         project_id=final_route["project_id"],
-                    ).snapshot_for_root(args.workstream, include_child_comments=False),
+                    ).snapshot_for_root(
+                        args.workstream, include_child_comments=False,
+                        include_description=True,
+                    ),
                     final_relations,
                     read_relation_targets(client, final_relations)
                     if final_relations else {},
@@ -460,6 +501,30 @@ def main() -> int:
                     }, sys.stdout, sort_keys=True, indent=2)
                     sys.stdout.write("\n")
                     return 3
+            if replay:
+                json.dump({
+                    "applied": True, "replay": True,
+                    "event_id": candidate_id,
+                    "expected_revision": base_revision,
+                    "remote_slot_id": expected_slot,
+                    "raw_frontier": material_frontier(raw),
+                    "repair_count": len(validated.repair_bindings),
+                    "receipt": receipt.__dict__,
+                    "recovery_state": "complete",
+                    "postwrite_validation": {
+                        "repair_reducer": "valid_historical_proof",
+                        "production_compact_resume": "external_gate_required",
+                        "production_full_resume": "external_gate_required",
+                        "strict_generation_candidate": "external_gate_required",
+                        "exact_manifest_replay": "valid",
+                    },
+                    "mutation_atomicity": {
+                        "material_checkpoint_boundary": "deterministic_remote_slot",
+                        "cross_surface": "historical_proof_replay_no_write",
+                    },
+                }, sys.stdout, sort_keys=True, indent=2)
+                sys.stdout.write("\n")
+                return 0
             try:
                 post_route = resolve_authenticated_issue_route(
                     client, args.workstream, declared,
@@ -494,7 +559,10 @@ def main() -> int:
                         client, team_id=post_route["team_id"],
                         workspace_id=post_route["workspace_id"],
                         project_id=post_route["project_id"],
-                    ).snapshot_for_root(args.workstream, include_child_comments=False),
+                    ).snapshot_for_root(
+                        args.workstream, include_child_comments=False,
+                        include_description=True,
+                    ),
                     post_relations,
                     read_relation_targets(client, post_relations)
                     if post_relations else {},

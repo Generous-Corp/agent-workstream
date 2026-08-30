@@ -46,7 +46,10 @@ class ResumeTests(unittest.TestCase):
     def test_repair_graph_frontier_binds_native_status_and_state_identity(self):
         snapshot = self.snapshot()
         snapshot["root"].update({
-            "id": "root", "status": "In Progress", "status_type": "started",
+            "id": "root", "title": "Repair", "description": "full description",
+            "next_action": "continue", "updatedAt": "2026-08-30T00:00:00Z",
+            "revision": 7, "plan_revision": "a" * 64,
+            "status": "In Progress", "status_type": "started",
             "state_id": "state-1", "state": {
                 "id": "state-1", "name": "In Progress", "type": "started",
             },
@@ -56,6 +59,11 @@ class ResumeTests(unittest.TestCase):
         for field, value in (
             ("status", "Blocked"), ("status_type", "canceled"),
             ("state_id", "state-2"),
+            ("id", "root-2"), ("title", "Changed title"),
+            ("description", "changed description"),
+            ("next_action", "changed action"), ("revision", 8),
+            ("plan_revision", "b" * 64),
+            ("updatedAt", "2026-08-30T00:01:00Z"),
         ):
             changed = copy.deepcopy(snapshot)
             changed["root"][field] = value
@@ -69,6 +77,30 @@ class ResumeTests(unittest.TestCase):
                 MODULE._issue_graph_repair_frontier(changed, [], {})["sha256"],
                 baseline["sha256"], field,
             )
+        child_changed = copy.deepcopy(snapshot)
+        child_changed["children"][0]["description"] = "changed child description"
+        self.assertNotEqual(
+            MODULE._issue_graph_repair_frontier(child_changed, [], {})["sha256"],
+            baseline["sha256"],
+        )
+        relation = [{"type": "related", "target": {
+            "workspace_id": "workspace", "issue_id": "target",
+            "identifier": "GEN-50",
+        }}]
+        targets = {"workspace:target": {
+            "id": "target", "identifier": "GEN-50", "status": "Todo",
+        }}
+        relation_baseline = MODULE._issue_graph_repair_frontier(
+            snapshot, relation, targets,
+        )
+        changed_targets = copy.deepcopy(targets)
+        changed_targets["workspace:target"]["identifier"] = "GEN-51"
+        self.assertNotEqual(
+            MODULE._issue_graph_repair_frontier(
+                snapshot, relation, changed_targets,
+            )["sha256"],
+            relation_baseline["sha256"],
+        )
 
     def test_repaired_history_joins_before_and_after_source_authentication(self):
         from test_workstream_linear_events import LinearCommentEventAdapterTests

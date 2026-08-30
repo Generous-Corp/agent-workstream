@@ -11,8 +11,10 @@ from unittest import mock
 
 from test_workstream_linear_events import FakeCommentClient
 import test_workstream_linear_events as linear_event_tests
+import test_workstream_generation_transition as generation_tests
 from workstream_delta import Delta
 from workstream_checkpoint import build_checkpoint
+from workstream_generation import GenerationTransport, build_retirement_proof
 from workstream_linear_checkpoints import (
     encode_checkpoint_comment, reduce_checkpoint_comments,
 )
@@ -168,12 +170,21 @@ class MaterialRepairCliTests(unittest.TestCase):
         client.root_issue_id = self.route["root_issue_id"]
         return client
 
-    def _invoke(self, argv, client):
+    def _invoke(self, argv, client, *, fetched_artifact=None):
         transport = mock.Mock()
         transport.snapshot_for_root.return_value = copy.deepcopy(self.graph)
         stdout = io.StringIO()
         stderr = io.StringIO()
+        artifact_path = Path(argv[argv.index("--review-artifact") + 1])
+        artifact_bytes = artifact_path.read_bytes()
+        remote_bytes = (
+            artifact_bytes if fetched_artifact is None else fetched_artifact
+        )
         with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                MODULE, "source_bytes",
+                side_effect=lambda identity, _canonical: (remote_bytes, identity),
+            ))
             stack.enter_context(mock.patch.object(MODULE, "load_linear_api_key", return_value="token"))
             stack.enter_context(mock.patch.object(MODULE, "HttpGraphQLClient", return_value=client))
             stack.enter_context(mock.patch.object(MODULE, "resolve_linear_route", return_value=(None, None)))
@@ -269,6 +280,121 @@ class MaterialRepairCliTests(unittest.TestCase):
                 len([call for call in client.calls if "commentCreate" in call[0]]), writes,
             )
 
+    def test_successor_generation_source_projection_child_and_old_manifest_replay(self):
+        client = self._client()
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path, artifact_path, _outer = self._prepare(directory, client)
+            argv = [
+                "workstream_material_repair.py", "GEN-37",
+                "--manifest", str(manifest_path),
+                "--review-artifact", str(artifact_path),
+                "--plan-source", "plan", "--apply",
+            ]
+            code, _output, error = self._invoke(argv, client)
+            self.assertEqual((code, error), (0, ""))
+
+            successor = generation_tests.FakeClient()
+            successor.comments = copy.deepcopy(client.comments)
+            loader = generation_tests.Loader(successor)
+            generation_tests.project_full(
+                successor, generation_tests.NEW,
+                identity=f"https://example.test/{generation_tests.NEW}",
+            )
+            old_state = generation_tests.adapter(
+                successor, generation_tests.OLD,
+            ).state()
+            retirement = build_retirement_proof(
+                predecessor_plan_revision=generation_tests.OLD,
+                retired_at="2026-08-30T01:00:00Z", retired_writer_epoch=0,
+                provenance_event_ids=[
+                    event["event_id"] for event in old_state.events
+                    if event["kind"] == "provenance"
+                ],
+                checkpoint_event_ids=[],
+            )
+            GenerationTransport(
+                successor, issue_id="GEN-37", workstream_id="GEN-37",
+                authority=generation_tests.AUTHORITY,
+                candidate_loader=loader,
+                legacy_description_plan_revision=generation_tests.OLD,
+            ).activate(
+                target_plan_revision=generation_tests.NEW,
+                created_at="2026-08-30T01:00:01Z", retirement=retirement,
+            )
+            target = generation_tests.adapter(successor, generation_tests.NEW)
+            successor_source = {
+                "identity": f"https://example.test/{generation_tests.NEW}",
+                "sha256": generation_tests.NEW,
+            }
+            generation_authority = target.select_child_extension_generation(
+                description_plan_revision=generation_tests.OLD,
+                source=successor_source,
+            )
+            target.reserve_child_extension(
+                source=successor_source, reviewed_candidate_key="successor-child",
+                child_issue_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                expected_material_revision=58,
+                expected_projection_revision=target.state().revision,
+                native_initialization={
+                    "state_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "assignee_id": None,
+                },
+                generation_authority=generation_authority,
+                native_validation_sha256="0" * 64,
+            )
+            comments = copy.deepcopy(successor.comments)
+            selected = select_plan_generation(
+                comments, workstream_id="GEN-37",
+                description_plan_revision=generation_tests.OLD,
+                authenticated_route=self.route,
+            )
+            graph = MODULE.LinearGraphQLTransport(
+                successor, team_id=self.route["team_id"],
+                workspace_id=self.route["workspace_id"],
+                project_id=self.route["project_id"],
+            ).snapshot_for_root(
+                "GEN-37", include_child_comments=False,
+                include_description=True,
+            )
+            graph["root"].update({
+                "plan_revision": selected["plan_revision"],
+                "description_plan_revision": selected["description_plan_revision"],
+                "generation_transition_tip_event_id": selected[
+                    "transition_tip_event_id"
+                ],
+                "generation_activation_epoch": selected["activation_epoch"],
+                "generation_authority_origin": selected["authority_origin"],
+            })
+            resumed = workstream_resume.add_material_history(
+                graph, comments, "GEN-37", authenticated_route=self.route,
+                authenticated_source=successor_source,
+            )
+            compact = workstream_resume.compact_context(
+                resumed, "GEN-37", require_projection_authority=True,
+                max_items=200, max_bytes=100 * 1024,
+            )
+            full = workstream_resume.compact_context(
+                resumed, "GEN-37", require_projection_authority=True,
+                include_history=True, max_items=300, max_bytes=150 * 1024,
+            )
+            self.assertEqual(compact["resume_authority"], "full")
+            self.assertEqual(compact["plan_revision"], generation_tests.NEW)
+            self.assertTrue(any(
+                event["kind"] == "child_extension_authorization"
+                for event in full["projection_events"]
+            ))
+
+            mutations_before = len(successor.mutations)
+            code, output, error = self._invoke(argv, successor)
+            self.assertEqual((code, error), (0, ""))
+            replay = json.loads(output)
+            self.assertTrue(replay["replay"])
+            self.assertEqual(
+                replay["postwrite_validation"]["repair_reducer"],
+                "valid_historical_proof",
+            )
+            self.assertEqual(len(successor.mutations), mutations_before)
+
     def test_lost_response_is_classified_and_exact_manifest_reconciles(self):
         prepare_client = self._client()
         with tempfile.TemporaryDirectory() as directory:
@@ -298,6 +424,37 @@ class MaterialRepairCliTests(unittest.TestCase):
             code, output, error = self._invoke(argv, observed)
             self.assertEqual((code, error), (0, ""))
             self.assertTrue(json.loads(output)["replay"])
+
+    def test_internal_preappend_read_oserror_is_known_zero_write_refusal(self):
+        prepare_client = self._client()
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path, artifact_path, _outer = self._prepare(
+                directory, prepare_client,
+            )
+            client = self._client()
+            original_execute = client.execute
+            reads = 0
+
+            def fail_internal_read(query, variables):
+                nonlocal reads
+                if "query WorkstreamDeltaComments" in query:
+                    reads += 1
+                    if reads == 3:
+                        raise OSError("preappend read unavailable")
+                return original_execute(query, variables)
+
+            client.execute = fail_internal_read
+            code, output, error = self._invoke([
+                "workstream_material_repair.py", "GEN-37",
+                "--manifest", str(manifest_path),
+                "--review-artifact", str(artifact_path),
+                "--plan-source", "plan", "--apply",
+            ], client)
+            self.assertEqual((code, output), (2, ""))
+            self.assertIn("pinned_repair_prewrite_unavailable", error)
+            self.assertFalse(any(
+                "commentCreate" in call[0] for call in client.calls
+            ))
 
     def test_review_artifact_digest_or_content_mismatch_refuses_before_remote_read(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -419,27 +576,59 @@ class MaterialRepairCliTests(unittest.TestCase):
                     "commentCreate" in call[0] for call in racing.calls
                 ))
 
-    def test_live_reviewed_gen37_target_artifact_matches_immutable_authority(self):
-        path = Path(
-            "/Users/danielraffel/Code/pulp-planning-gen37-material-repair-20260830/"
-            "artifacts/2026-08-30-gen37-material-semantic-repair-targets.json"
-        )
-        if not path.exists():
-            self.skipTest("local immutable planning artifact unavailable")
-        reviewed = json.loads(path.read_text(encoding="utf-8"))
-        payload = {**reviewed, "review_artifact": {
-            "identity": (
+    def test_review_artifact_requires_authenticated_remote_byte_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "targets.json"
+            reviewed = {
+                "schema_version": 1, "workstream_id": "GEN-37",
+                "target_bindings": self.payload["target_bindings"],
+            }
+            material = json.dumps(reviewed, sort_keys=True).encode()
+            path.write_bytes(material)
+            identity = (
                 "https://github.com/danielraffel/pulp-planning/blob/"
-                "d72cba77c7841e4d866dc3825fa134a5d1d43730/"
-                "artifacts/2026-08-30-gen37-material-semantic-repair-targets.json"
-            ),
-            "repository": "github.com/danielraffel/pulp-planning",
-            "commit": "d72cba77c7841e4d866dc3825fa134a5d1d43730",
-            "path": "artifacts/2026-08-30-gen37-material-semantic-repair-targets.json",
-            "sha256": "3ad4d9e1e8344727f3c56086a06f7857ee35d578a0630012be393b31b4ba6c12",
-            "reviewed_at": "2026-08-30T11:13:05Z",
-        }}
-        MODULE._verify_review_artifact(payload, str(path))
+                "d72cba77c7841e4d866dc3825fa134a5d1d43730/targets.json"
+            )
+            payload = {**reviewed, "review_artifact": {
+                "identity": identity,
+                "repository": "github.com/danielraffel/pulp-planning",
+                "commit": "d72cba77c7841e4d866dc3825fa134a5d1d43730",
+                "path": "targets.json",
+                "sha256": hashlib.sha256(material).hexdigest(),
+                "reviewed_at": "2026-08-30T11:13:05Z",
+            }}
+            with mock.patch.object(
+                MODULE, "source_bytes", return_value=(material, identity),
+            ) as fetch:
+                MODULE._verify_review_artifact(payload, str(path))
+            fetch.assert_called_once_with(identity, identity)
+            for fetched, fetched_identity in (
+                (b"tampered", identity),
+                (material, identity + "?wrong"),
+            ):
+                with self.subTest(fetched_identity=fetched_identity), \
+                     mock.patch.object(
+                         MODULE, "source_bytes",
+                         return_value=(fetched, fetched_identity),
+                     ), self.assertRaisesRegex(ValueError, "remote_mismatch"):
+                    MODULE._verify_review_artifact(payload, str(path))
+
+    def test_remote_review_artifact_mismatch_refuses_before_linear_read(self):
+        prepare_client = self._client()
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path, artifact_path, _outer = self._prepare(
+                directory, prepare_client,
+            )
+            client = self._client()
+            code, output, error = self._invoke([
+                "workstream_material_repair.py", "GEN-37",
+                "--manifest", str(manifest_path),
+                "--review-artifact", str(artifact_path),
+                "--plan-source", "plan", "--apply",
+            ], client, fetched_artifact=b"remote tamper")
+            self.assertEqual((code, output), (2, ""))
+            self.assertIn("review_artifact_remote_mismatch", error)
+            self.assertEqual(client.calls, [])
 
 
 if __name__ == "__main__":

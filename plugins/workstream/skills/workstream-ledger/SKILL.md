@@ -410,7 +410,8 @@ workstreamctl material-repair GEN-123 --manifest repair.json \
 ```
 
 The reviewed target file is authenticated locally by immutable commit/path and
-SHA-256. Normalization is mechanically lossless: exactly two incident targets,
+SHA-256 and fetched through the authenticated source-byte loader; fetched and
+local bytes must match before Linear access. Normalization is mechanically lossless: exactly two incident targets,
 `repair:<event-id>`, and one `progress` change containing the complete original
 payload. The material comment uses one deterministic slot; the complete
 cross-surface readback is a preflight/postcheck fence, not transactional CAS.
@@ -419,6 +420,7 @@ create, requires the exact pinned serialization frontier, and writes only the
 reviewed slot—never a recomputed successor slot.
 Later authorized generation, source, or child evolution does not invalidate the
 immutable historical repair proof.
+The control kind is reserved from generic journal/encoder/adapter paths.
 
 ### Durable choice events
 
