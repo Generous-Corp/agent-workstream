@@ -16,7 +16,7 @@ from workstream_linear import (
 from workstream_linear_checkpoints import reduce_checkpoint_comments
 from workstream_linear_events import (
     LinearCommentEventAdapter, apply_material_semantic_repairs,
-    assert_exact_pinned_repair_comment,
+    assert_exact_pinned_repair_comment, canonical_authenticated_source,
     encode_reviewed_repair_comment, ledger_boundary_slot_id,
     ledger_serialization_frontier, material_frontier,
     PinnedRepairPreconditionError, reduce_event_comments,
@@ -115,11 +115,18 @@ def main() -> int:
         client = HttpGraphQLClient(token, args.linear_endpoint)
         declared, _ = resolve_linear_route(config_path=args.config)
         route = resolve_authenticated_issue_route(client, args.workstream, declared)
-        source = plan_payload(
+        reviewed_source = canonical_authenticated_source(
+            payload.get("authenticated_source")
+        )
+        if control is None:
+            payload["authenticated_source"] = reviewed_source
+        elif payload.get("authenticated_source") != reviewed_source:
+            raise ValueError("malformed_material_semantic_repair_authenticated_source")
+        source = canonical_authenticated_source(plan_payload(
             args.plan_source,
-            args.plan_identity or payload.get("authenticated_source", {}).get("identity"),
-        )["source"]
-        if payload.get("authenticated_source") != source:
+            args.plan_identity or reviewed_source["identity"],
+        )["source"])
+        if reviewed_source != source:
             raise ValueError("material_semantic_repair_authenticated_source_drift")
         adapter = LinearCommentEventAdapter(
             client, issue_id=args.workstream,
@@ -386,10 +393,10 @@ def main() -> int:
                 final_route = resolve_authenticated_issue_route(
                     client, args.workstream, declared,
                 )
-                final_source = plan_payload(
+                final_source = canonical_authenticated_source(plan_payload(
                     args.plan_source,
                     args.plan_identity or source.get("identity"),
-                )["source"]
+                )["source"])
                 final_comments = adapter.comments()
                 final_raw = reduce_event_comments(
                     final_comments, workstream_id=args.workstream,
@@ -533,10 +540,10 @@ def main() -> int:
                 post_route = resolve_authenticated_issue_route(
                     client, args.workstream, declared,
                 )
-                post_source = plan_payload(
+                post_source = canonical_authenticated_source(plan_payload(
                     args.plan_source,
                     args.plan_identity or source.get("identity"),
-                )["source"]
+                )["source"])
                 post_comments = adapter.comments()
                 post_raw = reduce_event_comments(
                     post_comments, workstream_id=args.workstream,

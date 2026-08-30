@@ -390,6 +390,13 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.32 keeps material-repair source authority to the immutable identity
+and SHA-256 pair. The repair CLI authenticates the complete plan bytes but
+normalizes the diagnostic byte count out of reviewed seeds and every live
+prewrite/postwrite validation boundary. Pinned manifests and historical replay
+continue to bind only that pair. Identity or digest drift still refuses before
+mutation.
+
 Version 0.4.31 closes an incident in which two callers encoded flat progress
 payloads while labeling them `material_boundary`. New journal and remote writes
 now require a nonempty boundary ID and one or more exact `{kind, payload}`

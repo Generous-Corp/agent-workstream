@@ -270,7 +270,8 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
         effective = apply_material_semantic_repairs(
             raw, comments, checkpoint_frontier=checkpoint,
             projection_frontier=projection, generation=generation,
-            authenticated_route=route, authenticated_source=source,
+            authenticated_route=route,
+            authenticated_source={**source, "bytes": 65753},
             issue_graph_frontier=graph,
             ledger_serialization_frontier_value=[],
         )

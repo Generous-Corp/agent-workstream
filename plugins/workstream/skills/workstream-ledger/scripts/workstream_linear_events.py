@@ -80,6 +80,21 @@ class PinnedRepairPreconditionError(LinearEventError):
     """A repair's final internal read no longer matches its pinned manifest."""
 
 
+def canonical_authenticated_source(source: Any) -> dict[str, str]:
+    """Return the byte-authenticated source authority used by repair proofs."""
+    if not isinstance(source, dict):
+        raise ValueError("invalid_authenticated_source_authority")
+    identity = source.get("identity")
+    sha256 = source.get("sha256")
+    if (
+        not isinstance(identity, str)
+        or not identity
+        or re.fullmatch(r"[0-9a-f]{64}", str(sha256 or "")) is None
+    ):
+        raise ValueError("invalid_authenticated_source_authority")
+    return {"identity": identity, "sha256": sha256}
+
+
 @dataclass(frozen=True)
 class ReducedEventLog:
     workstream_id: str
@@ -772,6 +787,18 @@ def apply_material_semantic_repairs(
     ):
         if not isinstance(payload[field], dict):
             raise LinearEventError(f"malformed_material_semantic_repair_{field}")
+    try:
+        bound_source = canonical_authenticated_source(
+            payload["authenticated_source"]
+        )
+    except ValueError as error:
+        raise LinearEventError(
+            "malformed_material_semantic_repair_authenticated_source"
+        ) from error
+    if payload["authenticated_source"] != bound_source:
+        raise LinearEventError(
+            "malformed_material_semantic_repair_authenticated_source"
+        )
     prefix = ReducedEventLog(
         raw.workstream_id, control.expected_revision,
         tuple(raw.events[:control.expected_revision]),
@@ -812,16 +839,25 @@ def apply_material_semantic_repairs(
     ):
         raise LinearEventError("material_semantic_repair_root_authority_drift")
     if validate_live_fences:
+        try:
+            live_source = canonical_authenticated_source(authenticated_source)
+        except ValueError as error:
+            raise LinearEventError(
+                "material_semantic_repair_authenticated_source_drift"
+            ) from error
         for name, actual in (
             ("checkpoint_frontier", checkpoint_frontier),
             ("projection_frontier", projection_frontier),
             ("generation", generation),
             ("authenticated_route", authenticated_route),
-            ("authenticated_source", authenticated_source),
             ("issue_graph_frontier", issue_graph_frontier),
         ):
             if payload[name] != actual:
                 raise LinearEventError(f"material_semantic_repair_{name}_drift")
+        if bound_source != live_source:
+            raise LinearEventError(
+                "material_semantic_repair_authenticated_source_drift"
+            )
     artifact = payload["review_artifact"]
     try:
         validate_review_artifact_identity(artifact)
@@ -858,11 +894,11 @@ def apply_material_semantic_repairs(
         )) is None
     ):
         raise LinearEventError("malformed_material_semantic_repair_postwrite_oracle")
-    if oracle["source_identity"] != payload["authenticated_source"].get("identity"):
+    if oracle["source_identity"] != bound_source["identity"]:
         raise LinearEventError(
             "material_semantic_repair_postwrite_oracle_source_identity_drift"
         )
-    if oracle["source_sha256"] != payload["authenticated_source"].get("sha256"):
+    if oracle["source_sha256"] != bound_source["sha256"]:
         raise LinearEventError(
             "material_semantic_repair_postwrite_oracle_source_sha256_drift"
         )
@@ -908,7 +944,11 @@ def apply_material_semantic_repairs(
         raise LinearEventError(
             "material_semantic_repair_postwrite_oracle_source_event_id_drift"
         )
-    if source_event.get("value") != payload["authenticated_source"]:
+    try:
+        event_source = canonical_authenticated_source(source_event.get("value"))
+    except ValueError:
+        event_source = None
+    if event_source != bound_source:
         raise LinearEventError(
             "material_semantic_repair_postwrite_oracle_source_event_value_drift"
         )
