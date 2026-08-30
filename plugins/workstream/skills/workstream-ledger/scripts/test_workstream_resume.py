@@ -546,6 +546,55 @@ class ResumeTests(unittest.TestCase):
         )
         self.assertEqual(full["latest_checkpoint"]["provenance_chain"][0]["machine"], "M5")
 
+    def test_material_history_recovers_selected_generation_activation_checkpoint(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        snapshot = self.snapshot()
+        snapshot["root"]["generation_transition_tip_event_id"] = "transition-tip"
+        checkpoint = build_checkpoint(
+            workstream_id="GEN-37", boundary_id="generation-activation",
+            root_revision=0, plan_revision="sha",
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai", "session_id": "next",
+                "machine": "M5", "worktree": {
+                    "state": "safe", "path": "/repo/next", "branch": "next",
+                    "head": "abc123",
+                },
+            },
+            exact_head="abc123", evidence=[{"kind": "test", "id": "activation"}],
+            blocker=None, next_action="Resume the activated generation.",
+        )
+        with mock.patch(
+            "workstream_generation.selected_activation_checkpoints",
+            return_value=[(checkpoint, "transition-comment")],
+        ) as selected:
+            enriched = MODULE.add_material_history(
+                snapshot, [], "GEN-37", authenticated_route=route,
+            )
+        context = MODULE.compact_context(enriched, "GEN-37")
+        self.assertEqual(
+            context["latest_checkpoint"]["checkpoint_event_id"],
+            checkpoint["event_id"],
+        )
+        self.assertEqual(
+            context["latest_checkpoint"]["worktree"]["path"], "/repo/next",
+        )
+        selected.assert_called_once_with(
+            [], workstream_id="GEN-37", transition_event_id="transition-tip",
+            active_plan_revision="sha", authenticated_route=route,
+        )
+
+    def test_generation_activation_checkpoint_requires_authenticated_route(self):
+        snapshot = self.snapshot()
+        snapshot["root"]["generation_transition_tip_event_id"] = "transition-tip"
+        with self.assertRaisesRegex(
+            MODULE.ResumeError, "generation_activation_checkpoint_route_missing",
+        ):
+            MODULE.add_material_history(snapshot, [], "GEN-37")
+
     def test_material_event_after_checkpoint_supersedes_checkpoint_next_action(self):
         snapshot = self.snapshot()
         checkpoint = build_checkpoint(

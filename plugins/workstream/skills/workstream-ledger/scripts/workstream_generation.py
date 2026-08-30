@@ -888,6 +888,9 @@ class GenerationTransport:
         self, comments: list[dict[str, Any]], *, from_plan: str, to_plan: str,
         expected_retirement: dict[str, Any] | None = None,
         expected_created_at: str | None = None,
+        validate_activation_inputs: bool = False,
+        expected_activation_checkpoint: dict[str, Any] | None = None,
+        expected_remote_head: str | None = None,
     ) -> dict[str, Any] | None:
         for state in self._states(comments, from_plan):
             matching = [event for event in state.events
@@ -907,6 +910,42 @@ class GenerationTransport:
                     authenticated_route=self.authority,
                 )
                 event = matching[0]
+                if validate_activation_inputs:
+                    carried = event["value"].get("activation_checkpoint")
+                    if carried != expected_activation_checkpoint:
+                        raise WorkstreamGenerationError(
+                            "generation_historical_replay_checkpoint_mismatch"
+                        )
+                    if carried is None:
+                        if expected_remote_head is not None:
+                            raise WorkstreamGenerationError(
+                                "generation_historical_replay_remote_head_mismatch"
+                            )
+                    else:
+                        target = self._states(comments, to_plan)[0]
+                        bound_revision = event["value"]["to"][
+                            "projection_revision"
+                        ]
+                        disposition_event = next((
+                            item for item in reversed(
+                                target.events[:bound_revision]
+                            )
+                            if item["kind"] == "disposition"
+                            and item["key"] == "root"
+                        ), None)
+                        disposition = (
+                            disposition_event["value"]
+                            if disposition_event is not None else None
+                        )
+                        if (
+                            not isinstance(disposition, dict)
+                            or disposition.get("recovered_from_checkpoint")
+                            != carried["event_id"]
+                            or disposition.get("remote_head") != expected_remote_head
+                        ):
+                            raise WorkstreamGenerationError(
+                                "generation_historical_replay_remote_head_mismatch"
+                            )
                 return {"event_id": event["event_id"],
                         "remote_id": state.remote_ids[event["event_id"]],
                         "revision": event["expected_revision"] + 1,
@@ -1143,6 +1182,9 @@ class GenerationTransport:
             replay = self._historical_replay(
                 comments, from_plan=replay_from, to_plan=target_plan_revision,
                 expected_retirement=retirement, expected_created_at=created_at,
+                validate_activation_inputs=True,
+                expected_activation_checkpoint=activation_checkpoint,
+                expected_remote_head=remote_head,
             )
             if replay:
                 return replay
@@ -1156,6 +1198,29 @@ class GenerationTransport:
             raise WorkstreamGenerationError("generation_target_already_active")
         epoch = (selected["activation_epoch"] if selected["activation_epoch"] is not None else -1) + 1
         _validate_retirement(retirement, from_plan, epoch)
+        target_state = self._states(comments, target_plan_revision)[0]
+        target_disposition = target_state.snapshot.get("disposition")
+        prepared_checkpoint_id = (
+            target_disposition.get("recovered_from_checkpoint")
+            if isinstance(target_disposition, dict) else None
+        )
+        durable_checkpoint_ids = {
+            item["event_id"] for item in reduce_generation_checkpoint_comments(
+                comments, workstream_id=self.workstream_id,
+                authenticated_route=self.authority,
+            ).checkpoints
+        }
+        if (
+            isinstance(prepared_checkpoint_id, str)
+            and prepared_checkpoint_id not in durable_checkpoint_ids
+            and (
+                activation_checkpoint is None
+                or activation_checkpoint.get("event_id") != prepared_checkpoint_id
+            )
+        ):
+            raise WorkstreamGenerationError(
+                "generation_prepared_activation_checkpoint_required"
+            )
         if activation_checkpoint is not None:
             validate_checkpoint(activation_checkpoint)
             material = reduce_event_comments(comments, workstream_id=self.workstream_id)
@@ -1646,7 +1711,11 @@ def main() -> int:
         source = plan_payload(args.plan_source, args.plan_identity or args.plan_source)["source"]
         activation_checkpoint = None
         if args.command == "activate" and args.activation_checkpoint:
-            if args.max_bytes != DEFAULT_RESUME_MAX_BYTES or not args.remote_head:
+            if (
+                args.max_bytes != DEFAULT_RESUME_MAX_BYTES
+                or args.max_items != 100
+                or not args.remote_head
+            ):
                 raise WorkstreamGenerationError(
                     "generation_activation_checkpoint_requires_default_resume_budget"
                 )
