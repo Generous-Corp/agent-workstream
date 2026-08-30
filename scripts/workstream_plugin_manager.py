@@ -819,6 +819,167 @@ def codex_inventory(env: dict[str, str] | None = None) -> tuple[dict[str, Any] |
     return marketplace, plugin
 
 
+def _validated_runtime_marketplace_name(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.startswith(
+            CODEX_RUNTIME_MARKETPLACE_PREFIX):
+        return None
+    generation = value.removeprefix(CODEX_RUNTIME_MARKETPLACE_PREFIX)
+    if not re.fullmatch(r"[0-9a-f]{64}", generation):
+        raise InstallError(f"malformed_codex_runtime_marketplace:{value}")
+    return value
+
+
+def _validated_runtime_plugin_id(value: Any) -> str | None:
+    if not isinstance(value, str) or "@" not in value:
+        return None
+    plugin_name, marketplace_name = value.split("@", 1)
+    marketplace = _validated_runtime_marketplace_name(marketplace_name)
+    if marketplace is not None:
+        if plugin_name != CODEX_RUNTIME_PLUGIN:
+            raise InstallError(f"foreign_codex_runtime_plugin:{value}")
+        return value
+    if plugin_name == CODEX_RUNTIME_PLUGIN:
+        raise InstallError(f"foreign_codex_runtime_plugin:{value}")
+    return None
+
+
+def codex_runtime_registration_inventory(
+    target: Path, env: dict[str, str] | None = None,
+) -> dict[str, list[str]]:
+    """Read the bounded runtime identities from both CLI and raw config."""
+    marketplaces = run(
+        ["codex", "plugin", "marketplace", "list", "--json"],
+        parse_json=True, env=env,
+    )
+    plugins = run(
+        ["codex", "plugin", "list", "--json"], parse_json=True, env=env,
+    )
+    if not isinstance(marketplaces, dict):
+        raise InstallError("invalid_codex_marketplaces_top_level")
+    marketplace_items = marketplaces.get("marketplaces")
+    if not isinstance(marketplace_items, list):
+        raise InstallError("invalid_codex_marketplace_container")
+    if any(not isinstance(item, dict) for item in marketplace_items):
+        raise InstallError("invalid_codex_marketplace_item")
+    if not isinstance(plugins, dict):
+        raise InstallError("invalid_codex_plugins_top_level")
+    plugin_items = plugins.get("installed")
+    if not isinstance(plugin_items, list):
+        raise InstallError("invalid_codex_plugin_container")
+    if any(not isinstance(item, dict) for item in plugin_items):
+        raise InstallError("invalid_codex_plugin_item")
+
+    cli_marketplaces = [
+        identity for item in marketplace_items
+        if (identity := _validated_runtime_marketplace_name(item.get("name")))
+        is not None
+    ]
+    cli_plugins = [
+        identity for item in plugin_items
+        if (identity := _validated_runtime_plugin_id(item.get("pluginId")))
+        is not None
+    ]
+    if len(cli_marketplaces) != len(set(cli_marketplaces)):
+        raise InstallError("duplicate_codex_runtime_marketplace_records")
+    if len(cli_plugins) != len(set(cli_plugins)):
+        raise InstallError("duplicate_codex_runtime_plugin_records")
+
+    config_path = target / "config.toml"
+    if config_path.exists():
+        try:
+            with config_path.open("rb") as handle:
+                config = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise InstallError(f"codex_config_invalid:{config_path}") from error
+        if not isinstance(config, dict):
+            raise InstallError(f"codex_config_invalid:{config_path}")
+    else:
+        config = {}
+    config_marketplace_table = config.get("marketplaces", {})
+    config_plugin_table = config.get("plugins", {})
+    if not isinstance(config_marketplace_table, dict):
+        raise InstallError("codex_config_marketplace_table_invalid")
+    if not isinstance(config_plugin_table, dict):
+        raise InstallError("codex_config_plugin_table_invalid")
+    config_marketplaces: list[str] = []
+    for key, value in config_marketplace_table.items():
+        identity = _validated_runtime_marketplace_name(key)
+        if identity is not None:
+            if not isinstance(value, dict):
+                raise InstallError(
+                    f"malformed_codex_runtime_marketplace_record:{key}"
+                )
+            config_marketplaces.append(identity)
+    config_plugins: list[str] = []
+    for key, value in config_plugin_table.items():
+        identity = _validated_runtime_plugin_id(key)
+        if identity is not None:
+            if not isinstance(value, dict):
+                raise InstallError(
+                    f"malformed_codex_runtime_plugin_record:{key}"
+                )
+            config_plugins.append(identity)
+    return {
+        "cli_marketplaces": sorted(cli_marketplaces),
+        "cli_plugins": sorted(cli_plugins),
+        "config_marketplaces": sorted(config_marketplaces),
+        "config_plugins": sorted(config_plugins),
+    }
+
+
+def cleanup_codex_runtime_generations(
+    target: Path, env: dict[str, str], *, expected_plugin_id: str,
+    journal: "TransactionJournal",
+) -> bool:
+    """Remove only stale collision-proof generations through Codex's CLI."""
+    expected_plugin = _validated_runtime_plugin_id(expected_plugin_id)
+    if expected_plugin is None:
+        raise InstallError("expected_codex_runtime_plugin_invalid")
+    expected_marketplace = expected_plugin.split("@", 1)[1]
+    observed = codex_runtime_registration_inventory(target, env)
+    stale_plugins = sorted(
+        (
+            set(observed["cli_plugins"])
+            | set(observed["config_plugins"])
+        ) - {expected_plugin}
+    )
+    stale_marketplaces = sorted(
+        (
+            set(observed["cli_marketplaces"])
+            | set(observed["config_marketplaces"])
+        ) - {expected_marketplace}
+    )
+    changed = False
+    for plugin_id in stale_plugins:
+        journal.set_phase(f"removing_stale_runtime_plugin:{plugin_id}")
+        run(["codex", "plugin", "remove", plugin_id, "--json"], env=env)
+        journal.set_phase(f"stale_runtime_plugin_removed:{plugin_id}")
+        changed = True
+    for marketplace_name in stale_marketplaces:
+        journal.set_phase(
+            f"removing_stale_runtime_marketplace:{marketplace_name}"
+        )
+        run([
+            "codex", "plugin", "marketplace", "remove", marketplace_name,
+            "--json",
+        ], env=env)
+        journal.set_phase(
+            f"stale_runtime_marketplace_removed:{marketplace_name}"
+        )
+        changed = True
+    remaining = codex_runtime_registration_inventory(target, env)
+    for key, surface in remaining.items():
+        expected = expected_plugin if key.endswith("plugins") else expected_marketplace
+        stale = set(surface) - {expected}
+        if stale:
+            raise InstallError(
+                "codex_runtime_generation_cleanup_incomplete:"
+                + ",".join(sorted(stale))
+            )
+    journal.set_phase("runtime_generations_ready")
+    return changed
+
+
 def codex_legacy_inventory(env: dict[str, str] | None = None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     marketplaces = run(["codex", "plugin", "marketplace", "list", "--json"], parse_json=True, env=env)
     plugins = run(["codex", "plugin", "list", "--json"], parse_json=True, env=env)
@@ -934,6 +1095,10 @@ def repairable_verification_error(error: InstallError) -> bool:
         "installed_manifest_version_mismatch:",
         "codex_runtime_marketplace_generation_mismatch",
         "codex_runtime_plugin_generation_mismatch",
+        "codex_config_runtime_marketplace_mismatch",
+        "codex_config_runtime_plugin_mismatch",
+        "duplicate_codex_runtime_marketplace_records",
+        "duplicate_codex_runtime_plugin_records",
     ))
 
 
@@ -1279,9 +1444,20 @@ def main(argv: list[str] | None = None) -> int:
                                 expected_version=args.expected_version,
                                 expected_digest=source["tree_sha256"],
                                 journal=journal,
+                                capture_pre_migration=recovering,
                             )
                             changed |= projection_changed
                             changed |= remove_legacy_codex_registration(env, journal)
+                            changed |= cleanup_codex_runtime_generations(
+                                target, env,
+                                expected_plugin_id=(
+                                    codex_runtime_plugin_id(
+                                        args.expected_commit,
+                                        source["tree_sha256"],
+                                    )
+                                ),
+                                journal=journal,
+                            )
                         else:
                             client_source = codex_projection_root(
                                 args.expected_commit, source["tree_sha256"]
@@ -1298,8 +1474,10 @@ def main(argv: list[str] | None = None) -> int:
                             if previous.exists() or previous.is_symlink():
                                 raise InstallError("codex_projection_recovery_required")
                     if args.mode == "update":
-                        marketplace, plugin = inventory(client, env)
+                        marketplace = None
+                        plugin = None
                         try:
+                            marketplace, plugin = inventory(client, env)
                             receipt = verify_client(
                                 client, marketplace, plugin,
                                 expected_commit=args.expected_commit,
