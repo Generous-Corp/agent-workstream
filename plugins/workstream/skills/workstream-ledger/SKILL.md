@@ -433,7 +433,11 @@ reviewed `terminal_child_evidence_seed_predecessor` may instead carry only
 contracts that an exact predecessor-generation closure authorizes. The binding
 fences the complete stale projection history, predecessor projection and tip,
 material log, predecessor checkpoint chain, and graph/material/checkpoint input
-frontier. The carried contract may change only its plan revision; its historical
+frontier. A mixed predecessor is accepted only through the normal authenticated
+reducer when one v2 `cas_activation` binds the exact ordered legacy-v1 IDs and
+digest, every later event is v2 on the authenticated route, and no event is
+quarantined; the binding digest and frontier cover the complete accepted mixed
+history. The carried contract may change only its plan revision; its historical
 head, receipts, owner, and repository remain immutable. The carry proof is
 persisted on the new evidence event, so the later closure repair and ordinary
 resume can revalidate it against the predecessor history. Missing, ambiguous,
@@ -597,17 +601,24 @@ verification.
 Projection synchronization treats a labeled `Canonical plan: <URL>` line on
 the existing root issue as the source identity. Exactly one distinct URL is
 required before any write; zero or multiple candidates refuse with a concrete
-remediation and never create another issue or project. The command adds a
-missing structured source or refreshes its identity and SHA-256 when the living
-plan revision changes, while preserving the issue and append-only history. A
-change to a different plan document must be explicit in the reviewed manifest;
-an omitted source cannot silently replace the active document. The command
-rechecks the labeled URL after its writes, so a concurrent description edit
-refuses success. Repeated synchronization with a current review contract writes
-nothing. Intake does not add a labeled canonical URL by itself; any issue
-mutation that adds or changes that line must finish through this projection
-transaction. A projection operation is not reported successful until the same
-strict bounded validation as resume returns `resume_authority: full`.
+remediation and never create another issue or project. A legacy active plan
+still requires the supplied authenticated identity to equal that exact URL.
+An inactive, unselected, non-retired generation candidate may instead use an
+immutable revision URL for the same host/owner/repository/path only when its
+reviewed target projection contract is exact and its explicit source item
+matches the authenticated identity and SHA-256. Once activated, normal resume
+and projection trust that structured active source rather than description
+prose. The original canonical URL and full description digest are diagnostic
+fences: both are reread before the first append and after final validation, and
+the command never calls `issueUpdate`. A different document, ambiguous label,
+source mismatch, stale review frontier, or description drift refuses. The
+command otherwise adds a missing structured source or refreshes its identity
+and SHA-256 while preserving the issue and append-only history. Repeated
+synchronization with a current review contract writes nothing. Intake does not
+add a labeled canonical URL by itself; any issue mutation that adds or changes
+that line must finish through this projection transaction. A projection
+operation is not reported successful until the same strict bounded validation
+as resume returns `resume_authority: full`.
 If a historical relation points to a peer created before the relation-readback
 contract, only this reconcile command may load that incomplete head, and only
 when the reviewed manifest exactly retires or replaces every incomplete
