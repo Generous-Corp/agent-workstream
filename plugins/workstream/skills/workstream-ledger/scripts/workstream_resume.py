@@ -368,6 +368,23 @@ def add_child_material_history(
     return result
 
 
+def add_live_child_material_history(
+    snapshot: dict[str, Any], *, authenticated_route: dict[str, str],
+) -> dict[str, Any]:
+    """Join the transport's complete nonterminal-child comment collection.
+
+    ``LinearGraphQLTransport.snapshot_for_root(include_child_comments=True)``
+    is the single transport boundary for ordinary resume and every strict
+    projection validation. Keeping the join here prevents those consumers
+    from validating the root log while omitting child material and checkpoint
+    authority.
+    """
+    return add_child_material_history(
+        snapshot, snapshot.get("child_comments"),
+        authenticated_route=authenticated_route,
+    )
+
+
 def _uncheckpointed_material_obligations(
     events: list[dict[str, Any]], checkpoint_revision: int,
 ) -> list[dict[str, Any]]:
@@ -1666,10 +1683,8 @@ def main() -> int:
             live_graph_snapshot["root"]["generation_authority_origin"] = (
                 generation["authority_origin"]
             )
-            child_comments = live_graph_snapshot.pop("child_comments", None)
-            live_graph_snapshot = add_child_material_history(
-                live_graph_snapshot, child_comments,
-                authenticated_route=route,
+            live_graph_snapshot = add_live_child_material_history(
+                live_graph_snapshot, authenticated_route=route,
             )
             # This first join discovers the projected plan source before its
             # bytes can be authenticated. Lifecycle validation is necessarily

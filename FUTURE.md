@@ -79,6 +79,21 @@ service must be replaceable: installing the plugin alone should continue to
 provide local start, status, resume, and closure contracts without requiring a
 vendor daemon.
 
+## Cross-issue serialization
+
+Linear comment creation cannot atomically compare the root projection frontier
+with material comments on every nonterminal child. The current protocol
+validates the complete child-aware candidate, rechecks that frontier immediately
+before each projection append, and refuses authority if the final frontier
+changed. An append in the remaining API check/use gap can therefore leave one
+inert projection comment, but cannot return valid authority.
+
+A future protocol may eliminate even that inert write with a cooperative
+multi-issue reservation respected by every root and child material writer, or
+with a provider-native atomic primitive. Do not claim arbitrary-interleaving
+zero-write behavior until the reservation, crash recovery, stale-owner expiry,
+and mixed-client compatibility are implemented and physically tested.
+
 ## Provider and repository portability
 
 Future adapters should support additional source-control and planning providers
