@@ -2537,9 +2537,18 @@ def load_material_history_for_projection_reconcile(
         retirement["kind"] in {"evidence_contract", "child_closure"}
         for retirement in reviewed_retirements
     )
-    if authority_sensitive_changes:
-        if remote_head is None:
-            raise LinearProjectionError("prospective_remote_head_required")
+    reviewed_changes = any(
+        identity not in active or active[identity]["value"] != value
+        for identity, value in desired_by_identity.items()
+    ) or bool(reviewed_retirements)
+    if (
+        reviewed_changes
+        and projection_review_contract(initial) != reviewed_contract
+    ):
+        raise LinearProjectionError("projection_review_stale_reload_required")
+    if reviewed_changes and remote_head is None:
+        raise LinearProjectionError("prospective_remote_head_required")
+    if remote_head is not None:
         if projection_review_contract(initial) != reviewed_contract:
             raise LinearProjectionError("projection_review_stale_reload_required")
         latest = _latest_heads(initial)
@@ -2600,7 +2609,9 @@ def load_material_history_for_projection_reconcile(
                 authenticated_route=authenticated_route,
                 authenticated_source=authenticated_source,
                 relation_target_resolver=relation_target_resolver,
-                permit_stale_lifecycle_for_reconcile=True,
+                permit_stale_lifecycle_for_reconcile=(
+                    authority_sensitive_changes or bool(unresolved)
+                ),
             )
 
         seeds = manifest.get("terminal_child_evidence_seeds") or []
@@ -2710,11 +2721,19 @@ def reconcile_required_projection(
     checkpoint_fence: Callable[[], str | None] | None = None,
     projection_comments: list[dict[str, Any]] | None = None,
     projection_input_snapshot: dict[str, Any] | None = None,
+    expected_projection_input_frontier: str | None = None,
     legacy_unresolved_relation_heads: frozenset[tuple[str, str]] = frozenset(),
 ) -> dict[str, Any]:
     """Append only missing/changed values and verify the complete current view."""
     if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", remote_head):
         raise LinearProjectionError("verified_full_remote_head_required")
+    if (
+        expected_projection_input_frontier is not None
+        and not re.fullmatch(
+            r"[0-9a-f]{64}", expected_projection_input_frontier,
+        )
+    ):
+        raise LinearProjectionError("invalid_projection_input_frontier")
     expected_checkpoint_id = _latest_acknowledged_checkpoint_id(snapshot)
     desired, reviewed_retirements = _reviewed_manifest(manifest)
     scope_item = next(item for item in desired if item["kind"] == "scope")
@@ -3155,15 +3174,29 @@ def reconcile_required_projection(
                 )
 
     def fence_projection_inputs() -> None:
-        expected_frontier = (
+        transition_frontier = (
             seed_head_transition or seed_predecessor or {}
         ).get("input_frontier_sha256") or repair_predecessor_frontier
+        if (
+            transition_frontier is not None
+            and expected_projection_input_frontier is not None
+            and transition_frontier != expected_projection_input_frontier
+        ):
+            raise LinearProjectionError(
+                "projection_input_frontier_contract_mismatch"
+            )
+        expected_frontier = (
+            transition_frontier or expected_projection_input_frontier
+        )
         if expected_frontier is None:
             return
-        if (
-            projection_input_fence is None
-            or projection_input_fence() != expected_frontier
-        ):
+        if projection_input_fence is None:
+            raise LinearProjectionError("projection_input_fence_required")
+        if projection_input_fence() != expected_frontier:
+            if transition_frontier is None:
+                raise LinearProjectionError(
+                    "projection_input_frontier_changed_reload_required"
+                )
             raise LinearProjectionError(
                 "terminal_child_evidence_seed_input_frontier_changed"
             )
@@ -3202,6 +3235,13 @@ def reconcile_required_projection(
                 "expected_legacy_v1_events_sha256"
             ],
         )
+        if expected_projection_input_frontier is not None:
+            activation_receipt = {
+                **activation_receipt,
+                "reviewed_projection_input_frontier_sha256": (
+                    expected_projection_input_frontier
+                ),
+            }
         activated = adapter.state()
         activated_contract = projection_review_contract(activated)
         if (
@@ -3264,7 +3304,7 @@ def reconcile_required_projection(
             ),
             authority=adapter.authority,
         )
-        receipts.append(adapter.append(
+        receipt = adapter.append(
             event,
             expected_quarantine_count=observed_contract[
                 "expected_projection_quarantine_count"
@@ -3272,7 +3312,15 @@ def reconcile_required_projection(
             expected_quarantine_sha256=observed_contract[
                 "expected_projection_quarantine_sha256"
             ],
-        ))
+        )
+        if expected_projection_input_frontier is not None:
+            receipt = {
+                **receipt,
+                "reviewed_projection_input_frontier_sha256": (
+                    expected_projection_input_frontier
+                ),
+            }
+        receipts.append(receipt)
         expected_revision += 1
         expected_latest_heads[identity] = event
         if item["value"] == TOMBSTONE:
@@ -3335,7 +3383,7 @@ def reconcile_required_projection(
         expected_active.pop((retirement["kind"], retirement["key"]), None)
     if active != expected_active:
         raise LinearProjectionError("projection_readback_not_exact")
-    return {
+    result = {
         "workstream_id": adapter.workstream_id,
         "plan_revision": adapter.plan_revision,
         "projection_revision": final.revision,
@@ -3345,6 +3393,17 @@ def reconcile_required_projection(
         "resume_authority_verified": not bool(seeds or source_transition),
         "projection_contract": projection_review_contract(final),
     }
+    if expected_projection_input_frontier is not None:
+        result["projection_input_frontier"] = {
+            "sha256": expected_projection_input_frontier,
+            "prewrite_verified": True,
+            # Linear exposes no transaction spanning child comments and the
+            # root projection comment. Final product readback must therefore
+            # reject any interleaving the last prewrite observation missed.
+            "atomic_with_projection_append": False,
+            "postwrite_verification_required": True,
+        }
+    return result
 
 
 def main() -> int:
@@ -3432,6 +3491,9 @@ def main() -> int:
         )
         graph = deepcopy(graph)
         graph["root"].pop("description", None)
+        expected_projection_input_frontier = (
+            projection_input_frontier_sha256(graph, comments)
+        )
         seed_head_transition = manifest.get(
             "terminal_child_evidence_seed_head_transition"
         )
@@ -3441,8 +3503,7 @@ def main() -> int:
             or {}
         ).get("input_frontier_sha256")
         if seed_input_frontier is not None and (
-            projection_input_frontier_sha256(graph, comments)
-            != seed_input_frontier
+            expected_projection_input_frontier != seed_input_frontier
         ):
             raise LinearProjectionError(
                 "terminal_child_evidence_seed_input_frontier_changed"
@@ -3528,6 +3589,9 @@ def main() -> int:
             checkpoint_fence=checkpoint_fence,
             projection_comments=comments,
             projection_input_snapshot=graph,
+            expected_projection_input_frontier=(
+                expected_projection_input_frontier
+            ),
             legacy_unresolved_relation_heads=legacy_unresolved_relation_heads,
         )
         result["canonical_description_fence"] = description_fence
@@ -3554,6 +3618,14 @@ def main() -> int:
         )
         graph_after = deepcopy(graph_after)
         graph_after["root"].pop("description", None)
+        if (
+            projection_input_frontier_sha256(graph_after, comments_after)
+            != expected_projection_input_frontier
+        ):
+            raise LinearProjectionError(
+                "projection_input_frontier_changed_after_projection"
+            )
+        result["projection_input_frontier"]["postwrite_verified"] = True
         verified = add_material_history(
             graph_after, comments_after, token, authenticated_route=route,
             authenticated_source=authenticated_source,
