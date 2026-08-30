@@ -27,7 +27,8 @@ from workstream_linear_checkpoints import (
 )
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
-    LinearProjectionError, projection_slot_id, select_plan_generation, TOMBSTONE,
+    LinearProjectionError, projection_slot_id, reduce_projection_comments,
+    select_plan_generation, TOMBSTONE,
 )
 from workstream_plan import canonical_plan_url, plan_payload, same_plan_document
 from workstream_relation_readback import RelationReadbackError, read_relation_targets
@@ -76,29 +77,13 @@ def bind_projection_plan_generation(
     result = deepcopy(graph)
     root = result.get("root") or {}
     description_revision = root.get("plan_revision")
-    try:
-        selected = select_plan_generation(
-            comments, workstream_id=workstream_id,
-            description_plan_revision=description_revision,
-            authenticated_route=authenticated_route,
-        )
-    except LinearProjectionError as error:
-        if str(error) != "generation_description_plan_missing_bootstrap_required":
-            raise
-        selected = None
-    from workstream_generation import generation_controls
-    controlled_plans = {
-        frontier["plan_revision"] for event in generation_controls(comments)
-        for frontier in (event["value"]["from"], event["value"]["to"])
-    }
-    if (
-        selected is not None
-        and requested_plan_revision != selected["plan_revision"]
-        and requested_plan_revision in controlled_plans
-    ):
-        raise LinearProjectionError(
-            f"generation_projection_plan_retired:{requested_plan_revision}"
-        )
+    binding = projection_generation_source_binding(
+        comments, workstream_id=workstream_id,
+        description_plan_revision=description_revision,
+        requested_plan_revision=requested_plan_revision,
+        authenticated_route=authenticated_route,
+    )
+    selected = binding["selected"]
     result["root"] = dict(root)
     result["root"]["description_plan_revision"] = description_revision
     result["root"]["plan_revision"] = requested_plan_revision
@@ -113,6 +98,49 @@ def bind_projection_plan_generation(
             "authority_origin"
         ]
     return result
+
+
+def projection_generation_source_binding(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    description_plan_revision: str | None, requested_plan_revision: str,
+    authenticated_route: dict[str, str],
+) -> dict[str, Any]:
+    """Classify source authority without treating description prose as generation authority."""
+    try:
+        selected = select_plan_generation(
+            comments, workstream_id=workstream_id,
+            description_plan_revision=description_plan_revision,
+            authenticated_route=authenticated_route,
+        )
+    except LinearProjectionError as error:
+        if str(error) != "generation_description_plan_missing_bootstrap_required":
+            raise
+        selected = None
+    from workstream_generation import generation_controls
+    controls = generation_controls(comments)
+    controlled_plans = {
+        frontier["plan_revision"] for event in controls
+        for frontier in (event["value"]["from"], event["value"]["to"])
+    }
+    if (
+        selected is not None
+        and requested_plan_revision != selected["plan_revision"]
+        and requested_plan_revision in controlled_plans
+    ):
+        raise LinearProjectionError(
+            f"generation_projection_plan_retired:{requested_plan_revision}"
+        )
+    if selected is None or requested_plan_revision != selected["plan_revision"]:
+        mode = "inactive_candidate"
+    elif controls:
+        mode = "structured_active"
+    else:
+        mode = "legacy_active"
+    return {
+        "mode": mode, "selected": selected,
+        "requested_plan_revision": requested_plan_revision,
+        "controlled_plan_revisions": sorted(controlled_plans),
+    }
 
 
 def _value_digest(value: Any) -> str:
@@ -232,12 +260,23 @@ def synchronize_manifest_source(
     authenticated_source: dict[str, Any],
     live_source: dict[str, Any] | None = None,
     projection_history: list[dict[str, Any]] | None = None,
+    *, generation_binding: dict[str, Any] | None = None,
+    expected_projection_contract: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Bind one labeled issue plan to the desired structured source."""
     canonical = canonical_plan_url(description)
     supplied_identity = authenticated_source.get("identity")
+    source_mode = (
+        generation_binding.get("mode") if generation_binding is not None
+        else "legacy_active"
+    )
+    if source_mode not in {
+        "legacy_active", "inactive_candidate", "structured_active",
+    }:
+        raise LinearProjectionError("invalid_generation_source_binding")
     if (
-        isinstance(supplied_identity, str)
+        source_mode == "legacy_active"
+        and isinstance(supplied_identity, str)
         and supplied_identity.startswith(("http://", "https://"))
         and canonical != supplied_identity
     ):
@@ -252,6 +291,32 @@ def synchronize_manifest_source(
     ]
     if len(source_items) > 1:
         raise LinearProjectionError("manifest_projection_multiple_sources")
+    if source_mode == "inactive_candidate":
+        if (
+            not isinstance(supplied_identity, str)
+            or not same_plan_document(canonical, supplied_identity)
+        ):
+            raise LinearProjectionError(
+                "generation_candidate_source_document_mismatch"
+            )
+        if len(source_items) != 1:
+            raise LinearProjectionError(
+                "generation_candidate_source_explicit_review_required"
+            )
+        if expected_projection_contract is None or any(
+            manifest.get(field) != expected_projection_contract.get(field)
+            for field in REVIEW_CONTRACT_FIELDS
+        ):
+            raise LinearProjectionError(
+                "generation_candidate_projection_contract_mismatch"
+            )
+        if source_items[0].get("value") != {
+            "identity": supplied_identity,
+            "sha256": authenticated_source.get("sha256"),
+        }:
+            raise LinearProjectionError(
+                "generation_candidate_source_review_mismatch"
+            )
     if source_items:
         current_value = source_items[0].get("value")
         if not isinstance(current_value, dict):
@@ -272,8 +337,19 @@ def synchronize_manifest_source(
                 "live_source_document_change_requires_explicit_review:"
                 "add the canonical source to the reviewed projection manifest"
             )
+    if source_mode == "structured_active":
+        if live_source != {
+            "identity": supplied_identity,
+            "sha256": authenticated_source.get("sha256"),
+        }:
+            raise LinearProjectionError("active_projection_source_mismatch")
+    source_identity = (
+        supplied_identity
+        if source_mode in {"inactive_candidate", "structured_active"}
+        else canonical
+    )
     source = {
-        "identity": canonical,
+        "identity": source_identity,
         "sha256": authenticated_source.get("sha256"),
     }
     item = {"kind": "source", "key": "root", "value": source}
@@ -281,14 +357,30 @@ def synchronize_manifest_source(
         projection[projection.index(source_items[0])] = item
     else:
         projection.append(item)
-    return result, {**authenticated_source, "identity": canonical}
+    return result, {**authenticated_source, "identity": source_identity}
+
+
+def canonical_source_diagnostic_fence(
+    description: str | None,
+) -> dict[str, str]:
+    """Bind the immutable labeled value and the complete diagnostic prose."""
+    value = description if isinstance(description, str) else ""
+    return {
+        "canonical_identity": canonical_plan_url(description),
+        "description_sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+    }
 
 
 def validate_canonical_source_readback(
-    description: str | None, authenticated_source: dict[str, Any],
+    description: str | None, expected: dict[str, Any],
 ) -> None:
     """Refuse success if the issue's canonical source changed during writes."""
-    if canonical_plan_url(description) != authenticated_source.get("identity"):
+    if "description_sha256" in expected:
+        observed = canonical_source_diagnostic_fence(description)
+        matches = observed == expected
+    else:
+        matches = canonical_plan_url(description) == expected.get("identity")
+    if not matches:
         raise LinearProjectionError("canonical_plan_changed_during_projection")
 
 
@@ -1027,7 +1119,44 @@ def terminal_child_evidence_seed_predecessor_contract(
     history = state.snapshot.get("projection_history") or []
     if not isinstance(history, list):
         raise LinearProjectionError("terminal_seed_predecessor_history_invalid")
-    generation = sorted(
+    linear = desired_scope.get("linear") or {}
+    predecessor_route = {
+        field: linear.get(field)
+        for field in (
+            "workspace_id", "team_id", "project_id", "root_issue_id",
+        )
+    }
+    try:
+        predecessor_state = reduce_projection_comments(
+            comments, workstream_id=workstream_id,
+            expected_plan_revision=predecessor_plan_revision,
+            authenticated_route=predecessor_route,
+        )
+    except LinearProjectionError as error:
+        raise LinearProjectionError(
+            "terminal_seed_predecessor_projection_invalid"
+        ) from error
+    generation = list(predecessor_state.events)
+    activations = [
+        (index, event) for index, event in enumerate(generation)
+        if event.get("kind") == "cas_activation"
+    ]
+    has_legacy = any(event.get("schema_version") == 1 for event in generation)
+    mixed_history_invalid = has_legacy and (
+        len(activations) != 1
+        or any(
+            event.get("schema_version") != 1
+            for event in generation[:activations[0][0]]
+        )
+        or any(
+            event.get("schema_version") != 2
+            for event in generation[activations[0][0]:]
+        )
+        or activations[0][1]["value"].get("legacy_event_ids") != [
+            event["event_id"] for event in generation[:activations[0][0]]
+        ]
+    )
+    raw_generation = sorted(
         [
             event for event in history
             if event.get("plan_revision") == predecessor_plan_revision
@@ -1037,19 +1166,13 @@ def terminal_child_evidence_seed_predecessor_contract(
             event.get("event_id"),
         ),
     )
-    linear = desired_scope.get("linear") or {}
     if (
         not generation
-        or any(
-            event.get("schema_version") != 2
-            or event.get("expected_revision") != index
-            or event.get("authority") != {
-                field: linear.get(field)
-                for field in (
-                    "workspace_id", "team_id", "project_id", "root_issue_id",
-                )
-            }
-            for index, event in enumerate(generation)
+        or predecessor_state.snapshot.get("projection_quarantined")
+        or generation != raw_generation
+        or mixed_history_invalid
+        or not has_legacy and any(
+            event.get("schema_version") != 2 for event in generation
         )
     ):
         raise LinearProjectionError(
@@ -3158,6 +3281,14 @@ def main() -> int:
             root_issue_id=route["root_issue_id"],
         )
         comments = comment_adapter.comments()
+        description = graph["root"].get("description")
+        description_fence = canonical_source_diagnostic_fence(description)
+        generation_binding = projection_generation_source_binding(
+            comments, workstream_id=token,
+            description_plan_revision=graph["root"].get("plan_revision"),
+            requested_plan_revision=plan_revision,
+            authenticated_route=route,
+        )
         graph = bind_projection_plan_generation(
             graph, comments, workstream_id=token,
             requested_plan_revision=plan_revision,
@@ -3165,9 +3296,13 @@ def main() -> int:
         )
         projection_state = adapter.state()
         manifest, authenticated_source = synchronize_manifest_source(
-            manifest, graph["root"].get("description"), authenticated_source,
+            manifest, description, authenticated_source,
             projection_state.snapshot.get("source"),
             projection_state.snapshot.get("projection_history"),
+            generation_binding=generation_binding,
+            expected_projection_contract=projection_review_contract(
+                projection_state,
+            ),
         )
         manifest = prepare_terminal_child_source_transition(
             manifest, graph, projection_state,
@@ -3252,6 +3387,12 @@ def main() -> int:
                 plan_revision=plan_revision,
             )
 
+        description_before_write = transport.snapshot_for_root(
+            token, include_description=True,
+        )["root"].get("description")
+        validate_canonical_source_readback(
+            description_before_write, description_fence,
+        )
         result = reconcile_required_projection(
             adapter, snapshot, manifest, remote_head=args.remote_head,
             created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -3264,6 +3405,7 @@ def main() -> int:
             projection_input_snapshot=graph,
             legacy_unresolved_relation_heads=legacy_unresolved_relation_heads,
         )
+        result["canonical_description_fence"] = description_fence
         # Double-collect graph and comments so a concurrent root/child/checkpoint
         # mutation cannot be certified from a mixed pre/post-write snapshot.
         final_comments = LinearCommentEventAdapter(
@@ -3274,7 +3416,7 @@ def main() -> int:
             transport, final_comments, token, include_description=True,
         )
         validate_canonical_source_readback(
-            graph_after["root"].get("description"), authenticated_source,
+            graph_after["root"].get("description"), description_fence,
         )
         graph_after = bind_projection_plan_generation(
             graph_after, comments_after, workstream_id=token,

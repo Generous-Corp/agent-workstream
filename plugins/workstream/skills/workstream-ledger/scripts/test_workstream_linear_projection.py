@@ -17,10 +17,16 @@ from workstream_checkpoint import build_checkpoint
 from workstream_choices import record_choice
 from workstream_delta import Delta
 from workstream_evidence import evidence_errors
-from workstream_linear_checkpoints import encode_checkpoint_comment
+from workstream_linear_checkpoints import (
+    encode_checkpoint_comment, reduce_checkpoint_comments,
+)
 from workstream_linear import bootstrap_linear_route, LinearGraphQLTransport
 from workstream_linear_events import (
-    encode_event_comment, LinearCommentEventAdapter,
+    encode_event_comment, LinearCommentEventAdapter, reduce_event_comments,
+)
+from workstream_generation import (
+    _digest as generation_digest, build_retirement_proof, GenerationTransport,
+    generation_quarantine_metadata,
 )
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
@@ -35,6 +41,7 @@ import workstream_linear_projection as projection_module
 import workstream_resume as resume_module
 import workstream_shipyard_profile as shipyard_profile
 from workstream_projection import (
+    _fence_predecessor_projection_history,
     load_material_history_for_projection_reconcile, projection_review_contract,
     prepare_terminal_child_evidence_seeds, prepare_terminal_child_repairs,
     reconcile_required_projection,
@@ -6890,6 +6897,434 @@ class ProjectionTests(unittest.TestCase):
                 {"identity": "https://github.com/acme/old/blob/main/PLAN.md",
                  "sha256": "a" * 64},
             )
+
+    def test_generation_candidate_source_independence_composed_and_fail_closed(self):
+        raw = b"# Exact generation candidate\n"
+        target_plan = hashlib.sha256(raw).hexdigest()
+        predecessor_plan = "b" * 64
+        old_identity = (
+            "https://github.com/acme/plans/blob/" + "c" * 40 + "/PLAN.md"
+        )
+        target_identity = (
+            "https://github.com/acme/plans/blob/" + "d" * 40 + "/PLAN.md"
+        )
+        route = {"workspace_id": "workspace", "team_id": "team",
+                 "project_id": "project", "root_issue_id": ROOT_UUID}
+
+        def append_generation(client, plan_revision, identity):
+            adapter = LinearProjectionAdapter(
+                client, issue_id="GEN-37", workstream_id="GEN-37",
+                plan_revision=plan_revision, **AUTHORITY,
+            )
+            values = [
+                ("scope", "root", scope()),
+                ("source", "root", {
+                    "identity": identity, "sha256": plan_revision,
+                }),
+                ("provenance", "generation", {
+                    "agent": "codex", "machine": "M5", "session_id": plan_revision[:8],
+                    "worktree": {"state": "safe", "head": HEAD},
+                }),
+                ("disposition", "root", {
+                    "disposition": "attach", "remote_head": HEAD,
+                    "recovered_from_checkpoint": None,
+                }),
+            ]
+            for kind, key, value in values:
+                adapter.append(build_projection_event(
+                    workstream_id="GEN-37", kind=kind, key=key, value=value,
+                    plan_revision=plan_revision,
+                    expected_revision=adapter.state().revision,
+                    created_at=f"candidate-{adapter.state().revision}",
+                    authority=AUTHORITY,
+                ))
+            return adapter
+
+        def graph(description):
+            return {
+                "root": {
+                    "identifier": "GEN-37", "url": "https://linear/GEN-37",
+                    "description": description, "plan_revision": predecessor_plan,
+                    "revision": 0, "status": "In Progress",
+                    "next_action": "continue",
+                },
+                "children": [{
+                    "identifier": "GEN-38", "title": "Candidate child",
+                    "status": "In Progress", "next_action": "continue",
+                }],
+                "decisions": [],
+            }
+
+        def manifest_for(client, identity=target_identity):
+            target = LinearProjectionAdapter(
+                client, issue_id="GEN-37", workstream_id="GEN-37",
+                plan_revision=target_plan, **AUTHORITY,
+            )
+            return {
+                **projection_review_contract(target.state()),
+                "retirements": [],
+                "projection": [
+                    {"kind": "scope", "key": "root", "value": scope()},
+                    {"kind": "source", "key": "root", "value": {
+                        "identity": identity, "sha256": target_plan,
+                    }},
+                    {"kind": "provenance", "key": "candidate", "value": {
+                        "agent": "codex", "machine": "M5",
+                        "session_id": "candidate",
+                        "worktree": {"state": "safe", "head": HEAD},
+                    }},
+                ],
+            }
+
+        def invoke(client, manifest, live_graph, identity, *, graph_side_effect=None):
+            comments = mock.Mock()
+            comments.comments.side_effect = lambda: [
+                dict(item) for item in client.comments
+            ]
+            transport = mock.Mock()
+            if graph_side_effect is None:
+                transport.snapshot_for_root.return_value = live_graph
+            else:
+                transport.snapshot_for_root.side_effect = graph_side_effect
+            with tempfile.TemporaryDirectory() as directory:
+                plan_path = Path(directory) / "plan.md"
+                manifest_path = Path(directory) / "manifest.json"
+                plan_path.write_bytes(raw)
+                manifest_path.write_text(json.dumps(manifest))
+                argv = [
+                    "workstream_projection.py", "GEN-37", str(manifest_path),
+                    "--remote-head", HEAD, "--plan-source", str(plan_path),
+                    "--plan-identity", identity,
+                ]
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with mock.patch.object(workstream_projection.sys, "argv", argv), \
+                     mock.patch.object(workstream_projection.sys, "stdout", stdout), \
+                     mock.patch.object(workstream_projection.sys, "stderr", stderr), \
+                     mock.patch.object(workstream_projection, "load_linear_api_key", return_value="secret"), \
+                     mock.patch.object(workstream_projection, "HttpGraphQLClient", return_value=client), \
+                     mock.patch.object(workstream_projection, "resolve_linear_route", return_value=(route, None)), \
+                     mock.patch.object(workstream_projection, "resolve_authenticated_issue_route", return_value=route), \
+                     mock.patch.object(workstream_projection, "LinearGraphQLTransport", return_value=transport), \
+                     mock.patch.object(workstream_projection, "LinearCommentEventAdapter", return_value=comments):
+                    code = workstream_projection.main()
+            return code, stdout.getvalue(), stderr.getvalue()
+
+        client = FakeProjectionClient()
+        predecessor = append_generation(client, predecessor_plan, old_identity)
+        description = f"Canonical plan: {old_identity}\nKeep this diagnostic."
+        before = len(client.comments)
+        code, output, error = invoke(
+            client, manifest_for(client), graph(description), target_identity,
+        )
+        self.assertEqual((code, error), (0, ""))
+        receipt = json.loads(output)
+        self.assertEqual(receipt["source_sync"]["identity"], target_identity)
+        self.assertEqual(
+            receipt["canonical_description_fence"],
+            workstream_projection.canonical_source_diagnostic_fence(description),
+        )
+        self.assertGreater(len(client.comments), before)
+        self.assertFalse(any("issueUpdate" in query for query, _ in client.calls))
+
+        for label, bad_description, bad_identity in (
+            (
+                "document", description,
+                "https://github.com/acme/other/blob/" + "d" * 40 + "/OTHER.md",
+            ),
+            (
+                "ambiguous",
+                f"Canonical plan: {old_identity}\nCanonical plan: https://example.test/other",
+                target_identity,
+            ),
+        ):
+            failed = FakeProjectionClient()
+            append_generation(failed, predecessor_plan, old_identity)
+            count = len(failed.comments)
+            bad_manifest = manifest_for(failed, bad_identity)
+            code, _output, error = invoke(
+                failed, bad_manifest, graph(bad_description), bad_identity,
+            )
+            with self.subTest(label=label):
+                self.assertEqual(code, 2)
+                self.assertEqual(len(failed.comments), count)
+                self.assertFalse(any("issueUpdate" in query for query, _ in failed.calls))
+
+        for label, mutate in (
+            (
+                "missing_source",
+                lambda value: value["projection"].__setitem__(
+                    slice(1, 2), [],
+                ),
+            ),
+            (
+                "source_sha",
+                lambda value: value["projection"][1]["value"].__setitem__(
+                    "sha256", "0" * 64,
+                ),
+            ),
+            (
+                "review_contract",
+                lambda value: value.__setitem__(
+                    "expected_projection_revision", 1,
+                ),
+            ),
+        ):
+            failed = FakeProjectionClient()
+            append_generation(failed, predecessor_plan, old_identity)
+            bad_manifest = manifest_for(failed)
+            mutate(bad_manifest)
+            count = len(failed.comments)
+            code, _output, _error = invoke(
+                failed, bad_manifest, graph(description), target_identity,
+            )
+            with self.subTest(label=label):
+                self.assertEqual(code, 2)
+                self.assertEqual(len(failed.comments), count)
+                self.assertFalse(any("issueUpdate" in query for query, _ in failed.calls))
+
+        changed = graph(description + "\nConcurrent edit.")
+        failed = FakeProjectionClient()
+        append_generation(failed, predecessor_plan, old_identity)
+        count = len(failed.comments)
+        code, _output, error = invoke(
+            failed, manifest_for(failed), graph(description), target_identity,
+            graph_side_effect=[graph(description), changed],
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("canonical_plan_changed_during_projection", error)
+        self.assertEqual(len(failed.comments), count)
+
+        def candidate_loader(plan_revision):
+            state = LinearProjectionAdapter(
+                client, issue_id="GEN-37", workstream_id="GEN-37",
+                plan_revision=plan_revision, **AUTHORITY,
+            ).state()
+            source = state.snapshot["source"]
+            material = reduce_event_comments(client.comments, workstream_id="GEN-37")
+            checkpoints = reduce_checkpoint_comments(
+                client.comments, workstream_id="GEN-37",
+            )
+            checkpoint_ids = sorted(
+                item["event_id"] for item in checkpoints.checkpoints
+                if item["plan_revision"] == plan_revision
+            )
+            return {
+                "resume_authority": "full", "plan_revision": plan_revision,
+                "authenticated_route": AUTHORITY, "source": source,
+                "material_revision": material.revision,
+                "checkpoint_event_ids": checkpoint_ids,
+                "projection_revision": state.revision,
+                "graph_frontier_sha256": generation_digest("graph"),
+                "snapshot_sha256": generation_digest([
+                    event["event_id"] for event in state.events
+                ]),
+                "quarantined_legacy_writes": generation_quarantine_metadata(
+                    client.comments, workstream_id="GEN-37",
+                ),
+            }
+
+        old_state = predecessor.state()
+        generation_transport = GenerationTransport(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            authority=AUTHORITY, candidate_loader=candidate_loader,
+            legacy_description_plan_revision=predecessor_plan,
+        )
+        generation_transport._capability_checked = True
+        generation_transport.activate(
+            target_plan_revision=target_plan, created_at="activate",
+            retirement=build_retirement_proof(
+                predecessor_plan_revision=predecessor_plan,
+                retired_at="activate", retired_writer_epoch=0,
+                provenance_event_ids=[
+                    event["event_id"] for event in old_state.events
+                    if event["kind"] == "provenance"
+                ], checkpoint_event_ids=[],
+            ),
+        )
+        active_count = len(client.comments)
+        attacker_identity = (
+            "https://github.com/acme/plans/blob/" + "e" * 40 + "/PLAN.md"
+        )
+        active_manifest = manifest_for(client, attacker_identity)
+        code, _output, error = invoke(
+            client, active_manifest, graph(description), attacker_identity,
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("active_projection_source_mismatch", error)
+        self.assertEqual(len(client.comments), active_count)
+        self.assertFalse(any("issueUpdate" in query for query, _ in client.calls))
+
+    def test_predecessor_seed_accepts_only_authenticated_15_v1_67_v2_history(self):
+        client = FakeProjectionClient()
+        client.comments = deepcopy(gen37_040_activation_fixture())
+        activation = projection_module._decode_projection(
+            projection_module.PROJECTION_RE.findall(client.comments[-1]["body"])[0]
+        )
+        route = activation["authority"]
+        for revision in range(16, 82):
+            event = build_projection_event(
+                workstream_id="GEN-37", kind="provenance",
+                key=f"v2-{revision}", value={
+                    "agent": "codex", "machine": "M5",
+                    "session_id": f"v2-{revision}",
+                }, plan_revision=PLAN, expected_revision=revision,
+                created_at=f"2026-08-29T22:{revision:02d}:00Z",
+                authority=route,
+            )
+            client.comments.append({
+                "id": projection_slot_id("GEN-37", PLAN, revision, route),
+                "body": encode_projection_comment(event),
+            })
+        material = Delta(
+            "mixed-history-material", "GEN-37", "requirement", "reviewer",
+            {"text": "Bind the authenticated mixed predecessor."}, 0,
+            "2026-08-29T23:00:00Z",
+        )
+        checkpoint = build_checkpoint(
+            workstream_id="GEN-37", boundary_id="mixed-history",
+            root_revision=1, plan_revision=PLAN,
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai",
+                "session_id": "mixed-history", "machine": "M5",
+                "worktree": {
+                    "state": "safe", "path": "/worktree",
+                    "branch": "mixed", "head": HEAD,
+                },
+            }, exact_head=HEAD, evidence=[], blocker=None,
+            next_action="Project the candidate generation.",
+        )
+        client.comments.extend([
+            {"id": "mixed-material", "body": encode_event_comment(material)},
+            {"id": "mixed-checkpoint", "body": encode_checkpoint_comment(checkpoint)},
+        ])
+        accepted = list(reduce_projection_comments(
+            client.comments, workstream_id="GEN-37",
+            expected_plan_revision=PLAN, authenticated_route=route,
+        ).events)
+        self.assertEqual(sum(event["schema_version"] == 1 for event in accepted), 15)
+        self.assertEqual(sum(event["schema_version"] == 2 for event in accepted), 67)
+        current_plan = "c" * 64
+        desired_scope = scope()
+        desired_scope["linear"] = {
+            **desired_scope["linear"], **route,
+            "route_verification": {
+                **route, "observed_at": "2026-08-29T22:00:00Z",
+                "evidence": [{
+                    "kind": "authenticated_linear_readback",
+                    "authenticated": True, **route,
+                }],
+            },
+        }
+        snapshot = {
+            "root": {"identifier": "GEN-37", "plan_revision": current_plan},
+            "children": [],
+        }
+
+        def contract(comments):
+            state = reduce_projection_comments(
+                comments, workstream_id="GEN-37",
+                expected_plan_revision=current_plan, authenticated_route=route,
+            )
+            return terminal_child_evidence_seed_predecessor_contract(
+                snapshot, state, comments, workstream_id="GEN-37",
+                predecessor_plan_revision=PLAN, desired_scope=desired_scope,
+                seeds=[], desired_contracts={},
+            )[0]
+
+        binding = contract(client.comments)
+        self.assertEqual(binding["projection_revision"], 82)
+        self.assertEqual(binding["projection_events_sha256"], canonical_digest(accepted))
+        self.assertEqual(binding["projection_frontier_event_id"], accepted[-1]["event_id"])
+
+        def replace_activation(comments, mutate):
+            changed = deepcopy(comments)
+            for index, comment in enumerate(changed):
+                match = projection_module.PROJECTION_RE.findall(comment["body"])
+                if not match:
+                    continue
+                event = projection_module._decode_projection(match[0])
+                if event["kind"] != "cas_activation":
+                    continue
+                mutate(event)
+                event["event_id"] = projection_module._event_id(event)
+                changed[index] = {
+                    **comment,
+                    "id": projection_slot_id(
+                        "GEN-37", PLAN, event["expected_revision"], route,
+                    ),
+                    "body": encode_projection_comment(event),
+                }
+                return changed
+            raise AssertionError("activation missing")
+
+        def is_activation(comment):
+            matches = projection_module.PROJECTION_RE.findall(comment["body"])
+            return bool(matches) and projection_module._decode_projection(
+                matches[0]
+            )["kind"] == "cas_activation"
+
+        invalid_histories = {
+            "missing": client.comments[1:],
+            "duplicate": [
+                *client.comments, {**client.comments[0], "id": "duplicate-legacy"},
+            ],
+            "missing_activation": [
+                comment for comment in client.comments
+                if not is_activation(comment)
+            ],
+            "ordered_ids": replace_activation(
+                client.comments,
+                lambda event: event["value"]["legacy_event_ids"].reverse(),
+            ),
+            "digest": replace_activation(
+                client.comments,
+                lambda event: event["value"].__setitem__(
+                    "legacy_events_sha256", "0" * 64,
+                ),
+            ),
+        }
+        wrong_route = deepcopy(client.comments)
+        last_index = next(
+            index for index in range(len(wrong_route) - 1, -1, -1)
+            if projection_module.PROJECTION_RE.findall(wrong_route[index]["body"])
+        )
+        last = projection_module._decode_projection(
+            projection_module.PROJECTION_RE.findall(
+                wrong_route[last_index]["body"]
+            )[0]
+        )
+        last["authority"] = {**route, "team_id": "wrong-team"}
+        last["event_id"] = projection_module._event_id(last)
+        wrong_route[last_index] = {
+            **wrong_route[last_index],
+            "id": projection_slot_id("GEN-37", PLAN, 81, last["authority"]),
+            "body": encode_projection_comment(last),
+        }
+        invalid_histories["wrong_route"] = wrong_route
+        for label, comments in invalid_histories.items():
+            with self.subTest(label=label), self.assertRaises(LinearProjectionError):
+                contract(comments)
+
+        late = build_projection_event(
+            workstream_id="GEN-37", kind="provenance", key="late-v2",
+            value={"agent": "codex", "machine": "M5", "session_id": "late"},
+            plan_revision=PLAN, expected_revision=82,
+            created_at="2026-08-29T23:59:00Z", authority=route,
+        )
+        client.comments.append({
+            "id": projection_slot_id("GEN-37", PLAN, 82, route),
+            "body": encode_projection_comment(late),
+        })
+        changed_current = reduce_projection_comments(
+            client.comments, workstream_id="GEN-37",
+            expected_plan_revision=current_plan, authenticated_route=route,
+        )
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_seed_predecessor_history_changed_reload_required",
+        ):
+            _fence_predecessor_projection_history(changed_current, binding)
 
     def test_projection_cli_end_to_end_is_idempotent_and_full_resume_verified(self):
         raw = b"# Exact plan\n\n## Deliver\n"
