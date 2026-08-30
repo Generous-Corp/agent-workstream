@@ -48,7 +48,28 @@ class FakeClient:
             issue_id = data.get("id", f"id-{self.next_id}")
             if any(issue["id"] == issue_id for issue in self.issues):
                 raise LinearTransportError("duplicate issue id")
-            issue = {"id": issue_id, "identifier": f"GEN-{self.next_id}", "title": data["title"], "description": data["description"], "url": f"https://linear.test/{self.next_id}", "updatedAt": "now", "state": {"name": "Todo", "type": "unstarted"}, "parent": {"id": data.get("parentId")} if data.get("parentId") else None, "project": {"id": data["projectId"]} if data.get("projectId") else None, "team": {"id": data["teamId"], "organization": {"id": "workspace"}}}
+            issue = {
+                "id": issue_id, "identifier": f"GEN-{self.next_id}",
+                "title": data["title"], "description": data["description"],
+                "url": f"https://linear.test/{self.next_id}", "updatedAt": "now",
+                "state": {
+                    "id": data.get("stateId", "default-state"),
+                    "name": "Todo", "type": "unstarted",
+                },
+                "assignee": (
+                    {"id": data["assigneeId"]}
+                    if data.get("assigneeId") else None
+                ),
+                "parent": (
+                    {"id": data.get("parentId")} if data.get("parentId") else None
+                ),
+                "project": (
+                    {"id": data["projectId"]} if data.get("projectId") else None
+                ),
+                "team": {
+                    "id": data["teamId"], "organization": {"id": "workspace"},
+                },
+            }
             self.next_id += 1
             self.issues.append(issue)
             return {"issueCreate": {"success": True, "issue": issue}}
@@ -84,13 +105,15 @@ class FakeChildAuthorization:
         self.assert_calls = 0
 
     def select_child_extension_generation(
-        self, *, description_plan_revision, source,
+        self, *, description_plan_revision, source, **_context,
     ):
         legacy = description_plan_revision == source["sha256"]
         return {
             "plan_revision": source["sha256"],
             "description_plan_revision": description_plan_revision,
-            "transition_tip_event_id": None if legacy else "wsp-generation",
+            "transition_tip_event_id": (
+                None if legacy else "wsp_" + "f" * 32
+            ),
             "activation_epoch": None if legacy else 1,
             "authority_origin": (
                 "legacy_description" if legacy else "generation_transition"
@@ -125,6 +148,8 @@ class FakeChildAuthorization:
             "reviewed_candidate_key": values["reviewed_candidate_key"],
             "child_issue_id": values["child_issue_id"],
             "initial_state": "planned_pending_projection",
+            "native_initialization": values["native_initialization"],
+            "generation_authority": values["generation_authority"],
         }
         if self.event is None:
             value = {
@@ -253,6 +278,7 @@ class LinearTransportTests(unittest.TestCase):
 
     def extend_legacy(
         self, transport, *, authorization_adapter=None, expected_frontier=None,
+        state_id="ready-state", assignee_id="agent-owner", unassigned=False,
     ):
         frontier = expected_frontier or {
             "material_revision": 3, "projection_revision": 7,
@@ -264,6 +290,7 @@ class LinearTransportTests(unittest.TestCase):
             source_revision="sha-demo",
             plan_revision="sha-demo",
             expected_frontier=frontier,
+            state_id=state_id, assignee_id=assignee_id, unassigned=unassigned,
             authorization_adapter=authorization_adapter or FakeChildAuthorization(),
         )
 
@@ -364,8 +391,52 @@ class LinearTransportTests(unittest.TestCase):
             variables["input"] for query, variables in fake.calls
             if "issueCreate" in query
         )
-        self.assertNotIn("stateId", create_input)
+        self.assertEqual(create_input["stateId"], "ready-state")
+        self.assertEqual(create_input["assigneeId"], "agent-owner")
+        self.assertEqual(result["receipt"]["state_id"], "ready-state")
+        self.assertEqual(result["receipt"]["assignee_id"], "agent-owner")
+
+    def test_existing_root_extension_atomically_creates_unassigned_child(self):
+        fake = UUIDv4ValidatingFakeClient()
+        fake.issues.append(self.legacy_root())
+
+        result = self.extend_legacy(
+            self.routed_transport(fake), assignee_id=None, unassigned=True,
+        )
+
+        create_input = next(
+            variables["input"] for query, variables in fake.calls
+            if "issueCreate" in query
+        )
+        self.assertEqual(create_input["stateId"], "ready-state")
         self.assertNotIn("assigneeId", create_input)
+        self.assertIsNone(result["receipt"]["assignee_id"])
+
+    def test_existing_root_extension_refuses_native_drift_on_replay(self):
+        fake = UUIDv4ValidatingFakeClient()
+        fake.issues.append(self.legacy_root())
+        authorization = FakeChildAuthorization()
+        self.extend_legacy(
+            self.routed_transport(fake), authorization_adapter=authorization,
+        )
+        fake.issues[-1]["state"]["id"] = "wrong-state"
+        fake.calls.clear()
+
+        with self.assertRaisesRegex(
+            LinearTransportError, "intake_identity_collision:.*:state_id",
+        ):
+            self.extend_legacy(
+                self.routed_transport(fake),
+                authorization_adapter=authorization,
+                expected_frontier={
+                    "material_revision": 3, "projection_revision": 8,
+                },
+            )
+
+        self.assertFalse(any(
+            "issueCreate" in query or "issueUpdate" in query
+            for query, _variables in fake.calls
+        ))
 
     def test_activated_generation_extends_with_stale_diagnostic_description(self):
         fake = FakeClient()
@@ -730,6 +801,9 @@ class LinearTransportTests(unittest.TestCase):
                 expected_frontier={
                     "material_revision": 3, "projection_revision": 7,
                 },
+                state_id="ready-state",
+                assignee_id="agent-owner",
+                unassigned=False,
                 authorization_adapter=FakeChildAuthorization(),
             )
 

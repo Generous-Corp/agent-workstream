@@ -19,7 +19,7 @@ from workstream_generation import (
     strict_candidate_loader,
 )
 from workstream_checkpoint import build_checkpoint
-from workstream_linear import LinearTransportError
+from workstream_linear import LinearGraphQLTransport, LinearTransportError
 from workstream_linear_events import (
     encode_event_comment, LinearCommentEventAdapter, ledger_boundary_slot_id,
     reduce_event_comments,
@@ -54,12 +54,15 @@ class FakeClient:
         self.description = f"Plan revision: {OLD}"
         self.graph_nonce = "initial"
         self.graph_status = "In Progress"
+        self.children: list[dict] = []
+        self.before_issue_create = None
 
     def root_issue(self):
         return {
             "id": AUTHORITY["root_issue_id"], "identifier": WORKSTREAM,
             "title": "Generation test", "description": self.description,
             "url": "https://linear.test/GEN-37", "updatedAt": self.graph_nonce,
+            "parent": None,
             "project": {"id": "project"},
             "team": {"id": "team", "organization": {"id": "workspace"}},
             "assignee": None,
@@ -80,7 +83,7 @@ class FakeClient:
             }}}
         if "query WorkstreamIssues" in query:
             return {"team": {"issues": {
-                "nodes": [self.root_issue()], "pageInfo": {
+                "nodes": [self.root_issue(), *deepcopy(self.children)], "pageInfo": {
                     "hasNextPage": False, "endCursor": None,
                 },
             }}}
@@ -116,6 +119,35 @@ class FakeClient:
             if len(self.mutations) in self.commit_then_fail_at:
                 raise LinearTransportError("lost response after commit")
             return {"commentCreate": {"success": True, "comment": deepcopy(comment)}}
+        if "issueCreate" in query:
+            if self.before_issue_create is not None:
+                callback = self.before_issue_create
+                self.before_issue_create = None
+                callback()
+            item = deepcopy(variables["input"])
+            if any(child["id"] == item["id"] for child in self.children):
+                raise LinearTransportError("duplicate issue id")
+            child = {
+                "id": item["id"], "identifier": "GEN-38",
+                "title": item["title"], "description": item["description"],
+                "url": "https://linear.test/GEN-38", "updatedAt": "created",
+                "parent": {"id": item["parentId"], "identifier": WORKSTREAM},
+                "project": {"id": item["projectId"]},
+                "team": {
+                    "id": item["teamId"],
+                    "organization": {"id": "workspace"},
+                },
+                "state": {
+                    "id": item["stateId"], "name": "Ready", "type": "started",
+                },
+                "assignee": (
+                    {"id": item["assigneeId"]}
+                    if item.get("assigneeId") else None
+                ),
+            }
+            self.children.append(child)
+            self.mutations.append(item)
+            return {"issueCreate": {"success": True, "issue": deepcopy(child)}}
         raise AssertionError(f"unexpected operation: {query[:80]}")
 
 
@@ -342,11 +374,18 @@ class GenerationTransitionTests(unittest.TestCase):
         material = reduce_event_comments(
             self.client.comments, workstream_id=WORKSTREAM,
         ).revision
+        generation_authority = target.select_child_extension_generation(
+            description_plan_revision=OLD, source=source,
+        )
         first = target.reserve_child_extension(
             source=source, reviewed_candidate_key="new-child",
             child_issue_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
             expected_material_revision=material,
             expected_projection_revision=target.state().revision,
+            native_initialization={
+                "state_id": "ready-state", "assignee_id": "agent-owner",
+            },
+            generation_authority=generation_authority,
         )
         mutation_count = len(self.client.mutations)
 
@@ -355,11 +394,160 @@ class GenerationTransitionTests(unittest.TestCase):
             child_issue_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
             expected_material_revision=material,
             expected_projection_revision=target.state().revision,
+            native_initialization={
+                "state_id": "ready-state", "assignee_id": "agent-owner",
+            },
+            generation_authority=generation_authority,
         )
 
         self.assertEqual(first["event"], second["event"])
         self.assertEqual(first["disposition"], "created")
         self.assertEqual(second["disposition"], "existing")
+        self.assertEqual(len(self.client.mutations), mutation_count)
+
+    def test_retired_generation_exact_child_grant_remains_authoritative(self):
+        self.activate()
+        target = adapter(self.client, NEW)
+        source = {
+            "identity": f"https://example.test/{NEW}", "sha256": NEW,
+        }
+        native = {"state_id": "ready-state", "assignee_id": "agent-owner"}
+        authority = target.select_child_extension_generation(
+            description_plan_revision=OLD, source=source,
+        )
+        material = reduce_event_comments(
+            self.client.comments, workstream_id=WORKSTREAM,
+        ).revision
+        grant = target.reserve_child_extension(
+            source=source, reviewed_candidate_key="new-child",
+            child_issue_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            expected_material_revision=material,
+            expected_projection_revision=target.state().revision,
+            native_initialization=native, generation_authority=authority,
+        )
+        self.activate(target=LATER, predecessor=NEW, epoch=1)
+        mutation_count = len(self.client.mutations)
+
+        replay = target.reserve_child_extension(
+            source=source, reviewed_candidate_key="new-child",
+            child_issue_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            expected_material_revision=material,
+            expected_projection_revision=target.state().revision,
+            native_initialization=native, generation_authority=authority,
+        )
+        target.assert_child_extension_authorized(grant["event"])
+
+        self.assertEqual(replay["event"], grant["event"])
+        self.assertEqual(replay["disposition"], "existing")
+        self.assertEqual(len(self.client.mutations), mutation_count)
+        with self.assertRaisesRegex(
+            LinearProjectionError, "plan_generation_not_selected",
+        ):
+            target.reserve_child_extension(
+                source=source, reviewed_candidate_key="different-child",
+                child_issue_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                expected_material_revision=material,
+                expected_projection_revision=target.state().revision,
+                native_initialization=native, generation_authority=authority,
+            )
+
+    def test_preactivation_old_grant_cannot_be_laundered_after_activation(self):
+        project_full(self.client, NEW)
+        target = adapter(self.client, NEW)
+        source = {
+            "identity": f"https://example.test/{NEW}", "sha256": NEW,
+        }
+        child_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        old_value = {
+            "root_issue_id": AUTHORITY["root_issue_id"],
+            "route": AUTHORITY, "source": source, "plan_revision": NEW,
+            "reviewed_candidate_key": "new-child", "child_issue_id": child_id,
+            "expected_material_revision": 0,
+            "expected_projection_revision": target.state().revision,
+            "initial_state": "planned_pending_projection",
+        }
+        target.append(build_projection_event(
+            workstream_id=WORKSTREAM, kind="child_extension_authorization",
+            key=child_id, value=old_value, plan_revision=NEW,
+            expected_revision=target.state().revision, created_at="before-activation",
+            authority=AUTHORITY,
+        ))
+        self.activate()
+        authority = target.select_child_extension_generation(
+            description_plan_revision=OLD, source=source,
+        )
+
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "child_extension_authorization_superseded_or_conflicting",
+        ):
+            target.reserve_child_extension(
+                source=source, reviewed_candidate_key="new-child",
+                child_issue_id=child_id, expected_material_revision=0,
+                expected_projection_revision=target.state().revision,
+                native_initialization={
+                    "state_id": "ready-state", "assignee_id": "agent-owner",
+                },
+                generation_authority=authority,
+            )
+
+    def test_child_create_linearizes_before_planted_later_generation(self):
+        self.activate()
+        target = adapter(self.client, NEW)
+        plan = {
+            "graph_review_required": True,
+            "source": {
+                "identity": f"https://example.test/{NEW}",
+                "sha256": NEW, "bytes": 10,
+            },
+            "root": {"plan_revision": NEW},
+            "children": [{
+                "key": "new-child", "title": "Ready child",
+                "next_action": "Write the child-local checkpoint.",
+            }],
+        }
+        material = reduce_event_comments(
+            self.client.comments, workstream_id=WORKSTREAM,
+        ).revision
+        projection = target.state().revision
+        self.client.before_issue_create = lambda: self.activate(
+            target=LATER, predecessor=NEW, epoch=1,
+        )
+        transport = LinearGraphQLTransport(
+            self.client, workspace_id="workspace", team_id="team",
+            project_id="project",
+        )
+
+        created = transport.extend_existing_root_reviewed_child(
+            plan, root_issue_id=AUTHORITY["root_issue_id"],
+            reviewed_candidate_key="new-child", source_revision=NEW,
+            plan_revision=NEW, expected_frontier={
+                "material_revision": material,
+                "projection_revision": projection,
+            }, state_id="ready-state", assignee_id="agent-owner",
+            unassigned=False, authorization_adapter=target,
+        )
+
+        self.assertEqual(created["receipt"]["disposition"], "created")
+        self.assertEqual(created["receipt"]["state_id"], "ready-state")
+        self.assertEqual(created["receipt"]["assignee_id"], "agent-owner")
+        self.assertEqual(select_plan_generation(
+            self.client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=OLD, authenticated_route=AUTHORITY,
+        )["plan_revision"], LATER)
+        self.assertFalse(any("issueUpdate" in str(item) for item in self.client.mutations))
+
+        mutation_count = len(self.client.mutations)
+        replay = transport.extend_existing_root_reviewed_child(
+            plan, root_issue_id=AUTHORITY["root_issue_id"],
+            reviewed_candidate_key="new-child", source_revision=NEW,
+            plan_revision=NEW, expected_frontier={
+                "material_revision": material,
+                "projection_revision": target.state().revision,
+            }, state_id="ready-state", assignee_id="agent-owner",
+            unassigned=False, authorization_adapter=target,
+        )
+        self.assertEqual(replay["receipt"]["disposition"], "existing")
         self.assertEqual(len(self.client.mutations), mutation_count)
 
     def test_activation_checkpoint_is_inert_until_transition_and_replays(self):

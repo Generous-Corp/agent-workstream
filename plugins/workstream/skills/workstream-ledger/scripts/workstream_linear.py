@@ -161,6 +161,8 @@ mutation WorkstreamIssueCreate($input: IssueCreateInput!) {
       parent { id identifier }
       project { id }
       team { id organization { id } }
+      assignee { id }
+      state { id name type }
     }
   }
 }
@@ -595,6 +597,7 @@ class LinearGraphQLTransport:
         title: str,
         plan_revision: str,
         parent_id: str | None,
+        native_initialization: dict[str, Any] | None = None,
     ) -> None:
         """Validate every intake-owned immutable field after create or reload."""
         route = self._intake_route()
@@ -635,6 +638,19 @@ class LinearGraphQLTransport:
                 raise LinearTransportError(
                     f"intake_identity_collision:{stable_key}:{field}"
                 )
+        if native_initialization is not None:
+            native_observed = {
+                "state_id": (issue.get("state") or {}).get("id"),
+                "assignee_id": (issue.get("assignee") or {}).get("id"),
+            }
+            if native_observed != native_initialization:
+                differing = next(
+                    field for field in ("state_id", "assignee_id")
+                    if native_observed[field] != native_initialization[field]
+                )
+                raise LinearTransportError(
+                    f"intake_identity_collision:{stable_key}:{differing}"
+                )
 
     def _create_or_converge(
         self,
@@ -645,6 +661,7 @@ class LinearGraphQLTransport:
         description: str,
         plan_revision: str,
         parent_id: str | None,
+        native_initialization: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], str]:
         values: dict[str, Any] = {
             "id": issue_id,
@@ -653,6 +670,10 @@ class LinearGraphQLTransport:
         }
         if parent_id is not None:
             values["parentId"] = parent_id
+        if native_initialization is not None:
+            values["stateId"] = native_initialization["state_id"]
+            if native_initialization["assignee_id"] is not None:
+                values["assigneeId"] = native_initialization["assignee_id"]
         issue: dict[str, Any] | None = None
         failure: Exception | None = None
         try:
@@ -674,6 +695,7 @@ class LinearGraphQLTransport:
                 title=title,
                 plan_revision=plan_revision,
                 parent_id=parent_id,
+                native_initialization=native_initialization,
             )
             return issue, "created"
 
@@ -695,6 +717,7 @@ class LinearGraphQLTransport:
             title=title,
             plan_revision=plan_revision,
             parent_id=parent_id,
+            native_initialization=native_initialization,
         )
         return issue, "converged"
 
@@ -709,6 +732,8 @@ class LinearGraphQLTransport:
             "url": issue.get("url"),
             "title": issue.get("title"),
             "parent_id": (issue.get("parent") or {}).get("id"),
+            "state_id": (issue.get("state") or {}).get("id"),
+            "assignee_id": (issue.get("assignee") or {}).get("id"),
             "updated_at": issue.get("updatedAt"),
             "disposition": disposition,
         }
@@ -880,6 +905,9 @@ class LinearGraphQLTransport:
         source_revision: str,
         plan_revision: str,
         expected_frontier: dict[str, int],
+        state_id: str,
+        assignee_id: str | None,
+        unassigned: bool,
         authorization_adapter: Any,
     ) -> dict[str, Any]:
         """Create or converge one reviewed child beneath an immutable legacy root.
@@ -937,6 +965,22 @@ class LinearGraphQLTransport:
             raise ValueError("a durable child-extension authorization adapter is required")
         if not isinstance(root_issue_id, str) or not root_issue_id.strip():
             raise ValueError("existing root issue ID is required")
+        if not isinstance(state_id, str) or not state_id.strip():
+            raise ValueError("native child state ID is required")
+        if (
+            not isinstance(unassigned, bool)
+            or (unassigned and assignee_id is not None)
+            or (not unassigned and (
+                not isinstance(assignee_id, str) or not assignee_id.strip()
+            ))
+        ):
+            raise ValueError(
+                "exactly one native assignee ID or explicit unassigned is required"
+            )
+        native_initialization = {
+            "state_id": state_id,
+            "assignee_id": None if unassigned else assignee_id,
+        }
 
         route = self._intake_route()
         self._ensure_route()
@@ -950,11 +994,19 @@ class LinearGraphQLTransport:
         validate_issue_route(root, **route)
         description_plan_revision = parse_plan_revision(root.get("description"))
         authorization_route = {**route, "root_issue_id": root_issue_id}
+        child_id = deterministic_existing_root_child_id(
+            **route,
+            root_issue_id=root_issue_id,
+            child_stable_key=reviewed_candidate_key,
+        )
         selected_generation = authorization_adapter.select_child_extension_generation(
             description_plan_revision=description_plan_revision,
             source={
                 "identity": source["identity"], "sha256": source_revision,
             },
+            reviewed_candidate_key=reviewed_candidate_key,
+            child_issue_id=child_id,
+            native_initialization=native_initialization,
         )
         if (
             not isinstance(selected_generation, dict)
@@ -972,11 +1024,6 @@ class LinearGraphQLTransport:
                 "existing_root_plan_generation_authority_mismatch"
             )
 
-        child_id = deterministic_existing_root_child_id(
-            **route,
-            root_issue_id=root_issue_id,
-            child_stable_key=reviewed_candidate_key,
-        )
         root_children = [
             item for item in current
             if (item.get("parent") or {}).get("id") == root_issue_id
@@ -997,6 +1044,7 @@ class LinearGraphQLTransport:
                 title=candidate["title"],
                 plan_revision=plan_revision,
                 parent_id=root_issue_id,
+                native_initialization=native_initialization,
             )
         else:
             occupied = next((item for item in current if item.get("id") == child_id), None)
@@ -1008,6 +1056,7 @@ class LinearGraphQLTransport:
                     title=candidate["title"],
                     plan_revision=plan_revision,
                     parent_id=root_issue_id,
+                    native_initialization=native_initialization,
                 )
                 child, disposition = occupied, "converged"
 
@@ -1019,6 +1068,8 @@ class LinearGraphQLTransport:
             child_issue_id=child_id,
             expected_material_revision=expected_frontier["material_revision"],
             expected_projection_revision=expected_frontier["projection_revision"],
+            native_initialization=native_initialization,
+            generation_authority=selected_generation,
             require_existing=child is not None,
         )
         authorization_event = authorization.get("event")
@@ -1034,6 +1085,8 @@ class LinearGraphQLTransport:
             "reviewed_candidate_key": reviewed_candidate_key,
             "child_issue_id": child_id,
             "initial_state": "planned_pending_projection",
+            "native_initialization": native_initialization,
+            "generation_authority": selected_generation,
         }
         authorization_value = authorization_event.get("value")
         authorization_disposition = authorization.get("disposition")
@@ -1099,6 +1152,7 @@ class LinearGraphQLTransport:
                 ),
                 plan_revision=plan_revision,
                 parent_id=root_issue_id,
+                native_initialization=native_initialization,
             )
 
         final = self.snapshot()["issues"]
@@ -1125,6 +1179,7 @@ class LinearGraphQLTransport:
             title=candidate["title"],
             plan_revision=plan_revision,
             parent_id=root_issue_id,
+            native_initialization=native_initialization,
         )
         authorization_adapter.assert_child_extension_authorized(
             authorization_event

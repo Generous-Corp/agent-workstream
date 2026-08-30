@@ -67,6 +67,8 @@ class WorkstreamExtendChildTests(unittest.TestCase):
             "--candidate-key", "item-resume-report",
             "--material-revision", "51",
             "--projection-revision", "73",
+            "--state-id", "state-ready",
+            "--assignee-id", "agent-ready",
             "--workspace-id", "workspace",
             "--team-id", "team",
             "--project-id", "project",
@@ -131,6 +133,9 @@ class WorkstreamExtendChildTests(unittest.TestCase):
         })
         self.assertEqual(values["root_issue_id"], self.ROOT_ID)
         self.assertEqual(values["reviewed_candidate_key"], "item-resume-report")
+        self.assertEqual(values["state_id"], "state-ready")
+        self.assertEqual(values["assignee_id"], "agent-ready")
+        self.assertFalse(values["unassigned"])
         self.assertIsInstance(values["authorization_adapter"], FakeProjection)
         self.assertIs(FakeProjection.calls[0][0], client)
         self.assertEqual(FakeProjection.calls[0][1]["root_issue_id"], self.ROOT_ID)
@@ -144,6 +149,35 @@ class WorkstreamExtendChildTests(unittest.TestCase):
                 workstream_extend_child.run(args)
         source.assert_not_called()
         auth.assert_not_called()
+
+    def test_native_state_and_explicit_assignment_are_required(self):
+        for removed in ("--state-id", "--assignee-id"):
+            with self.subTest(removed=removed):
+                args = self.args()
+                index = args.index(removed)
+                del args[index:index + 2]
+                with mock.patch.object(workstream_extend_child, "plan_payload") as source:
+                    with self.assertRaises(SystemExit):
+                        workstream_extend_child.run(args)
+                source.assert_not_called()
+
+    def test_explicit_unassigned_is_wired_without_assignee(self):
+        args = self.args()
+        index = args.index("--assignee-id")
+        args[index:index + 2] = ["--unassigned"]
+        with mock.patch.object(
+            workstream_extend_child, "plan_payload", return_value=self.plan()
+        ), mock.patch.object(
+            workstream_extend_child, "load_linear_api_key", return_value="secret"
+        ), mock.patch.object(
+            workstream_extend_child, "LinearGraphQLTransport", FakeTransport
+        ), mock.patch.object(
+            workstream_extend_child, "LinearProjectionAdapter", FakeProjection
+        ):
+            workstream_extend_child.run(args, client_factory=lambda _token: object())
+        values = FakeTransport.calls[0][1]
+        self.assertIsNone(values["assignee_id"])
+        self.assertTrue(values["unassigned"])
 
     def test_changed_plan_refuses_before_auth_or_network(self):
         plan = self.plan()

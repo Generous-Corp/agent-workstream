@@ -174,6 +174,24 @@ class WorkstreamCtlTests(unittest.TestCase):
             [MODULE.sys.executable, str(script), "GEN-37"],
         )
 
+    def test_child_event_dispatches_exact_child_material_writer(self):
+        with mock.patch.object(MODULE.os, "execv") as execute:
+            MODULE.main(["child-event", "GEN-37", "--help"])
+        script = MODULE.SCRIPTS / "workstream_child_event.py"
+        execute.assert_called_once_with(
+            MODULE.sys.executable,
+            [MODULE.sys.executable, str(script), "GEN-37", "--help"],
+        )
+
+    def test_child_checkpoint_dispatches_exact_child_checkpoint_writer(self):
+        with mock.patch.object(MODULE.os, "execv") as execute:
+            MODULE.main(["child-checkpoint", "GEN-37", "--help"])
+        script = MODULE.SCRIPTS / "workstream_child_checkpoint.py"
+        execute.assert_called_once_with(
+            MODULE.sys.executable,
+            [MODULE.sys.executable, str(script), "GEN-37", "--help"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -47,6 +47,19 @@ def parser() -> argparse.ArgumentParser:
     )
     value.add_argument("--material-revision", required=True, type=int)
     value.add_argument("--projection-revision", required=True, type=int)
+    value.add_argument(
+        "--state-id", required=True,
+        help="exact native Linear workflow state UUID for the new child",
+    )
+    assignment = value.add_mutually_exclusive_group(required=True)
+    assignment.add_argument(
+        "--assignee-id",
+        help="exact native Linear assignee UUID for the new child",
+    )
+    assignment.add_argument(
+        "--unassigned", action="store_true",
+        help="explicitly create and validate the child without an assignee",
+    )
     value.add_argument("--config", help="exact .workstream.json path")
     value.add_argument("--workspace-id")
     value.add_argument("--team-id")
@@ -70,6 +83,10 @@ def run(
         raise ValueError("existing workstream identifier and root issue UUID are required")
     if args.material_revision < 0 or args.projection_revision < 0:
         raise ValueError("material and projection revisions must be non-negative")
+    if not args.state_id.strip():
+        raise ValueError("native child state ID must be non-empty")
+    if args.assignee_id is not None and not args.assignee_id.strip():
+        raise ValueError("native child assignee ID must be non-empty")
 
     plan = plan_payload(args.source, args.identity)
     if plan["root"]["plan_revision"] != args.plan_revision:
@@ -129,6 +146,9 @@ def run(
             "material_revision": args.material_revision,
             "projection_revision": args.projection_revision,
         },
+        state_id=args.state_id,
+        assignee_id=args.assignee_id,
+        unassigned=args.unassigned,
         authorization_adapter=authorization,
     )
     return {

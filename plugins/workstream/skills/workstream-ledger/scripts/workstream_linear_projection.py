@@ -727,18 +727,83 @@ def validate_projection_event(event: dict[str, Any]) -> None:
         ):
             raise LinearProjectionError("invalid_projection_identity_history_seal")
     if event["kind"] == "child_extension_authorization":
-        required_authorization = {
+        legacy_authorization = {
             "root_issue_id", "route", "source", "plan_revision",
             "reviewed_candidate_key", "child_issue_id",
             "expected_material_revision", "expected_projection_revision",
             "initial_state",
         }
+        current_authorization = {
+            *legacy_authorization, "native_initialization",
+            "generation_authority",
+        }
         route = value.get("route") if isinstance(value, dict) else None
         source = value.get("source") if isinstance(value, dict) else None
+        native = (
+            value.get("native_initialization")
+            if isinstance(value, dict) else None
+        )
+        generation = (
+            value.get("generation_authority")
+            if isinstance(value, dict) else None
+        )
+        generation_valid = (
+            isinstance(generation, dict)
+            and set(generation) == {
+                "plan_revision", "description_plan_revision",
+                "transition_tip_event_id", "activation_epoch",
+                "authority_origin", "workstream_id", "authority", "source",
+            }
+            and generation.get("plan_revision") == event["plan_revision"]
+            and generation.get("workstream_id") == event["workstream_id"]
+            and generation.get("authority") == event["authority"]
+            and generation.get("source") == source
+            and generation.get("authority_origin") in {
+                "legacy_description", "generation_genesis",
+                "generation_transition",
+            }
+            and (
+                generation.get("transition_tip_event_id") is None
+                if generation.get("authority_origin") == "legacy_description"
+                else re.fullmatch(
+                    r"wsp_[0-9a-f]{32}",
+                    str(generation.get("transition_tip_event_id", "")),
+                ) is not None
+            )
+            and (
+                generation.get("activation_epoch") is None
+                if generation.get("authority_origin") == "legacy_description"
+                else isinstance(generation.get("activation_epoch"), int)
+                and not isinstance(generation.get("activation_epoch"), bool)
+                and generation["activation_epoch"] >= 0
+            )
+            and (
+                generation.get("description_plan_revision") is None
+                or isinstance(generation["description_plan_revision"], str)
+            )
+        )
+        native_valid = (
+            set(value) == legacy_authorization
+            or (
+                set(value) == current_authorization
+                and isinstance(native, dict)
+                and set(native) == {"state_id", "assignee_id"}
+                and isinstance(native.get("state_id"), str)
+                and bool(native["state_id"].strip())
+                and (
+                    native.get("assignee_id") is None
+                    or (
+                        isinstance(native["assignee_id"], str)
+                        and bool(native["assignee_id"].strip())
+                    )
+                )
+                and generation_valid
+            )
+        )
         if (
             schema_version != 2
             or tombstone
-            or set(value) != required_authorization
+            or not native_valid
             or event["key"] != value.get("child_issue_id")
             or value.get("root_issue_id") != event["authority"]["root_issue_id"]
             or route != event["authority"]
@@ -1941,14 +2006,91 @@ class LinearProjectionAdapter:
 
     def select_child_extension_generation(
         self, *, description_plan_revision: str | None,
-        source: dict[str, str],
+        source: dict[str, str], reviewed_candidate_key: str | None = None,
+        child_issue_id: str | None = None,
+        native_initialization: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Authenticate the one generation allowed to extend this root."""
-        return self._select_child_extension_generation(
-            self._comments(),
+        comments = self._comments()
+        try:
+            return self._select_child_extension_generation(
+                comments, description_plan_revision=description_plan_revision,
+                source=source,
+            )
+        except LinearProjectionError as current_error:
+            if not all((reviewed_candidate_key, child_issue_id)) or not isinstance(
+                native_initialization, dict
+            ):
+                raise
+            state = reduce_projection_comments(
+                comments, workstream_id=self.workstream_id,
+                expected_plan_revision=self.plan_revision,
+                authenticated_route=self.authority,
+            )
+            matching = [
+                event for event in state.events
+                if event["kind"] == "child_extension_authorization"
+                and event["key"] == child_issue_id
+            ]
+            if len(matching) != 1:
+                raise current_error
+            event = matching[0]
+            value = event.get("value")
+            if (
+                not isinstance(value, dict)
+                or value.get("source") != source
+                or value.get("reviewed_candidate_key") != reviewed_candidate_key
+                or value.get("child_issue_id") != child_issue_id
+                or value.get("native_initialization") != native_initialization
+                or not isinstance(value.get("generation_authority"), dict)
+            ):
+                raise current_error
+            self._assert_child_extension_generation_authority(
+                event, comments, value["generation_authority"],
+            )
+            return deepcopy(value["generation_authority"])
+
+    def select_generation_authority(
+        self, *, description_plan_revision: str | None,
+    ) -> dict[str, Any]:
+        """Return only the currently selected route-authenticated generation."""
+        selected = select_plan_generation(
+            self._comments(), workstream_id=self.workstream_id,
             description_plan_revision=description_plan_revision,
-            source=source,
+            authenticated_route=self.authority,
         )
+        if selected["plan_revision"] != self.plan_revision:
+            raise LinearProjectionError("plan_generation_not_selected")
+        return selected
+
+    def select_owned_child_generation(
+        self, *, description_plan_revision: str | None,
+        child_workstream_id: str,
+    ) -> dict[str, Any]:
+        """Authenticate a current generation and its exact child owner."""
+        comments = self._comments()
+        selected = select_plan_generation(
+            comments, workstream_id=self.workstream_id,
+            description_plan_revision=description_plan_revision,
+            authenticated_route=self.authority,
+        )
+        if selected["plan_revision"] != self.plan_revision:
+            raise LinearProjectionError("plan_generation_not_selected")
+        state = reduce_projection_comments(
+            comments, workstream_id=self.workstream_id,
+            expected_plan_revision=self.plan_revision,
+            authenticated_route=self.authority,
+        )
+        scope = state.snapshot.get("scope")
+        owner = (
+            scope.get("child_ownership", {}).get(child_workstream_id)
+            if isinstance(scope, dict) else None
+        )
+        if not isinstance(owner, str) or not owner.strip():
+            raise LinearProjectionError(
+                f"child_target_not_owned:{child_workstream_id}"
+            )
+        return {**selected, "child_repository_owner": owner}
 
     def _select_child_extension_generation(
         self, comments: list[dict[str, Any]], *,
@@ -2194,13 +2336,16 @@ class LinearProjectionAdapter:
         self, event: dict[str, Any], comments: list[dict[str, Any]],
     ) -> dict[str, Any]:
         value = event.get("value")
-        if not isinstance(value, dict) or not isinstance(value.get("source"), dict):
+        if (
+            not isinstance(value, dict)
+            or not isinstance(value.get("source"), dict)
+            or not isinstance(value.get("generation_authority"), dict)
+        ):
             raise LinearProjectionError(
                 "child_extension_authorization_source_invalid"
             )
-        self._select_child_extension_generation(
-            comments, description_plan_revision=self.plan_revision,
-            source=value["source"],
+        self._assert_child_extension_generation_authority(
+            event, comments, value["generation_authority"],
         )
         state = reduce_projection_comments(
             comments, workstream_id=self.workstream_id,
@@ -2224,10 +2369,95 @@ class LinearProjectionAdapter:
             raise LinearProjectionError("child_extension_authorization_readback_missing")
         return {"event": event, "remote_id": remote_id, "revision": state.revision}
 
+    def _assert_child_extension_generation_authority(
+        self, event: dict[str, Any], comments: list[dict[str, Any]],
+        generation_authority: dict[str, Any],
+    ) -> None:
+        source = event["value"]["source"]
+        selected = select_plan_generation(
+            comments, workstream_id=self.workstream_id,
+            description_plan_revision=generation_authority.get(
+                "description_plan_revision"
+            ),
+            authenticated_route=self.authority,
+        )
+        if selected["plan_revision"] == self.plan_revision:
+            current = self._select_child_extension_generation(
+                comments,
+                description_plan_revision=generation_authority.get(
+                    "description_plan_revision"
+                ),
+                source=source,
+            )
+            if current != generation_authority:
+                raise LinearProjectionError(
+                    "child_extension_generation_authority_changed"
+                )
+            return
+
+        from workstream_generation import generation_controls
+
+        controls = sorted(
+            generation_controls(comments),
+            key=lambda item: item["value"]["activation_epoch"],
+        )
+        proof_tip = generation_authority.get("transition_tip_event_id")
+        if proof_tip is None:
+            if (
+                generation_authority.get("authority_origin")
+                != "legacy_description"
+                or generation_authority.get("description_plan_revision")
+                != self.plan_revision
+            ):
+                raise LinearProjectionError(
+                    "child_extension_generation_authority_invalid"
+                )
+        else:
+            proof_controls = [
+                item for item in controls if item["event_id"] == proof_tip
+            ]
+            if (
+                len(proof_controls) != 1
+                or proof_controls[0]["value"]["to"]["plan_revision"]
+                != self.plan_revision
+                or proof_controls[0]["value"]["activation_epoch"]
+                != generation_authority.get("activation_epoch")
+                or proof_controls[0]["kind"]
+                != generation_authority.get("authority_origin")
+                or proof_controls[0]["value"].get("source") != source
+            ):
+                raise LinearProjectionError(
+                    "child_extension_generation_authority_invalid"
+                )
+        retirements = [
+            item for item in controls
+            if item["kind"] == "generation_transition"
+            and item["value"]["from"]["plan_revision"] == self.plan_revision
+        ]
+        if len(retirements) != 1:
+            raise LinearProjectionError(
+                "child_extension_generation_retirement_ambiguous"
+            )
+        retirement = retirements[0]
+        state = reduce_projection_comments(
+            comments, workstream_id=self.workstream_id,
+            expected_plan_revision=self.plan_revision,
+            authenticated_route=self.authority,
+        )
+        prefix = state.events[
+            :retirement["value"]["from"]["projection_revision"]
+        ]
+        if event not in prefix:
+            raise LinearProjectionError(
+                "child_extension_grant_not_in_retirement_frontier"
+            )
+
     def reserve_child_extension(
         self, *, source: dict[str, str], reviewed_candidate_key: str,
         child_issue_id: str, expected_material_revision: int,
-        expected_projection_revision: int, require_existing: bool = False,
+        expected_projection_revision: int,
+        native_initialization: dict[str, Any],
+        generation_authority: dict[str, Any], require_existing: bool = False,
     ) -> dict[str, Any]:
         """Win one durable projection-CAS authorization before child creation."""
         if (
@@ -2242,13 +2472,24 @@ class LinearProjectionAdapter:
             or expected_projection_revision < 0
         ):
             raise LinearProjectionError("invalid_child_extension_projection_frontier")
+        if (
+            not isinstance(native_initialization, dict)
+            or set(native_initialization) != {"state_id", "assignee_id"}
+            or not isinstance(native_initialization.get("state_id"), str)
+            or not native_initialization["state_id"].strip()
+            or (
+                native_initialization.get("assignee_id") is not None
+                and (
+                    not isinstance(native_initialization["assignee_id"], str)
+                    or not native_initialization["assignee_id"].strip()
+                )
+            )
+        ):
+            raise LinearProjectionError(
+                "invalid_child_extension_native_initialization"
+            )
         before_comments = self._comments()
         from workstream_linear_events import reduce_event_comments
-
-        self._select_child_extension_generation(
-            before_comments, description_plan_revision=self.plan_revision,
-            source=source,
-        )
 
         material_before = reduce_event_comments(
             before_comments, workstream_id=self.workstream_id
@@ -2266,6 +2507,8 @@ class LinearProjectionAdapter:
             "reviewed_candidate_key": reviewed_candidate_key,
             "child_issue_id": child_issue_id,
             "initial_state": "planned_pending_projection",
+            "native_initialization": deepcopy(native_initialization),
+            "generation_authority": deepcopy(generation_authority),
         }
         matching = [
             item for item in before.events
@@ -2294,6 +2537,9 @@ class LinearProjectionAdapter:
                 raise LinearProjectionError(
                     "child_extension_authorization_superseded_or_conflicting"
                 )
+            self._assert_child_extension_generation_authority(
+                event, before_comments, generation_authority,
+            )
             if material_before.revision != expected_material_revision:
                 raise LinearProjectionError(
                     "child_extension_material_frontier_stale_reload_required"
@@ -2308,6 +2554,17 @@ class LinearProjectionAdapter:
             if require_existing:
                 raise LinearProjectionError(
                     "child_extension_preexisting_child_without_authorization"
+                )
+            selected_generation = self._select_child_extension_generation(
+                before_comments,
+                description_plan_revision=generation_authority.get(
+                    "description_plan_revision"
+                ) if isinstance(generation_authority, dict) else None,
+                source=source,
+            )
+            if selected_generation != generation_authority:
+                raise LinearProjectionError(
+                    "child_extension_generation_authority_changed"
                 )
             if material_before.revision != expected_material_revision:
                 raise LinearProjectionError(
