@@ -36,7 +36,9 @@ from workstream_linear_events import (
     reduce_event_comments,
 )
 from workstream_linear_projection import (
-    LinearProjectionError, reduce_projection_comments, TOMBSTONE,
+    _inspect_unsealed_identity_history, inspect_unsealed_identity_history,
+    LinearProjectionError,
+    reduce_projection_comments, TOMBSTONE,
     validate_projection_event,
 )
 from workstream_plan import plan_payload
@@ -1633,13 +1635,43 @@ def main() -> int:
             # bytes can be authenticated. Lifecycle validation is necessarily
             # provisional here; the full-authority join below repeats the same
             # live inputs with authenticated_source and enforces it strictly.
-            snapshot = add_material_history(
-                live_graph_snapshot, comments, token, authenticated_route=route,
-                permit_stale_lifecycle_for_reconcile=not args.inspection_only,
-                relation_target_resolver=lambda relations: read_relation_targets(
-                    client, relations,
-                ),
-            )
+            try:
+                snapshot = add_material_history(
+                    live_graph_snapshot, comments, token, authenticated_route=route,
+                    permit_stale_lifecycle_for_reconcile=not args.inspection_only,
+                    relation_target_resolver=lambda relations: read_relation_targets(
+                        client, relations,
+                    ),
+                )
+            except LinearProjectionError as error:
+                if not str(error).startswith("repository_identity_history_regressed:"):
+                    raise
+                material_revision = reduce_event_comments(
+                    comments, workstream_id=token,
+                ).revision
+                provisional = _inspect_unsealed_identity_history(
+                    comments, workstream_id=token,
+                    expected_plan_revision=live_graph_snapshot["root"]["plan_revision"],
+                    authenticated_route=route, authenticated_source=None,
+                    material_revision=material_revision,
+                )
+                projected_source = provisional["source"]
+                source_location = args.plan_source or projected_source.get("identity")
+                if not source_location:
+                    raise ResumeError("identity_history_reconcile_plan_source_missing")
+                authenticated_source = plan_payload(
+                    source_location, args.plan_identity or projected_source.get("identity"),
+                )["source"]
+                partial = inspect_unsealed_identity_history(
+                    comments, workstream_id=token,
+                    expected_plan_revision=live_graph_snapshot["root"]["plan_revision"],
+                    authenticated_route=route,
+                    authenticated_source=authenticated_source,
+                    material_revision=material_revision,
+                )
+                json.dump(partial, sys.stdout, ensure_ascii=False, sort_keys=True, indent=2)
+                sys.stdout.write("\n")
+                return 3
         else:
             raw = (
                 sys.stdin.read() if args.snapshot == "-"

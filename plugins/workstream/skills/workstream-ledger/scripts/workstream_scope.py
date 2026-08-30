@@ -169,8 +169,87 @@ def _validate_identity_history(repository: dict[str, Any], key: str) -> list[str
     return canonical_aliases
 
 
-def validate_repository_identity_transition(
-    previous_scope: dict[str, Any], next_scope: dict[str, Any],
+def _is_monotonic_resolution_refresh(
+    previous: dict[str, Any], current: dict[str, Any], slug: str,
+) -> bool:
+    """Accept an authenticated readback refresh without rewriting its claims."""
+    if not isinstance(previous, dict) or not isinstance(current, dict):
+        return False
+    if set(previous) != set(current):
+        return False
+    previous_claim = {key: value for key, value in previous.items() if key != "observed_at"}
+    current_claim = {key: value for key, value in current.items() if key != "observed_at"}
+    if previous_claim != current_claim:
+        return False
+    try:
+        return _observed_at(
+            current.get("observed_at"),
+            f"invalid_repository_resolution_timestamp:{slug}",
+        ) >= _observed_at(
+            previous.get("observed_at"),
+            f"invalid_repository_resolution_timestamp:{slug}",
+        )
+    except ScopeError:
+        return False
+
+
+def _is_legacy_identity_backfill(
+    previous: dict[str, Any], current: dict[str, Any], key: str,
+    appended_aliases: list[str], appended_updates: list[dict[str, Any]],
+) -> bool:
+    """Recognize the bounded pre-v2 redirect receipt already stored in Linear."""
+    if len(appended_aliases) != 1 or len(appended_updates) != 1:
+        return False
+    update = appended_updates[0]
+    if not isinstance(update, dict) or set(update) != {
+        "from", "to", "repository_key", "provider_repository_id",
+        "observed_at", "evidence",
+    }:
+        return False
+    slug = current.get("slug")
+    provider_id = current.get("provider_repository_id")
+    previous_slug = appended_aliases[0]
+    evidence = update.get("evidence")
+    expected_evidence = [{
+        "kind": "authenticated_provider_readback",
+        "authenticated": True,
+        "repository_key": key,
+        "provider_repository_id": provider_id,
+        "requested_slug": previous_slug,
+        "resolved_slug": slug,
+    }]
+    resolution = current.get("identity_resolution")
+    previous_resolution = previous.get("identity_resolution")
+    if (
+        update.get("from") != previous_slug
+        or update.get("to") != slug
+        or update.get("repository_key") != key
+        or update.get("provider_repository_id") != provider_id
+        or update.get("evidence") != expected_evidence
+        or not isinstance(resolution, dict)
+        or set(resolution) != {
+            "provider_repository_id", "resolved_slug", "observed_at", "evidence",
+        }
+        or resolution.get("provider_repository_id") != provider_id
+        or resolution.get("resolved_slug") != slug
+        or resolution.get("observed_at") != update.get("observed_at")
+        or resolution.get("evidence") != [{
+            "kind": "authenticated_provider_readback",
+            "authenticated": True,
+            "provider_repository_id": provider_id,
+            "resolved_slug": slug,
+        }]
+        or not _is_monotonic_resolution_refresh(
+            previous_resolution, resolution, str(slug),
+        )
+    ):
+        return False
+    return True
+
+
+def _validate_repository_identity_transition(
+    previous_scope: dict[str, Any], next_scope: dict[str, Any], *,
+    authenticated_legacy_history: bool,
 ) -> None:
     """Prevent an ordinary scope replacement from rewriting identity history."""
     previous_repositories = previous_scope.get("repositories")
@@ -225,13 +304,31 @@ def validate_repository_identity_transition(
         ):
             raise ScopeError(f"repository_identity_history_regressed:{key}")
         appended_updates = current_updates[len(previous_updates):]
+        appended_aliases = current_aliases[len(previous_aliases):]
         if not appended_updates:
             if (
-                current.get("identity_resolution")
-                != previous.get("identity_resolution")
-                or current.get("slug") != previous.get("slug")
+                current.get("slug") != previous.get("slug")
+                or (
+                    current.get("identity_resolution")
+                    != previous.get("identity_resolution")
+                    and not (
+                        authenticated_legacy_history
+                        and _is_monotonic_resolution_refresh(
+                            previous.get("identity_resolution"),
+                            current.get("identity_resolution"),
+                            str(current.get("slug")),
+                        )
+                    )
+                )
             ):
                 raise ScopeError(f"repository_identity_history_regressed:{key}")
+            continue
+        if (
+            authenticated_legacy_history
+            and _is_legacy_identity_backfill(
+                previous, current, key, appended_aliases, appended_updates,
+            )
+        ):
             continue
         latest = appended_updates[-1]
         resolution = current.get("identity_resolution")
@@ -298,6 +395,23 @@ def validate_repository_identity_transition(
             }]
         ):
             raise ScopeError(f"repository_identity_history_regressed:{key}")
+
+
+def validate_repository_identity_transition(
+    previous_scope: dict[str, Any], next_scope: dict[str, Any],
+) -> None:
+    _validate_repository_identity_transition(
+        previous_scope, next_scope, authenticated_legacy_history=False,
+    )
+
+
+def validate_authenticated_legacy_repository_identity_transition(
+    previous_scope: dict[str, Any], next_scope: dict[str, Any],
+) -> None:
+    """Validate a legacy transition after its immutable receipt is authenticated."""
+    _validate_repository_identity_transition(
+        previous_scope, next_scope, authenticated_legacy_history=True,
+    )
 
 
 def validate_scope(scope: dict[str, Any], *, root_id: str,

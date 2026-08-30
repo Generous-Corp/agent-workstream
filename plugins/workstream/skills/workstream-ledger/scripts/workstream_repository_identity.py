@@ -33,7 +33,8 @@ from workstream_linear_events import (
     pending_ledger_reservations, reduce_event_comments, reduce_ledger_reservations,
 )
 from workstream_linear_projection import (
-    build_projection_event, LinearProjectionAdapter, LinearProjectionError,
+    _reduce_projection_comments_impl, build_projection_event,
+    LinearProjectionAdapter, LinearProjectionError,
     reduce_projection_comments,
 )
 from workstream_scope import (
@@ -226,6 +227,32 @@ class GitHubRepositoryResolver:
             "authenticated": True,
         }
 
+    def resolve_route(
+        self, *, requested_slug: str, provider_repository_id: str,
+        canonical_slug: str,
+    ) -> dict[str, Any]:
+        """Authenticate one current or legacy route against immutable provider ID."""
+        old = self._read(requested_slug, allow_redirect=True)
+        current = self._read(old["resolved_slug"], allow_redirect=False)
+        expected = canonical_repository(canonical_slug)
+        if (
+            old["resolved_slug"] != expected
+            or current["resolved_slug"] != expected
+            or old["provider_ids"] != current["provider_ids"]
+            or provider_repository_id not in old["provider_ids"]
+            or old["redirect_count"] not in {0, 1}
+        ):
+            raise RepositoryIdentityError("github_repository_route_mismatch")
+        return {
+            "requested_slug": canonical_repository(requested_slug),
+            "resolved_slug": expected,
+            "provider_repository_id": provider_repository_id,
+            "requested_response_url": old["final_url"],
+            "canonical_response_url": current["final_url"],
+            "redirect_count": old["redirect_count"],
+            "authenticated": True,
+        }
+
 
 def _scope_head(state: Any) -> dict[str, Any]:
     heads = [
@@ -240,6 +267,7 @@ def _scope_head(state: Any) -> dict[str, Any]:
 def _reserve_material_frontier(
     adapter: LinearProjectionAdapter, *, comments: list[dict[str, Any]],
     material_revision: int, intent_event: dict[str, Any],
+    permit_unsealed_legacy_candidates: bool = False,
 ) -> dict[str, Any]:
     """Claim the shared material boundary before writing the projection event."""
     from workstream_linear_checkpoints import reduce_checkpoint_comments
@@ -253,6 +281,35 @@ def _reserve_material_frontier(
     ]
     if same_intent:
         existing = same_intent[0][0]
+        if permit_unsealed_legacy_candidates and len(same_intent) == 1:
+            from workstream_linear_checkpoints import reduce_checkpoint_comments
+
+            remote_id = same_intent[0][1]
+            without_own = [
+                comment for comment in comments if comment.get("id") != remote_id
+            ]
+            checkpoint_ids = sorted(
+                event["event_id"] for event in reduce_checkpoint_comments(
+                    without_own, workstream_id=adapter.workstream_id,
+                ).checkpoints
+            )
+            expected_frontier = ledger_serialization_frontier(
+                checkpoint_ids, without_own,
+                workstream_id=adapter.workstream_id,
+                authenticated_route=adapter.authority,
+                current_plan_revision=adapter.plan_revision,
+                material_revision=material_revision,
+            )
+            if (
+                existing["frontier_ids"] != expected_frontier
+                or remote_id != ledger_boundary_slot_id(
+                    adapter.workstream_id, material_revision,
+                    expected_frontier, adapter.authority,
+                )
+            ):
+                raise RepositoryIdentityError(
+                    "repository_material_reservation_frontier_unproven"
+                )
         if (
             len(same_intent) != 1
             or existing["intent_event"] != intent_event
@@ -276,10 +333,18 @@ def _reserve_material_frontier(
         current_plan_revision=adapter.plan_revision,
         material_revision=material_revision,
     )
-    projection = reduce_projection_comments(
-        comments, workstream_id=adapter.workstream_id,
-        expected_plan_revision=adapter.plan_revision,
-        authenticated_route=adapter.authority,
+    projection = (
+        _reduce_projection_comments_impl(
+            comments, workstream_id=adapter.workstream_id,
+            expected_plan_revision=adapter.plan_revision,
+            authenticated_route=adapter.authority,
+            permit_unsealed_legacy_candidates=True,
+        )
+        if permit_unsealed_legacy_candidates else reduce_projection_comments(
+            comments, workstream_id=adapter.workstream_id,
+            expected_plan_revision=adapter.plan_revision,
+            authenticated_route=adapter.authority,
+        )
     )
     reservation = {
         "schema_version": 1,
@@ -292,7 +357,11 @@ def _reserve_material_frontier(
         ],
         "frontier_ids": frontier,
         "authority": adapter.authority,
-        "intent_kind": "repository_identity_projection",
+        "intent_kind": (
+            "repository_identity_history_seal"
+            if intent_event["kind"] == "identity_history_seal"
+            else "repository_identity_projection"
+        ),
         "intent_event": intent_event,
         "intent_sha256": _value_digest(intent_event),
     }

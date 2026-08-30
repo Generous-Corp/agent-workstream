@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 
 MARKETPLACE = "generous-workstream"
@@ -23,6 +24,7 @@ PLUGIN_ID = "workstream@generous-workstream"
 CLIENTS = ("codex", "claude")
 COMMAND_TIMEOUT_SECONDS = 180
 TERMINATION_TIMEOUT_SECONDS = 5
+CODEX_POST_UPDATE_STABILITY_DELAYS_SECONDS = (1.0, 2.0)
 STATE_ROOT = Path.home() / ".local/state/agent-workstream"
 MANIFESTS = {"codex": ".codex-plugin/plugin.json", "claude": ".claude-plugin/plugin.json"}
 MIRROR_MARKER = ".agent-workstream-skill-sync.json"
@@ -667,6 +669,34 @@ def verify_client(client: str, marketplace: dict[str, Any] | None,
             "status": "verified"}
 
 
+def verify_post_update_stability(client: str, *, expected_commit: str,
+                                 expected_version: str, expected_source: Path,
+                                 expected_digest: str, host_id: str,
+                                 target: Path, env: dict[str, str]) -> dict[str, Any]:
+    """Fence delayed client cache writers before publishing update success."""
+    receipt: dict[str, Any] | None = None
+    delays = CODEX_POST_UPDATE_STABILITY_DELAYS_SECONDS if client == "codex" else (0.0,)
+    for delay in delays:
+        if delay:
+            time.sleep(delay)
+        marketplace, plugin = inventory(client, env)
+        try:
+            receipt = verify_client(
+                client, marketplace, plugin,
+                expected_commit=expected_commit,
+                expected_version=expected_version,
+                expected_source=expected_source,
+                expected_digest=expected_digest,
+                host_id=host_id, target=target,
+            )
+        except InstallError as error:
+            raise InstallError(
+                f"post_update_stability_failed:{client}:{error}"
+            ) from error
+    assert receipt is not None
+    return receipt
+
+
 def inventory(client: str, env: dict[str, str]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     return codex_inventory(env) if client == "codex" else claude_inventory(env)
 
@@ -908,6 +938,16 @@ def main(argv: list[str] | None = None) -> int:
                                 expected_source=source_root,
                                 expected_digest=source["tree_sha256"],
                                 host_id=args.host_id, target=target,
+                            )
+                        if client == "codex" and (changed or recovering):
+                            journal.set_phase("verifying_stability")
+                            receipt = verify_post_update_stability(
+                                client,
+                                expected_commit=args.expected_commit,
+                                expected_version=args.expected_version,
+                                expected_source=source_root,
+                                expected_digest=source["tree_sha256"],
+                                host_id=args.host_id, target=target, env=env,
                             )
                         journal.clear()
                     else:

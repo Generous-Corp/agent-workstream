@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
+from copy import deepcopy
 import unittest
 
 from workstream_scope import (
     canonical_repository, relation_target_key, repository_key, ScopeError,
-    validate_relation_graph, validate_relations, validate_scope,
+    validate_relation_graph, validate_relations,
+    validate_authenticated_legacy_repository_identity_transition,
+    validate_repository_identity_transition, validate_scope,
 )
 
 
@@ -246,6 +249,120 @@ class WorkstreamScopeTests(unittest.TestCase):
         }]
         with self.assertRaisesRegex(ScopeError, "unverified_identity_update"):
             validate_scope(scope, root_id="GEN-37", child_ids={"GEN-38", "GEN-39"})
+
+    def test_gen37_legacy_resolution_refresh_and_redirect_history_remain_valid(self):
+        """Sanitized structural fixture from GEN-37 revisions 43, 49, and 54."""
+        before = self.scope()
+        before["repositories"].append({
+            "slug": "github.com/danielraffel/shipyard", "exact_head": "c" * 40,
+            "provider_repository_id": "R_shipyard", "aliases": [],
+            "identity_resolution": {
+                "provider_repository_id": "R_shipyard",
+                "resolved_slug": "github.com/danielraffel/shipyard",
+                "observed_at": "2026-08-28T07:34:20Z",
+                "evidence": [{
+                    "kind": "authenticated_provider_readback", "authenticated": True,
+                    "provider_repository_id": "R_shipyard",
+                    "resolved_slug": "github.com/danielraffel/shipyard",
+                }],
+            },
+            "identity_updates": [], "evidence": [],
+        })
+        before["repositories"][0]["identity_resolution"]["observed_at"] = (
+            "2026-08-28T07:34:20Z"
+        )
+
+        redirected = deepcopy(before)
+        pulp = redirected["repositories"][0]
+        pulp["identity_resolution"]["observed_at"] = "2026-08-29T03:35:30Z"
+        pulp["aliases"] = ["github.com/danielraffel/pulp"]
+        pulp["identity_updates"] = [{
+            "from": "github.com/danielraffel/pulp",
+            "to": "github.com/generous-corp/pulp",
+            "repository_key": "github.com:id:R_pulp",
+            "provider_repository_id": "R_pulp",
+            "observed_at": "2026-08-29T03:35:30Z",
+            "evidence": [{
+                "kind": "authenticated_provider_readback", "authenticated": True,
+                "repository_key": "github.com:id:R_pulp",
+                "provider_repository_id": "R_pulp",
+                "requested_slug": "github.com/danielraffel/pulp",
+                "resolved_slug": "github.com/generous-corp/pulp",
+            }],
+        }]
+        validate_authenticated_legacy_repository_identity_transition(
+            before, redirected,
+        )
+        validate_authenticated_legacy_repository_identity_transition(
+            redirected, deepcopy(redirected),
+        )
+        with self.assertRaisesRegex(ScopeError, "identity_history_regressed"):
+            validate_repository_identity_transition(before, redirected)
+
+        erased = deepcopy(redirected)
+        erased["repositories"][0]["aliases"] = []
+        erased["repositories"][0]["identity_updates"] = []
+        with self.assertRaisesRegex(ScopeError, "identity_history_regressed"):
+            validate_authenticated_legacy_repository_identity_transition(
+                redirected, erased,
+            )
+
+        forged = deepcopy(redirected)
+        forged["repositories"][0]["identity_updates"][0]["evidence"][0][
+            "authenticated"
+        ] = False
+        with self.assertRaisesRegex(ScopeError, "unverified_identity_update"):
+            validate_authenticated_legacy_repository_identity_transition(
+                before, forged,
+            )
+
+        reordered = deepcopy(redirected)
+        pulp = reordered["repositories"][0]
+        other = "github.com/legacy/pulp"
+        pulp["aliases"].insert(0, other)
+        pulp["identity_updates"].insert(0, {
+            "from": other,
+            "to": "github.com/generous-corp/pulp",
+            "repository_key": "github.com:id:R_pulp",
+            "provider_repository_id": "R_pulp",
+            "observed_at": "2026-08-29T03:35:30Z",
+            "evidence": [{
+                "kind": "authenticated_provider_readback", "authenticated": True,
+                "repository_key": "github.com:id:R_pulp",
+                "provider_repository_id": "R_pulp",
+                "requested_slug": other,
+                "resolved_slug": "github.com/generous-corp/pulp",
+            }],
+        })
+        with self.assertRaisesRegex(ScopeError, "identity_history_regressed"):
+            validate_authenticated_legacy_repository_identity_transition(
+                redirected, reordered,
+            )
+
+    def test_resolution_refresh_is_monotonic_and_cannot_forge_other_fields(self):
+        before = self.scope()
+        refreshed = deepcopy(before)
+        refreshed["repositories"][0]["identity_resolution"]["observed_at"] = (
+            "2026-08-22T00:00:00Z"
+        )
+        validate_authenticated_legacy_repository_identity_transition(
+            before, refreshed,
+        )
+
+        for mutate in ("backward", "evidence", "extra"):
+            with self.subTest(mutate=mutate):
+                forged = deepcopy(refreshed)
+                resolution = forged["repositories"][0]["identity_resolution"]
+                if mutate == "backward":
+                    resolution["observed_at"] = "2026-08-20T00:00:00Z"
+                elif mutate == "evidence":
+                    resolution["evidence"].append({"kind": "untrusted_hint"})
+                else:
+                    resolution["claim"] = "invented"
+                with self.assertRaisesRegex(ScopeError, "identity_history_regressed"):
+                    validate_authenticated_legacy_repository_identity_transition(
+                        refreshed, forged,
+                    )
 
     def test_linear_route_readback_must_bind_project_and_root(self):
         scope = self.scope()

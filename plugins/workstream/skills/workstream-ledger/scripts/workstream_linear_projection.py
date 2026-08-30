@@ -19,6 +19,7 @@ import json
 import os
 import re
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -44,6 +45,7 @@ KINDS = {
     "provenance", "disposition", "closure_review", "lifecycle", "cas_activation",
     "quarantine_disposition", "child_closure",
     "child_extension_authorization", "child_dependency_authorization",
+    "identity_history_seal",
 }
 SINGLETON_KINDS = {
     "scope", "source", "disposition", "lifecycle", "cas_activation",
@@ -56,6 +58,168 @@ LEGACY_DIGEST_KIND_FULL_EVENTS = "canonical-full-events-v1"
 
 class LinearProjectionError(LinearTransportError):
     """The remote projection cannot be persisted or reduced without guessing."""
+
+
+def _projection_receipt(comment: dict[str, Any]) -> dict[str, Any]:
+    return {key: comment.get(key) for key in ("id", "createdAt", "updatedAt", "body")}
+
+
+def projection_prefix_sha256(
+    events: list[dict[str, Any]], comments_by_event_id: Mapping[str, dict[str, Any]],
+    through_event_id: str,
+) -> str:
+    prefix: list[dict[str, Any]] = []
+    found = False
+    for event in events:
+        comment = comments_by_event_id.get(event["event_id"])
+        if not isinstance(comment, dict):
+            raise LinearProjectionError("identity_history_seal_receipt_missing")
+        receipt = _projection_receipt(comment)
+        body = receipt.pop("body")
+        if not isinstance(body, str):
+            raise LinearProjectionError("identity_history_seal_receipt_missing")
+        prefix.append({
+            "event": event,
+            "receipt": {
+                **receipt,
+                "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            },
+        })
+        if event["event_id"] == through_event_id:
+            found = True
+            break
+    if not found:
+        raise LinearProjectionError("identity_history_seal_target_missing")
+    target = next(event for event in events if event["event_id"] == through_event_id)
+    return hashlib.sha256(_canonical([
+        "identity-history-prefix-v1",
+        target.get("authority"), target["workstream_id"], target["plan_revision"],
+        target["expected_revision"], prefix,
+    ])).hexdigest()
+
+
+def _validated_identity_history_seals(
+    events: list[dict[str, Any]],
+    comments_by_event_id: Mapping[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    from workstream_scope import (
+        repository_key, ScopeError,
+        validate_authenticated_legacy_repository_identity_transition,
+        validate_repository_identity_transition,
+    )
+
+    positions = {event["event_id"]: index for index, event in enumerate(events)}
+    scope_events = [
+        event for event in events
+        if event["kind"] == "scope" and event["key"] == "root"
+        and event["value"] != TOMBSTONE
+    ]
+    previous_scope = {
+        scope_events[index]["event_id"]: scope_events[index - 1]
+        for index in range(1, len(scope_events))
+    }
+    seals: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if event["kind"] != "identity_history_seal":
+            continue
+        value = event["value"]
+        target_id = value["sealed_scope_event_id"]
+        transitions = value["legacy_transitions"]
+        transition_ids = [item["transition_scope_event_id"] for item in transitions]
+        target = next(
+            (item for item in scope_events if item["event_id"] == target_id), None,
+        )
+        frontier_position = positions[event["event_id"]] - 1
+        frontier = events[frontier_position] if frontier_position >= 0 else None
+        scope_frontier = [
+            item for item in scope_events
+            if positions[item["event_id"]] < positions[event["event_id"]]
+        ]
+        source_event = next((
+            item for item in reversed(events[:positions[event["event_id"]]])
+            if item["kind"] == "source" and item["key"] == "root"
+            and item["value"] != TOMBSTONE
+        ), None)
+        if (
+            target is None
+            or not transition_ids
+            or not scope_frontier
+            or target["event_id"] != scope_frontier[-1]["event_id"]
+            or positions[event["event_id"]] <= positions[target_id]
+            or any(transition_id in seals for transition_id in transition_ids)
+            or source_event is None
+            or value["source_identity"]
+            != (source_event["value"].get("identity") or source_event["value"].get("url"))
+            or value["source_sha256"] != source_event["value"].get("sha256")
+            or value["sealed_scope_value_sha256"]
+            != hashlib.sha256(_canonical(target["value"])).hexdigest()
+            or frontier is None
+            or value["sealed_projection_frontier_event_id"]
+            != frontier["event_id"]
+            or value["sealed_projection_frontier_event_sha256"]
+            != hashlib.sha256(_canonical(frontier)).hexdigest()
+            or value["legacy_projection_prefix_sha256"]
+            != projection_prefix_sha256(
+                events, comments_by_event_id, frontier["event_id"],
+            )
+        ):
+            raise LinearProjectionError("identity_history_seal_frontier_mismatch")
+        expected_transitions: list[dict[str, str]] = []
+        for transition in scope_frontier[1:]:
+            predecessor = previous_scope[transition["event_id"]]
+            try:
+                validate_repository_identity_transition(
+                    predecessor["value"], transition["value"],
+                )
+            except ScopeError:
+                try:
+                    validate_authenticated_legacy_repository_identity_transition(
+                        predecessor["value"], transition["value"],
+                    )
+                except ScopeError as error:
+                    raise LinearProjectionError(
+                        "identity_history_seal_transition_mismatch"
+                    ) from error
+                expected_transitions.append({
+                    "predecessor_scope_event_id": predecessor["event_id"],
+                    "predecessor_scope_value_sha256": hashlib.sha256(
+                        _canonical(predecessor["value"])
+                    ).hexdigest(),
+                    "transition_scope_event_id": transition["event_id"],
+                    "transition_scope_value_sha256": hashlib.sha256(
+                        _canonical(transition["value"])
+                    ).hexdigest(),
+                })
+            else:
+                continue
+        if transitions != expected_transitions:
+            raise LinearProjectionError("identity_history_seal_transition_mismatch")
+        repositories = value["repositories"]
+        proofs = {item["repository_key"]: item for item in repositories}
+        scoped: dict[str, dict[str, Any]] = {}
+        try:
+            for repository in target["value"]["repositories"]:
+                scoped[repository_key(repository)] = repository
+        except (KeyError, TypeError, ValueError) as error:
+            raise LinearProjectionError("identity_history_seal_scope_invalid") from error
+        if set(proofs) != set(scoped):
+            raise LinearProjectionError("identity_history_seal_repository_mismatch")
+        for key, repository in scoped.items():
+            proof = proofs[key]
+            expected_routes = sorted([
+                repository["slug"], *repository.get("aliases", []),
+            ])
+            if (
+                proof["provider_repository_id"]
+                != repository.get("provider_repository_id")
+                or proof["canonical_slug"] != repository.get("slug")
+                or [item["requested_slug"] for item in proof["routes"]]
+                != expected_routes
+            ):
+                raise LinearProjectionError("identity_history_seal_repository_mismatch")
+        for transition_id in transition_ids:
+            seals[transition_id] = event
+    return seals
 
 
 def projection_slot_id(
@@ -216,6 +380,136 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             )
         ):
             raise LinearProjectionError("invalid_projection_quarantine_disposition")
+    if event["kind"] == "identity_history_seal":
+        required_seal = {
+            "schema_version", "root_issue_id", "plan_revision",
+            "source_identity", "source_sha256", "expected_material_revision",
+            "expected_projection_revision",
+            "sealed_scope_event_id", "sealed_scope_value_sha256",
+            "legacy_transitions",
+            "sealed_projection_frontier_event_id",
+            "sealed_projection_frontier_event_sha256",
+            "legacy_projection_prefix_sha256", "repositories",
+            "repositories_sha256", "observed_at",
+        }
+        repositories = value.get("repositories") if isinstance(value, dict) else None
+        valid_repositories = (
+            isinstance(repositories, list)
+            and bool(repositories)
+            and repositories == sorted(
+                repositories, key=lambda item: str(item.get("repository_key", "")),
+            )
+            and len({item.get("repository_key") for item in repositories})
+            == len(repositories)
+            and all(
+                isinstance(item, dict)
+                and set(item) == {
+                    "repository_key", "provider_repository_id", "canonical_slug",
+                    "routes",
+                }
+                and isinstance(item.get("repository_key"), str)
+                and bool(item["repository_key"])
+                and isinstance(item.get("provider_repository_id"), str)
+                and bool(item["provider_repository_id"])
+                and isinstance(item.get("canonical_slug"), str)
+                and bool(item["canonical_slug"])
+                and isinstance(item.get("routes"), list)
+                and bool(item["routes"])
+                and item["routes"] == sorted(
+                    item["routes"], key=lambda route: str(route.get("requested_slug", "")),
+                )
+                and len({route.get("requested_slug") for route in item["routes"]})
+                == len(item["routes"])
+                and all(
+                    isinstance(route, dict)
+                    and set(route) == {
+                        "requested_slug", "resolved_slug", "provider_repository_id",
+                        "requested_response_url", "canonical_response_url",
+                        "redirect_count", "authenticated",
+                    }
+                    and route.get("authenticated") is True
+                    and route.get("provider_repository_id")
+                    == item["provider_repository_id"]
+                    and route.get("resolved_slug") == item["canonical_slug"]
+                    and isinstance(route.get("requested_slug"), str)
+                    and bool(route["requested_slug"])
+                    and isinstance(route.get("requested_response_url"), str)
+                    and bool(route["requested_response_url"])
+                    and isinstance(route.get("canonical_response_url"), str)
+                    and bool(route["canonical_response_url"])
+                    and isinstance(route.get("redirect_count"), int)
+                    and not isinstance(route.get("redirect_count"), bool)
+                    and route["redirect_count"] in {0, 1}
+                    for route in item["routes"]
+                )
+                for item in repositories
+            )
+        )
+        if (
+            schema_version != 2
+            or tombstone
+            or set(value) != required_seal
+            or event["key"] != value.get("sealed_scope_event_id")
+            or value.get("root_issue_id") != event["authority"]["root_issue_id"]
+            or value.get("plan_revision") != event["plan_revision"]
+            or value.get("source_sha256") != event["plan_revision"]
+            or not isinstance(value.get("source_identity"), str)
+            or not value["source_identity"]
+            or not isinstance(value.get("expected_material_revision"), int)
+            or isinstance(value.get("expected_material_revision"), bool)
+            or value["expected_material_revision"] < 0
+            or value.get("expected_projection_revision") != event["expected_revision"]
+            or not all(
+                re.fullmatch(r"wsp_[0-9a-f]{32}", str(value.get(field, "")))
+                for field in (
+                    "sealed_scope_event_id",
+                    "sealed_projection_frontier_event_id",
+                )
+            )
+            or not isinstance(value.get("legacy_transitions"), list)
+            or not value["legacy_transitions"]
+            or not all(
+                isinstance(item, dict)
+                and set(item) == {
+                    "predecessor_scope_event_id",
+                    "predecessor_scope_value_sha256",
+                    "transition_scope_event_id",
+                    "transition_scope_value_sha256",
+                }
+                and all(
+                    re.fullmatch(r"wsp_[0-9a-f]{32}", str(item.get(field, "")))
+                    for field in (
+                        "predecessor_scope_event_id", "transition_scope_event_id",
+                    )
+                )
+                and all(
+                    re.fullmatch(r"[0-9a-f]{64}", str(item.get(field, "")))
+                    for field in (
+                        "predecessor_scope_value_sha256",
+                        "transition_scope_value_sha256",
+                    )
+                )
+                for item in value["legacy_transitions"]
+            )
+            or len({
+                item["transition_scope_event_id"]
+                for item in value["legacy_transitions"]
+            }) != len(value["legacy_transitions"])
+            or not all(
+                re.fullmatch(r"[0-9a-f]{64}", str(value.get(field, "")))
+                for field in (
+                    "sealed_scope_value_sha256",
+                    "sealed_projection_frontier_event_sha256",
+                    "legacy_projection_prefix_sha256", "repositories_sha256",
+                )
+            )
+            or not isinstance(value.get("observed_at"), str)
+            or not value["observed_at"]
+            or not valid_repositories
+            or value.get("repositories_sha256")
+            != hashlib.sha256(_canonical(repositories)).hexdigest()
+        ):
+            raise LinearProjectionError("invalid_projection_identity_history_seal")
     if event["kind"] == "child_extension_authorization":
         required_authorization = {
             "root_issue_id", "route", "source", "plan_revision",
@@ -629,13 +923,14 @@ class ReducedProjection:
     snapshot: dict[str, Any]
 
 
-def reduce_projection_comments(
+def _reduce_projection_comments_impl(
     comments: list[dict[str, Any]], *, workstream_id: str,
     expected_plan_revision: str,
     authenticated_route: dict[str, str] | None = None,
     authenticated_source: dict[str, Any] | None = None,
+    permit_unsealed_legacy_candidates: bool = False,
 ) -> ReducedProjection:
-    observed: dict[str, tuple[dict[str, Any], str, bytes]] = {}
+    observed: dict[str, tuple[dict[str, Any], str, bytes, dict[str, Any]]] = {}
     for comment in comments:
         body = comment.get("body") or ""
         if not isinstance(body, str):
@@ -656,7 +951,7 @@ def reduce_projection_comments(
         remote_id = comment.get("id")
         if not isinstance(remote_id, str) or not remote_id:
             raise LinearProjectionError("projection_comment_missing_remote_id")
-        observed[event["event_id"]] = (event, remote_id, signature)
+        observed[event["event_id"]] = (event, remote_id, signature, comment)
 
     history = sorted(
         (item[0] for item in observed.values()),
@@ -740,6 +1035,13 @@ def reduce_projection_comments(
         ):
             raise LinearProjectionError(f"projection_slot_identity_mismatch:{event['event_id']}")
     events = [*accepted_legacy, *modern]
+    comments_by_event_id = {
+        event_id: item[3] for event_id, item in observed.items()
+    }
+    identity_history_seals = _validated_identity_history_seals(
+        events, comments_by_event_id,
+    )
+    identity_history_candidates: list[dict[str, Any]] = []
     active: dict[tuple[str, str], dict[str, Any]] = {}
     heads: dict[tuple[str, str], dict[str, Any]] = {}
     for index, event in enumerate(events):
@@ -751,12 +1053,38 @@ def reduce_projection_comments(
         if current is not None and supersedes != current["event_id"]:
             raise LinearProjectionError(f"projection_concurrent_conflict:{event['kind']}:{event['key']}")
         if identity == ("scope", "root") and current is not None and event["value"] != TOMBSTONE:
-            from workstream_scope import ScopeError, validate_repository_identity_transition
+            from workstream_scope import (
+                ScopeError,
+                validate_authenticated_legacy_repository_identity_transition,
+                validate_repository_identity_transition,
+            )
 
             try:
                 validate_repository_identity_transition(current["value"], event["value"])
             except ScopeError as error:
-                raise LinearProjectionError(str(error)) from error
+                sealed = event["event_id"] in identity_history_seals
+                if not sealed and not permit_unsealed_legacy_candidates:
+                    raise LinearProjectionError(str(error)) from error
+                try:
+                    validate_authenticated_legacy_repository_identity_transition(
+                        current["value"], event["value"],
+                    )
+                except ScopeError as legacy_error:
+                    raise LinearProjectionError(str(legacy_error)) from legacy_error
+                if not sealed:
+                    identity_history_candidates.append({
+                        "predecessor_scope_event_id": current["event_id"],
+                        "predecessor_scope_value_sha256": hashlib.sha256(
+                            _canonical(current["value"])
+                        ).hexdigest(),
+                        "sealed_scope_event_id": event["event_id"],
+                        "sealed_scope_value_sha256": hashlib.sha256(
+                            _canonical(event["value"])
+                        ).hexdigest(),
+                        "legacy_projection_prefix_sha256": projection_prefix_sha256(
+                            events, comments_by_event_id, event["event_id"],
+                        ),
+                    })
         heads[identity] = event
         if event["value"] == TOMBSTONE:
             active.pop(identity, None)
@@ -838,10 +1166,99 @@ def reduce_projection_comments(
             "stale_plan_count": len(stale_events),
         },
     }
+    if identity_history_candidates:
+        final_scope = heads.get(("scope", "root"))
+        frontier = events[-1]
+        if final_scope is None:
+            raise LinearProjectionError("identity_history_candidate_scope_missing")
+        snapshot["identity_history_candidates"] = [{
+            "legacy_transitions": [{
+                "predecessor_scope_event_id": item["predecessor_scope_event_id"],
+                "predecessor_scope_value_sha256": item[
+                    "predecessor_scope_value_sha256"
+                ],
+                "transition_scope_event_id": item["sealed_scope_event_id"],
+                "transition_scope_value_sha256": item["sealed_scope_value_sha256"],
+            } for item in identity_history_candidates],
+            "sealed_scope_event_id": final_scope["event_id"],
+            "sealed_scope_value_sha256": hashlib.sha256(
+                _canonical(final_scope["value"])
+            ).hexdigest(),
+            "sealed_projection_frontier_event_id": frontier["event_id"],
+            "sealed_projection_frontier_event_sha256": hashlib.sha256(
+                _canonical(frontier)
+            ).hexdigest(),
+            "legacy_projection_prefix_sha256": projection_prefix_sha256(
+                events, comments_by_event_id, frontier["event_id"],
+            ),
+        }]
     return ReducedProjection(
         workstream_id=workstream_id, revision=len(events), events=tuple(events),
         remote_ids={event_id: item[1] for event_id, item in observed.items()},
         snapshot=snapshot,
+    )
+
+
+def reduce_projection_comments(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    expected_plan_revision: str,
+    authenticated_route: dict[str, str] | None = None,
+    authenticated_source: dict[str, Any] | None = None,
+) -> ReducedProjection:
+    return _reduce_projection_comments_impl(
+        comments, workstream_id=workstream_id,
+        expected_plan_revision=expected_plan_revision,
+        authenticated_route=authenticated_route,
+        authenticated_source=authenticated_source,
+        permit_unsealed_legacy_candidates=False,
+    )
+
+
+def _inspect_unsealed_identity_history(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    expected_plan_revision: str, authenticated_route: dict[str, str],
+    authenticated_source: dict[str, Any] | None, material_revision: int,
+) -> dict[str, Any]:
+    """Return bounded migration metadata without exposing an executable snapshot."""
+    reduced = _reduce_projection_comments_impl(
+        comments, workstream_id=workstream_id,
+        expected_plan_revision=expected_plan_revision,
+        authenticated_route=authenticated_route,
+        authenticated_source=authenticated_source,
+        permit_unsealed_legacy_candidates=True,
+    )
+    candidates = reduced.snapshot.get("identity_history_candidates") or []
+    if len(candidates) != 1:
+        raise LinearProjectionError("identity_history_candidate_ambiguous")
+    source = reduced.snapshot.get("source") or {}
+    return {
+        "schema_version": 1,
+        "disposition": "partial_reconcile_required",
+        "resume_authority": "none",
+        "workstream_id": workstream_id,
+        "authority": dict(authenticated_route),
+        "source": {"identity": source.get("identity"), "sha256": source.get("sha256")},
+        "plan_revision": expected_plan_revision,
+        "material_revision": material_revision,
+        "projection_revision": reduced.revision,
+        "candidate": candidates[0],
+        "remediation": "run repository-identity-seal preview, review, then apply",
+    }
+
+
+def inspect_unsealed_identity_history(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    expected_plan_revision: str, authenticated_route: dict[str, str],
+    authenticated_source: dict[str, Any], material_revision: int,
+) -> dict[str, Any]:
+    if not isinstance(authenticated_source, dict):
+        raise LinearProjectionError("identity_history_authenticated_source_required")
+    return _inspect_unsealed_identity_history(
+        comments, workstream_id=workstream_id,
+        expected_plan_revision=expected_plan_revision,
+        authenticated_route=authenticated_route,
+        authenticated_source=authenticated_source,
+        material_revision=material_revision,
     )
 
 

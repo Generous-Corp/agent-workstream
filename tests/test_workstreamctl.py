@@ -119,6 +119,17 @@ class WorkstreamCtlTests(unittest.TestCase):
             [MODULE.sys.executable, str(script), "--request", "request.json", "--apply"],
         )
 
+    def test_repository_identity_seal_dispatches_bounded_migration_command(self):
+        with mock.patch.object(MODULE.os, "execv") as execute:
+            MODULE.main([
+                "repository-identity-seal", "--request", "request.json", "--apply",
+            ])
+        script = MODULE.SCRIPTS / "workstream_repository_identity_seal.py"
+        execute.assert_called_once_with(
+            MODULE.sys.executable,
+            [MODULE.sys.executable, str(script), "--request", "request.json", "--apply"],
+        )
+
     def test_reconcile_dispatches_live_closure_command(self):
         with mock.patch.object(MODULE.os, "execv") as execute:
             MODULE.main(["reconcile", "GEN-37", "--help"])
