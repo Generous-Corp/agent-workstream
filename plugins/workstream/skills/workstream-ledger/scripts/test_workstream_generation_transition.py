@@ -71,6 +71,22 @@ class FakeClient:
         }
 
     def execute(self, query, variables):
+        if "query WorkstreamNativeState" in query:
+            return {
+                "team": {"id": variables["teamId"],
+                         "organization": {"id": "workspace"}},
+                "workflowState": {"id": variables["stateId"],
+                                  "team": {"id": variables["teamId"]}},
+            }
+        if "query WorkstreamNativeAssignee" in query:
+            return {"user": {
+                "id": variables["assigneeId"],
+                "active": True,
+                "organization": {"id": "workspace"},
+                "teams": {"nodes": [{"id": "team"}], "pageInfo": {
+                    "hasNextPage": False, "endCursor": None,
+                }},
+            }}
         if "issueUpdate" in query:
             raise AssertionError("generation protocol must never issueUpdate")
         if "CommentCreateCapability" in query:
@@ -383,9 +399,10 @@ class GenerationTransitionTests(unittest.TestCase):
             expected_material_revision=material,
             expected_projection_revision=target.state().revision,
             native_initialization={
-                "state_id": "ready-state", "assignee_id": "agent-owner",
+                "state_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "assignee_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
             },
             generation_authority=generation_authority,
+            native_validation_sha256="0" * 64,
         )
         mutation_count = len(self.client.mutations)
 
@@ -395,9 +412,10 @@ class GenerationTransitionTests(unittest.TestCase):
             expected_material_revision=material,
             expected_projection_revision=target.state().revision,
             native_initialization={
-                "state_id": "ready-state", "assignee_id": "agent-owner",
+                "state_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "assignee_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
             },
             generation_authority=generation_authority,
+            native_validation_sha256="0" * 64,
         )
 
         self.assertEqual(first["event"], second["event"])
@@ -411,7 +429,7 @@ class GenerationTransitionTests(unittest.TestCase):
         source = {
             "identity": f"https://example.test/{NEW}", "sha256": NEW,
         }
-        native = {"state_id": "ready-state", "assignee_id": "agent-owner"}
+        native = {"state_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "assignee_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}
         authority = target.select_child_extension_generation(
             description_plan_revision=OLD, source=source,
         )
@@ -424,6 +442,7 @@ class GenerationTransitionTests(unittest.TestCase):
             expected_material_revision=material,
             expected_projection_revision=target.state().revision,
             native_initialization=native, generation_authority=authority,
+            native_validation_sha256="0" * 64,
         )
         self.activate(target=LATER, predecessor=NEW, epoch=1)
         mutation_count = len(self.client.mutations)
@@ -434,6 +453,7 @@ class GenerationTransitionTests(unittest.TestCase):
             expected_material_revision=material,
             expected_projection_revision=target.state().revision,
             native_initialization=native, generation_authority=authority,
+            native_validation_sha256="0" * 64,
         )
         target.assert_child_extension_authorized(grant["event"])
 
@@ -449,6 +469,7 @@ class GenerationTransitionTests(unittest.TestCase):
                 expected_material_revision=material,
                 expected_projection_revision=target.state().revision,
                 native_initialization=native, generation_authority=authority,
+                native_validation_sha256="0" * 64,
             )
 
     def test_preactivation_old_grant_cannot_be_laundered_after_activation(self):
@@ -479,16 +500,17 @@ class GenerationTransitionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             LinearProjectionError,
-            "child_extension_authorization_superseded_or_conflicting",
+            "legacy_authorization_requires_existing_child",
         ):
             target.reserve_child_extension(
                 source=source, reviewed_candidate_key="new-child",
                 child_issue_id=child_id, expected_material_revision=0,
                 expected_projection_revision=target.state().revision,
                 native_initialization={
-                    "state_id": "ready-state", "assignee_id": "agent-owner",
+                    "state_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "assignee_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
                 },
                 generation_authority=authority,
+                native_validation_sha256="0" * 64,
             )
 
     def test_child_create_linearizes_before_planted_later_generation(self):
@@ -524,13 +546,13 @@ class GenerationTransitionTests(unittest.TestCase):
             plan_revision=NEW, expected_frontier={
                 "material_revision": material,
                 "projection_revision": projection,
-            }, state_id="ready-state", assignee_id="agent-owner",
+            }, state_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", assignee_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
             unassigned=False, authorization_adapter=target,
         )
 
         self.assertEqual(created["receipt"]["disposition"], "created")
-        self.assertEqual(created["receipt"]["state_id"], "ready-state")
-        self.assertEqual(created["receipt"]["assignee_id"], "agent-owner")
+        self.assertEqual(created["receipt"]["state_id"], "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        self.assertEqual(created["receipt"]["assignee_id"], "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
         self.assertEqual(select_plan_generation(
             self.client.comments, workstream_id=WORKSTREAM,
             description_plan_revision=OLD, authenticated_route=AUTHORITY,
@@ -544,7 +566,7 @@ class GenerationTransitionTests(unittest.TestCase):
             plan_revision=NEW, expected_frontier={
                 "material_revision": material,
                 "projection_revision": target.state().revision,
-            }, state_id="ready-state", assignee_id="agent-owner",
+            }, state_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", assignee_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
             unassigned=False, authorization_adapter=target,
         )
         self.assertEqual(replay["receipt"]["disposition"], "existing")

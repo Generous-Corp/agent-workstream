@@ -14,6 +14,7 @@ import workstream_child_event
 from workstream_linear import LinearTransportError
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, projection_slot_id,
+    TOMBSTONE,
 )
 from workstream_resume import add_child_material_history, compact_context
 
@@ -29,6 +30,13 @@ ROUTE = {
 class FakeChildStateClient:
     def __init__(self):
         scope = self.scope_event({"GEN-38": "github.com:id:R_repo"})
+        source = build_projection_event(
+            workstream_id="GEN-37", kind="source", key="root",
+            value={"identity": "https://example.test/plan", "sha256": PLAN},
+            plan_revision=PLAN, expected_revision=1,
+            created_at="2026-08-30T00:00:01Z",
+            authority={**ROUTE, "root_issue_id": ROOT_ID},
+        )
         self.root_comments: list[dict] = [{
             "id": projection_slot_id(
                 scope["workstream_id"], scope["plan_revision"],
@@ -37,9 +45,17 @@ class FakeChildStateClient:
             "body": encode_projection_comment(scope),
             "createdAt": "2026-08-30T00:00:00Z",
             "updatedAt": "2026-08-30T00:00:00Z",
+        }, {
+            "id": projection_slot_id(
+                source["workstream_id"], source["plan_revision"],
+                source["expected_revision"], source["authority"],
+            ), "body": encode_projection_comment(source),
+            "createdAt": "2026-08-30T00:00:01Z",
+            "updatedAt": "2026-08-30T00:00:01Z",
         }]
         self.child_comments: list[dict] = []
         self.calls: list[tuple[str, dict]] = []
+        self.crash_after_root_append = False
 
     @staticmethod
     def scope_event(child_ownership):
@@ -81,6 +97,11 @@ class FakeChildStateClient:
                     "parent": {"id": ROOT_ID, "identifier": "GEN-37"},
                 },
             }
+        if "query WorkstreamChildMutationTarget" in query:
+            return {"issue": {
+                **self.issue("GEN-38", CHILD_ID, self.child_comments),
+                "parent": {"id": ROOT_ID, "identifier": "GEN-37"},
+            }}
         if "query WorkstreamDeltaComments" in query:
             identifier = variables["issueId"]
             if identifier == "GEN-37":
@@ -92,16 +113,24 @@ class FakeChildStateClient:
             return {"__type": {"inputFields": [{"name": "id"}]}}
         if "commentCreate" in query:
             item = variables["input"]
-            if item["issueId"] != "GEN-38":
-                raise AssertionError("child command attempted a root comment write")
-            if any(comment["id"] == item["id"] for comment in self.child_comments):
+            target = (
+                self.child_comments if item["issueId"] == "GEN-38"
+                else self.root_comments if item["issueId"] == "GEN-37"
+                else None
+            )
+            if target is None:
+                raise AssertionError("unexpected comment target")
+            if any(comment["id"] == item["id"] for comment in target):
                 raise LinearTransportError("duplicate comment id")
             comment = {
                 "id": item["id"], "body": item["body"],
                 "createdAt": "2026-08-30T00:00:00Z",
                 "updatedAt": "2026-08-30T00:00:00Z",
             }
-            self.child_comments.append(comment)
+            target.append(comment)
+            if item["issueId"] == "GEN-37" and self.crash_after_root_append:
+                self.crash_after_root_append = False
+                raise SystemExit("death after root activation")
             return {"commentCreate": {"success": True, "comment": deepcopy(comment)}}
         raise AssertionError(f"unexpected GraphQL operation: {query[:80]}")
 
@@ -181,7 +210,12 @@ class WorkstreamChildStateTests(unittest.TestCase):
                     checkpoint_args, client_factory=lambda _token: client,
                 )
 
-        self.assertEqual(client.root_comments, root_comments_before)
+        self.assertEqual(client.root_comments[:2], root_comments_before)
+        self.assertEqual(len(client.root_comments), 4)
+        self.assertTrue(all(
+            "Run the child acceptance proof." not in comment["body"]
+            for comment in client.root_comments
+        ))
         self.assertEqual(len(client.child_comments), writes)
         self.assertEqual(first_event["receipt"], replay_event["receipt"])
         self.assertEqual(
@@ -206,6 +240,7 @@ class WorkstreamChildStateTests(unittest.TestCase):
         enriched = add_child_material_history(
             snapshot, {"GEN-38": deepcopy(client.child_comments)},
             authenticated_route={**ROUTE, "root_issue_id": ROOT_ID},
+            root_comments=deepcopy(client.root_comments),
         )
         child = compact_context(enriched, "GEN-37")["children"][0]
         self.assertEqual(child["next_action"], "Run the child acceptance proof.")
@@ -243,7 +278,7 @@ class WorkstreamChildStateTests(unittest.TestCase):
                 workstream_child_event.run(
                     args, client_factory=lambda _token: client,
                 )
-        self.assertEqual(len(client.root_comments), 1)
+        self.assertEqual(len(client.root_comments), 2)
         self.assertEqual(client.child_comments, [])
 
     def test_unowned_child_refuses_before_comment_write(self):
@@ -268,8 +303,116 @@ class WorkstreamChildStateTests(unittest.TestCase):
             workstream_child_event.run(
                 args, client_factory=lambda _token: client,
             )
-        self.assertEqual(len(client.root_comments), 1)
+        self.assertEqual(len(client.root_comments), 2)
         self.assertEqual(client.child_comments, [])
+
+    def test_death_before_root_activation_leaves_inert_recoverable_proposal(self):
+        client = FakeChildStateClient()
+        args = [
+            *self.common(), "--kind", "progress", "--source", "user_turn",
+            "--expected-revision", "0", "--created-at", "now",
+            "--payload-json", '{"next_action":"recover"}',
+        ]
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch, mock.patch(
+            "workstream_linear_projection.LinearProjectionAdapter.reserve_child_mutation",
+            side_effect=OSError("death before activation"),
+        ):
+            with self.assertRaisesRegex(OSError, "death before activation"):
+                workstream_child_event.run(args, client_factory=lambda _token: client)
+        self.assertEqual(len(client.root_comments), 2)
+        self.assertEqual(len(client.child_comments), 1)
+        self.assertNotIn("workstream-delta:v1", client.child_comments[0]["body"])
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch:
+            result = workstream_child_event.run(
+                args, client_factory=lambda _token: client,
+            )
+        self.assertEqual(result["receipt"]["revision"], 1)
+
+    def test_death_after_root_activation_replays_without_second_write(self):
+        client = FakeChildStateClient(); client.crash_after_root_append = True
+        args = [
+            *self.common(), "--kind", "progress", "--source", "user_turn",
+            "--expected-revision", "0", "--created-at", "now",
+            "--payload-json", '{"next_action":"recover"}',
+        ]
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch, self.assertRaisesRegex(
+            SystemExit, "death after root activation",
+        ):
+            workstream_child_event.run(args, client_factory=lambda _token: client)
+        root_writes = len(client.root_comments)
+        child_writes = len(client.child_comments)
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch:
+            result = workstream_child_event.run(
+                args, client_factory=lambda _token: client,
+            )
+        self.assertEqual(result["authorization"]["disposition"], "existing")
+        self.assertEqual(len(client.root_comments), root_writes)
+        self.assertEqual(len(client.child_comments), child_writes)
+
+    def test_exact_activation_replays_after_scope_removes_child(self):
+        client = FakeChildStateClient()
+        args = [
+            *self.common(), "--kind", "progress", "--source", "user_turn",
+            "--expected-revision", "0", "--created-at", "now",
+            "--payload-json", '{"next_action":"historical"}',
+        ]
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch:
+            first = workstream_child_event.run(
+                args, client_factory=lambda _token: client,
+            )
+        initial_scope = client.scope_event({"GEN-38": "github.com:id:R_repo"})
+        removed = build_projection_event(
+            workstream_id="GEN-37", kind="scope", key="root",
+            value=TOMBSTONE, plan_revision=PLAN, expected_revision=3,
+            created_at="later",
+            supersedes_event_id=initial_scope["event_id"],
+            authority={**ROUTE, "root_issue_id": ROOT_ID},
+        )
+        client.root_comments.append({
+            "id": projection_slot_id(
+                removed["workstream_id"], removed["plan_revision"],
+                removed["expected_revision"], removed["authority"],
+            ), "body": encode_projection_comment(removed),
+            "createdAt": "later", "updatedAt": "later",
+        })
+        root_count = len(client.root_comments); child_count = len(client.child_comments)
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch:
+            replay = workstream_child_event.run(
+                args, client_factory=lambda _token: client,
+            )
+        self.assertEqual(first["receipt"], replay["receipt"])
+        self.assertEqual(len(client.root_comments), root_count)
+        self.assertEqual(len(client.child_comments), child_count)
+
+    def test_different_payload_at_authorized_child_frontier_stays_inert(self):
+        client = FakeChildStateClient()
+        base = [
+            *self.common(), "--kind", "progress", "--source", "user_turn",
+            "--expected-revision", "0", "--created-at", "now",
+        ]
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch:
+            workstream_child_event.run(
+                [*base, "--payload-json", '{"next_action":"first"}'],
+                client_factory=lambda _token: client,
+            )
+        root_count = len(client.root_comments)
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch, self.assertRaisesRegex(
+            LinearTransportError, "material_frontier_stale",
+        ):
+            workstream_child_event.run(
+                [*base, "--payload-json", '{"next_action":"different"}'],
+                client_factory=lambda _token: client,
+            )
+        self.assertEqual(len(client.root_comments), root_count)
+        self.assertEqual(len(client.child_comments), 2)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ issue identities are deterministic; mutable updates still require remote CAS.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import ssl
 import urllib.request
@@ -163,6 +164,23 @@ mutation WorkstreamIssueCreate($input: IssueCreateInput!) {
       team { id organization { id } }
       assignee { id }
       state { id name type }
+    }
+  }
+}
+"""
+NATIVE_STATE_QUERY = """
+query WorkstreamNativeState($teamId: String!, $stateId: String!) {
+  team(id: $teamId) { id organization { id } }
+  workflowState(id: $stateId) { id team { id } }
+}
+"""
+NATIVE_ASSIGNEE_QUERY = """
+query WorkstreamNativeAssignee($assigneeId: String!, $after: String) {
+  user(id: $assigneeId) {
+    id active organization { id }
+    teams(first: 250, after: $after) {
+      nodes { id }
+      pageInfo { hasNextPage endCursor }
     }
   }
 }
@@ -639,6 +657,10 @@ class LinearGraphQLTransport:
                     f"intake_identity_collision:{stable_key}:{field}"
                 )
         if native_initialization is not None:
+            if "state" not in issue or "assignee" not in issue:
+                raise LinearTransportError(
+                    f"intake_identity_collision:{stable_key}:native_readback_missing"
+                )
             native_observed = {
                 "state_id": (issue.get("state") or {}).get("id"),
                 "assignee_id": (issue.get("assignee") or {}).get("id"),
@@ -965,6 +987,23 @@ class LinearGraphQLTransport:
             raise ValueError("a durable child-extension authorization adapter is required")
         if not isinstance(root_issue_id, str) or not root_issue_id.strip():
             raise ValueError("existing root issue ID is required")
+        try:
+            canonical_state_id = str(uuid.UUID(state_id))
+        except (ValueError, AttributeError) as error:
+            raise ValueError("native child state ID must be a canonical UUID") from error
+        if canonical_state_id != state_id.lower():
+            raise ValueError("native child state ID must be a canonical UUID")
+        if assignee_id is not None:
+            try:
+                canonical_assignee_id = str(uuid.UUID(assignee_id))
+            except (ValueError, AttributeError) as error:
+                raise ValueError(
+                    "native child assignee ID must be a canonical UUID"
+                ) from error
+            if canonical_assignee_id != assignee_id.lower():
+                raise ValueError("native child assignee ID must be a canonical UUID")
+        else:
+            canonical_assignee_id = None
         if not isinstance(state_id, str) or not state_id.strip():
             raise ValueError("native child state ID is required")
         if (
@@ -978,12 +1017,78 @@ class LinearGraphQLTransport:
                 "exactly one native assignee ID or explicit unassigned is required"
             )
         native_initialization = {
-            "state_id": state_id,
-            "assignee_id": None if unassigned else assignee_id,
+            "state_id": canonical_state_id,
+            "assignee_id": None if unassigned else canonical_assignee_id,
         }
 
         route = self._intake_route()
         self._ensure_route()
+        state_result = self.client.execute(NATIVE_STATE_QUERY, {
+            "teamId": route["team_id"], "stateId": canonical_state_id,
+        })
+        native_team = state_result.get("team")
+        native_state = state_result.get("workflowState")
+        if (
+            not isinstance(native_team, dict)
+            or native_team.get("id") != route["team_id"]
+            or (native_team.get("organization") or {}).get("id")
+            != route["workspace_id"]
+            or not isinstance(native_state, dict)
+            or native_state.get("id") != canonical_state_id
+            or (native_state.get("team") or {}).get("id") != route["team_id"]
+        ):
+            raise LinearTransportError("native_child_state_authority_mismatch")
+        if canonical_assignee_id is not None:
+            after = None
+            seen_assignee_cursors: set[str] = set()
+            teams: set[str] = set()
+            while True:
+                assignee_result = self.client.execute(NATIVE_ASSIGNEE_QUERY, {
+                    "assigneeId": canonical_assignee_id, "after": after,
+                })
+                user = assignee_result.get("user")
+                connection = (user or {}).get("teams") or {}
+                if (
+                    not isinstance(user, dict)
+                    or user.get("id") != canonical_assignee_id
+                    or user.get("active") is not True
+                    or (user.get("organization") or {}).get("id")
+                    != route["workspace_id"]
+                    or not isinstance(connection.get("nodes"), list)
+                    or not isinstance(connection.get("pageInfo"), dict)
+                ):
+                    raise LinearTransportError(
+                        "native_child_assignee_authority_mismatch"
+                    )
+                teams.update(
+                    item.get("id") for item in connection["nodes"]
+                    if isinstance(item, dict) and isinstance(item.get("id"), str)
+                )
+                if not connection["pageInfo"].get("hasNextPage"):
+                    break
+                after = connection["pageInfo"].get("endCursor")
+                if (
+                    not isinstance(after, str) or not after
+                    or after in seen_assignee_cursors
+                ):
+                    raise LinearTransportError(
+                        "native_child_assignee_authority_mismatch"
+                    )
+                seen_assignee_cursors.add(after)
+            if route["team_id"] not in teams:
+                raise LinearTransportError("native_child_assignee_team_mismatch")
+        validation_facts = {
+            "state_id": canonical_state_id, "state_team_id": route["team_id"],
+            "workspace_id": route["workspace_id"],
+            "assignee_id": canonical_assignee_id,
+            "assignee_active": True if canonical_assignee_id is not None else None,
+            "assignee_team_id": (
+                route["team_id"] if canonical_assignee_id is not None else None
+            ),
+        }
+        native_validation_sha256 = hashlib.sha256(json.dumps(
+            validation_facts, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
 
         current = self.snapshot()["issues"]
         root = next((item for item in current if item.get("id") == root_issue_id), None)
@@ -1044,7 +1149,6 @@ class LinearGraphQLTransport:
                 title=candidate["title"],
                 plan_revision=plan_revision,
                 parent_id=root_issue_id,
-                native_initialization=native_initialization,
             )
         else:
             occupied = next((item for item in current if item.get("id") == child_id), None)
@@ -1056,7 +1160,6 @@ class LinearGraphQLTransport:
                     title=candidate["title"],
                     plan_revision=plan_revision,
                     parent_id=root_issue_id,
-                    native_initialization=native_initialization,
                 )
                 child, disposition = occupied, "converged"
 
@@ -1070,6 +1173,7 @@ class LinearGraphQLTransport:
             expected_projection_revision=expected_frontier["projection_revision"],
             native_initialization=native_initialization,
             generation_authority=selected_generation,
+            native_validation_sha256=native_validation_sha256,
             require_existing=child is not None,
         )
         authorization_event = authorization.get("event")
@@ -1087,9 +1191,19 @@ class LinearGraphQLTransport:
             "initial_state": "planned_pending_projection",
             "native_initialization": native_initialization,
             "generation_authority": selected_generation,
+            "native_validation_sha256": native_validation_sha256,
         }
         authorization_value = authorization_event.get("value")
         authorization_disposition = authorization.get("disposition")
+        legacy_authorization = authorization_disposition == "legacy_existing"
+        expected_receipt_static = (
+            {key: value for key, value in expected_authorization_static.items()
+             if key not in {
+                 "native_initialization", "generation_authority",
+                 "native_validation_sha256",
+             }}
+            if legacy_authorization else expected_authorization_static
+        )
         if (
             authorization_event.get("schema_version") != 2
             or authorization_event.get("workstream_id")
@@ -1102,8 +1216,8 @@ class LinearGraphQLTransport:
             or not isinstance(authorization_value, dict)
             or {
                 key: authorization_value.get(key)
-                for key in expected_authorization_static
-            } != expected_authorization_static
+                for key in expected_receipt_static
+            } != expected_receipt_static
             or not isinstance(
                 authorization_value.get("expected_material_revision"), int
             )
@@ -1122,8 +1236,13 @@ class LinearGraphQLTransport:
             > expected_frontier["projection_revision"]
             or authorization_event.get("expected_revision")
             != authorization_value["expected_projection_revision"]
-            or authorization_disposition not in {"created", "existing"}
-            or (child is not None and authorization_disposition != "existing")
+            or authorization_disposition not in {
+                "created", "existing", "legacy_existing",
+            }
+            or (legacy_authorization and child is None)
+            or (child is not None and authorization_disposition not in {
+                "existing", "legacy_existing",
+            })
             or (
                 authorization_disposition == "created"
                 and (
@@ -1179,11 +1298,14 @@ class LinearGraphQLTransport:
             title=candidate["title"],
             plan_revision=plan_revision,
             parent_id=root_issue_id,
-            native_initialization=native_initialization,
+            native_initialization=(
+                None if legacy_authorization else native_initialization
+            ),
         )
-        authorization_adapter.assert_child_extension_authorized(
-            authorization_event
-        )
+        if not legacy_authorization:
+            authorization_adapter.assert_child_extension_authorized(
+                authorization_event
+            )
         return {
             "schema_version": 1,
             "source": source,

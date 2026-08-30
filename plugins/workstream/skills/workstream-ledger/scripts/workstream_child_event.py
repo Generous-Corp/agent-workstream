@@ -12,6 +12,10 @@ from workstream_child_target import add_target_arguments, authenticate_child_tar
 from workstream_delta import Delta, event_id_for
 from workstream_linear import HttpGraphQLClient, LinearTransportError
 from workstream_linear_events import LinearCommentEventAdapter
+from workstream_child_proposal import (
+    activated_comments, append_proposal, build_proposal,
+)
+from workstream_linear_events import reduce_event_comments
 
 
 def parser() -> argparse.ArgumentParser:
@@ -42,21 +46,53 @@ def run(
         raise ValueError("child event payload must be valid JSON") from error
     if not isinstance(payload, dict):
         raise ValueError("child event payload must be a JSON object")
-    target = authenticate_child_target(args, client_factory=client_factory)
     event_id = args.event_id or event_id_for(
-        target["child_workstream_id"], args.kind, payload,
+        args.child_workstream_id.upper(), args.kind, payload,
         args.expected_revision, source=args.source,
     )
     delta = Delta(
-        event_id, target["child_workstream_id"], args.kind, args.source,
+        event_id, args.child_workstream_id.upper(), args.kind, args.source,
         payload, args.expected_revision, args.created_at,
     )
-    adapter = LinearCommentEventAdapter(
-        target["client"], issue_id=target["child_workstream_id"],
-        plan_revision=target["plan_revision"],
-        root_issue_id=target["child_issue_id"], **target["route"],
+    proposal = build_proposal(
+        "event", delta.__dict__,
+        child_workstream_id=args.child_workstream_id.upper(),
+        child_issue_id=args.child_issue_id.lower(),
+        plan_revision=args.plan_revision,
     )
-    receipt = adapter.apply(delta)
+    target = authenticate_child_target(
+        args, proposal_id=proposal["proposal_id"],
+        client_factory=client_factory,
+    )
+    proposal_receipt = append_proposal(target["client"], proposal)
+    selected = target["generation_authority"]
+    generation = {
+        key: selected[key] for key in (
+            "plan_revision", "description_plan_revision",
+            "transition_tip_event_id", "activation_epoch", "authority_origin",
+            "workstream_id", "authority", "source",
+        )
+    }
+    authorization = target["projection"].reserve_child_mutation(
+        proposal=proposal, proposal_remote_id=proposal_receipt["remote_id"],
+        child_identity=target["child_identity"], generation_authority=generation,
+        scope_event_id=selected["scope_event_id"],
+        scope_value_sha256=selected["scope_value_sha256"],
+        repository_owner=selected["child_repository_owner"],
+        expected_projection_revision=selected["projection_revision"],
+    )
+    comments = LinearCommentEventAdapter(
+        target["client"], issue_id=target["child_workstream_id"],
+        plan_revision=target["plan_revision"], root_issue_id=target["child_issue_id"],
+        **target["route"],
+    ).comments()
+    active = activated_comments(
+        comments, [authorization["event"]],
+        child_workstream_id=target["child_workstream_id"],
+        child_issue_id=target["child_issue_id"],
+    )
+    state = reduce_event_comments(active, workstream_id=target["child_workstream_id"])
+    remote_id = state.remote_ids[event_id]
     return {
         "schema_version": 1,
         "root_workstream_id": target["root_workstream_id"],
@@ -64,9 +100,10 @@ def run(
         "child_issue_id": target["child_issue_id"],
         "plan_revision": target["plan_revision"],
         "generation_authority": target["generation_authority"],
+        "proposal": proposal_receipt, "authorization": authorization,
         "receipt": {
-            "event_id": receipt.event_id, "revision": receipt.revision,
-            "remote_id": receipt.remote_id,
+            "event_id": event_id, "revision": list(state.events).index(delta) + 1,
+            "remote_id": remote_id,
         },
     }
 

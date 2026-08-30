@@ -13,6 +13,10 @@ from workstream_child_target import add_target_arguments, authenticate_child_tar
 from workstream_checkpoint import CheckpointError, validate_checkpoint
 from workstream_linear import HttpGraphQLClient, LinearTransportError
 from workstream_linear_checkpoints import LinearCheckpointAdapter
+from workstream_child_proposal import (
+    activated_comments, append_proposal, build_proposal,
+)
+from workstream_linear_checkpoints import reduce_checkpoint_comments
 
 
 def parser() -> argparse.ArgumentParser:
@@ -47,18 +51,55 @@ def run(
         raise ValueError("checkpoint material revision fence mismatch")
     if checkpoint.get("predecessor_event_id") != expected_predecessor:
         raise ValueError("checkpoint predecessor fence mismatch")
-    target = authenticate_child_target(args, client_factory=client_factory)
     if (
-        checkpoint.get("workstream_id") != target["child_workstream_id"]
-        or checkpoint.get("plan_revision") != target["plan_revision"]
+        checkpoint.get("workstream_id") != args.child_workstream_id.upper()
+        or checkpoint.get("plan_revision") != args.plan_revision
     ):
         raise ValueError("checkpoint child or plan identity mismatch")
-    adapter = LinearCheckpointAdapter(
-        target["client"], issue_id=target["child_workstream_id"],
-        workstream_id=target["child_workstream_id"],
-        issue_uuid=target["child_issue_id"], **target["route"],
+    proposal = build_proposal(
+        "checkpoint", checkpoint,
+        child_workstream_id=args.child_workstream_id.upper(),
+        child_issue_id=args.child_issue_id.lower(),
+        plan_revision=args.plan_revision,
     )
-    receipt = adapter.persist(checkpoint)
+    target = authenticate_child_target(
+        args, proposal_id=proposal["proposal_id"],
+        client_factory=client_factory,
+    )
+    proposal_receipt = append_proposal(target["client"], proposal)
+    selected = target["generation_authority"]
+    generation = {
+        key: selected[key] for key in (
+            "plan_revision", "description_plan_revision",
+            "transition_tip_event_id", "activation_epoch", "authority_origin",
+            "workstream_id", "authority", "source",
+        )
+    }
+    authorization = target["projection"].reserve_child_mutation(
+        proposal=proposal, proposal_remote_id=proposal_receipt["remote_id"],
+        child_identity=target["child_identity"], generation_authority=generation,
+        scope_event_id=selected["scope_event_id"],
+        scope_value_sha256=selected["scope_value_sha256"],
+        repository_owner=selected["child_repository_owner"],
+        expected_projection_revision=selected["projection_revision"],
+    )
+    comments = LinearCheckpointAdapter(
+        target["client"], issue_id=target["child_workstream_id"],
+        workstream_id=target["child_workstream_id"], issue_uuid=target["child_issue_id"],
+        **target["route"],
+    )._comments()
+    active = activated_comments(
+        comments, [authorization["event"]],
+        child_workstream_id=target["child_workstream_id"],
+        child_issue_id=target["child_issue_id"],
+    )
+    state = reduce_checkpoint_comments(
+        active, workstream_id=target["child_workstream_id"],
+    )
+    receipt = next(
+        item for item in state.checkpoints
+        if item["event_id"] == checkpoint["event_id"]
+    )
     return {
         "schema_version": 1,
         "root_workstream_id": target["root_workstream_id"],
@@ -66,6 +107,7 @@ def run(
         "child_issue_id": target["child_issue_id"],
         "plan_revision": target["plan_revision"],
         "generation_authority": target["generation_authority"],
+        "proposal": proposal_receipt, "authorization": authorization,
         "receipt": receipt,
     }
 

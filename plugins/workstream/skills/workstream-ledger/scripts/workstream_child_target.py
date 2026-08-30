@@ -65,6 +65,7 @@ def _uuid(value: str, field: str) -> str:
 
 def authenticate_child_target(
     args: argparse.Namespace, *,
+    proposal_id: str | None = None,
     client_factory: Callable[[str], Any] = HttpGraphQLClient,
 ) -> dict[str, Any]:
     root_token = _token(args.root_workstream_id, "root workstream token")
@@ -119,10 +120,16 @@ def authenticate_child_target(
     generation = projection.select_owned_child_generation(
         description_plan_revision=parse_plan_revision(root.get("description")),
         child_workstream_id=child_token,
+        proposal_id=proposal_id,
     )
     return {
         "client": client, "root_workstream_id": root_token,
         "root_issue_id": root_issue_id, "child_workstream_id": child_token,
         "child_issue_id": child_issue_id, "plan_revision": args.plan_revision,
         "route": route, "generation_authority": generation,
+        "projection": projection,
+        "child_identity": {
+            "identifier": child_token, "id": child_issue_id,
+            "parent_issue_id": root_issue_id, "route": route,
+        },
     }

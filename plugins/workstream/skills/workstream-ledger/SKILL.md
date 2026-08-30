@@ -207,13 +207,20 @@ python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_extend_child.py" ./PLAN.md \
 ```
 
 The command requires exact plan bytes, route, root identity, reviewed candidate,
-both live frontiers, a native state, and exactly one of `--assignee-id` or
-`--unassigned`. The append-only grant binds the current generation selection
-proof and native setup before one atomic deterministic child create. A sealed
+both live frontiers, a canonical native state UUID, and exactly one of
+`--assignee-id` or `--unassigned`. Before the grant, authenticated Linear
+readback proves the state belongs to the exact team and an active assignee
+belongs to the workspace/team; the grant binds that validation digest. The
+append-only grant binds the current generation selection proof and native setup
+before one atomic deterministic child create. A sealed
 retirement prefix preserves an exact granted create/replay while refusing new
 retired-generation grants. Readback must match state and assignee. A replay
 converges; it never updates an issue, root, or project. Project the child's
 repository ownership before treating it as executable.
+If a validated provider identity disappears after the grant, automatic
+correction is unsafe without a provider conditional or positive writer-death
+fence. Restore the exact identity and replay; otherwise stop for explicit
+review. Never supersede merely because the deterministic child is absent.
 
 ### Append-only plan-generation authority
 
@@ -591,8 +598,14 @@ the root's exact workspace/team/project route before the fenced read.
 After scope owns the exact child, `workstreamctl child-event` and
 `workstreamctl child-checkpoint` append child-local state. Both require the root
 token/UUID, child token/UUID, route, selected plan generation, and live
-revision/predecessor fences. They write only child comments; exact replay is
-zero-write and an unowned or mismatched child refuses.
+revision/predecessor fences. Each first writes a deterministic inert proposal
+containing the full child record, then root projection CAS activates only its
+exact ID/digest after fresh generation, scope-owner, child-parent, and route
+authentication. Resume ignores unactivated proposals. Root metadata contains
+no child business payload. Crash before activation leaves a recoverable inert
+proposal; crash after activation makes that exact proposal authoritative.
+Exact replay is zero-write, including after sealed generation retirement or a
+later scope removal; an unowned new or mismatched child refuses.
 
 The direct resume helper is full-authority by default and fetches the projected
 source identity. `--plan-source` overrides the fetch location for an

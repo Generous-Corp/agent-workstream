@@ -298,6 +298,7 @@ def _recover_checkpoint_generations(
 def add_child_material_history(
     snapshot: dict[str, Any], child_comments: dict[str, list[dict[str, Any]]],
     *, authenticated_route: dict[str, str],
+    root_comments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Reduce every nonterminal child log without mixing child/root authority."""
     if not isinstance(child_comments, dict):
@@ -312,6 +313,18 @@ def add_child_material_history(
     if set(child_comments) != nonterminal_tokens:
         raise ResumeError("incomplete_child_comment_collection")
     plan_revision = (snapshot.get("root") or {}).get("plan_revision")
+    authorizations: list[dict[str, Any]] = []
+    if root_comments is not None:
+        from workstream_linear_projection import (
+            child_mutation_authorizations_from_comments,
+        )
+        authorizations = child_mutation_authorizations_from_comments(
+            root_comments,
+            workstream_id=(snapshot.get("root") or {})["identifier"],
+            description_plan_revision=(snapshot.get("root") or {}).get(
+                "description_plan_revision", plan_revision
+            ), authenticated_route=authenticated_route,
+        )
     for source_child in snapshot.get("children", []):
         child = dict(source_child)
         token = str(child.get("identifier", "")).upper()
@@ -322,6 +335,13 @@ def add_child_material_history(
         comments = child_comments[token]
         if not isinstance(comments, list):
             raise ResumeError(f"invalid_child_comment_collection:{token}")
+        if authorizations:
+            from workstream_child_proposal import activated_comments
+
+            comments = activated_comments(
+                comments, authorizations, child_workstream_id=token,
+                child_issue_id=child["id"],
+            )
         event_log = reduce_event_comments(comments, workstream_id=token)
         checkpoint_log = reduce_checkpoint_comments(comments, workstream_id=token)
         if not event_log.events and not checkpoint_log.checkpoints:
@@ -370,6 +390,7 @@ def add_child_material_history(
 
 def add_live_child_material_history(
     snapshot: dict[str, Any], *, authenticated_route: dict[str, str],
+    root_comments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Join the transport's complete nonterminal-child comment collection.
 
@@ -381,7 +402,7 @@ def add_live_child_material_history(
     """
     return add_child_material_history(
         snapshot, snapshot.get("child_comments"),
-        authenticated_route=authenticated_route,
+        authenticated_route=authenticated_route, root_comments=root_comments,
     )
 
 
@@ -1701,6 +1722,7 @@ def main() -> int:
             )
             live_graph_snapshot = add_live_child_material_history(
                 live_graph_snapshot, authenticated_route=route,
+                root_comments=comments,
             )
             # This first join discovers the projected plan source before its
             # bytes can be authenticated. Lifecycle validation is necessarily

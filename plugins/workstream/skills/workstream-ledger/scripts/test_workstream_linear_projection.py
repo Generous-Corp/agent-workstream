@@ -382,7 +382,7 @@ class ProjectionTests(unittest.TestCase):
             "expected_material_revision": 0,
             "expected_projection_revision": 0,
             "native_initialization": {
-                "state_id": "ready-state", "assignee_id": "agent-owner",
+                "state_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "assignee_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
             },
             "generation_authority": {
                 "plan_revision": PLAN,
@@ -394,6 +394,7 @@ class ProjectionTests(unittest.TestCase):
                 "authority": AUTHORITY,
                 "source": {"identity": "plan:legacy", "sha256": PLAN},
             },
+            "native_validation_sha256": "0" * 64,
         }
         values.update(overrides)
         return adapter.reserve_child_extension(**values)
@@ -416,7 +417,7 @@ class ProjectionTests(unittest.TestCase):
             "planned_pending_projection",
         )
         self.assertEqual(first["event"]["value"]["native_initialization"], {
-            "state_id": "ready-state", "assignee_id": "agent-owner",
+            "state_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "assignee_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
         })
         self.assertEqual(first["disposition"], "created")
         self.assertEqual(replay["disposition"], "existing")
