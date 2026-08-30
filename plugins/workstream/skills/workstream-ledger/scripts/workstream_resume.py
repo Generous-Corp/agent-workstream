@@ -697,12 +697,28 @@ def add_material_history(
         comments, workstream_id=token,
     )
     event_log = reduce_event_comments(comments, workstream_id=token)
-    checkpoint_log = reduce_checkpoint_comments(comments, workstream_id=token)
     plan_revision = result["root"].get("plan_revision")
     projection_log = reduce_projection_comments(
         comments, workstream_id=token, expected_plan_revision=plan_revision,
         authenticated_route=authenticated_route,
         authenticated_source=authenticated_source,
+    )
+    selected_checkpoints = None
+    transition_tip = result["root"].get("generation_transition_tip_event_id")
+    if transition_tip is not None:
+        if authenticated_route is None:
+            raise ResumeError("generation_activation_checkpoint_route_missing")
+        from workstream_generation import selected_activation_checkpoints
+
+        selected_checkpoints = selected_activation_checkpoints(
+            comments, workstream_id=token,
+            transition_event_id=transition_tip,
+            active_plan_revision=plan_revision,
+            authenticated_route=authenticated_route,
+        )
+    checkpoint_log = reduce_checkpoint_comments(
+        comments, workstream_id=token,
+        selected_activation_checkpoints=selected_checkpoints,
     )
     events = [_event_record(event) for event in event_log.events]
 

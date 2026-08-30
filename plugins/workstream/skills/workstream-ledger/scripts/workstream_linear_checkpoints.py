@@ -127,7 +127,8 @@ def _decode_checkpoint(encoded: str) -> dict[str, Any]:
 
 
 def reduce_checkpoint_comments(
-    comments: list[dict[str, Any]], *, workstream_id: str
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    selected_activation_checkpoints: list[tuple[dict[str, Any], str]] | None = None,
 ) -> ReducedCheckpointLog:
     """Reduce a complete comment snapshot and derive remote acknowledgements."""
     from workstream_generation import generation_quarantined_comment_ids
@@ -136,6 +137,24 @@ def reduce_checkpoint_comments(
         comments, workstream_id=workstream_id,
     )
     observed: dict[str, tuple[dict[str, Any], str, bytes]] = {}
+
+    def observe(checkpoint: dict[str, Any], remote_id: str) -> None:
+        event_id = checkpoint["event_id"]
+        signature = _canonical_record(checkpoint)
+        if event_id in observed:
+            previous = observed[event_id]
+            reason = (
+                "duplicate_checkpoint_event_id"
+                if previous[2] == signature
+                else "conflicting_checkpoint_event_id"
+            )
+            raise LinearCheckpointError(f"{reason}:{event_id}")
+        acknowledged = acknowledge_checkpoint(
+            checkpoint, remote_id=remote_id,
+            applied_revision=checkpoint["root_revision"],
+        )
+        observed[event_id] = (acknowledged, remote_id, signature)
+
     for comment in comments:
         body = comment.get("body")
         if body is None:
@@ -152,23 +171,17 @@ def reduce_checkpoint_comments(
         checkpoint = _decode_checkpoint(matches[0])
         if checkpoint["workstream_id"] != workstream_id:
             raise LinearCheckpointError("workstream_id_mismatch")
-        event_id = checkpoint["event_id"]
-        signature = _canonical_record(checkpoint)
-        if event_id in observed:
-            previous = observed[event_id]
-            reason = (
-                "duplicate_checkpoint_event_id"
-                if previous[2] == signature
-                else "conflicting_checkpoint_event_id"
-            )
-            raise LinearCheckpointError(f"{reason}:{event_id}")
         remote_id = comment.get("id")
         if not isinstance(remote_id, str) or not remote_id:
             raise LinearCheckpointError("checkpoint_comment_missing_remote_id")
-        acknowledged = acknowledge_checkpoint(
-            checkpoint, remote_id=remote_id, applied_revision=checkpoint["root_revision"]
-        )
-        observed[event_id] = (acknowledged, remote_id, signature)
+        observe(checkpoint, remote_id)
+
+    for checkpoint, remote_id in selected_activation_checkpoints or []:
+        if checkpoint.get("workstream_id") != workstream_id:
+            raise LinearCheckpointError("workstream_id_mismatch")
+        if not isinstance(remote_id, str) or not remote_id:
+            raise LinearCheckpointError("checkpoint_comment_missing_remote_id")
+        observe(checkpoint, remote_id)
 
     checkpoints = sorted(
         (item[0] for item in observed.values()),
@@ -288,8 +301,32 @@ class LinearCheckpointAdapter:
             seen_cursors.add(after)
 
     def _state(self) -> ReducedCheckpointLog:
+        return self._reduce(self._comments())
+
+    def _reduce(self, comments: list[dict[str, Any]]) -> ReducedCheckpointLog:
+        selected_checkpoints = None
+        from workstream_generation import (
+            generation_controls, selected_activation_checkpoints,
+        )
+        from workstream_linear_projection import select_plan_generation
+
+        if generation_controls(comments):
+            if self._observed_authority is None:
+                raise LinearCheckpointError("comment_slot_authority_incomplete")
+            selected = select_plan_generation(
+                comments, workstream_id=self.workstream_id,
+                description_plan_revision=None,
+                authenticated_route=self._observed_authority,
+            )
+            selected_checkpoints = selected_activation_checkpoints(
+                comments, workstream_id=self.workstream_id,
+                transition_event_id=selected["transition_tip_event_id"],
+                active_plan_revision=selected["plan_revision"],
+                authenticated_route=self._observed_authority,
+            )
         return reduce_checkpoint_comments(
-            self._comments(), workstream_id=self.workstream_id
+            comments, workstream_id=self.workstream_id,
+            selected_activation_checkpoints=selected_checkpoints,
         )
 
     def _assert_comment_id_capability(self) -> None:
@@ -333,9 +370,7 @@ class LinearCheckpointAdapter:
     ) -> dict[str, Any]:
         """Confirm one durable checkpoint and that it still covers the log tip."""
         comments = self._comments()
-        checkpoints = reduce_checkpoint_comments(
-            comments, workstream_id=self.workstream_id
-        )
+        checkpoints = self._reduce(comments)
         self._recover_checkpoint_generations(checkpoints)
         observed = next(
             (
@@ -361,9 +396,7 @@ class LinearCheckpointAdapter:
         if checkpoint["workstream_id"] != self.workstream_id:
             raise LinearCheckpointError("workstream_id_mismatch")
         comments = self._comments()
-        before = reduce_checkpoint_comments(
-            comments, workstream_id=self.workstream_id
-        )
+        before = self._reduce(comments)
         generations = self._recover_checkpoint_generations(before)
         existing_id = before.remote_ids.get(checkpoint["event_id"])
         if existing_id:
@@ -456,9 +489,7 @@ class LinearCheckpointAdapter:
             )
         except LinearTransportError:
             comments_after = self._comments()
-            checkpoints_after = reduce_checkpoint_comments(
-                comments_after, workstream_id=self.workstream_id
-            )
+            checkpoints_after = self._reduce(comments_after)
             events_after = reduce_event_comments(
                 comments_after, workstream_id=self.workstream_id
             )
