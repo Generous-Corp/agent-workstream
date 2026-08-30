@@ -211,6 +211,84 @@ authorization plus readback receipt. A replay converges; it never creates or
 updates a root or project. Project the child's ownership, status, evidence, and
 dependencies before treating it as executable.
 
+### Append-only plan-generation authority
+
+An existing root changes plan generations only through
+`scripts/workstream_generation.py`; never update its issue description to make
+a new digest authoritative. Before the first generation-control event, a
+legacy root with exactly one description `Plan revision` remains compatible and
+that line selects its plan. Once a schema-v2 genesis or activation exists, the
+append-only control chain is authority and description prose is diagnostic
+only.
+
+For a legacy root that has no description plan revision, authenticate the exact
+route and plan source and bootstrap one deterministic genesis:
+
+```sh
+python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_generation.py" \
+  bootstrap GEN-123 --plan-source ./PLAN.md \
+  --plan-identity <canonical-immutable-plan-url> \
+  --created-at <reviewed-utc-time> --apply
+```
+
+Do not bootstrap a description-backed root. For a reviewed plan replacement,
+first build the complete candidate projection, then provide a structured
+retirement proof for the current active epoch:
+
+```sh
+python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_generation.py" \
+  activate GEN-123 --plan-source ./PLAN.md \
+  --plan-identity <canonical-immutable-plan-url> \
+  --retirement-proof ./retirement.json \
+  --created-at <reviewed-utc-time> --apply
+```
+
+The command uses the normal strict full-resume validator against authenticated
+source bytes and route readback, with the resume defaults of 24 KiB and 100
+items unless matching `--max-bytes` / `--max-items` values are supplied. The
+strict check validates complete history but emits the normal compact-validated
+resume surface; it does not require a full-history output artifact. It
+binds the actual material, checkpoint, issue-graph, and projection frontiers.
+Mutation order is fixed: reserve the
+shared material/checkpoint boundary, append the target candidate seal, reread
+and strictly validate, then append the predecessor activation last. Competing
+candidates use the same route/root boundary slot. Material and checkpoint
+writers cannot pass a pending reservation. Old runtimes which try to route
+around that occupied slot through deterministic collision successors are
+quarantined from both reduced frontiers; upgraded active writers use the
+completed-generation frontier token. A sealed candidate cannot change before
+activation, and a retired epoch's production writers refuse before mutation.
+Quarantined legacy ledger writes remain non-authoritative, but resume and
+generation receipts surface their stable count and digest for diagnosis;
+upgraded active-generation writes are not counted. After activation, the active
+target may evolve normally; its sealed prefix remains the activation proof. The
+CLI performs another authenticated strict
+full-resume read of the actual active generation after authority changes before
+reporting success. A same-generation bound/live graph or candidate digest
+mismatch refuses with `authority_changed_with_post_read_drift`; authority has
+already changed and the command does not claim rollback or cross-resource
+atomicity. An exact historical replay returns the original receipt without
+writing even after later successors, then validates and reports the current
+active successor rather than forcing the historical target.
+
+The retirement proof is not a boolean. It names the predecessor plan, writer
+epoch, complete provenance and checkpoint event-ID sets, retirement time, and
+its canonical declaration digest. A partial operation remains durably
+recoverable from its exact reservation. If review decides it must not continue,
+use the `activate` command's exact `--abort-reservation-id`,
+`--abort-reservation-sha256`, and `--abort-reason` form; abort releases only
+that reservation and never changes generation authority. Abort is a validated,
+non-authoritative projection event, so it advances the predecessor CAS frontier
+without advancing the generation authority chain. Abort and final
+activation compete for the same deterministic predecessor authority slot, so
+an abort that wins the final race cannot be followed by that activation. If an
+unrelated predecessor writer wins the original slot first, abort binds the
+complete intervening event-ID frontier, digest, and original occupant, then
+rebases to the current next predecessor slot with bounded reload/retry. A
+reviewed replacement can reserve and activate from the revision advanced by
+that abort. The generation
+transport uses `commentCreate` only and never calls `issueUpdate`.
+
 After intake returns the canonical root token, invoke
 `scripts/workstream_tab.py GEN-123`. In cmux or Herdr it preserves the existing
 tab title and appends exactly one token; the same token is a no-op and a

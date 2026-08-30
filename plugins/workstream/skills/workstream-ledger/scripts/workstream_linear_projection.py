@@ -48,7 +48,8 @@ KINDS = {
     "quarantine_disposition", "child_closure",
     "child_extension_authorization", "child_dependency_authorization",
     "identity_history_seal",
-    "generation_transition",
+    "generation_genesis", "generation_candidate_seal", "generation_transition",
+    "generation_abort",
 }
 SINGLETON_KINDS = {
     "scope", "source", "disposition", "lifecycle", "cas_activation",
@@ -60,7 +61,22 @@ LEGACY_DIGEST_KIND_FULL_EVENTS = "canonical-full-events-v1"
 GENERATION_FRONTIER_FIELDS = {
     "plan_revision", "source_event_id", "source_identity", "source_sha256",
     "material_revision", "checkpoint_event_ids", "projection_revision",
-    "projection_frontier_event_id", "projection_events_sha256",
+    "checkpoint_events_sha256", "projection_frontier_event_id",
+    "projection_events_sha256",
+}
+GENERATION_SOURCE_FIELDS = {"identity", "sha256"}
+GENERATION_RETIREMENT_FIELDS = {
+    "predecessor_plan_revision", "retired_at", "retired_writer_epoch",
+    "provenance_event_ids", "checkpoint_event_ids", "declaration_sha256",
+}
+GENERATION_SEAL_FIELDS = {
+    "schema_version", "reservation_id", "reservation_sha256", "from", "to",
+    "source", "graph_frontier_sha256", "candidate_resume_sha256",
+    "retirement", "previous_control_event_id", "activation_epoch",
+}
+GENERATION_CONTROL_FIELDS = {
+    *GENERATION_SEAL_FIELDS, "candidate_seal_event_id",
+    "candidate_seal_sha256",
 }
 
 
@@ -343,38 +359,92 @@ def validate_projection_event(event: dict[str, Any]) -> None:
         raise LinearProjectionError("invalid_projection_value")
     value = event["value"]
     tombstone = value == TOMBSTONE
-    if event["kind"] == "generation_transition":
+    if event["kind"] == "generation_abort":
         if (
-            schema_version != 2
-            or tombstone
-            or event["key"] != "root"
+            schema_version != 2 or tombstone
             or event["supersedes_event_id"] is not None
-            or set(value) != {"from", "to", "previous_transition_event_id"}
-            or not all(
-                isinstance(value.get(side), dict)
-                and set(value[side]) == GENERATION_FRONTIER_FIELDS
-                for side in ("from", "to")
+            or event["key"] != value.get("reservation_id")
+            or set(value) != {
+                "schema_version", "reservation_id", "reservation_sha256",
+                "reason", "original_projection_revision",
+                "intervening_event_ids", "intervening_events_sha256",
+                "original_occupant_event_id",
+            }
+            or value.get("schema_version") != 2
+            or not re.fullmatch(
+                r"wsgr_[0-9a-f]{32}", str(value.get("reservation_id", ""))
+            )
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(value.get("reservation_sha256", ""))
+            )
+            or not isinstance(value.get("reason"), str) or not value["reason"]
+            or not isinstance(value.get("original_projection_revision"), int)
+            or isinstance(value.get("original_projection_revision"), bool)
+            or value["original_projection_revision"] < 0
+            or not isinstance(value.get("intervening_event_ids"), list)
+            or not all(isinstance(item, str) and item
+                       for item in value["intervening_event_ids"])
+            or len(value["intervening_event_ids"])
+            != len(set(value["intervening_event_ids"]))
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(value.get("intervening_events_sha256", ""))
+            )
+            or (
+                value.get("original_occupant_event_id") is not None
+                and not re.fullmatch(
+                    r"wsp_[0-9a-f]{32}",
+                    str(value["original_occupant_event_id"]),
+                )
             )
         ):
-            raise LinearProjectionError("invalid_generation_transition")
+            raise LinearProjectionError("invalid_generation_abort")
+    if event["kind"] in {
+        "generation_genesis", "generation_candidate_seal", "generation_transition",
+    }:
+        error_name = f"invalid_{event['kind']}"
+        required_fields = (
+            GENERATION_SEAL_FIELDS
+            if event["kind"] == "generation_candidate_seal"
+            else GENERATION_CONTROL_FIELDS
+        )
+        if (
+            schema_version != 2 or tombstone
+            or event["supersedes_event_id"] is not None
+            or set(value) != required_fields
+            or value.get("schema_version") != 2
+            or not isinstance(value.get("from"), dict)
+            or not isinstance(value.get("to"), dict)
+            or set(value["from"]) != GENERATION_FRONTIER_FIELDS
+            or set(value["to"]) != GENERATION_FRONTIER_FIELDS
+            or not isinstance(value.get("source"), dict)
+            or set(value["source"]) != GENERATION_SOURCE_FIELDS
+            or not isinstance(value.get("retirement"), dict)
+            or set(value["retirement"]) != GENERATION_RETIREMENT_FIELDS
+            or not re.fullmatch(r"wsgr_[0-9a-f]{32}", str(value.get("reservation_id", "")))
+            or not all(re.fullmatch(r"[0-9a-f]{64}", str(value.get(field, "")))
+                       for field in (
+                           "reservation_sha256", "graph_frontier_sha256",
+                           "candidate_resume_sha256",
+                       ))
+            or not isinstance(value.get("activation_epoch"), int)
+            or isinstance(value.get("activation_epoch"), bool)
+            or value["activation_epoch"] < 0
+        ):
+            raise LinearProjectionError(error_name)
         for side in ("from", "to"):
             frontier = value[side]
             if (
-                not all(
-                    isinstance(frontier.get(field), str) and frontier[field]
-                    for field in (
-                        "plan_revision", "source_event_id", "source_identity",
-                        "source_sha256", "projection_frontier_event_id",
-                        "projection_events_sha256",
-                    )
-                )
-                or not all(
-                    re.fullmatch(r"[0-9a-f]{64}", frontier[field])
-                    for field in (
-                        "plan_revision", "source_sha256",
-                        "projection_events_sha256",
-                    )
-                )
+                not all(isinstance(frontier.get(field), str) and frontier[field]
+                        for field in (
+                            "plan_revision", "source_event_id", "source_identity",
+                            "source_sha256", "checkpoint_events_sha256",
+                            "projection_frontier_event_id", "projection_events_sha256",
+                        ))
+                or not all(re.fullmatch(r"[0-9a-f]{64}", frontier[field])
+                           for field in (
+                               "plan_revision", "source_sha256",
+                               "checkpoint_events_sha256", "projection_events_sha256",
+                           ))
                 or frontier["source_sha256"] != frontier["plan_revision"]
                 or not isinstance(frontier.get("material_revision"), int)
                 or isinstance(frontier.get("material_revision"), bool)
@@ -385,24 +455,64 @@ def validate_projection_event(event: dict[str, Any]) -> None:
                 or not isinstance(frontier.get("checkpoint_event_ids"), list)
                 or frontier["checkpoint_event_ids"]
                 != sorted(set(frontier["checkpoint_event_ids"]))
-                or not all(
-                    isinstance(item, str) and item
-                    for item in frontier["checkpoint_event_ids"]
-                )
+                or not all(isinstance(item, str) and item
+                           for item in frontier["checkpoint_event_ids"])
+                or frontier["checkpoint_events_sha256"]
+                != hashlib.sha256(_canonical(frontier["checkpoint_event_ids"])).hexdigest()
             ):
-                raise LinearProjectionError("invalid_generation_transition")
-        previous = value["previous_transition_event_id"]
-        if previous is not None and (
-            not isinstance(previous, str)
-            or not re.fullmatch(r"wsp_[0-9a-f]{32}", previous)
-        ):
-            raise LinearProjectionError("invalid_generation_transition")
+                raise LinearProjectionError(error_name)
+        retirement = value["retirement"]
         if (
-            value["from"]["plan_revision"] != event["plan_revision"]
-            or value["from"]["plan_revision"] == value["to"]["plan_revision"]
-            or event["expected_revision"] != value["from"]["projection_revision"]
+            not re.fullmatch(r"[0-9a-f]{64}", str(retirement.get("predecessor_plan_revision", "")))
+            or not isinstance(retirement.get("retired_at"), str)
+            or not retirement["retired_at"]
+            or not isinstance(retirement.get("retired_writer_epoch"), int)
+            or isinstance(retirement.get("retired_writer_epoch"), bool)
+            or retirement["retired_writer_epoch"] < 0
+            or any(
+                not isinstance(retirement.get(field), list)
+                or retirement[field] != sorted(set(retirement[field]))
+                or not all(isinstance(item, str) and item for item in retirement[field])
+                for field in ("provenance_event_ids", "checkpoint_event_ids")
+            )
+            or not re.fullmatch(r"[0-9a-f]{64}", str(retirement.get("declaration_sha256", "")))
+            or value["source"].get("sha256") != value["to"]["plan_revision"]
+            or value["source"].get("identity") != value["to"]["source_identity"]
+            or retirement["predecessor_plan_revision"] != value["from"]["plan_revision"]
+            or retirement["retired_writer_epoch"] != value["activation_epoch"]
         ):
-            raise LinearProjectionError("invalid_generation_transition")
+            raise LinearProjectionError(error_name)
+        previous = value["previous_control_event_id"]
+        if previous is not None and not re.fullmatch(r"wsp_[0-9a-f]{32}", str(previous)):
+            raise LinearProjectionError(error_name)
+        if event["kind"] == "generation_genesis":
+            if (
+                event["key"] != "root" or previous is not None
+                or value["activation_epoch"] != 0
+                or value["from"] != value["to"]
+                or event["plan_revision"] != value["to"]["plan_revision"]
+                or event["expected_revision"] != value["to"]["projection_revision"]
+                or value["candidate_seal_event_id"] is not None
+                or value["candidate_seal_sha256"] is not None
+            ):
+                raise LinearProjectionError(error_name)
+        elif event["kind"] == "generation_candidate_seal":
+            if (
+                event["key"] != value["reservation_id"]
+                or event["plan_revision"] != value["to"]["plan_revision"]
+                or event["expected_revision"] != value["to"]["projection_revision"]
+                or value["to"]["plan_revision"] == value["from"]["plan_revision"]
+            ):
+                raise LinearProjectionError(error_name)
+        elif (
+            event["key"] != "root"
+            or event["plan_revision"] != value["from"]["plan_revision"]
+            or event["expected_revision"] != value["from"]["projection_revision"]
+            or value["to"]["plan_revision"] == value["from"]["plan_revision"]
+            or not re.fullmatch(r"wsp_[0-9a-f]{32}", str(value.get("candidate_seal_event_id", "")))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("candidate_seal_sha256", "")))
+        ):
+            raise LinearProjectionError(error_name)
     if event["kind"] == "cas_activation":
         historical_fields = {"legacy_event_ids", "legacy_events_sha256"}
         tagged_fields = {*historical_fields, "legacy_digest_kind"}
@@ -1329,16 +1439,20 @@ def _generation_frontier(
         or source.get("sha256") != plan_revision
     ):
         raise LinearProjectionError("generation_transition_source_incomplete")
+    checkpoint_event_ids = _generation_checkpoint_ids(
+        comments, workstream_id=state.workstream_id,
+        plan_revision=plan_revision,
+    )
     return {
         "plan_revision": plan_revision,
         "source_event_id": source_event["event_id"],
         "source_identity": identity,
         "source_sha256": source["sha256"],
         "material_revision": material_revision,
-        "checkpoint_event_ids": _generation_checkpoint_ids(
-            comments, workstream_id=state.workstream_id,
-            plan_revision=plan_revision,
-        ),
+        "checkpoint_event_ids": checkpoint_event_ids,
+        "checkpoint_events_sha256": hashlib.sha256(
+            _canonical(checkpoint_event_ids)
+        ).hexdigest(),
         "projection_revision": revision,
         "projection_frontier_event_id": events[-1]["event_id"],
         "projection_events_sha256": hashlib.sha256(_canonical(events)).hexdigest(),
@@ -1358,8 +1472,10 @@ def _assert_generation_frontier(
         material_revision=expected["material_revision"],
     )
     observed_checkpoints = observed.pop("checkpoint_event_ids")
+    observed.pop("checkpoint_events_sha256")
     expected_without_checkpoints = dict(expected)
     expected_checkpoints = expected_without_checkpoints.pop("checkpoint_event_ids")
+    expected_without_checkpoints.pop("checkpoint_events_sha256")
     checkpoints_match = (
         observed_checkpoints == expected_checkpoints
         if exact_checkpoints
@@ -1371,11 +1487,10 @@ def _assert_generation_frontier(
 
 def select_plan_generation(
     comments: list[dict[str, Any]], *, workstream_id: str,
-    description_plan_revision: str, authenticated_route: dict[str, str] | None = None,
+    description_plan_revision: str | None,
+    authenticated_route: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Select the append-only transition tip, or preserve legacy description selection."""
-    if not isinstance(description_plan_revision, str) or not description_plan_revision:
-        raise LinearProjectionError("generation_description_plan_missing")
+    """Select the append-only authority tip, preserving description-only roots."""
     material_revision = reduce_event_comments(
         comments, workstream_id=workstream_id,
     ).revision
@@ -1397,16 +1512,24 @@ def select_plan_generation(
         event for event in encoded_events
         if event["kind"] == "generation_transition"
     ]
-    if not transitions:
+    geneses = [
+        event for event in encoded_events if event["kind"] == "generation_genesis"
+    ]
+    controls = [*geneses, *transitions]
+    if not controls:
+        if not isinstance(description_plan_revision, str) or not description_plan_revision:
+            raise LinearProjectionError("generation_description_plan_missing_bootstrap_required")
         return {
             "plan_revision": description_plan_revision,
             "description_plan_revision": description_plan_revision,
             "transition_tip_event_id": None,
+            "activation_epoch": None,
+            "authority_origin": "legacy_description",
         }
 
     plan_revisions = {
         frontier["plan_revision"]
-        for event in transitions
+        for event in controls
         for frontier in (event["value"]["from"], event["value"]["to"])
     }
     states = {
@@ -1417,40 +1540,42 @@ def select_plan_generation(
         )
         for revision in plan_revisions
     }
-    by_id = {event["event_id"]: event for event in transitions}
-    if len(by_id) != len(transitions):
-        raise LinearProjectionError("generation_transition_duplicate")
+    by_id = {event["event_id"]: event for event in controls}
+    if len(by_id) != len(controls):
+        raise LinearProjectionError("generation_control_duplicate")
     roots = [
-        event for event in transitions
-        if event["value"]["previous_transition_event_id"] is None
+        event for event in controls
+        if event["value"]["previous_control_event_id"] is None
     ]
     if len(roots) != 1:
-        raise LinearProjectionError("generation_transition_root_ambiguous")
+        raise LinearProjectionError("generation_control_root_ambiguous")
+    if geneses and (len(geneses) != 1 or roots[0]["kind"] != "generation_genesis"):
+        raise LinearProjectionError("generation_genesis_ambiguous")
     children: dict[str, list[dict[str, Any]]] = {}
-    for event in transitions:
-        previous = event["value"]["previous_transition_event_id"]
+    for event in controls:
+        previous = event["value"]["previous_control_event_id"]
         if previous is None:
             continue
         if previous not in by_id:
-            raise LinearProjectionError("generation_transition_orphan")
+            raise LinearProjectionError("generation_control_orphan")
         children.setdefault(previous, []).append(event)
     if any(len(items) != 1 for items in children.values()):
-        raise LinearProjectionError("generation_transition_fork")
+        raise LinearProjectionError("generation_control_fork")
 
     ordered: list[dict[str, Any]] = []
     current = roots[0]
     seen: set[str] = set()
     while True:
         if current["event_id"] in seen:
-            raise LinearProjectionError("generation_transition_cycle")
+            raise LinearProjectionError("generation_control_cycle")
         seen.add(current["event_id"])
         ordered.append(current)
         successors = children.get(current["event_id"], [])
         if not successors:
             break
         current = successors[0]
-    if len(seen) != len(transitions):
-        raise LinearProjectionError("generation_transition_orphan_or_cycle")
+    if len(seen) != len(controls):
+        raise LinearProjectionError("generation_control_orphan_or_cycle")
 
     previous = None
     for event in ordered:
@@ -1458,14 +1583,43 @@ def select_plan_generation(
         if previous is not None and (
             value["from"]["plan_revision"]
             != previous["value"]["to"]["plan_revision"]
+            or value["activation_epoch"]
+            != previous["value"]["activation_epoch"] + 1
         ):
             raise LinearProjectionError("generation_transition_chain_discontinuous")
         from_state = states[value["from"]["plan_revision"]]
-        to_state = states[value["to"]["plan_revision"]]
+        provenance_heads: dict[str, dict[str, Any]] = {}
+        for predecessor_event in from_state.events[
+            :value["from"]["projection_revision"]
+        ]:
+            if predecessor_event["kind"] == "provenance":
+                provenance_heads[predecessor_event["key"]] = predecessor_event
+        expected_provenance_ids = sorted(
+            item["event_id"] for item in provenance_heads.values()
+            if item["value"] != TOMBSTONE
+        )
+        if (
+            value["retirement"]["provenance_event_ids"]
+            != expected_provenance_ids
+            or value["retirement"]["checkpoint_event_ids"]
+            != value["from"]["checkpoint_event_ids"]
+        ):
+            raise LinearProjectionError("generation_retirement_frontier_mismatch")
         _assert_generation_frontier(
             value["from"], from_state, comments,
-            material_revision=material_revision, exact_checkpoints=True,
+            material_revision=material_revision,
+            exact_checkpoints=(event["kind"] != "generation_genesis"),
         )
+        if event["kind"] == "generation_genesis":
+            position = value["from"]["projection_revision"]
+            if (
+                len(from_state.events) < position + 1
+                or from_state.events[position] != event
+            ):
+                raise LinearProjectionError("generation_genesis_not_at_frontier")
+            previous = event
+            continue
+        to_state = states[value["to"]["plan_revision"]]
         _assert_generation_frontier(
             value["to"], to_state, comments,
             material_revision=material_revision, exact_checkpoints=False,
@@ -1476,6 +1630,22 @@ def select_plan_generation(
             or from_state.events[position] != event
         ):
             raise LinearProjectionError("generation_transition_not_last")
+        seal_id = value["candidate_seal_event_id"]
+        seal = next(
+            (item for item in to_state.events if item["event_id"] == seal_id), None,
+        )
+        if (
+            seal is None or seal["kind"] != "generation_candidate_seal"
+            or seal["value"]["reservation_id"] != value["reservation_id"]
+            or seal["value"]["reservation_sha256"] != value["reservation_sha256"]
+            or seal["value"]["previous_control_event_id"]
+            != value["previous_control_event_id"]
+            or seal["value"]["activation_epoch"] != value["activation_epoch"]
+            or value["candidate_seal_sha256"]
+            != hashlib.sha256(_canonical(seal)).hexdigest()
+            or to_state.events[value["to"]["projection_revision"] - 1] != seal
+        ):
+            raise LinearProjectionError("generation_candidate_seal_mismatch")
         # A retired predecessor may not acquire new checkpoints after activation.
         if _generation_checkpoint_ids(
             comments, workstream_id=workstream_id,
@@ -1485,16 +1655,12 @@ def select_plan_generation(
         previous = event
 
     tip = ordered[-1]
-    tip_frontier = tip["value"]["to"]
-    if (
-        states[tip_frontier["plan_revision"]].revision
-        != tip_frontier["projection_revision"]
-    ):
-        raise LinearProjectionError("generation_transition_tip_projection_changed")
     return {
         "plan_revision": tip["value"]["to"]["plan_revision"],
         "description_plan_revision": description_plan_revision,
         "transition_tip_event_id": tip["event_id"],
+        "activation_epoch": tip["value"]["activation_epoch"],
+        "authority_origin": tip["kind"],
     }
 
 
@@ -1631,118 +1797,11 @@ class LinearProjectionAdapter:
         self, *, target_plan_revision: str, created_at: str,
         predecessor_sessions_retired: bool,
     ) -> dict[str, Any]:
-        """Activate one already-complete target generation in the predecessor CAS slot."""
-        if predecessor_sessions_retired is not True:
-            raise LinearProjectionError(
-                "generation_transition_predecessor_sessions_not_retired"
-            )
-        if (
-            not isinstance(target_plan_revision, str)
-            or not re.fullmatch(r"[0-9a-f]{64}", target_plan_revision)
-            or target_plan_revision == self.plan_revision
-        ):
-            raise LinearProjectionError("invalid_generation_transition_target")
-        comments = self._comments()
-        material_revision = reduce_event_comments(
-            comments, workstream_id=self.workstream_id,
-        ).revision
-        before = reduce_projection_comments(
-            comments, workstream_id=self.workstream_id,
-            expected_plan_revision=self.plan_revision,
-            authenticated_route=self.authority,
+        """Deprecated unsafe entrypoint retained only for a clear refusal."""
+        raise LinearProjectionError(
+            "generation_cli_required:use_workstream_generation_activate_with_"
+            "strict_resume_and_durable_retirement_proof"
         )
-        existing = [
-            event for event in before.events
-            if event["kind"] == "generation_transition"
-        ]
-        if existing:
-            if (
-                len(existing) != 1
-                or existing[0]["value"]["to"]["plan_revision"]
-                != target_plan_revision
-            ):
-                raise LinearProjectionError("generation_transition_already_activated")
-            selected = select_plan_generation(
-                comments, workstream_id=self.workstream_id,
-                description_plan_revision=self.plan_revision,
-                authenticated_route=self.authority,
-            )
-            if selected["plan_revision"] != target_plan_revision:
-                raise LinearProjectionError("generation_transition_replay_mismatch")
-            event = existing[0]
-            return {
-                "event_id": event["event_id"],
-                "remote_id": before.remote_ids[event["event_id"]],
-                "revision": before.revision,
-            }
-        target = reduce_projection_comments(
-            comments, workstream_id=self.workstream_id,
-            expected_plan_revision=target_plan_revision,
-            authenticated_route=self.authority,
-        )
-        if (
-            target.snapshot.get("projection_unresolved_quarantine")
-            or any(
-                event["kind"] == "generation_transition"
-                for event in target.events
-            )
-        ):
-            raise LinearProjectionError("generation_transition_target_not_candidate")
-        from_frontier = _generation_frontier(
-            before, comments, plan_revision=self.plan_revision,
-            material_revision=material_revision,
-        )
-        to_frontier = _generation_frontier(
-            target, comments, plan_revision=target_plan_revision,
-            material_revision=material_revision,
-        )
-        transitions = [
-            event for event in target.snapshot.get("projection_history", [])
-            if event["kind"] == "generation_transition"
-        ]
-        previous_transition_event_id = None
-        if transitions:
-            selected = select_plan_generation(
-                comments, workstream_id=self.workstream_id,
-                description_plan_revision=self.plan_revision,
-                authenticated_route=self.authority,
-            )
-            if selected["plan_revision"] != self.plan_revision:
-                raise LinearProjectionError(
-                    "generation_transition_predecessor_not_active_tip"
-                )
-            if any(
-                target_plan_revision in {
-                    event["value"]["from"]["plan_revision"],
-                    event["value"]["to"]["plan_revision"],
-                }
-                for event in transitions
-            ):
-                raise LinearProjectionError(
-                    "generation_transition_target_already_in_chain"
-                )
-            previous_transition_event_id = selected["transition_tip_event_id"]
-        event = build_projection_event(
-            workstream_id=self.workstream_id, kind="generation_transition",
-            key="root", value={
-                "from": from_frontier,
-                "to": to_frontier,
-                "previous_transition_event_id": previous_transition_event_id,
-            },
-            plan_revision=self.plan_revision,
-            expected_revision=before.revision,
-            created_at=created_at, authority=self.authority,
-        )
-        receipt = self.append(event, expected_material_revision=material_revision)
-        after = self._comments()
-        selected = select_plan_generation(
-            after, workstream_id=self.workstream_id,
-            description_plan_revision=self.plan_revision,
-            authenticated_route=self.authority,
-        )
-        if selected["plan_revision"] != target_plan_revision:
-            raise LinearProjectionError("generation_transition_activation_not_observed")
-        return receipt
 
     @classmethod
     def from_env(
@@ -1811,6 +1870,8 @@ class LinearProjectionAdapter:
         expected_quarantine_count: int | None = None,
         expected_quarantine_sha256: str | None = None,
         expected_material_revision: int | None = None,
+        allowed_generation_reservation_id: str | None = None,
+        allow_retired_generation_control: bool = False,
     ) -> dict[str, Any]:
         validate_projection_event(event)
         if (expected_quarantine_count is None) != (
@@ -1825,10 +1886,42 @@ class LinearProjectionAdapter:
             or expected_material_revision < 0
         ):
             raise LinearProjectionError("invalid_projection_material_frontier")
+        if allow_retired_generation_control and event["kind"] not in {
+            "generation_genesis", "generation_transition",
+        }:
+            raise LinearProjectionError("invalid_generation_control_bypass")
+        if allowed_generation_reservation_id is not None and (
+            event["kind"] not in {
+                "generation_genesis", "generation_candidate_seal",
+                "generation_transition",
+            }
+            or event["value"].get("reservation_id")
+            != allowed_generation_reservation_id
+        ):
+            raise LinearProjectionError("invalid_generation_reservation_bypass")
+        before_comments = self._comments()
+        try:
+            from workstream_generation import (
+                assert_generation_write_authority,
+                assert_no_pending_generation_reservation,
+            )
+            assert_no_pending_generation_reservation(
+                before_comments, workstream_id=self.workstream_id,
+                authenticated_route=self.authority,
+                allowed_reservation_id=allowed_generation_reservation_id,
+            )
+            if not allow_retired_generation_control:
+                assert_generation_write_authority(
+                    before_comments, workstream_id=self.workstream_id,
+                    plan_revision=self.plan_revision,
+                    authenticated_route=self.authority,
+                    allow_unactivated_candidate_projection=True,
+                )
+        except LinearTransportError as error:
+            raise LinearProjectionError(str(error)) from error
         if expected_material_revision is not None:
             from workstream_linear_events import reduce_event_comments
 
-            before_comments = self._comments()
             before = reduce_projection_comments(
                 before_comments, workstream_id=self.workstream_id,
                 expected_plan_revision=self.plan_revision,
@@ -1845,6 +1938,9 @@ class LinearProjectionAdapter:
                     "projection_material_frontier_stale_reload_required"
                 )
         else:
+            # Keep the public state observation boundary used by reconcile
+            # race fences. The separate complete read above belongs to the
+            # generation guard and must not erase that observation point.
             before = self.state()
         if expected_quarantine_count is not None or expected_quarantine_sha256 is not None:
             quarantine = before.snapshot.get("projection_quarantined") or []

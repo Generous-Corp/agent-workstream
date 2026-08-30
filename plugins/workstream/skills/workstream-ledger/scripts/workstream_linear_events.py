@@ -299,10 +299,15 @@ def ledger_serialization_frontier(
         authenticated_route=authenticated_route,
         current_plan_revision=current_plan_revision,
     )
+    from workstream_generation import generation_ledger_frontier_tokens
+
     frontier = sorted([
         *checkpoint_event_ids,
         *(f"reservation:{item['intent_event']['event_id']}:{item['intent_sha256']}"
           for item, _remote_id in reservations),
+        *generation_ledger_frontier_tokens(
+            comments, workstream_id=workstream_id,
+        ),
     ])
     by_id = {
         comment.get("id"): comment for comment in comments
@@ -547,6 +552,11 @@ def reduce_event_comments(
     comments: list[dict[str, Any]], *, workstream_id: str
 ) -> ReducedEventLog:
     """Reduce a complete comment snapshot, failing closed on ambiguity."""
+    from workstream_generation import generation_quarantined_comment_ids
+
+    quarantined_ids = generation_quarantined_comment_ids(
+        comments, workstream_id=workstream_id,
+    )
     observed: dict[str, tuple[Delta, str, str]] = {}
     for comment in comments:
         body = comment.get("body")
@@ -555,6 +565,8 @@ def reduce_event_comments(
         if not isinstance(body, str):
             raise LinearEventError("malformed_event_marker")
         if EVENT_PREFIX not in body:
+            continue
+        if comment.get("id") in quarantined_ids:
             continue
         matches = EVENT_RE.findall(body)
         if len(matches) != 1 or body.count(EVENT_PREFIX) != 1:
@@ -786,6 +798,22 @@ class LinearCommentEventAdapter:
             )
             if self._observed_authority is None:
                 raise LinearEventError("comment_slot_authority_incomplete")
+            from workstream_generation import (
+                assert_generation_write_authority,
+                assert_no_pending_generation_reservation,
+            )
+            try:
+                assert_no_pending_generation_reservation(
+                    comments, workstream_id=self.issue_id,
+                    authenticated_route=self._observed_authority,
+                )
+                assert_generation_write_authority(
+                    comments, workstream_id=self.issue_id,
+                    plan_revision=self.plan_revision,
+                    authenticated_route=self._observed_authority,
+                )
+            except LinearTransportError as error:
+                raise LinearEventError(str(error)) from error
             frontier = ledger_serialization_frontier(
                 self._checkpoint_frontier(checkpoints), comments,
                 workstream_id=self.issue_id,

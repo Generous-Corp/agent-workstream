@@ -27,7 +27,7 @@ from workstream_linear_checkpoints import (
 )
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
-    LinearProjectionError, projection_slot_id, TOMBSTONE,
+    LinearProjectionError, projection_slot_id, select_plan_generation, TOMBSTONE,
 )
 from workstream_plan import canonical_plan_url, plan_payload, same_plan_document
 from workstream_relation_readback import RelationReadbackError, read_relation_targets
@@ -65,6 +65,54 @@ PREDECESSOR_SEED_BINDING_FIELDS = {
     "material_revision", "material_events_sha256", "checkpoint_event_id",
     "checkpoint_events_sha256", "input_frontier_sha256", "evidence_heads",
 }
+
+
+def bind_projection_plan_generation(
+    graph: dict[str, Any], comments: list[dict[str, Any]], *,
+    workstream_id: str, requested_plan_revision: str,
+    authenticated_route: dict[str, str],
+) -> dict[str, Any]:
+    """Bind projection work to an active or new candidate, never description authority."""
+    result = deepcopy(graph)
+    root = result.get("root") or {}
+    description_revision = root.get("plan_revision")
+    try:
+        selected = select_plan_generation(
+            comments, workstream_id=workstream_id,
+            description_plan_revision=description_revision,
+            authenticated_route=authenticated_route,
+        )
+    except LinearProjectionError as error:
+        if str(error) != "generation_description_plan_missing_bootstrap_required":
+            raise
+        selected = None
+    from workstream_generation import generation_controls
+    controlled_plans = {
+        frontier["plan_revision"] for event in generation_controls(comments)
+        for frontier in (event["value"]["from"], event["value"]["to"])
+    }
+    if (
+        selected is not None
+        and requested_plan_revision != selected["plan_revision"]
+        and requested_plan_revision in controlled_plans
+    ):
+        raise LinearProjectionError(
+            f"generation_projection_plan_retired:{requested_plan_revision}"
+        )
+    result["root"] = dict(root)
+    result["root"]["description_plan_revision"] = description_revision
+    result["root"]["plan_revision"] = requested_plan_revision
+    if selected is not None:
+        result["root"]["generation_transition_tip_event_id"] = selected[
+            "transition_tip_event_id"
+        ]
+        result["root"]["generation_activation_epoch"] = selected[
+            "activation_epoch"
+        ]
+        result["root"]["generation_authority_origin"] = selected[
+            "authority_origin"
+        ]
+    return result
 
 
 def _value_digest(value: Any) -> str:
@@ -3099,8 +3147,6 @@ def main() -> int:
             project_id=route["project_id"],
         )
         graph = transport.snapshot_for_root(token, include_description=True)
-        if graph["root"].get("plan_revision") != plan_revision:
-            raise LinearProjectionError("root_plan_revision_source_bytes_mismatch")
         comment_adapter = LinearCommentEventAdapter(
             client, issue_id=token, workspace_id=route["workspace_id"],
             team_id=route["team_id"], project_id=route["project_id"],
@@ -3111,6 +3157,12 @@ def main() -> int:
             team_id=route["team_id"], project_id=route["project_id"],
             root_issue_id=route["root_issue_id"],
         )
+        comments = comment_adapter.comments()
+        graph = bind_projection_plan_generation(
+            graph, comments, workstream_id=token,
+            requested_plan_revision=plan_revision,
+            authenticated_route=route,
+        )
         projection_state = adapter.state()
         manifest, authenticated_source = synchronize_manifest_source(
             manifest, graph["root"].get("description"), authenticated_source,
@@ -3120,7 +3172,6 @@ def main() -> int:
         manifest = prepare_terminal_child_source_transition(
             manifest, graph, projection_state,
         )
-        comments = comment_adapter.comments()
         manifest = prepare_terminal_child_evidence_seeds(
             manifest, graph, projection_state, remote_head=args.remote_head,
             comments=comments,
@@ -3224,6 +3275,11 @@ def main() -> int:
         )
         validate_canonical_source_readback(
             graph_after["root"].get("description"), authenticated_source,
+        )
+        graph_after = bind_projection_plan_generation(
+            graph_after, comments_after, workstream_id=token,
+            requested_plan_revision=plan_revision,
+            authenticated_route=route,
         )
         graph_after = deepcopy(graph_after)
         graph_after["root"].pop("description", None)
