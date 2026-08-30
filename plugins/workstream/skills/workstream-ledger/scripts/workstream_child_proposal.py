@@ -32,7 +32,7 @@ def _canonical(value: Any) -> bytes:
                       separators=(",", ":")).encode()
 
 
-def proposal_id(kind: str, record: dict[str, Any]) -> str:
+def proposal_id(kind: str, record: Any) -> str:
     return "wscp_" + hashlib.sha256(_canonical([kind, record])).hexdigest()[:32]
 
 
@@ -46,14 +46,16 @@ def proposal_slot_id(child_issue_id: str, proposal: str) -> str:
     return str(uuid.UUID(bytes=bytes(raw)))
 
 
-def _validate_proposal_record(kind: str, record: dict[str, Any]) -> None:
+def _validate_proposal_record(kind: str, record: Any) -> None:
+    if not isinstance(record, dict):
+        raise ValueError("invalid child proposal record")
     if kind == "event":
         required = {
             "created_at", "event_id", "expected_revision", "kind", "payload",
             "source", "workstream_id",
         }
         if (
-            not isinstance(record, dict) or set(record) != required
+            set(record) != required
             or not all(
                 isinstance(record.get(field), str) and record[field]
                 for field in (
@@ -74,7 +76,7 @@ def _validate_proposal_record(kind: str, record: dict[str, Any]) -> None:
     raise ValueError("invalid child proposal kind")
 
 
-def build_proposal(kind: str, record: dict[str, Any], *, child_workstream_id: str,
+def build_proposal(kind: str, record: Any, *, child_workstream_id: str,
                    child_issue_id: str, plan_revision: str) -> dict[str, Any]:
     _validate_proposal_record(kind, record)
     value = {

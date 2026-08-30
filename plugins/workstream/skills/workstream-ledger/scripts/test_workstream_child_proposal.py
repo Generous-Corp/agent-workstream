@@ -53,6 +53,22 @@ class ChildProposalTests(unittest.TestCase):
             "child_issue_id": CHILD, "plan_revision": PLAN,
         }}
 
+    def malformed_body(self, kind, record):
+        value = {
+            "schema_version": 1,
+            "proposal_id": proposal_id(kind, record),
+            "kind": kind, "child_workstream_id": "GEN-38",
+            "child_issue_id": CHILD, "plan_revision": PLAN,
+            "record": record,
+            "record_sha256": hashlib.sha256(_canonical(record)).hexdigest(),
+        }
+        envelope = {
+            "proposal": value,
+            "sha256": hashlib.sha256(_canonical(value)).hexdigest(),
+        }
+        encoded = base64.urlsafe_b64encode(_canonical(envelope)).decode().rstrip("=")
+        return value, f"{PREFIX}{encoded} -->"
+
     def test_append_replay_finds_full_paginated_connection(self):
         proposal = self.proposal(); client = PagedClient(proposal)
         receipt = append_proposal(client, proposal)
@@ -112,6 +128,47 @@ class ChildProposalTests(unittest.TestCase):
         encoded = base64.urlsafe_b64encode(_canonical(envelope)).decode().rstrip("=")
         with self.assertRaisesRegex(LinearTransportError, "malformed_child_proposal"):
             decode_proposal(f"{PREFIX}{encoded} -->")
+
+    def test_non_mapping_supported_records_fail_closed_at_build_and_encode(self):
+        for kind in ("event", "checkpoint"):
+            for record in (None, []):
+                with self.subTest(kind=kind, record=record):
+                    with self.assertRaisesRegex(ValueError, "invalid child proposal record"):
+                        build_proposal(
+                            kind, record, child_workstream_id="GEN-38",
+                            child_issue_id=CHILD, plan_revision=PLAN,
+                        )
+                    value, _ = self.malformed_body(kind, record)
+                    with self.assertRaisesRegex(ValueError, "invalid child proposal record"):
+                        encode_proposal(value)
+
+    def test_non_mapping_supported_records_refuse_decode_pending_and_activation(self):
+        for kind in ("event", "checkpoint"):
+            for record in (None, []):
+                with self.subTest(kind=kind, record=record):
+                    value, body = self.malformed_body(kind, record)
+                    remote = proposal_slot_id(CHILD, value["proposal_id"])
+                    comment = {"id": remote, "body": body}
+                    with self.assertRaisesRegex(
+                        LinearTransportError, "malformed_child_proposal"
+                    ):
+                        decode_proposal(body)
+                    with self.assertRaisesRegex(
+                        LinearTransportError, "malformed_child_proposal"
+                    ):
+                        pending_proposal_obligations(
+                            [comment], [], child_workstream_id="GEN-38",
+                            child_issue_id=CHILD, plan_revision=PLAN,
+                        )
+                    authorization = self.authorization(value, remote)
+                    authorization["value"]["mutation_kind"] = kind
+                    with self.assertRaisesRegex(
+                        LinearTransportError, "malformed_child_proposal"
+                    ):
+                        activated_comments(
+                            [comment], [authorization],
+                            child_workstream_id="GEN-38", child_issue_id=CHILD,
+                        )
 
 
 if __name__ == "__main__":
