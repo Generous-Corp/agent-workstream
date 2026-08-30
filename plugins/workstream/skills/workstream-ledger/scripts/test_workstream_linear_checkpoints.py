@@ -57,7 +57,9 @@ def checkpoint(
 def material_comment(revision: int) -> dict:
     event = Delta(
         f"event-{revision}", "GEN-37", "material_boundary", "system",
-        {"revision": revision}, revision - 1,
+        {"boundary_id": f"boundary-{revision}", "changes": [{
+            "kind": "progress", "payload": {"revision": revision},
+        }]}, revision - 1,
         f"2026-08-20T00:00:{revision:02d}Z",
     )
     return {
@@ -284,7 +286,7 @@ class LinearCheckpointAdapterTests(unittest.TestCase):
                 injected = True
                 event = Delta(
                     "event-2", "GEN-37", "material_boundary", "system",
-                    {"revision": 2}, 1, "2026-08-20T00:00:02Z",
+                    {"boundary_id": "boundary-2", "changes": [{"kind": "progress", "payload": {"revision": 2}}]}, 1, "2026-08-20T00:00:02Z",
                 )
                 client.comments.append({
                     "id": variables["input"]["id"],
@@ -439,7 +441,7 @@ class LinearCheckpointAdapterTests(unittest.TestCase):
             LinearCommentEventAdapter(client, issue_id="GEN-37").apply(
                 Delta(
                     "event-3", "GEN-37", "material_boundary", "system",
-                    {"revision": 3}, 2, "2026-08-20T00:00:03Z",
+                    {"boundary_id": "boundary-3", "changes": [{"kind": "progress", "payload": {"revision": 3}}]}, 2, "2026-08-20T00:00:03Z",
                 )
             )
         writes_after = len([
@@ -458,7 +460,7 @@ class LinearCheckpointAdapterTests(unittest.TestCase):
         receipt = LinearCommentEventAdapter(client, issue_id="GEN-37").apply(
             Delta(
                 "event-3", "GEN-37", "material_boundary", "system",
-                {"revision": 3}, 2, "2026-08-20T00:00:03Z",
+                {"boundary_id": "boundary-3", "changes": [{"kind": "progress", "payload": {"revision": 3}}]}, 2, "2026-08-20T00:00:03Z",
             )
         )
 
@@ -500,7 +502,7 @@ class LinearCheckpointAdapterTests(unittest.TestCase):
             LinearCommentEventAdapter(client, issue_id="GEN-37").apply(
                 Delta(
                     "event-2", "GEN-37", "material_boundary", "system",
-                    {"revision": 2}, 1, "2026-08-20T00:00:02Z",
+                    {"boundary_id": "boundary-2", "changes": [{"kind": "progress", "payload": {"revision": 2}}]}, 1, "2026-08-20T00:00:02Z",
                 )
             )
         writes_after = len([

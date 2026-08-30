@@ -390,6 +390,23 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.31 closes an incident in which two callers encoded flat progress
+payloads while labeling them `material_boundary`. New journal and remote writes
+now require a nonempty boundary ID and one or more exact `{kind, payload}`
+changes. Historical envelopes remain inspectable, but resume will not interpret
+a malformed boundary unless a later reviewed `material_semantic_repair` control
+binds every malformed event and the exact material, checkpoint, projection,
+generation, route, and plan-source frontiers. The repair is append-only: it
+overlays normalized boundaries at their original positions and never edits or
+deletes the original comments. Preview the reviewed manifest first, then apply:
+
+```sh
+workstreamctl material-repair GEN-123 --manifest repair.json \
+  --plan-source ./PLAN.md --plan-identity <canonical-url>
+workstreamctl material-repair GEN-123 --manifest repair.json \
+  --plan-source ./PLAN.md --plan-identity <canonical-url> --apply
+```
+
 ### Durable choice events
 
 Material choices made where the specification was silent are typed immutable

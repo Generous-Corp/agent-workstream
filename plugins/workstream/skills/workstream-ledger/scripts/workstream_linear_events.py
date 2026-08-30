@@ -21,7 +21,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from workstream_checkpoint import CheckpointError, recover_generations
-from workstream_delta import Delta, MutationReceipt, RevisionConflict
+from workstream_delta import (
+    MATERIAL_REPAIR_KIND, Delta, MutationReceipt, RevisionConflict,
+    canonical_sha256, validate_material_event_semantics,
+)
 from workstream_linear import (
     GraphQLClient, HttpGraphQLClient, LinearTransportError, validate_issue_route,
 )
@@ -78,6 +81,8 @@ class ReducedEventLog:
     revision: int
     events: tuple[Delta, ...]
     remote_ids: dict[str, str]
+    raw_events: tuple[Delta, ...] = ()
+    repair_bindings: tuple[dict[str, Any], ...] = ()
 
 
 def ledger_boundary_slot_id(
@@ -501,6 +506,9 @@ def _rebase_compatible_replay(existing: Delta, requested: Delta) -> bool:
 
 
 def encode_event_comment(delta: Delta) -> str:
+    # Historical decode is intentionally envelope-only.  Encoding is the
+    # strict new-write boundary and must reject before a remote call is made.
+    validate_material_event_semantics(delta)
     encoded = base64.urlsafe_b64encode(
         json.dumps(
             _canonical_event(delta),
@@ -600,6 +608,182 @@ def reduce_event_comments(
         revision=len(ordered),
         events=tuple(ordered),
         remote_ids={event_id: item[1] for event_id, item in observed.items()},
+        raw_events=tuple(ordered),
+    )
+
+
+def _body_by_remote_id(comments: list[dict[str, Any]]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for comment in comments:
+        remote_id, body = comment.get("id"), comment.get("body")
+        if isinstance(remote_id, str) and remote_id and isinstance(body, str):
+            if remote_id in result:
+                raise LinearEventError(f"duplicate_remote_comment_id:{remote_id}")
+            result[remote_id] = body
+    return result
+
+
+def material_frontier(log: ReducedEventLog) -> dict[str, Any]:
+    records = [_canonical_event(event) for event in log.raw_events or log.events]
+    ids = [event["event_id"] for event in records]
+    remote_map = {event_id: log.remote_ids[event_id] for event_id in ids}
+    return {
+        "algorithm": "raw-reducer-order-v1",
+        "revision": len(records),
+        "event_ids_reducer_order_sha256": canonical_sha256(ids),
+        "events_sha256": canonical_sha256(records),
+        "remote_map_sha256": canonical_sha256(remote_map),
+    }
+
+
+def apply_material_semantic_repairs(
+    raw: ReducedEventLog, comments: list[dict[str, Any]], *,
+    checkpoint_frontier: dict[str, Any], projection_frontier: dict[str, Any],
+    generation: dict[str, Any], authenticated_route: dict[str, str],
+    authenticated_source: dict[str, Any], issue_graph_frontier: dict[str, Any],
+    ledger_serialization_frontier_value: list[str],
+) -> ReducedEventLog:
+    """Validate repair controls, then overlay replacements at raw positions."""
+    controls = [event for event in raw.events if event.kind == MATERIAL_REPAIR_KIND]
+    business = [event for event in raw.events if event.kind != MATERIAL_REPAIR_KIND]
+    malformed: list[Delta] = []
+    for event in business:
+        try:
+            validate_material_event_semantics(event)
+        except ValueError:
+            malformed.append(event)
+    if not controls:
+        if malformed:
+            raise LinearEventError(
+                f"malformed_material_boundary_unrepaired:{malformed[0].event_id}"
+            )
+        return raw
+    if len(controls) != 1:
+        raise LinearEventError("duplicate_material_semantic_repair")
+    control = controls[0]
+    if not malformed:
+        raise LinearEventError("material_semantic_repair_targets_valid_history")
+    if control.expected_revision != raw.events.index(control):
+        raise LinearEventError("material_semantic_repair_not_at_raw_frontier")
+    payload = control.payload
+    required = {
+        "schema_version", "workstream_id", "target_bindings", "raw_frontier",
+        "checkpoint_frontier", "projection_frontier", "generation",
+        "authenticated_route", "authenticated_source", "issue_graph_frontier",
+        "ledger_serialization_frontier", "review_artifact",
+    }
+    if set(payload) != required or payload.get("schema_version") != 1:
+        raise LinearEventError("malformed_material_semantic_repair")
+    if payload["workstream_id"] != raw.workstream_id:
+        raise LinearEventError("material_semantic_repair_workstream_mismatch")
+    prefix = ReducedEventLog(
+        raw.workstream_id, control.expected_revision,
+        tuple(raw.events[:control.expected_revision]),
+        {event.event_id: raw.remote_ids[event.event_id]
+         for event in raw.events[:control.expected_revision]},
+        tuple(raw.events[:control.expected_revision]),
+    )
+    if payload["raw_frontier"] != material_frontier(prefix):
+        raise LinearEventError("material_semantic_repair_material_frontier_drift")
+    ledger_frontier = payload["ledger_serialization_frontier"]
+    if (
+        not isinstance(ledger_frontier, list)
+        or ledger_frontier != sorted(set(ledger_frontier))
+        or not all(isinstance(item, str) and item for item in ledger_frontier)
+    ):
+        raise LinearEventError("malformed_material_semantic_repair_ledger_frontier")
+    if not set(ledger_frontier).issubset(ledger_serialization_frontier_value):
+        raise LinearEventError("material_semantic_repair_ledger_frontier_drift")
+    # The bound serialization frontier is historical. Later checkpoints may
+    # extend the live frontier, but cannot change the deterministic base slot
+    # occupied by this control. The caller still supplies the current value so
+    # a pre-write preview can require equality; resume validates the occupied
+    # base slot and the separately bound checkpoint prefix.
+    expected_control_slot = ledger_boundary_slot_id(
+        raw.workstream_id, control.expected_revision, ledger_frontier,
+        authenticated_route,
+    )
+    if raw.remote_ids.get(control.event_id) != expected_control_slot:
+        raise LinearEventError("material_semantic_repair_non_base_slot")
+    for name, actual in (
+        ("checkpoint_frontier", checkpoint_frontier),
+        ("projection_frontier", projection_frontier),
+        ("generation", generation),
+        ("authenticated_route", authenticated_route),
+        ("authenticated_source", authenticated_source),
+        ("issue_graph_frontier", issue_graph_frontier),
+    ):
+        if payload[name] != actual:
+            raise LinearEventError(f"material_semantic_repair_{name}_drift")
+    artifact = payload["review_artifact"]
+    if (
+        not isinstance(artifact, dict)
+        or set(artifact) != {
+            "identity", "repository", "commit", "path", "sha256", "reviewed_at",
+        }
+        or not all(isinstance(artifact.get(k), str) and artifact[k]
+                   for k in artifact)
+        or re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"]) is None
+        or re.fullmatch(r"[0-9a-f]{40}", artifact["commit"]) is None
+        or artifact["commit"] not in artifact["identity"]
+    ):
+        raise LinearEventError("malformed_material_semantic_repair_artifact")
+    bindings = payload["target_bindings"]
+    if not isinstance(bindings, list) or not bindings:
+        raise LinearEventError("malformed_material_semantic_repair_targets")
+    bodies = _body_by_remote_id(comments)
+    malformed_ids = {event.event_id for event in malformed}
+    bound: dict[str, dict[str, Any]] = {}
+    positions = {event.event_id: index for index, event in enumerate(raw.events)}
+    events = {event.event_id: event for event in raw.events}
+    binding_fields = {
+        "event_id", "remote_comment_id", "comment_body_sha256",
+        "canonical_event_sha256", "payload_sha256", "original_expected_revision",
+        "original_index_zero_based", "original_applied_revision", "replacement",
+    }
+    for binding in bindings:
+        if not isinstance(binding, dict) or set(binding) != binding_fields:
+            raise LinearEventError("malformed_material_semantic_repair_binding")
+        event_id = binding.get("event_id")
+        if not isinstance(event_id, str) or event_id in bound:
+            raise LinearEventError("duplicate_material_semantic_repair_target")
+        event = events.get(event_id)
+        if event is None or positions[event_id] >= positions[control.event_id]:
+            raise LinearEventError("material_semantic_repair_forward_or_unknown_target")
+        if event_id not in malformed_ids:
+            raise LinearEventError("material_semantic_repair_valid_target")
+        remote_id = raw.remote_ids[event_id]
+        body = bodies.get(remote_id)
+        if (
+            binding["remote_comment_id"] != remote_id
+            or body is None
+            or binding["comment_body_sha256"] != hashlib.sha256(body.encode()).hexdigest()
+            or binding["canonical_event_sha256"] != _canonical_event(event)["sha256"]
+            or binding["payload_sha256"] != canonical_sha256(event.payload)
+            or binding["original_expected_revision"] != event.expected_revision
+            or binding["original_index_zero_based"] != positions[event_id]
+            or binding["original_applied_revision"] != positions[event_id] + 1
+        ):
+            raise LinearEventError("material_semantic_repair_target_drift")
+        replacement = Delta(
+            event.event_id, event.workstream_id, "material_boundary", event.source,
+            binding["replacement"], event.expected_revision, event.created_at,
+        )
+        try:
+            validate_material_event_semantics(replacement)
+        except ValueError as error:
+            raise LinearEventError("malformed_material_semantic_repair_replacement") from error
+        bound[event_id] = {**binding, "replacement_event": replacement}
+    if set(bound) != malformed_ids:
+        raise LinearEventError("material_semantic_repair_incomplete_target_set")
+    effective = tuple(
+        bound[event.event_id]["replacement_event"] if event.event_id in bound else event
+        for event in raw.events
+    )
+    return ReducedEventLog(
+        raw.workstream_id, raw.revision, effective, dict(raw.remote_ids),
+        tuple(raw.events), tuple({k: v for k, v in item.items()
+                                 if k != "replacement_event"} for item in bound.values()),
     )
 
 
@@ -786,6 +970,10 @@ class LinearCommentEventAdapter:
                     _event_applied_revision(before, delta.event_id),
                     existing_id,
                 )
+            try:
+                validate_material_event_semantics(delta)
+            except ValueError as error:
+                raise LinearEventError(str(error)) from error
             if delta.expected_revision != before.revision:
                 raise RevisionConflict(
                     f"expected revision {delta.expected_revision}, "

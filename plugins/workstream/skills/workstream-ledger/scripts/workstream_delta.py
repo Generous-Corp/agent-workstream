@@ -21,6 +21,73 @@ from pathlib import Path
 from typing import Any, Protocol
 
 
+MATERIAL_REPAIR_KIND = "material_semantic_repair"
+
+
+def canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def validate_material_event_semantics(delta: "Delta") -> None:
+    """Validate semantics required for every newly persisted material event.
+
+    Historical decoding deliberately does not call this function.  That split
+    lets a malformed, digest-valid v1 envelope remain inspectable long enough
+    to be repaired without allowing another writer to reproduce the bug.
+    """
+    if delta.kind == MATERIAL_REPAIR_KIND:
+        required = {
+            "schema_version", "workstream_id", "target_bindings", "raw_frontier",
+            "checkpoint_frontier", "projection_frontier", "generation",
+            "authenticated_route", "authenticated_source", "issue_graph_frontier",
+            "ledger_serialization_frontier", "review_artifact",
+        }
+        payload = delta.payload
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != required
+            or payload.get("schema_version") != 1
+            or payload.get("workstream_id") != delta.workstream_id
+            or not isinstance(payload.get("target_bindings"), list)
+            or not payload["target_bindings"]
+        ):
+            raise ValueError("malformed_material_semantic_repair")
+        return
+    if delta.kind != "material_boundary":
+        return
+    payload = delta.payload
+    if not isinstance(payload, dict):
+        raise ValueError("malformed_material_boundary:payload")
+    boundary_id = payload.get("boundary_id")
+    changes = payload.get("changes")
+    if not isinstance(boundary_id, str) or not boundary_id.strip():
+        raise ValueError("malformed_material_boundary:boundary_id")
+    if not isinstance(changes, list) or not changes:
+        raise ValueError("malformed_material_boundary:changes")
+    for change in changes:
+        if (
+            not isinstance(change, dict)
+            or set(change) != {"kind", "payload"}
+            or not isinstance(change.get("kind"), str)
+            or not change["kind"].strip()
+            or not isinstance(change.get("payload"), dict)
+        ):
+            raise ValueError("malformed_material_boundary:change")
+
+
+def interpret_material_event(delta: "Delta") -> tuple[tuple[str, dict[str, Any]], ...]:
+    """Return the semantic changes represented by one validated event."""
+    validate_material_event_semantics(delta)
+    if delta.kind == MATERIAL_REPAIR_KIND:
+        return ()
+    if delta.kind != "material_boundary":
+        return ((delta.kind, delta.payload),)
+    return tuple((change["kind"], change["payload"])
+                 for change in delta.payload["changes"])
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -152,6 +219,11 @@ class DeltaJournal:
             raise ValueError(f"unsupported material-delta source: {source}")
         if expected_revision < 0:
             raise ValueError("expected_revision must be non-negative")
+        candidate = Delta(
+            event_id or "pending", workstream_id, kind, source, payload,
+            expected_revision, "pending",
+        )
+        validate_material_event_semantics(candidate)
         event_id = event_id or event_id_for(
             workstream_id, kind, payload, expected_revision, source=source
         )
@@ -199,9 +271,6 @@ class DeltaJournal:
             return None
         if not boundary_id:
             raise ValueError("boundary_id is required")
-        for change in changes:
-            if not isinstance(change, dict) or not change.get("kind") or "payload" not in change:
-                raise ValueError("each boundary change needs kind and payload")
         payload: dict[str, Any] = {
             "boundary_id": boundary_id,
             "changes": changes,
