@@ -564,7 +564,7 @@ class ProjectionTests(unittest.TestCase):
             "children": [],
         }
 
-    def mixed_head_plan_generation_fixture(self):
+    def mixed_head_plan_generation_fixture(self, *, current_secondary=False):
         predecessor_plan = "b" * 64
         first_head = "1" * 40
         second_head = "2" * 40
@@ -574,6 +574,8 @@ class ProjectionTests(unittest.TestCase):
             plan_revision=predecessor_plan, **AUTHORITY,
         )
         identifiers = ["GEN-38", "GEN-39", "GEN-40", "GEN-41", "GEN-85"]
+        if current_secondary:
+            identifiers.append("GEN-42")
         children = []
         for offset, identifier in enumerate(identifiers, start=1):
             children.append({
@@ -648,8 +650,32 @@ class ProjectionTests(unittest.TestCase):
             contracts[contract["slice_id"]] = contract
         second_scope = deepcopy(predecessor_scope)
         second_scope["repositories"][0]["exact_head"] = second_head
+        if current_secondary:
+            shipyard = deepcopy(second_scope["repositories"][0])
+            shipyard.update({
+                "provider_repository_id": "shipyard-id",
+                "slug": "github.com/acme/shipyard",
+                "exact_head": "d513461fed3571a18f748aa9dd939d5c431ee957",
+                "identity_resolution": {
+                    "provider_repository_id": "shipyard-id",
+                    "resolved_slug": "github.com/acme/shipyard",
+                    "observed_at": "2026-08-29T20:00:00Z",
+                    "evidence": [{
+                        "kind": "authenticated_provider_readback",
+                        "authenticated": True,
+                        "provider_repository_id": "shipyard-id",
+                        "resolved_slug": "github.com/acme/shipyard",
+                    }],
+                },
+            })
+            second_scope["repositories"].append(shipyard)
+            second_scope["child_ownership"]["GEN-42"] = (
+                "github.com:id:shipyard-id"
+            )
         append("scope", "root", second_scope)
-        child = children[-1]
+        child = next(
+            item for item in children if item["identifier"] == "GEN-85"
+        )
         contract = evidence_contract()
         contract["slice_id"] = "gen-85-terminal"
         contract["owning_child"] = "GEN-85"
@@ -675,6 +701,42 @@ class ProjectionTests(unittest.TestCase):
             "child_readback_sha256": canonical_digest(readback),
         })
         contracts[contract["slice_id"]] = contract
+        if current_secondary:
+            child = next(
+                item for item in children if item["identifier"] == "GEN-42"
+            )
+            contract = evidence_contract()
+            contract.update({
+                "slice_id": "gen-42-terminal",
+                "owning_child": "GEN-42",
+                "plan_revision": predecessor_plan,
+                "repository": "github.com/acme/shipyard",
+                "repository_key": "github.com:id:shipyard-id",
+                "exact_head": shipyard["exact_head"],
+            })
+            for layer in contract["layers"].values():
+                for receipt in layer.get("receipts", []):
+                    receipt.update({
+                        "repository_key": "github.com:id:shipyard-id",
+                        "exact_head": shipyard["exact_head"],
+                    })
+            append("evidence_contract", contract["slice_id"], contract)
+            evidence_event = predecessor.state().events[-1]
+            readback = terminal_child_readback(child)
+            append("child_closure", "GEN-42", {
+                "schema_version": 2, **readback,
+                "plan_revision": predecessor_plan,
+                "repository_key": contract["repository_key"],
+                "exact_head": shipyard["exact_head"],
+                "evidence_heads": [{
+                    "key": evidence_event["key"],
+                    "event_id": evidence_event["event_id"],
+                    "value_sha256": canonical_digest(evidence_event["value"]),
+                }],
+                "evidence_receipts_sha256": evidence_receipts_sha256([contract]),
+                "child_readback_sha256": canonical_digest(readback),
+            })
+            contracts[contract["slice_id"]] = contract
 
         material = Delta(
             "plan-transition", "GEN-37", "requirement", "agent",
@@ -736,7 +798,7 @@ class ProjectionTests(unittest.TestCase):
                 "expected_assignee_id": child["assignee"]["id"],
                 "evidence_keys": [f"{child['identifier'].lower()}-terminal"],
             }
-            for child in children
+            for child in sorted(children, key=lambda item: item["identifier"])
         ]
         binding, _authorities = terminal_child_evidence_seed_predecessor_contract(
             graph, current.state(), client.comments, workstream_id="GEN-37",
@@ -793,6 +855,93 @@ class ProjectionTests(unittest.TestCase):
             return result
 
         client.execute = execute
+
+    def test_generation_carry_accepts_five_historical_and_one_current_head(self):
+        client, current, _source, graph, _children, manifest, binding = (
+            self.mixed_head_plan_generation_fixture(current_secondary=True)
+        )
+        self.assertEqual(
+            [item["child_identifier"] for item in binding["evidence_heads"]],
+            ["GEN-38", "GEN-39", "GEN-40", "GEN-41", "GEN-42", "GEN-85"],
+        )
+        prepared = prepare_terminal_child_evidence_seeds(
+            manifest, graph, current.state(), remote_head=HEAD,
+            comments=client.comments,
+        )
+        self.assertEqual(
+            prepared["terminal_child_evidence_seed_predecessor"], binding,
+        )
+        self.assertEqual(
+            sum(
+                "predecessor_closure_authority" in item["value"]
+                for item in prepared["projection"]
+                if item["kind"] == "evidence_contract"
+            ),
+            6,
+        )
+
+        predecessor_plan = "b" * 64
+        scope_value = next(
+            item["value"] for item in manifest["projection"]
+            if (item["kind"], item["key"]) == ("scope", "root")
+        )
+        contracts = {
+            item["key"]: item["value"] for item in manifest["projection"]
+            if item["kind"] == "evidence_contract"
+        }
+        seeds = manifest["terminal_child_evidence_seeds"]
+
+        def contract(candidate_graph, candidate_contracts=contracts):
+            return terminal_child_evidence_seed_predecessor_contract(
+                candidate_graph, current.state(), client.comments,
+                workstream_id="GEN-37",
+                predecessor_plan_revision=predecessor_plan,
+                desired_scope=scope_value, seeds=seeds,
+                desired_contracts=candidate_contracts,
+            )
+
+        duplicate = deepcopy(graph)
+        duplicate["children"].append(next(
+            deepcopy(child) for child in graph["children"]
+            if child["identifier"] == "GEN-42"
+        ))
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_seed_predecessor_child_ambiguous:GEN-42",
+        ):
+            contract(duplicate)
+
+        stale = deepcopy(graph)
+        next(
+            child for child in stale["children"]
+            if child["identifier"] == "GEN-42"
+        )["assignee"] = {"id": "different-owner"}
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_seed_predecessor_evidence_not_authorized:GEN-42",
+        ):
+            contract(stale)
+
+        wrong_head = deepcopy(contracts)
+        wrong_head["gen-42-terminal"]["exact_head"] = "0" * 40
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_seed_predecessor_contract_mutated:GEN-42",
+        ):
+            contract(graph, wrong_head)
+
+        (reconcile_client, reconcile_current, reconcile_source,
+         reconcile_graph, _reconcile_children, reconcile_manifest,
+         reconcile_binding) = self.mixed_head_plan_generation_fixture(
+             current_secondary=True,
+         )
+        result = self.run_mixed_head_seed_reconcile(
+            reconcile_client, reconcile_current, reconcile_source,
+            reconcile_graph, reconcile_manifest, reconcile_binding,
+        )
+        self.assertFalse(result["resume_authority_verified"])
+        self.assertEqual(result["projection_revision"], 10)
+        self.assertEqual(len(result["writes"]), 10)
 
     def run_mixed_head_seed_reconcile(
         self, client, adapter, source, graph, manifest, binding,
