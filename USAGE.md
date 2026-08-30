@@ -57,6 +57,10 @@ The agent runs `workstreamctl tab-title GEN-123` after intake or resume. It
 appends the token to an existing human-readable title, does nothing when that
 token is already present, and refuses to overwrite a different workstream
 token. Outside cmux, the command exits successfully without changing anything.
+Codex or Claude may separately rename its own provider session/thread; that
+message does not rename a cmux or HerdR tab and is never copied into one by
+Agent Workstream. Manager-tab binding requires a successfully resolved stable
+workstream token.
 
 Useful follow-ups are:
 
