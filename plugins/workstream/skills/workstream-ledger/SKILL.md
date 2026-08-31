@@ -390,6 +390,11 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.36 keeps inactive target projection, ordinary resume, and their
+prewrite/final fences on the same child-proposal authority. Each live child
+join uses its paired root snapshot; inactive targets explicitly retain the
+selected predecessor while active and genesis resumes use the current plan.
+
 Version 0.4.35 keeps reviewed child proposals and plan-generation changes on
 one root serialization boundary. It preserves predecessor authority while an
 inactive target is validated, binds every child/proposal/authorization identity
