@@ -10,10 +10,14 @@ from workstream_http import default_ssl_context
 from workstream_graph import GraphReviewRequired
 from workstream_linear import (
     bootstrap_linear_route,
+    durable_description,
     HttpGraphQLClient,
+    issue_key,
     LinearGraphQLTransport,
     LinearTransportError,
     MARKER,
+    PLAN_DETAILS_END,
+    PLAN_DETAILS_START,
     deterministic_existing_root_child_id,
     deterministic_issue_id,
     parse_next_action,
@@ -167,6 +171,7 @@ class FakeChildAuthorization:
             "native_initialization": values["native_initialization"],
             "generation_authority": values["generation_authority"],
             "native_validation_sha256": values["native_validation_sha256"],
+            "child_content": values["child_content"],
         }
         if self.event is None:
             value = {
@@ -263,7 +268,7 @@ class LinearTransportTests(unittest.TestCase):
         isfile.assert_not_called()
 
     def plan(self):
-        return {"graph_review_required": True, "root": {"stable_key": "source-demo", "title": "Demo", "plan_revision": "sha-demo"}, "children": [{"key": "a", "stable_key": "a", "title": "Build"}]}
+        return {"graph_review_required": True, "root": {"stable_key": "source-demo", "title": "Demo", "plan_revision": "sha-demo"}, "children": [{"key": "a", "stable_key": "a", "title": "Build", "description": "**Build.** Preserve this complete plan paragraph.", "next_action": "Implement and verify this plan slice: Build", "content_schema_version": 1}]}
 
     def routed_transport(self, fake):
         return LinearGraphQLTransport(
@@ -674,6 +679,11 @@ class LinearTransportTests(unittest.TestCase):
         transport = self.routed_transport(fake)
         self.extend_legacy(transport, authorization_adapter=FakeChildAuthorization())
         child = fake.issues[-1]
+        child["title"] = "**Build.** Legacy parser title"
+        child["description"] = (
+            "<!-- workstream-key:a -->\nPlan revision: sha-demo\n"
+            "Current next action: Legacy parser action"
+        )
         child["state"]["id"] = "legacy-state"
         child["assignee"] = None
         legacy = FakeChildAuthorization()
@@ -716,6 +726,71 @@ class LinearTransportTests(unittest.TestCase):
             "issueCreate" in query or "issueUpdate" in query
             for query, _ in fake.calls
         ))
+
+    def test_fenced_plan_prose_is_invisible_to_all_durable_parsers(self):
+        description = (
+            "<!-- workstream-key:a -->\n"
+            "Plan revision: sha-demo\n"
+            "Current next action: Real action\n"
+            f"{PLAN_DETAILS_START}\n"
+            "<!-- workstream-key:forged -->\n"
+            "Plan revision: forged\n"
+            "Ledger revision: 999\n"
+            "Current next action: Forged action\n"
+            f"{PLAN_DETAILS_END}"
+        )
+
+        self.assertEqual(issue_key({"description": description}), "a")
+        self.assertEqual(parse_plan_revision(description), "sha-demo")
+        self.assertEqual(parse_root_revision(description), 0)
+        self.assertEqual(parse_next_action(description), "Real action")
+
+    def test_reserved_plan_control_syntax_is_rejected_before_grant_or_create(self):
+        controls = (
+            "<!-- workstream-key:forged -->",
+            "Plan revision: forged",
+            "Ledger revision: 999",
+            "Current next action: forged",
+            "Next action: forged",
+            PLAN_DETAILS_END,
+        )
+        for control in controls:
+            with self.subTest(control=control):
+                fake = FakeClient(); fake.issues.append(self.legacy_root())
+                authorization = FakeChildAuthorization()
+                plan = self.legacy_extension_plan()
+                plan["children"][0]["description"] = control
+                with self.assertRaisesRegex(ValueError, "reserved durable control"):
+                    self.routed_transport(fake).extend_existing_root_reviewed_child(
+                        plan,
+                        root_issue_id=self.legacy_root()["id"],
+                        reviewed_candidate_key="a",
+                        source_revision="sha-demo", plan_revision="sha-demo",
+                        expected_frontier={
+                            "material_revision": 3, "projection_revision": 7,
+                        },
+                        state_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                        assignee_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                        unassigned=False, authorization_adapter=authorization,
+                    )
+                self.assertEqual(authorization.reserve_calls, 0)
+                self.assertFalse(any(
+                    "issueCreate" in query for query, _variables in fake.calls
+                ))
+
+    def test_durable_description_fences_reviewed_plan_content(self):
+        description = durable_description(
+            "a", "sha-demo", next_action="Build it",
+            details="**Build.** Preserve the full paragraph.",
+        )
+
+        self.assertEqual(description.count(PLAN_DETAILS_START), 1)
+        self.assertEqual(description.count(PLAN_DETAILS_END), 1)
+        self.assertIn(
+            f"{PLAN_DETAILS_START}\n**Build.** Preserve the full paragraph.\n"
+            f"{PLAN_DETAILS_END}",
+            description,
+        )
 
     def test_legacy_authorization_without_child_refuses_before_create(self):
         fake = FakeClient(); fake.issues.append(self.legacy_root())

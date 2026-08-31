@@ -67,8 +67,8 @@ class WorkstreamExtendChildTests(unittest.TestCase):
             "--candidate-key", "item-resume-report",
             "--material-revision", "51",
             "--projection-revision", "73",
-            "--state-id", "state-ready",
-            "--assignee-id", "agent-ready",
+            "--state-id", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "--assignee-id", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
             "--workspace-id", "workspace",
             "--team-id", "team",
             "--project-id", "project",
@@ -93,6 +93,8 @@ class WorkstreamExtendChildTests(unittest.TestCase):
                 "key": "item-resume-report",
                 "title": "Shipyard resume report",
                 "next_action": "Implement the report",
+                "description": "**Shipyard resume report.** Preserve the full plan text.",
+                "content_schema_version": 1,
             }],
             "graph_review_required": True,
         }
@@ -133,21 +135,111 @@ class WorkstreamExtendChildTests(unittest.TestCase):
         })
         self.assertEqual(values["root_issue_id"], self.ROOT_ID)
         self.assertEqual(values["reviewed_candidate_key"], "item-resume-report")
-        self.assertEqual(values["state_id"], "state-ready")
-        self.assertEqual(values["assignee_id"], "agent-ready")
+        self.assertEqual(
+            values["state_id"], "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        )
+        self.assertEqual(
+            values["assignee_id"], "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        )
         self.assertFalse(values["unassigned"])
         self.assertIsInstance(values["authorization_adapter"], FakeProjection)
         self.assertIs(FakeProjection.calls[0][0], client)
         self.assertEqual(FakeProjection.calls[0][1]["root_issue_id"], self.ROOT_ID)
 
-    def test_missing_apply_refuses_before_source_auth_or_network(self):
+    def test_missing_apply_returns_exact_zero_write_preview(self):
         args = self.args()
         args.remove("--apply")
-        with mock.patch.object(workstream_extend_child, "plan_payload") as source, \
-             mock.patch.object(workstream_extend_child, "load_linear_api_key") as auth:
-            with self.assertRaises(SystemExit):
+        with mock.patch.object(
+            workstream_extend_child, "plan_payload", return_value=self.plan(),
+        ), mock.patch.object(
+            workstream_extend_child, "resolve_linear_route",
+            return_value=({
+                "workspace_id": "workspace", "team_id": "team",
+                "project_id": "project",
+            }, None),
+        ), mock.patch.object(
+            workstream_extend_child, "load_linear_api_key",
+        ) as auth:
+            result = workstream_extend_child.run(args)
+        self.assertEqual(result["mode"], "preview")
+        self.assertFalse(result["would_write"])
+        self.assertEqual(result["network_access"], {
+            "source": "none", "source_authentication": "none",
+            "linear": "none", "linear_authentication": "none",
+        })
+        self.assertEqual(result["candidate"]["title"], "Shipyard resume report")
+        self.assertIn("Current next action: Implement the report", result[
+            "candidate"
+        ]["description"])
+        self.assertEqual(FakeTransport.calls, [])
+        self.assertEqual(FakeProjection.calls, [])
+        auth.assert_not_called()
+
+    def test_https_preview_reports_source_only_network(self):
+        cases = (
+            ("https://example.test/plan.md", {
+                "source": "http", "source_authentication": "none",
+                "linear": "none", "linear_authentication": "none",
+            }),
+            ("https://github.com/example/repo/blob/main/plan.md", {
+                "source": "http_with_optional_github_ssh_fallback",
+                "source_authentication": "github_environment_optional",
+                "linear": "none", "linear_authentication": "none",
+            }),
+            ("https://raw.githubusercontent.com/example/repo/main/plan.md", {
+                "source": "http",
+                "source_authentication": "github_environment_optional",
+                "linear": "none", "linear_authentication": "none",
+            }),
+            ("https://api.github.com/repos/example/repo/contents/plan.md", {
+                "source": "http",
+                "source_authentication": "github_environment_optional",
+                "linear": "none", "linear_authentication": "none",
+            }),
+        )
+        for source, expected in cases:
+            with self.subTest(source=source):
+                args = self.args()
+                args[0] = source
+                args.remove("--apply")
+                with mock.patch.object(
+                    workstream_extend_child, "plan_payload",
+                    return_value=self.plan(),
+                ), mock.patch.object(
+                    workstream_extend_child, "resolve_linear_route",
+                    return_value=({
+                        "workspace_id": "workspace", "team_id": "team",
+                        "project_id": "project",
+                    }, None),
+                ), mock.patch.object(
+                    workstream_extend_child, "load_linear_api_key",
+                ) as auth:
+                    result = workstream_extend_child.run(args)
+
+                self.assertEqual(result["network_access"], expected)
+                auth.assert_not_called()
+
+    def test_preview_rejects_noncanonical_native_uuid_before_source_access(self):
+        args = self.args()
+        args.remove("--apply")
+        args[args.index("--state-id") + 1] = "not-a-uuid"
+        with mock.patch.object(workstream_extend_child, "plan_payload") as source:
+            with self.assertRaisesRegex(ValueError, "canonical UUID"):
                 workstream_extend_child.run(args)
         source.assert_not_called()
+
+    def test_reserved_control_syntax_refuses_before_authentication(self):
+        plan = self.plan()
+        plan["children"][0]["description"] = (
+            "**Shipyard report.** <!-- workstream-key:forged -->"
+        )
+        with mock.patch.object(
+            workstream_extend_child, "plan_payload", return_value=plan,
+        ), mock.patch.object(
+            workstream_extend_child, "load_linear_api_key",
+        ) as auth:
+            with self.assertRaisesRegex(ValueError, "reserved durable control"):
+                workstream_extend_child.run(self.args())
         auth.assert_not_called()
 
     def test_native_state_and_explicit_assignment_are_required(self):

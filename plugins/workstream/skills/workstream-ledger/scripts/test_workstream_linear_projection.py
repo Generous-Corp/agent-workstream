@@ -395,6 +395,11 @@ class ProjectionTests(unittest.TestCase):
                 "source": {"identity": "plan:legacy", "sha256": PLAN},
             },
             "native_validation_sha256": "0" * 64,
+            "child_content": {
+                "schema_version": 1,
+                "title": "Candidate A",
+                "description_sha256": "1" * 64,
+            },
         }
         values.update(overrides)
         return adapter.reserve_child_extension(**values)
@@ -419,8 +424,81 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(first["event"]["value"]["native_initialization"], {
             "state_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "assignee_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
         })
+        self.assertEqual(first["event"]["value"]["child_content"], {
+            "schema_version": 1,
+            "title": "Candidate A",
+            "description_sha256": "1" * 64,
+        })
         self.assertEqual(first["disposition"], "created")
         self.assertEqual(replay["disposition"], "existing")
+
+    def test_child_extension_authorization_binds_exact_content_and_schema(self):
+        client = FakeProjectionClient()
+        adapter = self.authorization_adapter(client)
+        self.reserve_child(adapter)
+
+        for child_content in (
+            {
+                "schema_version": 1, "title": "Changed title",
+                "description_sha256": "1" * 64,
+            },
+            {
+                "schema_version": 1, "title": "Candidate A",
+                "description_sha256": "2" * 64,
+            },
+            {
+                "schema_version": 2, "title": "Candidate A",
+                "description_sha256": "1" * 64,
+            },
+        ):
+            with self.subTest(child_content=child_content):
+                with self.assertRaisesRegex(
+                    LinearProjectionError,
+                    "child_extension_authorization_superseded_or_conflicting|"
+                    "invalid_child_extension_content",
+                ):
+                    self.reserve_child(
+                        adapter, expected_projection_revision=1,
+                        child_content=child_content,
+                    )
+        self.assertEqual(len(client.comments), 1)
+
+    def test_contentless_current_authorization_only_replays_existing_child(self):
+        client = FakeProjectionClient()
+        adapter = self.authorization_adapter(client)
+        current = self.reserve_child(adapter)["event"]
+        contentless_value = {
+            key: value for key, value in current["value"].items()
+            if key != "child_content"
+        }
+        contentless = build_projection_event(
+            workstream_id="GEN-37", kind="child_extension_authorization",
+            key=current["key"], value=contentless_value,
+            plan_revision=PLAN, expected_revision=0,
+            created_at="1970-01-01T00:00:00Z", authority=AUTHORITY,
+        )
+        client.comments[:] = [{
+            "id": projection_slot_id("GEN-37", PLAN, 0, AUTHORITY),
+            "body": encode_projection_comment(contentless),
+            "createdAt": "1970-01-01T00:00:00Z",
+            "updatedAt": "1970-01-01T00:00:00Z",
+        }]
+
+        replay = self.reserve_child(
+            adapter, expected_projection_revision=1, require_existing=True,
+        )
+        self.assertEqual(replay["disposition"], "legacy_content_existing")
+        self.assertEqual(len(client.comments), 1)
+
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "legacy_content_authorization_requires_existing_child",
+        ):
+            self.reserve_child(
+                adapter, expected_projection_revision=1,
+                require_existing=False,
+            )
+        self.assertEqual(len(client.comments), 1)
 
     def test_preexisting_child_requires_preexisting_authorization(self):
         client = FakeProjectionClient()

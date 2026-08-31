@@ -407,6 +407,10 @@ class MaterialRepairCliTests(unittest.TestCase):
                 "children": [{
                     "key": "successor-child", "title": "Successor child",
                     "next_action": "Validate the repaired successor.",
+                    "description": (
+                        "**Successor child.** Validate the repaired successor."
+                    ),
+                    "content_schema_version": 1,
                 }],
             }
             child_result = generation_tests.LinearGraphQLTransport(

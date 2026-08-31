@@ -39,6 +39,9 @@ NEXT_ACTION = re.compile(
     r"(?:\s*\([^)]*\))?\s*:\s*(?:\*\*)?\s*(.+?)\s*(?:\*\*)?\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
+PLAN_DETAILS_START = "<!-- workstream-plan-details:v1:start -->"
+PLAN_DETAILS_END = "<!-- workstream-plan-details:v1:end -->"
+CHILD_CONTENT_SCHEMA_VERSION = 1
 
 
 class LinearTransportError(RuntimeError):
@@ -258,14 +261,76 @@ def marker(key: str) -> str:
     return f"<!-- workstream-key:{key} -->"
 
 
+def canonical_native_uuid(value: str, *, kind: str) -> str:
+    """Validate and normalize one native Linear state or assignee UUID."""
+    if kind not in {"state", "assignee"}:
+        raise ValueError("native UUID kind must be state or assignee")
+    message = f"native child {kind} ID must be a canonical UUID"
+    try:
+        canonical = str(uuid.UUID(value))
+    except (ValueError, AttributeError) as error:
+        raise ValueError(message) from error
+    if canonical != value.lower():
+        raise ValueError(message)
+    return canonical
+
+
+def child_content_authority(
+    *, title: str, description: str, schema_version: int,
+) -> dict[str, Any]:
+    """Bind a reviewed parser schema and exact child content into one grant."""
+    if (
+        schema_version != CHILD_CONTENT_SCHEMA_VERSION
+        or isinstance(schema_version, bool)
+        or not isinstance(title, str)
+        or not title.strip()
+        or not isinstance(description, str)
+        or not description
+    ):
+        raise ValueError("reviewed child content authority is invalid")
+    return {
+        "schema_version": schema_version,
+        "title": title,
+        "description_sha256": hashlib.sha256(
+            description.encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def valid_child_content_authority(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"schema_version", "title", "description_sha256"}
+        and value.get("schema_version") == CHILD_CONTENT_SCHEMA_VERSION
+        and not isinstance(value.get("schema_version"), bool)
+        and isinstance(value.get("title"), str)
+        and bool(value["title"].strip())
+        and re.fullmatch(
+            r"[0-9a-f]{64}", str(value.get("description_sha256", ""))
+        ) is not None
+    )
+
+
+def durable_control_description(description: str | None) -> str:
+    """Return control text with one well-formed plan-prose region removed."""
+    text = description or ""
+    before, start, remainder = text.partition(f"\n{PLAN_DETAILS_START}\n")
+    if not start:
+        return text
+    _details, end, after = remainder.partition(f"\n{PLAN_DETAILS_END}")
+    if not end:
+        return text
+    return before + after
+
+
 def issue_key(issue: dict[str, Any]) -> str | None:
-    match = MARKER.search(issue.get("description") or "")
+    match = MARKER.search(durable_control_description(issue.get("description")))
     return match.group(1) if match else None
 
 
 def parse_next_action(description: str | None) -> str | None:
     """Read the durable next-action field from plain or Markdown issue text."""
-    match = NEXT_ACTION.search(description or "")
+    match = NEXT_ACTION.search(durable_control_description(description))
     if not match:
         return None
     value = match.group(1).strip()
@@ -275,12 +340,12 @@ def parse_next_action(description: str | None) -> str | None:
 
 
 def parse_plan_revision(description: str | None) -> str | None:
-    match = PLAN_REVISION.search(description or "")
+    match = PLAN_REVISION.search(durable_control_description(description))
     return next((value for value in match.groups() if value), None) if match else None
 
 
 def parse_root_revision(description: str | None) -> int:
-    match = ROOT_REVISION.search(description or "")
+    match = ROOT_REVISION.search(durable_control_description(description))
     return int(match.group(1)) if match else 0
 
 
@@ -352,12 +417,26 @@ def durable_description(
     *,
     next_action: str | None = None,
     ledger_revision: int | None = None,
+    details: str | None = None,
 ) -> str:
+    if details is not None and not isinstance(details, str):
+        raise ValueError("reviewed plan details must be text")
+    if details and (
+        PLAN_DETAILS_START in details
+        or PLAN_DETAILS_END in details
+        or MARKER.search(details)
+        or PLAN_REVISION.search(details)
+        or ROOT_REVISION.search(details)
+        or NEXT_ACTION.search(details)
+    ):
+        raise ValueError("reviewed plan details contain reserved durable control syntax")
     lines = [marker(key), f"Plan revision: {plan_revision}"]
     if ledger_revision is not None:
         lines.append(f"Ledger revision: {ledger_revision}")
     if next_action:
         lines.append(f"Current next action: {next_action}")
+    if details:
+        lines.extend([PLAN_DETAILS_START, details, PLAN_DETAILS_END])
     return "\n".join(lines)
 
 
@@ -716,18 +795,20 @@ class LinearGraphQLTransport:
         *,
         issue_id: str,
         stable_key: str,
-        title: str,
+        title: str | None,
         plan_revision: str,
         parent_id: str | None,
         native_initialization: dict[str, Any] | None = None,
+        expected_description: str | None = None,
     ) -> None:
         """Validate every intake-owned immutable field after create or reload."""
         route = self._intake_route()
         description = issue.get("description") or ""
-        markers = MARKER.findall(description)
+        control_description = durable_control_description(description)
+        markers = MARKER.findall(control_description)
         revisions = [
             value
-            for match in PLAN_REVISION.findall(description)
+            for match in PLAN_REVISION.findall(control_description)
             for value in match
             if value
         ]
@@ -739,6 +820,10 @@ class LinearGraphQLTransport:
             raise LinearTransportError(
                 f"intake_identity_collision:{stable_key}:plan_revision"
             )
+        if expected_description is not None and description != expected_description:
+            raise LinearTransportError(
+                f"intake_identity_collision:{stable_key}:description"
+            )
         observed = {
             "id": issue.get("id"),
             "title": issue.get("title"),
@@ -749,12 +834,13 @@ class LinearGraphQLTransport:
         }
         expected = {
             "id": issue_id,
-            "title": title,
             "parent_id": parent_id,
             "project_id": route["project_id"],
             "team_id": route["team_id"],
             "workspace_id": route["workspace_id"],
         }
+        if title is not None:
+            expected["title"] = title
         for field, value in expected.items():
             if observed[field] != value:
                 raise LinearTransportError(
@@ -1070,6 +1156,23 @@ class LinearGraphQLTransport:
         candidate = candidates[0]
         if not isinstance(candidate.get("title"), str) or not candidate["title"].strip():
             raise GraphReviewRequired("reviewed candidate title is invalid")
+        if (
+            candidate.get("content_schema_version")
+            != CHILD_CONTENT_SCHEMA_VERSION
+            or isinstance(candidate.get("content_schema_version"), bool)
+        ):
+            raise GraphReviewRequired(
+                "reviewed candidate content schema is unsupported"
+            )
+        reviewed_description = durable_description(
+            reviewed_candidate_key, plan_revision,
+            next_action=candidate.get("next_action"),
+            details=candidate.get("description"),
+        )
+        reviewed_content = child_content_authority(
+            title=candidate["title"], description=reviewed_description,
+            schema_version=candidate["content_schema_version"],
+        )
         required_frontier = {"material_revision", "projection_revision"}
         if (
             set(expected_frontier) != required_frontier
@@ -1091,21 +1194,11 @@ class LinearGraphQLTransport:
             raise ValueError("a durable child-extension authorization adapter is required")
         if not isinstance(root_issue_id, str) or not root_issue_id.strip():
             raise ValueError("existing root issue ID is required")
-        try:
-            canonical_state_id = str(uuid.UUID(state_id))
-        except (ValueError, AttributeError) as error:
-            raise ValueError("native child state ID must be a canonical UUID") from error
-        if canonical_state_id != state_id.lower():
-            raise ValueError("native child state ID must be a canonical UUID")
+        canonical_state_id = canonical_native_uuid(state_id, kind="state")
         if assignee_id is not None:
-            try:
-                canonical_assignee_id = str(uuid.UUID(assignee_id))
-            except (ValueError, AttributeError) as error:
-                raise ValueError(
-                    "native child assignee ID must be a canonical UUID"
-                ) from error
-            if canonical_assignee_id != assignee_id.lower():
-                raise ValueError("native child assignee ID must be a canonical UUID")
+            canonical_assignee_id = canonical_native_uuid(
+                assignee_id, kind="assignee",
+            )
         else:
             canonical_assignee_id = None
         if (
@@ -1130,12 +1223,6 @@ class LinearGraphQLTransport:
             child_stable_key=reviewed_candidate_key,
         )
         child = next((item for item in current if item.get("id") == child_id), None)
-        if child is not None:
-            self._validate_intake_issue(
-                child, issue_id=child_id, stable_key=reviewed_candidate_key,
-                title=candidate["title"], plan_revision=plan_revision,
-                parent_id=root_issue_id,
-            )
         legacy = authorization_adapter.replay_legacy_child_extension(
             source={"identity": source["identity"], "sha256": source_revision},
             reviewed_candidate_key=reviewed_candidate_key,
@@ -1144,6 +1231,21 @@ class LinearGraphQLTransport:
             authorization_adapter, "replay_legacy_child_extension", None,
         )) else None
         if legacy is not None:
+            if not isinstance(child, dict):
+                raise LinearTransportError(
+                    "legacy_authorization_requires_existing_child"
+                )
+            legacy_value = (legacy.get("event") or {}).get("value")
+            legacy_native = (
+                legacy_value.get("native_initialization")
+                if isinstance(legacy_value, dict) else None
+            )
+            self._validate_intake_issue(
+                child, issue_id=child_id, stable_key=reviewed_candidate_key,
+                title=None, plan_revision=plan_revision,
+                parent_id=root_issue_id,
+                native_initialization=legacy_native,
+            )
             return {
                 "schema_version": 1, "source": source,
                 "plan_revision": plan_revision, "route": route, "root": root,
@@ -1156,6 +1258,13 @@ class LinearGraphQLTransport:
                 "authorization": legacy,
                 "initial_state": "planned_pending_projection",
             }
+        if child is not None:
+            self._validate_intake_issue(
+                child, issue_id=child_id, stable_key=reviewed_candidate_key,
+                title=candidate["title"], plan_revision=plan_revision,
+                parent_id=root_issue_id,
+                expected_description=reviewed_description,
+            )
         native_initialization = {
             "state_id": canonical_state_id,
             "assignee_id": None if unassigned else canonical_assignee_id,
@@ -1287,6 +1396,7 @@ class LinearGraphQLTransport:
                 title=candidate["title"],
                 plan_revision=plan_revision,
                 parent_id=root_issue_id,
+                expected_description=reviewed_description,
             )
         else:
             occupied = next((item for item in current if item.get("id") == child_id), None)
@@ -1298,6 +1408,7 @@ class LinearGraphQLTransport:
                     title=candidate["title"],
                     plan_revision=plan_revision,
                     parent_id=root_issue_id,
+                    expected_description=reviewed_description,
                 )
                 child, disposition = occupied, "converged"
 
@@ -1312,6 +1423,7 @@ class LinearGraphQLTransport:
             native_initialization=native_initialization,
             generation_authority=selected_generation,
             native_validation_sha256=native_validation_sha256,
+            child_content=reviewed_content,
             require_existing=child is not None,
         )
         authorization_event = authorization.get("event")
@@ -1330,6 +1442,7 @@ class LinearGraphQLTransport:
             "native_initialization": native_initialization,
             "generation_authority": selected_generation,
             "native_validation_sha256": native_validation_sha256,
+            "child_content": reviewed_content,
         }
         authorization_value = authorization_event.get("value")
         authorization_disposition = authorization.get("disposition")
@@ -1402,11 +1515,7 @@ class LinearGraphQLTransport:
                 issue_id=child_id,
                 stable_key=reviewed_candidate_key,
                 title=candidate["title"],
-                description=durable_description(
-                    reviewed_candidate_key,
-                    plan_revision,
-                    next_action=candidate.get("next_action"),
-                ),
+                description=reviewed_description,
                 plan_revision=plan_revision,
                 parent_id=root_issue_id,
                 native_initialization=native_initialization,
@@ -1436,6 +1545,7 @@ class LinearGraphQLTransport:
             title=candidate["title"],
             plan_revision=plan_revision,
             parent_id=root_issue_id,
+            expected_description=reviewed_description,
             native_initialization=(
                 None if legacy_authorization else native_initialization
             ),
