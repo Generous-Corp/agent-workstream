@@ -396,6 +396,11 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.40 makes activation preview and apply validate the same exact
+retirement frontier, pending reservations, target checkpoint, prospective
+disposition, and historical replay before the first possible write. Refused or
+aborted activation attempts remain zero-write.
+
 Version 0.4.39 recovers an interrupted terminal-closure projection batch from
 the exact reviewed manifest. Canonical closure prefixes are validated before
 inactive target-source synchronization, while source synchronization and the
