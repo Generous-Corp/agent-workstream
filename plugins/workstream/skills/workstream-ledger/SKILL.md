@@ -396,6 +396,11 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.41 keeps checkpoint-bound generation activation within the standard
+resume budget by digesting only the predecessor child-ledger prefix already
+acknowledged by a stale checkpoint. Current child state and every post-fence
+obligation remain exact; an ahead-of-log stale checkpoint refuses.
+
 Version 0.4.40 makes activation preview and apply validate the same exact
 retirement frontier, pending reservations, target checkpoint, prospective
 disposition, and historical replay before the first possible write. Refused or
