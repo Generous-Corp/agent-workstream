@@ -390,6 +390,12 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.35 keeps reviewed child proposals and plan-generation changes on
+one root serialization boundary. It preserves predecessor authority while an
+inactive target is validated, binds every child/proposal/authorization identity
+before writes, refuses unresolved predecessor proposals, and makes proposal
+publication versus generation activation a deterministic one-winner operation.
+
 Version 0.4.34 adds a reviewed, append-only origin seal for an existing
 scope-owned legacy child whose identity predates deterministic intake. The seal
 freezes its exact direct material/checkpoint prefix, route, parent, source,
