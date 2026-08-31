@@ -9,10 +9,12 @@ import unittest
 from unittest import mock
 
 from workstream_checkpoint import build_checkpoint
+from workstream_child_proposal import _append_proposal, build_proposal
 import workstream_child_checkpoint
 import workstream_child_event
 import workstream_child_proposal_activate
 from workstream_linear import LinearTransportError
+from workstream_linear_events import assert_no_pending_ledger_reservation
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
     projection_slot_id,
@@ -199,10 +201,18 @@ class FakeChildStateClient:
                 "updatedAt": "2026-08-30T00:00:00Z",
             }
             target.append(comment)
-            if item["issueId"] == "GEN-37" and self.transport_error_after_root_append:
+            if (
+                item["issueId"] == "GEN-37"
+                and "workstream-projection:v1" in item["body"]
+                and self.transport_error_after_root_append
+            ):
                 self.transport_error_after_root_append = False
                 raise LinearTransportError("lost response after durable append")
-            if item["issueId"] == "GEN-37" and self.crash_after_root_append:
+            if (
+                item["issueId"] == "GEN-37"
+                and "workstream-projection:v1" in item["body"]
+                and self.crash_after_root_append
+            ):
                 self.crash_after_root_append = False
                 raise SystemExit("death after root activation")
             return {"commentCreate": {"success": True, "comment": deepcopy(comment)}}
@@ -300,7 +310,9 @@ class WorkstreamChildStateTests(unittest.TestCase):
         self.assertEqual(
             client.root_comments[:len(root_comments_before)], root_comments_before,
         )
-        self.assertEqual(len(client.root_comments), len(root_comments_before) + 2)
+        # Each child record now has one root serialization intent followed by
+        # its projection authorization.
+        self.assertEqual(len(client.root_comments), len(root_comments_before) + 4)
         self.assertTrue(all(
             "Run the child acceptance proof." not in comment["body"]
             for comment in client.root_comments
@@ -370,6 +382,50 @@ class WorkstreamChildStateTests(unittest.TestCase):
         self.assertEqual(len(client.root_comments), 3)
         self.assertEqual(client.child_comments, [])
 
+    def test_proposal_wrapper_target_mismatch_cannot_append_root_authority(self):
+        client = FakeChildStateClient()
+        wrong_child = "22222222-2222-4222-8222-222222222222"
+        proposal = build_proposal(
+            "event", {
+                "event_id": "wrong-wrapper-child", "workstream_id": "GEN-38",
+                "kind": "progress", "source": "user_turn", "payload": {},
+                "expected_revision": 0, "created_at": "now",
+            }, child_workstream_id="GEN-38", child_issue_id=wrong_child,
+            plan_revision=PLAN,
+        )
+        receipt = _append_proposal(client, proposal)
+        projection = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **ROUTE, root_issue_id=ROOT_ID,
+        )
+        selected = projection.select_owned_child_generation(
+            description_plan_revision=PLAN, child_workstream_id="GEN-38",
+            child_issue_id=CHILD_ID,
+        )
+        generation = {key: selected[key] for key in (
+            "plan_revision", "description_plan_revision",
+            "transition_tip_event_id", "activation_epoch", "authority_origin",
+            "workstream_id", "authority", "source",
+        )}
+        root_count = len(client.root_comments)
+        with self.assertRaisesRegex(
+            Exception, "child_mutation_proposal_identity_mismatch",
+        ):
+            projection.reserve_child_mutation(
+                proposal=proposal, proposal_remote_id=receipt["remote_id"],
+                child_identity={
+                    "identifier": "GEN-38", "id": CHILD_ID,
+                    "parent_issue_id": ROOT_ID, "route": ROUTE,
+                }, generation_authority=generation,
+                scope_event_id=selected["scope_event_id"],
+                scope_value_sha256=selected["scope_value_sha256"],
+                repository_owner=selected["child_repository_owner"],
+                child_origin=selected["child_origin"],
+                expected_projection_revision=selected["projection_revision"],
+            )
+        self.assertEqual(len(client.root_comments), root_count)
+        self.assertEqual(len(client.child_comments), 1)
+
     def test_unowned_child_refuses_before_comment_write(self):
         client = FakeChildStateClient()
         scope = client.scope_event({})
@@ -403,15 +459,26 @@ class WorkstreamChildStateTests(unittest.TestCase):
             "--payload-json", '{"next_action":"recover"}',
         ]
         route_patch, auth_patch = self.patches()
+        original_reserve = LinearProjectionAdapter.reserve_child_mutation
+        def die_after_proposal(adapter, **kwargs):
+            if kwargs.get("publish_intent"):
+                return original_reserve(adapter, **kwargs)
+            raise OSError("death before activation")
         with route_patch, auth_patch, mock.patch(
             "workstream_linear_projection.LinearProjectionAdapter.reserve_child_mutation",
-            side_effect=OSError("death before activation"),
+            new=die_after_proposal,
         ):
             with self.assertRaisesRegex(OSError, "death before activation"):
                 workstream_child_event.run(args, client_factory=lambda _token: client)
-        self.assertEqual(len(client.root_comments), 3)
+        self.assertEqual(len(client.root_comments), 4)
         self.assertEqual(len(client.child_comments), 1)
         self.assertNotIn("workstream-delta:v1", client.child_comments[0]["body"])
+        with self.assertRaisesRegex(Exception, "ledger_boundary_reserved"):
+            assert_no_pending_ledger_reservation(
+                client.root_comments, workstream_id="GEN-37",
+                authenticated_route={**ROUTE, "root_issue_id": ROOT_ID},
+                current_plan_revision=PLAN,
+            )
         snapshot = {
             "root": {
                 "identifier": "GEN-37", "plan_revision": PLAN,
@@ -591,7 +658,7 @@ class WorkstreamChildStateTests(unittest.TestCase):
                 client_factory=lambda _token: client,
             )
         self.assertEqual(len(client.root_comments), root_count)
-        self.assertEqual(len(client.child_comments), 2)
+        self.assertEqual(len(client.child_comments), 1)
 
     def test_conflicting_explicit_event_id_refuses_before_second_grant(self):
         client = FakeChildStateClient()

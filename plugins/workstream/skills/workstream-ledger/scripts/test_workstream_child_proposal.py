@@ -3,8 +3,9 @@ import base64
 import hashlib
 import unittest
 
+from workstream_checkpoint import build_checkpoint
 from workstream_child_proposal import (
-    _canonical, activated_comments, append_proposal, build_proposal,
+    _append_proposal, _canonical, activated_comments, build_proposal,
     decode_proposal, encode_proposal, pending_proposal_obligations, PREFIX,
     proposal_id, proposal_slot_id,
 )
@@ -71,7 +72,7 @@ class ChildProposalTests(unittest.TestCase):
 
     def test_append_replay_finds_full_paginated_connection(self):
         proposal = self.proposal(); client = PagedClient(proposal)
-        receipt = append_proposal(client, proposal)
+        receipt = _append_proposal(client, proposal)
         self.assertEqual(receipt["disposition"], "existing")
         self.assertEqual([call[1]["after"] for call in client.calls], [None, "next"])
 
@@ -110,6 +111,67 @@ class ChildProposalTests(unittest.TestCase):
             comments, [auth], child_workstream_id="GEN-38",
             child_issue_id=CHILD,
         )), 2)
+
+    def test_global_multi_child_authorizations_filter_only_exact_identity(self):
+        retired = self.proposal()
+        retired_remote = proposal_slot_id(CHILD, retired["proposal_id"])
+        other_child = "33333333-3333-4333-8333-333333333333"
+        other_record = {**RECORD, "event_id": "other", "workstream_id": "GEN-39"}
+        other = build_proposal(
+            "event", other_record, child_workstream_id="GEN-39",
+            child_issue_id=other_child, plan_revision="b" * 64,
+        )
+        other_remote = proposal_slot_id(other_child, other["proposal_id"])
+        other_auth = {"value": {
+            "proposal_id": other["proposal_id"],
+            "proposal_remote_id": other_remote,
+            "record_sha256": other["record_sha256"],
+            "mutation_kind": "event", "child_workstream_id": "GEN-39",
+            "child_issue_id": other_child, "plan_revision": "b" * 64,
+        }}
+        authorizations = [self.authorization(retired, retired_remote), other_auth]
+
+        self.assertEqual(pending_proposal_obligations(
+            [{"id": retired_remote, "body": encode_proposal(retired)}],
+            authorizations, child_workstream_id="GEN-38",
+            child_issue_id=CHILD, plan_revision="b" * 64,
+        ), [])
+        self.assertEqual(len(pending_proposal_obligations(
+            [{"id": other_remote, "body": encode_proposal(other)}],
+            [authorizations[0]], child_workstream_id="GEN-39",
+            child_issue_id=other_child, plan_revision="b" * 64,
+        )), 1)
+
+        mismatched = self.authorization(retired, retired_remote)
+        mismatched["value"]["record_sha256"] = "0" * 64
+        with self.assertRaisesRegex(LinearTransportError, "foreign_child_proposal"):
+            pending_proposal_obligations(
+                [{"id": retired_remote, "body": encode_proposal(retired)}],
+                [mismatched], child_workstream_id="GEN-38",
+                child_issue_id=CHILD, plan_revision="b" * 64,
+            )
+
+    def test_wrapper_and_record_identity_must_match_before_encoding(self):
+        with self.assertRaisesRegex(ValueError, "child proposal identity mismatch"):
+            build_proposal(
+                "event", {**RECORD, "workstream_id": "GEN-39"},
+                child_workstream_id="GEN-38", child_issue_id=CHILD,
+                plan_revision=PLAN,
+            )
+        checkpoint = build_checkpoint(
+            workstream_id="GEN-38", boundary_id="identity", root_revision=0,
+            plan_revision=PLAN, before_status="In Progress",
+            after_status="In Progress", execution={
+                "agent": "test", "provider": "test", "session_id": "test",
+                "machine": "test", "worktree": {"state": "unavailable"},
+            }, exact_head=None, evidence=[], blocker=None,
+            next_action="continue",
+        )
+        with self.assertRaisesRegex(ValueError, "child proposal identity mismatch"):
+            build_proposal(
+                "checkpoint", checkpoint, child_workstream_id="GEN-38",
+                child_issue_id=CHILD, plan_revision="b" * 64,
+            )
 
     def test_decode_refuses_digested_bogus_kind_and_record(self):
         record = {}

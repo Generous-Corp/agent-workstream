@@ -635,6 +635,7 @@ class LinearGraphQLTransport:
         child_comments = result.setdefault("child_comments", {})
         existing = {item.get("id") for item in children}
         expected: dict[str, str] = {}
+        expected_ids_by_token: dict[str, str] = {}
         for event in authorizations:
             value = event["value"]
             issue_id = value["child_issue_id"]
@@ -642,7 +643,11 @@ class LinearGraphQLTransport:
             previous = expected.get(issue_id)
             if previous is not None and previous != token:
                 raise LinearTransportError("authorized_child_identity_ambiguous")
+            previous_issue_id = expected_ids_by_token.get(token)
+            if previous_issue_id is not None and previous_issue_id != issue_id:
+                raise LinearTransportError("authorized_child_identity_ambiguous")
             expected[issue_id] = token
+            expected_ids_by_token[token] = issue_id
         for issue_id, token in sorted(expected.items()):
             if issue_id in existing:
                 continue

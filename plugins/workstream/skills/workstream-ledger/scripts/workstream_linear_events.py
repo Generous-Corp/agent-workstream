@@ -187,6 +187,7 @@ def encode_ledger_reservation(reservation: dict[str, Any]) -> str:
         )
         or reservation["intent_kind"] not in {
             "repository_identity_projection", "repository_identity_history_seal",
+            "child_mutation_projection",
         }
         or not re.fullmatch(
             r"wsp_[0-9a-f]{32}", str(
@@ -230,6 +231,13 @@ def encode_ledger_reservation(reservation: dict[str, Any]) -> str:
             and (
                 intent["kind"] != "identity_history_seal"
                 or intent["key"] != intent["value"].get("sealed_scope_event_id")
+            )
+        )
+        or (
+            reservation["intent_kind"] == "child_mutation_projection"
+            and (
+                intent["kind"] != "child_mutation_authorization"
+                or intent["key"] != intent["value"].get("proposal_id")
             )
         )
         or hashlib.sha256(json.dumps(

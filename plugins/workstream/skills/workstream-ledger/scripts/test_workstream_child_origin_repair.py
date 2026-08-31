@@ -24,7 +24,7 @@ from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
     legacy_child_origin_repairs_from_comments, projection_slot_id,
 )
-from workstream_child_proposal import append_proposal, build_proposal
+from workstream_child_proposal import _append_proposal, build_proposal
 from workstream_resume import add_child_material_history, compact_context
 
 
@@ -589,7 +589,7 @@ class LegacyChildOriginRepairTests(unittest.TestCase):
             "event", record, child_workstream_id="GEN-38",
             child_issue_id=CHILD_ID, plan_revision=PLAN,
         )
-        proposal_receipt = append_proposal(client, proposal)
+        proposal_receipt = _append_proposal(client, proposal)
         checkpoint = build_checkpoint(
             workstream_id="GEN-38", boundary_id="direct-bypass",
             root_revision=48, plan_revision=PLAN,

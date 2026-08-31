@@ -3233,10 +3233,24 @@ class LinearProjectionAdapter:
             raise LinearProjectionError("invalid_generation_reservation_bypass")
         before_comments = self._comments()
         try:
+            from workstream_linear_events import pending_ledger_reservations
             from workstream_generation import (
                 assert_generation_write_authority,
                 assert_no_pending_generation_reservation,
             )
+            material_reservations = pending_ledger_reservations(
+                before_comments, workstream_id=self.workstream_id,
+                authenticated_route=self.authority,
+                current_plan_revision=self.plan_revision,
+            )
+            if material_reservations and not (
+                len(material_reservations) == 1
+                and material_reservations[0]["intent_event"] == event
+            ):
+                raise LinearProjectionError(
+                    "projection_material_boundary_reserved:"
+                    + material_reservations[0]["intent_event"]["event_id"]
+                )
             assert_no_pending_generation_reservation(
                 before_comments, workstream_id=self.workstream_id,
                 authenticated_route=self.authority,
@@ -3944,8 +3958,20 @@ class LinearProjectionAdapter:
         scope_event_id: str, scope_value_sha256: str, repository_owner: str,
         child_origin: dict[str, Any],
         expected_projection_revision: int,
+        publish_intent: bool = False,
     ) -> dict[str, Any]:
-        """Activate one inert child proposal through the root projection CAS."""
+        """Reserve or activate one child proposal through the root CAS."""
+        from workstream_child_proposal import proposal_slot_id
+
+        if (
+            proposal.get("child_workstream_id") != child_identity.get("identifier")
+            or proposal.get("child_issue_id") != child_identity.get("id")
+            or proposal.get("plan_revision") != self.plan_revision
+            or proposal_remote_id != proposal_slot_id(
+                child_identity.get("id"), proposal.get("proposal_id")
+            )
+        ):
+            raise LinearProjectionError("child_mutation_proposal_identity_mismatch")
         comments = self._comments()
         state = reduce_projection_comments(
             comments, workstream_id=self.workstream_id,
@@ -4081,7 +4107,6 @@ class LinearProjectionAdapter:
             raise LinearProjectionError(
                 "child_mutation_projection_frontier_stale_reload_required"
             )
-        self._assert_child_mutation_proposal_value(value, proposal)
         scope_events = [
             item for item in state.events
             if item["kind"] == "scope" and item["key"] == "root"
@@ -4106,10 +4131,125 @@ class LinearProjectionAdapter:
             expected_revision=state.revision,
             created_at="1970-01-01T00:00:00Z", authority=self.authority,
         )
+        reservation = self._reserve_child_mutation_intent(event)
+        if publish_intent:
+            return {
+                "event": event, "reservation": reservation,
+                "disposition": "reserved",
+            }
+        self._assert_child_mutation_proposal_value(value, proposal)
         self.append(event)
-        self._assert_child_mutation_authorization(event, self._comments())
+        after = self._comments()
+        self._assert_child_mutation_authorization(event, after)
         self._assert_child_mutation_proposal(event, proposal)
+        from workstream_linear_events import pending_ledger_reservations
+
+        if any(
+            item["intent_event"] == event for item in pending_ledger_reservations(
+                after, workstream_id=self.workstream_id,
+                authenticated_route=self.authority,
+                current_plan_revision=self.plan_revision,
+            )
+        ):
+            raise LinearProjectionError("child_mutation_reservation_not_released")
         return {"event": event, "disposition": "created"}
+
+    def _reserve_child_mutation_intent(
+        self, event: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Serialize child publication against generation authority changes."""
+        from workstream_generation import assert_no_pending_generation_reservation
+        from workstream_linear_checkpoints import reduce_checkpoint_comments
+        from workstream_linear_events import (
+            encode_ledger_reservation, ledger_boundary_slot_id,
+            ledger_serialization_frontier, pending_ledger_reservations,
+        )
+
+        comments = self._comments()
+        pending = pending_ledger_reservations(
+            comments, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+            current_plan_revision=self.plan_revision,
+        )
+        exact = [item for item in pending if item["intent_event"] == event]
+        if len(exact) == 1:
+            return exact[0]
+        if exact or pending:
+            raise LinearProjectionError("child_mutation_serialization_reserved")
+        assert_no_pending_generation_reservation(
+            comments, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+        )
+        state = reduce_projection_comments(
+            comments, workstream_id=self.workstream_id,
+            expected_plan_revision=self.plan_revision,
+            authenticated_route=self.authority,
+        )
+        if state.revision != event["expected_revision"]:
+            raise LinearProjectionError(
+                "child_mutation_projection_frontier_stale_reload_required"
+            )
+        material = reduce_event_comments(
+            comments, workstream_id=self.workstream_id,
+        )
+        checkpoints = reduce_checkpoint_comments(
+            comments, workstream_id=self.workstream_id,
+        )
+        frontier = ledger_serialization_frontier(
+            sorted(item["event_id"] for item in checkpoints.checkpoints),
+            comments, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+            current_plan_revision=self.plan_revision,
+            material_revision=material.revision,
+        )
+        reservation = {
+            "schema_version": 1, "workstream_id": self.workstream_id,
+            "material_revision": material.revision,
+            "intent_kind": "child_mutation_projection",
+            "plan_revision": self.plan_revision,
+            "projection_revision": state.revision,
+            "projection_frontier_ids": [
+                state.remote_ids[item["event_id"]] for item in state.events
+            ],
+            "frontier_ids": frontier, "authority": self.authority,
+            "intent_event": event,
+            "intent_sha256": hashlib.sha256(_canonical(event)).hexdigest(),
+        }
+        slot = ledger_boundary_slot_id(
+            self.workstream_id, material.revision, frontier, self.authority,
+        )
+        body = encode_ledger_reservation(reservation)
+        self._assert_comment_id_capability()
+        try:
+            response = self.client.execute(COMMENT_CREATE_MUTATION, {"input": {
+                "id": slot, "issueId": self.issue_id, "body": body,
+            }})
+        except (LinearTransportError, OSError, TimeoutError):
+            response = None
+        after = self._comments()
+        observed = [
+            item for item in pending_ledger_reservations(
+                after, workstream_id=self.workstream_id,
+                authenticated_route=self.authority,
+                current_plan_revision=self.plan_revision,
+            )
+            if item["intent_event"] == event
+        ]
+        if len(observed) != 1:
+            raise LinearProjectionError(
+                "child_mutation_serialization_slot_lost_reload_required"
+            )
+        if response is not None:
+            created = response.get("commentCreate") or {}
+            comment = created.get("comment") or {}
+            if (
+                created.get("success") is not True
+                or comment.get("id") != slot or comment.get("body") != body
+            ):
+                raise LinearProjectionError(
+                    "child_mutation_reservation_unconfirmed"
+                )
+        return observed[0]
 
     def _assert_child_mutation_proposal_value(
         self, value: dict[str, Any], proposal: dict[str, Any],

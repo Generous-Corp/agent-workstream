@@ -1711,6 +1711,10 @@ class GenerationTransitionTests(unittest.TestCase):
         self.assertEqual(
             child_history.call_args.kwargs["root_comments"], self.client.comments,
         )
+        self.assertEqual(
+            child_history.call_args.args[0]["root"]["description_plan_revision"],
+            OLD,
+        )
         snapshot_transport.recover_authorized_children.assert_called_once_with(
             snapshot_transport.snapshot_for_root.return_value, [activated_child],
         )

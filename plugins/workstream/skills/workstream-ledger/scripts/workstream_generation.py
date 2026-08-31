@@ -1489,7 +1489,44 @@ def strict_candidate_loader(
                 graph, mutation_authorizations,
             )
         child_comments = graph.pop("child_comments", None)
+        # A predecessor proposal which has not won its root activation is a
+        # real recovery obligation. Activating another generation would make
+        # that proposal ineligible forever, so refuse before constructing or
+        # reserving the candidate. This loader is rerun at every generation
+        # fence, which also catches proposals appearing during preparation.
+        from workstream_child_proposal import pending_proposal_obligations
+
+        pending_predecessor_proposals: list[dict[str, Any]] = []
+        if not isinstance(child_comments, dict):
+            raise WorkstreamGenerationError(
+                "generation_child_comment_collection_missing"
+            )
+        for child in graph.get("children", []):
+            token_value = str(child.get("identifier", "")).upper()
+            comments_for_child = child_comments.get(token_value)
+            if comments_for_child is None:
+                continue
+            pending_predecessor_proposals.extend(
+                pending_proposal_obligations(
+                    comments_for_child, mutation_authorizations,
+                    child_workstream_id=token_value,
+                    child_issue_id=child.get("id"),
+                    plan_revision=selected["plan_revision"],
+                )
+            )
+        if pending_predecessor_proposals:
+            raise WorkstreamGenerationError(
+                "generation_predecessor_child_proposals_pending:"
+                + ",".join(sorted(
+                    item["proposal_id"] for item in pending_predecessor_proposals
+                ))
+            )
         graph["root"]["plan_revision"] = plan_revision
+        # Candidate validation may target an inactive generation. Preserve the
+        # actual description-backed predecessor selector so child proposal
+        # authorizations from that generation remain verifiable while the
+        # candidate graph is evaluated under the target plan.
+        graph["root"]["description_plan_revision"] = description_plan_revision
         selected_checkpoints = None
         if selected["plan_revision"] == plan_revision:
             graph["root"].update({
