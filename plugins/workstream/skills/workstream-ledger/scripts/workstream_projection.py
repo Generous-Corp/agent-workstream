@@ -3484,6 +3484,16 @@ def main() -> int:
                 manifest, graph, projection_state, remote_head=args.remote_head,
                 comments=comments,
             )
+        # A closure batch has the same crash-recovery requirement as an
+        # evidence seed batch: its canonical prefix (including a completed
+        # batch whose final response was lost) must advance the reviewed
+        # contract before inactive-source synchronization compares it with the
+        # live target frontier. The repair validator admits only the exact
+        # ordered closure/scope prefix and rejects every unrelated drift.
+        if manifest.get("terminal_child_repairs"):
+            manifest = prepare_terminal_child_repairs(
+                manifest, graph, projection_state,
+            )
         manifest, authenticated_source = synchronize_manifest_source(
             manifest, description, authenticated_source,
             projection_state.snapshot.get("source"),

@@ -8207,6 +8207,251 @@ class ProjectionTests(unittest.TestCase):
                 )
                 self.assertEqual(len(drift_client.comments), writes_before)
 
+    def test_inactive_candidate_closure_cli_recovers_every_exact_crash_prefix(self):
+        def case():
+            client, current, source, graph, children, seed_manifest, _binding = (
+                self.mixed_head_plan_generation_fixture(current_secondary=True)
+            )
+            predecessor = "b" * 64
+            graph = deepcopy(graph)
+            graph["root"].update({
+                "description": f"Canonical plan: {source['identity']}",
+                "plan_revision": predecessor,
+            })
+            route = dict(AUTHORITY)
+            comments = mock.Mock()
+            comments.comments.side_effect = lambda: [
+                dict(item) for item in client.comments
+            ]
+            transport = mock.Mock()
+            transport.snapshot_for_root.return_value = (
+                live_graph_with_empty_child_comments(graph)
+            )
+            bound = workstream_projection.bind_projection_plan_generation(
+                live_graph_with_empty_child_comments(graph), client.comments,
+                workstream_id="GEN-37", requested_plan_revision=PLAN,
+                authenticated_route=route,
+            )
+            bound = add_live_child_material_history(
+                bound, authenticated_route=route,
+                root_comments=client.comments,
+                proposal_plan_revision=predecessor,
+            )
+            desired_scope = next(
+                item["value"] for item in seed_manifest["projection"]
+                if (item["kind"], item["key"]) == ("scope", "root")
+            )
+            desired_contracts = {
+                item["key"]: item["value"]
+                for item in seed_manifest["projection"]
+                if item["kind"] == "evidence_contract"
+            }
+            binding, _authorities = (
+                terminal_child_evidence_seed_predecessor_contract(
+                    bound, current.state(), client.comments,
+                    workstream_id="GEN-37",
+                    predecessor_plan_revision=predecessor,
+                    desired_scope=desired_scope,
+                    seeds=seed_manifest["terminal_child_evidence_seeds"],
+                    desired_contracts=desired_contracts,
+                )
+            )
+            seed_manifest["terminal_child_evidence_seed_predecessor"] = binding
+            directory = tempfile.TemporaryDirectory()
+            self.addCleanup(directory.cleanup)
+            manifest_path = Path(directory.name) / "manifest.json"
+            argv = [
+                "workstream_projection.py", "GEN-37", str(manifest_path),
+                "--remote-head", HEAD, "--plan-source", "ignored",
+                "--plan-identity", source["identity"],
+                "--max-bytes", "65536", "--max-items", "500",
+            ]
+
+            def invoke(reviewed):
+                manifest_path.write_text(json.dumps(reviewed))
+                output, error = io.StringIO(), io.StringIO()
+                with mock.patch.object(workstream_projection.sys, "argv", argv), \
+                     mock.patch.object(workstream_projection.sys, "stdout", output), \
+                     mock.patch.object(workstream_projection.sys, "stderr", error), \
+                     mock.patch.object(workstream_projection, "plan_payload", return_value={"source": source}), \
+                     mock.patch.object(workstream_projection, "load_linear_api_key", return_value="secret"), \
+                     mock.patch.object(workstream_projection, "HttpGraphQLClient", return_value=client), \
+                     mock.patch.object(workstream_projection, "resolve_linear_route", return_value=(route, None)), \
+                     mock.patch.object(workstream_projection, "resolve_authenticated_issue_route", return_value=route), \
+                     mock.patch.object(workstream_projection, "LinearGraphQLTransport", return_value=transport), \
+                     mock.patch.object(workstream_projection, "LinearCommentEventAdapter", return_value=comments):
+                    code = workstream_projection.main()
+                return code, output.getvalue(), error.getvalue()
+
+            code, _output, error = invoke(seed_manifest)
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(current.state().revision, 10)
+            active = workstream_projection._active_heads(current.state())
+            projection = [
+                {"kind": kind, "key": key, "value": deepcopy(event["value"])}
+                for (kind, key), event in sorted(active.items())
+                if kind != "disposition"
+            ]
+            repairs = []
+            for child in sorted(children, key=lambda item: item["identifier"]):
+                evidence = sorted(
+                    [
+                        {
+                            "key": key,
+                            "event_id": event["event_id"],
+                            "value_sha256": canonical_digest(event["value"]),
+                        }
+                        for (kind, key), event in active.items()
+                        if kind == "evidence_contract"
+                        and event["value"].get("owning_child")
+                        == child["identifier"]
+                    ],
+                    key=lambda item: (item["key"], item["event_id"]),
+                )
+                repairs.append({
+                    "child_identifier": child["identifier"],
+                    "child_issue_id": child["id"],
+                    "expected_child_readback_sha256": canonical_digest(
+                        terminal_child_readback(child)
+                    ),
+                    "expected_assignee_id": child["assignee"]["id"],
+                    "approved_evidence_heads": evidence,
+                })
+            closure_manifest = {
+                **reviewed_manifest(current, projection),
+                "terminal_child_repairs": repairs,
+            }
+            return client, current, closure_manifest, invoke
+
+        def crash_after(client, invoke, manifest, append_limit):
+            original_execute = client.execute
+            append_count = 0
+
+            def interrupted_execute(query, variables):
+                nonlocal append_count
+                response = original_execute(query, variables)
+                if "commentCreate" in query:
+                    append_count += 1
+                    if append_count == append_limit:
+                        raise SystemExit("simulated caller death")
+                return response
+
+            client.execute = interrupted_execute
+            try:
+                try:
+                    result = invoke(manifest)
+                except SystemExit as error:
+                    self.assertRegex(str(error), "simulated caller death")
+                else:
+                    self.fail(f"SystemExit not raised: {result!r}")
+            finally:
+                client.execute = original_execute
+
+        # Every strict prefix of the six canonical closure writes resumes from
+        # the exact originally reviewed manifest, then replays with zero writes.
+        for prefix in range(1, 6):
+            with self.subTest(prefix=prefix):
+                client, current, manifest, invoke = case()
+                crash_after(client, invoke, manifest, prefix)
+                self.assertEqual(current.state().revision, 10 + prefix)
+                code, _output, error = invoke(manifest)
+                self.assertEqual((code, error), (0, ""))
+                self.assertEqual(current.state().revision, 16)
+                writes = len(client.comments)
+                code, output, error = invoke(manifest)
+                self.assertEqual((code, error), (0, ""))
+                self.assertEqual(len(client.comments), writes)
+                self.assertEqual(json.loads(output)["writes"], [])
+
+        # Losing the response to the final closure append is also an exact
+        # replay, not a stale-review error or a seventh write.
+        client, current, manifest, invoke = case()
+        crash_after(client, invoke, manifest, 6)
+        self.assertEqual(current.state().revision, 16)
+        writes = len(client.comments)
+        code, output, error = invoke(manifest)
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(len(client.comments), writes)
+        self.assertEqual(json.loads(output)["writes"], [])
+
+        def source_drift(reviewed):
+            next(item for item in reviewed["projection"]
+                 if item["kind"] == "source")["value"]["sha256"] = "c" * 64
+
+        def scope_drift(reviewed):
+            next(item for item in reviewed["projection"]
+                 if item["kind"] == "scope")["value"]["repositories"][0][
+                     "exact_head"
+                 ] = "f" * 40
+
+        def provenance_drift(reviewed):
+            next(item for item in reviewed["projection"]
+                 if item["kind"] == "provenance")["value"]["session_id"] = "stale"
+
+        def quarantine_drift(reviewed):
+            reviewed["expected_projection_quarantine_count"] = 1
+            reviewed["expected_projection_quarantine_sha256"] = "f" * 64
+
+        def unrelated_drift(reviewed):
+            reviewed["projection"].append({
+                "kind": "provenance", "key": "unrelated",
+                "value": {
+                    "agent": "other", "machine": "M3",
+                    "session_id": "unrelated",
+                    "worktree": {"state": "safe", "head": HEAD},
+                },
+            })
+
+        for label, mutate in (
+            ("source", source_drift), ("scope", scope_drift),
+            ("provenance", provenance_drift),
+            ("quarantine", quarantine_drift),
+            ("unrelated", unrelated_drift),
+        ):
+            with self.subTest(label=label):
+                drift_client, _current, reviewed, drift_invoke = case()
+                crash_after(drift_client, drift_invoke, reviewed, 3)
+                reviewed = deepcopy(reviewed)
+                mutate(reviewed)
+                writes = len(drift_client.comments)
+                code, _output, error = drift_invoke(reviewed)
+                self.assertEqual(code, 2)
+                self.assertTrue(error.startswith("workstream projection refused:"))
+                self.assertEqual(len(drift_client.comments), writes)
+
+        for label, kind, key, value in (
+            ("order", "source", "root", {
+                "identity": "https://example.test/plan", "sha256": PLAN,
+            }),
+            ("unrelated_live", "provenance", "unexpected", {
+                "agent": "other", "machine": "M3",
+                "session_id": "unexpected",
+                "worktree": {"state": "safe", "head": HEAD},
+            }),
+        ):
+            with self.subTest(label=label):
+                drift_client, drift_current, reviewed, drift_invoke = case()
+                crash_after(drift_client, drift_invoke, reviewed, 3)
+                supersedes = None
+                if (kind, key) in workstream_projection._active_heads(
+                    drift_current.state()
+                ):
+                    supersedes = workstream_projection._active_heads(
+                        drift_current.state()
+                    )[(kind, key)]["event_id"]
+                drift_current.append(build_projection_event(
+                    workstream_id="GEN-37", kind=kind, key=key, value=value,
+                    plan_revision=PLAN,
+                    expected_revision=drift_current.state().revision,
+                    created_at="2026-08-30T00:01:00Z", authority=AUTHORITY,
+                    supersedes_event_id=supersedes,
+                ))
+                writes = len(drift_client.comments)
+                code, _output, error = drift_invoke(reviewed)
+                self.assertEqual(code, 2)
+                self.assertIn("projection_review_stale_reload_required", error)
+                self.assertEqual(len(drift_client.comments), writes)
+
     def test_final_live_readback_refuses_concurrent_graph_or_checkpoint_change(self):
         graph = {"root": {"identifier": "GEN-37"}, "children": []}
         changed = {"root": {"identifier": "GEN-37"},
