@@ -736,6 +736,139 @@ class LegacyChildOriginRepairTests(unittest.TestCase):
             )
         self.assertEqual(recovered, [retired])
 
+    def test_mutable_root_updates_preserve_resume_target_and_reserve_authority(self):
+        class MutableRootClient(FakeChildStateClient):
+            def __init__(self):
+                super().__init__()
+                self.mutable = False
+
+            def execute(self, query, variables):
+                result = super().execute(query, variables)
+                if self.mutable:
+                    target = (
+                        result.get("root")
+                        if "query WorkstreamChildTarget" in query
+                        else result.get("issue")
+                        if "query WorkstreamRootOriginNativeReadback" in query
+                        else None
+                    )
+                    if isinstance(target, dict):
+                        target["description"] = (
+                            f"Plan revision: {PLAN}\nLegitimate updated prose"
+                        )
+                        if "state" in target:
+                            target["state"] = {
+                                "id": "state-updated", "name": "Review",
+                                "type": "started",
+                            }
+                            target["assignee"] = {"id": "new-assignee"}
+                return result
+
+        client = self.populate_legacy_history(MutableRootClient())
+        self.seal(client)
+        client.mutable = True
+        event_args = [
+            "GEN-37", "--root-issue-id", ROOT_ID,
+            "--child-workstream-id", "GEN-38", "--child-issue-id", CHILD_ID,
+            "--plan-revision", PLAN, "--workspace-id", "workspace",
+            "--team-id", "team", "--project-id", "project", "--apply",
+            "--kind", "progress", "--source", "agent_discovery",
+            "--expected-revision", "48", "--created-at", "later",
+            "--payload-json", '{"next_action":"continue after root update"}',
+        ]
+        with mock.patch(
+            "workstream_child_target.resolve_linear_route",
+            return_value=(ROUTE, None),
+        ), mock.patch(
+            "workstream_child_target.load_linear_api_key", return_value="secret",
+        ):
+            result = workstream_child_event.run(
+                event_args, client_factory=lambda _token: client,
+            )
+        self.assertEqual(result["authorization"]["disposition"], "created")
+        snapshot = {
+            "root": {
+                "identifier": "GEN-37", "plan_revision": PLAN,
+                "description_plan_revision": PLAN,
+                "url": "https://linear.test/GEN-37", "revision": 4,
+                "status": "Review", "status_type": "started",
+                "next_action": "continue",
+            },
+            "children": [{
+                "id": CHILD_ID, "identifier": "GEN-38", "title": "Child",
+                "url": "https://linear.test/GEN-38",
+                "status": "In Progress", "status_type": "started",
+                "parent": {"id": ROOT_ID}, "project": {"id": "project"},
+                "team": {"id": "team", "organization": {"id": "workspace"}},
+            }],
+        }
+        resumed = compact_context(add_child_material_history(
+            snapshot, {"GEN-38": deepcopy(client.child_comments)},
+            authenticated_route={**ROUTE, "root_issue_id": ROOT_ID},
+            root_comments=deepcopy(client.root_comments),
+        ), "GEN-37")
+        self.assertEqual(
+            resumed["children"][0]["next_action"],
+            "continue after root update",
+        )
+
+    def test_consumer_refuses_root_uuid_route_or_parent_drift(self):
+        class ImmutableRootDriftClient(FakeChildStateClient):
+            def __init__(self):
+                super().__init__()
+                self.drift = None
+
+            def execute(self, query, variables):
+                result = super().execute(query, variables)
+                if (
+                    self.drift is not None
+                    and "query WorkstreamRootOriginNativeReadback" in query
+                ):
+                    root = result["issue"]
+                    if self.drift == "uuid":
+                        root["id"] = "33333333-3333-4333-8333-333333333333"
+                    elif self.drift == "route":
+                        root["team"]["id"] = "other-team"
+                    elif self.drift == "parent":
+                        root["parent"] = {
+                            "id": "44444444-4444-4444-8444-444444444444",
+                            "identifier": "GEN-1",
+                        }
+                return result
+
+        for drift in ("uuid", "route", "parent"):
+            with self.subTest(drift=drift):
+                client = self.populate_legacy_history(ImmutableRootDriftClient())
+                self.seal(client)
+                client.drift = drift
+                before_root = len(client.root_comments)
+                before_child = len(client.child_comments)
+                args = [
+                    "GEN-37", "--root-issue-id", ROOT_ID,
+                    "--child-workstream-id", "GEN-38",
+                    "--child-issue-id", CHILD_ID,
+                    "--plan-revision", PLAN, "--workspace-id", "workspace",
+                    "--team-id", "team", "--project-id", "project", "--apply",
+                    "--kind", "progress", "--source", "agent_discovery",
+                    "--expected-revision", "48", "--created-at", "later",
+                    "--payload-json", "{}",
+                ]
+                with mock.patch(
+                    "workstream_child_target.resolve_linear_route",
+                    return_value=(ROUTE, None),
+                ), mock.patch(
+                    "workstream_child_target.load_linear_api_key",
+                    return_value="secret",
+                ), self.assertRaisesRegex(
+                    Exception,
+                    "child_origin_repair_root_identity_drift|configured team",
+                ):
+                    workstream_child_event.run(
+                        args, client_factory=lambda _token: client,
+                    )
+                self.assertEqual(len(client.root_comments), before_root)
+                self.assertEqual(len(client.child_comments), before_child)
+
 
 if __name__ == "__main__":
     unittest.main()

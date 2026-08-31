@@ -499,10 +499,10 @@ def canonical_root_origin_native_readback(
     return readback, description_fence
 
 
-def validate_existing_child_origin_root_native(
+def validate_existing_child_origin_root_snapshot(
     client: GraphQLClient, repair: dict[str, Any],
 ) -> None:
-    """Revalidate a seal's exact native root fence at a consumer boundary."""
+    """Revalidate the complete reviewed native root immediately before sealing."""
     value = repair["value"]
     result = client.execute(
         ROOT_ORIGIN_NATIVE_QUERY, {"rootId": value["root_issue_id"]},
@@ -519,6 +519,29 @@ def validate_existing_child_origin_root_native(
         or description != value["root_description"]
     ):
         raise LinearProjectionError("child_origin_repair_native_root_drift")
+
+
+def validate_existing_child_origin_root_identity(
+    client: GraphQLClient, repair: dict[str, Any],
+) -> None:
+    """Revalidate only immutable root identity at a later consumer boundary."""
+    value = repair["value"]
+    root = client.execute(
+        ROOT_ORIGIN_NATIVE_QUERY, {"rootId": value["root_issue_id"]},
+    ).get("issue")
+    if (
+        not isinstance(root, dict)
+        or root.get("id") != value["root_issue_id"]
+        or str(root.get("identifier", "")).upper() != repair["workstream_id"]
+        or root.get("parent") is not None
+    ):
+        raise LinearProjectionError("child_origin_repair_root_identity_drift")
+    validate_issue_route(root, **{
+        key: value["route"][key]
+        for key in ("workspace_id", "team_id", "project_id")
+    })
+    if root.get("createdAt") != value["native_root_readback"]["created_at"]:
+        raise LinearProjectionError("child_origin_repair_root_identity_drift")
 
 
 def _immutable(event: dict[str, Any]) -> dict[str, Any]:
@@ -3848,7 +3871,7 @@ class LinearProjectionAdapter:
             child_before, workstream_id=value["child_workstream_id"],
         ) != value.get("child_history"):
             raise LinearProjectionError("child_origin_repair_child_history_changed")
-        validate_existing_child_origin_root_native(self.client, event)
+        validate_existing_child_origin_root_snapshot(self.client, event)
         receipt = self.append(
             event,
             expected_material_revision=value["root_history"][
@@ -4178,7 +4201,7 @@ class LinearProjectionAdapter:
             ]
             if len(matches) != 1:
                 raise LinearProjectionError("child_origin_repair_ambiguous")
-            validate_existing_child_origin_root_native(self.client, matches[0])
+            validate_existing_child_origin_root_identity(self.client, matches[0])
 
     def child_mutation_authorizations(self) -> list[dict[str, Any]]:
         comments = self._comments()
