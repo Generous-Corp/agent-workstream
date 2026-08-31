@@ -1382,7 +1382,7 @@ class ProjectionTests(unittest.TestCase):
         }
         return client, adapter, source, graph, children, manifest
 
-    def gen37_production_shaped_fixture(self):
+    def gen37_production_shaped_fixture(self, *, stale_child_history=False):
         """Build five closures plus two verbose open children and checkpoints."""
         client = FakeProjectionClient()
         adapter = LinearProjectionAdapter(
@@ -1469,14 +1469,33 @@ class ProjectionTests(unittest.TestCase):
             },
         ]
         graph["children"] = [*open_children, *children]
-        child_event = Delta(
+        child_events = [Delta(
             "gen43-progress", "GEN-43", "progress", "agent",
             {"next_action": "Land the M3 adapter, then rerun the continuation canary."},
             0, "2026-08-29T18:10:00Z",
-        )
+        )]
+        if stale_child_history:
+            obligation_kinds = (
+                "blocker", "decision", "decision_required", "followup",
+                "requirement",
+            )
+            child_events.extend(
+                Delta(
+                    f"gen43-obligation-{index}", "GEN-43",
+                    obligation_kinds[index % len(obligation_kinds)], "agent",
+                    {
+                        obligation_kinds[index % len(obligation_kinds)]:
+                        f"historical obligation {index}: " + "x" * 420,
+                    },
+                    index + 1, f"2026-08-29T18:{index + 11:02d}:00Z",
+                )
+                for index in range(30)
+            )
         child_checkpoint = build_checkpoint(
-            workstream_id="GEN-43", boundary_id="gen43-current", root_revision=1,
-            plan_revision=PLAN, before_status="In Progress",
+            workstream_id="GEN-43", boundary_id="gen43-current",
+            root_revision=len(child_events),
+            plan_revision=("f" * 64 if stale_child_history else PLAN),
+            before_status="In Progress",
             after_status="In Progress",
             execution={
                 "agent": "codex", "provider": "openai", "session_id": "session-child",
@@ -1491,7 +1510,11 @@ class ProjectionTests(unittest.TestCase):
             graph,
             {
                 "GEN-43": [
-                    {"id": "gen43-event", "body": encode_event_comment(child_event)},
+                    *[
+                        {"id": f"gen43-event-{index}",
+                         "body": encode_event_comment(event)}
+                        for index, event in enumerate(child_events)
+                    ],
                     {"id": "gen43-checkpoint",
                      "body": encode_checkpoint_comment(child_checkpoint)},
                 ],
@@ -1578,6 +1601,51 @@ class ProjectionTests(unittest.TestCase):
             authenticated_source=source,
         )
         return strict, contracts
+
+    def test_gen37_stale_generation_child_history_is_digest_bound_and_actionable(self):
+        strict, _contracts = self.gen37_production_shaped_fixture(
+            stale_child_history=True,
+        )
+        context = compact_context(
+            strict, "GEN-37", require_projection_authority=True,
+        )
+        encoded = json.dumps(
+            context, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()
+        child = next(
+            item for item in context["children"]
+            if item["identifier"] == "GEN-43"
+        )
+
+        self.assertLessEqual(len(encoded), 24 * 1024)
+        self.assertEqual(context["resume_authority"], "full")
+        self.assertEqual(child["status"], "In Progress")
+        self.assertEqual(
+            child["next_action"],
+            "Land the M3 adapter, then rerun the continuation canary.",
+        )
+        self.assertEqual(child["checkpoint_recovery"]["state"], "stale_plan")
+        self.assertEqual(
+            child["stale_plan_material_obligations"]["checkpoint_root_revision"],
+            31,
+        )
+        self.assertEqual(
+            child["stale_plan_material_obligations"]["acknowledged_count"], 30,
+        )
+        self.assertEqual(
+            child["stale_plan_material_obligations"]["uncheckpointed_count"], 0,
+        )
+        self.assertRegex(
+            child["stale_plan_material_obligations"]["sha256"], r"^[0-9a-f]{64}$",
+        )
+        self.assertEqual(child["uncheckpointed_material_obligations"], [])
+        self.assertEqual(len(context["child_closures"]), 5)
+        self.assertEqual(len(context["evidence_contracts"]), 5)
+        self.assertEqual(context["source"]["sha256"], PLAN)
+        self.assertEqual(context["disposition"]["disposition"], "attach")
+        self.assertEqual(context["latest_checkpoint"]["plan_revision"], PLAN)
+        self.assertEqual(context["provenance"]["worktree_authority_count"], 1)
+        self.assertEqual(context["projection_quarantine"]["count"], 0)
 
     def test_gen37_production_shaped_resume_has_meaningful_budget_headroom(self):
         strict, contracts = self.gen37_production_shaped_fixture()

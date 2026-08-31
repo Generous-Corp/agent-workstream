@@ -795,6 +795,148 @@ class GenerationTransitionTests(unittest.TestCase):
         )
         self.assertEqual(actual, prospective)
 
+    def test_production_shaped_stale_child_compaction_preserves_preview_apply_parity(self):
+        project_full(self.client, NEW)
+        target = adapter(self.client, NEW)
+        state = target.state()
+        prior_scope = next(
+            event for event in state.events
+            if event["kind"] == "scope" and event["key"] == "root"
+        )
+        owned_scope = deepcopy(prior_scope["value"])
+        owned_scope["child_ownership"]["GEN-43"] = "github.com:id:R_repo"
+        target.append(build_projection_event(
+            workstream_id=WORKSTREAM, kind="scope", key="root",
+            value=owned_scope, plan_revision=NEW,
+            expected_revision=state.revision, created_at="owned-scope",
+            supersedes_event_id=prior_scope["event_id"], authority=AUTHORITY,
+        ))
+        checkpoint = self.activation_checkpoint(root_revision=0)
+        kinds = ("blocker", "decision", "decision_required", "followup", "requirement")
+        child_events = [
+            Delta(
+                f"production-obligation-{index}", "GEN-43",
+                kinds[index % len(kinds)], "agent",
+                {kinds[index % len(kinds)]: f"obligation {index}: " + "x" * 420},
+                index, f"2026-08-29T19:{index:02d}:00Z",
+            )
+            for index in range(30)
+        ]
+        stale_checkpoint = build_checkpoint(
+            workstream_id="GEN-43", boundary_id="predecessor-child",
+            root_revision=len(child_events), plan_revision=OLD,
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai", "session_id": "old",
+                "machine": "M3", "worktree": {"state": "unavailable"},
+            }, exact_head=None, evidence=[], blocker=None,
+            next_action="Historical predecessor action.",
+        )
+        graph = {
+            "root": {
+                "id": AUTHORITY["root_issue_id"], "identifier": WORKSTREAM,
+                "url": "https://linear.test/GEN-37", "plan_revision": OLD,
+                "revision": 0, "status": "In Progress",
+                "next_action": "Activate the reviewed generation.",
+            },
+            "children": [{
+                "id": "44444444-4444-4444-8444-444444444444",
+                "identifier": "GEN-43", "url": "https://linear.test/GEN-43",
+                "title": "Physical successor canary", "status": "In Progress",
+                "status_type": "started", "state_id": "started",
+                "next_action": "Run the current physical canary.",
+                "parent": {"id": AUTHORITY["root_issue_id"],
+                           "identifier": WORKSTREAM},
+                "team": {"id": AUTHORITY["team_id"], "organization": {
+                    "id": AUTHORITY["workspace_id"],
+                }},
+                "project": {"id": AUTHORITY["project_id"]},
+            }],
+            "decisions": [],
+            "child_comments": {"GEN-43": [
+                *[
+                    {"id": f"child-event-{index}",
+                     "body": encode_event_comment(event)}
+                    for index, event in enumerate(child_events)
+                ],
+                {"id": "stale-checkpoint",
+                 "body": encode_checkpoint_comment(stale_checkpoint)},
+            ]},
+        }
+        snapshot_transport = MagicMock()
+        snapshot_transport.snapshot_for_root.side_effect = (
+            lambda *_args, **_kwargs: deepcopy(graph)
+        )
+        retirement = self.retirement()
+        contexts = []
+
+        def capture_compact(snapshot, token, **kwargs):
+            result = real_compact_context(snapshot, token, **kwargs)
+            contexts.append(deepcopy(result))
+            return result
+
+        with patch("workstream_generation.plan_payload", return_value={
+            "source": {
+                "identity": f"https://example.test/{NEW}", "sha256": NEW,
+            },
+        }), patch("workstream_generation.LinearGraphQLTransport",
+                  return_value=snapshot_transport), patch(
+            "workstream_generation.compact_context", side_effect=capture_compact,
+        ):
+            strict = strict_candidate_loader(
+                self.client, token=WORKSTREAM, authority=AUTHORITY,
+                plan_source="plan", plan_identity=None,
+                activation_checkpoint=checkpoint,
+                activation_remote_head="e" * 40,
+                activation_created_at="production-preview",
+            )
+            candidates = []
+
+            def recording_loader(plan):
+                receipt = strict(plan)
+                candidates.append(deepcopy(receipt))
+                return receipt
+
+            transport = GenerationTransport(
+                self.client, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
+                authority=AUTHORITY, candidate_loader=recording_loader,
+                legacy_description_plan_revision=OLD,
+            )
+            writes = len(self.client.mutations)
+            preview = transport.preview_activate(
+                target_plan_revision=NEW, created_at="production-preview",
+                retirement=retirement, activation_checkpoint=checkpoint,
+                remote_head="e" * 40,
+            )
+            self.assertEqual(len(self.client.mutations), writes)
+            preview_candidate = deepcopy(preview["candidate"])
+            candidates.clear()
+            transport.activate(
+                target_plan_revision=NEW, created_at="production-preview",
+                retirement=retirement, activation_checkpoint=checkpoint,
+                remote_head="e" * 40,
+            )
+
+        self.assertEqual(candidates[0], preview_candidate)
+        self.assertTrue(contexts)
+        for context in contexts:
+            encoded = json.dumps(
+                context, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            self.assertLessEqual(len(encoded), 24 * 1024)
+            child = context["children"][0]
+            self.assertEqual(child["next_action"], "Run the current physical canary.")
+            self.assertEqual(
+                child["stale_plan_material_obligations"][
+                    "checkpoint_root_revision"
+                ], 30,
+            )
+            self.assertEqual(
+                child["stale_plan_material_obligations"]["acknowledged_count"], 30,
+            )
+            self.assertEqual(child["uncheckpointed_material_obligations"], [])
+
     def test_activation_cli_preview_validates_retirement_and_writes_nothing(self):
         project_full(self.client, NEW)
         checkpoint = self.activation_checkpoint()

@@ -1151,6 +1151,39 @@ class ResumeTests(unittest.TestCase):
                 snapshot, "GEN-37", max_items=2, include_history=True,
             )
 
+    def test_stale_plan_checkpoint_only_summarizes_acknowledged_prefix(self):
+        events = [{
+            "event_id": f"event-{index}", "kind": "requirement",
+            "payload": {"requirement": f"requirement-{index}"},
+        } for index in range(4)]
+        remaining, summary = MODULE._compact_stale_plan_obligations(
+            events, [{"root_revision": 2}],
+        )
+
+        self.assertEqual(remaining, [{
+            "event_id": "event-2", "kind": "requirement",
+            "payload": {"requirement": "requirement-2"},
+        }, {
+            "event_id": "event-3", "kind": "requirement",
+            "payload": {"requirement": "requirement-3"},
+        }])
+        self.assertEqual(summary["checkpoint_root_revision"], 2)
+        self.assertEqual(summary["acknowledged_count"], 2)
+        self.assertEqual(summary["uncheckpointed_count"], 2)
+        changed = copy.deepcopy(events)
+        changed[0]["payload"]["requirement"] = "planted-mutation"
+        _remaining, changed_summary = MODULE._compact_stale_plan_obligations(
+            changed, [{"root_revision": 2}],
+        )
+        self.assertNotEqual(summary["sha256"], changed_summary["sha256"])
+        with self.assertRaisesRegex(
+            MODULE.ResumeError,
+            "child_stale_checkpoint_ahead_of_material_event_log:5>4",
+        ):
+            MODULE._compact_stale_plan_obligations(
+                events, [{"root_revision": 5}],
+            )
+
     def test_resume_preserves_typed_choice_scope_and_relations_when_supplied(self):
         snapshot = self.snapshot()
         snapshot["scope"] = {
