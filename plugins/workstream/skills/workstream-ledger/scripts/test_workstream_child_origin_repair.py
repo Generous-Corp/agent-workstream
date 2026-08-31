@@ -18,6 +18,9 @@ import workstream_child_checkpoint
 import workstream_child_origin_repair
 from workstream_linear_events import encode_event_comment
 from workstream_linear_checkpoints import encode_checkpoint_comment
+from workstream_linear_projection import (
+    build_projection_event, encode_projection_comment, projection_slot_id,
+)
 from workstream_resume import add_child_material_history, compact_context
 
 
@@ -79,6 +82,12 @@ class LegacyChildOriginRepairTests(unittest.TestCase):
             "--writers-retired-at", "2026-08-30T00:59:00Z",
         ]
 
+    def populate_legacy_history(self, client: FakeChildStateClient):
+        populated = self.client()
+        client.root_comments = deepcopy(populated.root_comments)
+        client.child_comments = deepcopy(populated.child_comments)
+        return client
+
     def patches(self):
         return (
             mock.patch(
@@ -114,6 +123,24 @@ class LegacyChildOriginRepairTests(unittest.TestCase):
                     ),
                 )
         return preview, result
+
+    def apply_preview(self, client: FakeChildStateClient, preview):
+        material = json.dumps(
+            preview, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            review = Path(directory) / "review.json"
+            review.write_bytes(material)
+            route_patch, auth_patch = self.patches()
+            with route_patch, auth_patch:
+                return workstream_child_origin_repair.run(
+                    [*self.common(), "--review", str(review),
+                     "--review-identity", REVIEW_IDENTITY, "--apply"],
+                    client_factory=lambda _token: client,
+                    source_loader=lambda _identity, _expected: (
+                        material, REVIEW_IDENTITY,
+                    ),
+                )
 
     def test_reviewed_repair_preserves_legacy_history_and_unlocks_child_event(self):
         client = self.client()
@@ -329,6 +356,196 @@ class LegacyChildOriginRepairTests(unittest.TestCase):
         _preview, result = self.seal(client)
         self.assertEqual(result["receipt"]["disposition"], "created")
         self.assertEqual(len(client.root_comments), 3)
+
+    def test_multiple_origins_across_generations_refuse_without_write(self):
+        client = self.client()
+        first = {
+            "value": {"child_issue_id": CHILD_ID},
+            "plan_revision": "b" * 64,
+        }
+        second = {
+            "value": {"child_issue_id": CHILD_ID},
+            "plan_revision": PLAN,
+        }
+        before = deepcopy(client.root_comments)
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch, mock.patch(
+            "workstream_child_origin_repair.legacy_child_origin_repairs_from_comments",
+            return_value=[first, second],
+        ), self.assertRaisesRegex(Exception, "child_origin_repair_ambiguous"):
+            workstream_child_origin_repair.run(
+                self.common(), client_factory=lambda _token: client,
+            )
+        self.assertEqual(client.root_comments, before)
+
+    def test_reordered_or_changed_reviewed_prefix_refuses_without_write(self):
+        for mutation in ("reordered", "changed"):
+            with self.subTest(mutation=mutation):
+                client = self.client()
+                route_patch, auth_patch = self.patches()
+                with route_patch, auth_patch:
+                    preview = workstream_child_origin_repair.run(
+                        self.common(), client_factory=lambda _token: client,
+                    )
+                if mutation == "reordered":
+                    first = client.child_comments[0]["body"]
+                    client.child_comments[0]["body"] = client.child_comments[1]["body"]
+                    client.child_comments[1]["body"] = first
+                else:
+                    client.child_comments[0]["body"] += " tampered"
+                with self.assertRaisesRegex(
+                    Exception, "child_origin_review_stale|child_history_changed",
+                ):
+                    self.apply_preview(client, preview)
+                self.assertEqual(len(client.root_comments), 2)
+
+    def test_planted_projection_slot_race_refuses_without_seal(self):
+        class SlotRaceClient(FakeChildStateClient):
+            planted = False
+
+            def execute(self, query, variables):
+                if (
+                    "commentCreate" in query
+                    and variables["input"]["issueId"] == "GEN-37"
+                    and not self.planted
+                ):
+                    self.planted = True
+                    winner = build_projection_event(
+                        workstream_id="GEN-37", kind="provenance", key="racer",
+                        value={"agent": "racer", "machine": "M5",
+                               "session_id": "concurrent"},
+                        plan_revision=PLAN, expected_revision=2,
+                        created_at="2026-08-30T01:00:00Z",
+                        authority={**ROUTE, "root_issue_id": ROOT_ID},
+                    )
+                    self.root_comments.append({
+                        "id": variables["input"]["id"],
+                        "body": encode_projection_comment(winner),
+                        "createdAt": winner["created_at"],
+                        "updatedAt": winner["created_at"],
+                    })
+                return super().execute(query, variables)
+
+        client = self.populate_legacy_history(SlotRaceClient())
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch:
+            preview = workstream_child_origin_repair.run(
+                self.common(), client_factory=lambda _token: client,
+            )
+        with self.assertRaisesRegex(
+            Exception, "projection_slot_lost_reload_required",
+        ):
+            self.apply_preview(client, preview)
+        self.assertEqual(len(client.root_comments), 3)
+
+    def test_preflight_root_and_child_append_races_add_no_seal(self):
+        for target in ("root", "child"):
+            with self.subTest(target=target):
+                client = self.client()
+                route_patch, auth_patch = self.patches()
+                with route_patch, auth_patch:
+                    preview = workstream_child_origin_repair.run(
+                        self.common(), client_factory=lambda _token: client,
+                    )
+                if target == "root":
+                    event = build_projection_event(
+                        workstream_id="GEN-37", kind="provenance", key="preflight",
+                        value={"agent": "racer", "machine": "M5",
+                               "session_id": "preflight"},
+                        plan_revision=PLAN, expected_revision=2,
+                        created_at="2026-08-30T00:59:59Z",
+                        authority={**ROUTE, "root_issue_id": ROOT_ID},
+                    )
+                    client.root_comments.append({
+                        "id": projection_slot_id(
+                            event["workstream_id"], event["plan_revision"],
+                            event["expected_revision"], event["authority"],
+                        ),
+                        "body": encode_projection_comment(event),
+                        "createdAt": event["created_at"],
+                        "updatedAt": event["created_at"],
+                    })
+                else:
+                    event = Delta(
+                        event_id="preflight-child", workstream_id="GEN-38",
+                        kind="progress", source="agent_discovery", payload={},
+                        expected_revision=48, created_at="2026-08-30T00:59:59Z",
+                    )
+                    client.child_comments.append({
+                        "id": "preflight-child", "body": encode_event_comment(event),
+                        "createdAt": event.created_at, "updatedAt": event.created_at,
+                    })
+                before_root = len(client.root_comments)
+                with self.assertRaisesRegex(
+                    Exception,
+                    "child_origin_review_stale|child_origin_repair_child_history_changed",
+                ):
+                    self.apply_preview(client, preview)
+                self.assertEqual(len(client.root_comments), before_root)
+
+    def test_postread_root_and_child_append_races_fail_closed(self):
+        class PostreadRaceClient(FakeChildStateClient):
+            def __init__(self, target):
+                super().__init__()
+                self.target = target
+                self.seal_appended = False
+                self.injected = False
+
+            def execute(self, query, variables):
+                if (
+                    "commentCreate" in query
+                    and variables["input"]["issueId"] == "GEN-37"
+                ):
+                    response = super().execute(query, variables)
+                    self.seal_appended = True
+                    return response
+                if self.seal_appended and not self.injected:
+                    if self.target == "root" and "query WorkstreamDeltaComments" in query and variables["issueId"] == "GEN-37":
+                        self.injected = True
+                        event = build_projection_event(
+                            workstream_id="GEN-37", kind="provenance", key="late",
+                            value={"agent": "racer", "machine": "M5",
+                                   "session_id": "postread"},
+                            plan_revision=PLAN, expected_revision=3,
+                            created_at="2026-08-30T01:00:01Z",
+                            authority={**ROUTE, "root_issue_id": ROOT_ID},
+                        )
+                        self.root_comments.append({
+                            "id": projection_slot_id(
+                                event["workstream_id"], event["plan_revision"],
+                                event["expected_revision"], event["authority"],
+                            ),
+                            "body": encode_projection_comment(event),
+                            "createdAt": event["created_at"],
+                            "updatedAt": event["created_at"],
+                        })
+                    elif self.target == "child" and "query WorkstreamDeltaComments" in query and variables["issueId"] == "GEN-38":
+                        self.injected = True
+                        event = Delta(
+                            event_id="late-child", workstream_id="GEN-38",
+                            kind="progress", source="agent_discovery", payload={},
+                            expected_revision=48, created_at="later",
+                        )
+                        self.child_comments.append({
+                            "id": "late-child", "body": encode_event_comment(event),
+                            "createdAt": "later", "updatedAt": "later",
+                        })
+                return super().execute(query, variables)
+
+        for target, error in (
+            ("root", "postread_root_drift"),
+            ("child", "postread_child_drift"),
+        ):
+            with self.subTest(target=target):
+                client = self.populate_legacy_history(PostreadRaceClient(target))
+                route_patch, auth_patch = self.patches()
+                with route_patch, auth_patch:
+                    preview = workstream_child_origin_repair.run(
+                        self.common(), client_factory=lambda _token: client,
+                    )
+                with self.assertRaisesRegex(Exception, error):
+                    self.apply_preview(client, preview)
+                self.assertTrue(client.injected)
 
 
 if __name__ == "__main__":

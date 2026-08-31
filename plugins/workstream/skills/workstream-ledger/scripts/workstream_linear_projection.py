@@ -3788,7 +3788,10 @@ class LinearProjectionAdapter:
         if observed != [event]:
             raise LinearProjectionError("child_origin_repair_readback_mismatch")
         if (
-            projection_prefix_frontier(
+            after.revision != value["expected_projection_revision"] + 1
+            or not after.events
+            or after.events[-1] != event
+            or projection_prefix_frontier(
                 after, after_comments,
                 through_event_id=value["root_projection_prefix"][
                     "through_event_id"
