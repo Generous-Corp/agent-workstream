@@ -3467,7 +3467,12 @@ def main() -> int:
             authenticated_route=route,
         )
         graph = add_live_child_material_history(
-            graph, authenticated_route=route,
+            graph, authenticated_route=route, root_comments=comments,
+            proposal_plan_revision=(
+                generation_binding["selected"] or {
+                    "plan_revision": plan_revision,
+                }
+            )["plan_revision"],
         )
         projection_state = adapter.state()
         manifest, authenticated_source = synchronize_manifest_source(
@@ -3549,6 +3554,12 @@ def main() -> int:
                 transport, comment_adapter, token,
                 include_child_comments=True,
             )
+            live_generation_binding = projection_generation_source_binding(
+                live_comments, workstream_id=token,
+                description_plan_revision=live_graph["root"].get("plan_revision"),
+                requested_plan_revision=plan_revision,
+                authenticated_route=route,
+            )
             live_graph = bind_projection_plan_generation(
                 live_graph, live_comments, workstream_id=token,
                 requested_plan_revision=plan_revision,
@@ -3556,6 +3567,12 @@ def main() -> int:
             )
             live_graph = add_live_child_material_history(
                 live_graph, authenticated_route=route,
+                root_comments=live_comments,
+                proposal_plan_revision=(
+                    live_generation_binding["selected"] or {
+                        "plan_revision": plan_revision,
+                    }
+                )["plan_revision"],
             )
             return projection_input_frontier_sha256(
                 live_graph, live_comments,
@@ -3608,6 +3625,12 @@ def main() -> int:
         validate_canonical_source_readback(
             graph_after["root"].get("description"), description_fence,
         )
+        final_generation_binding = projection_generation_source_binding(
+            comments_after, workstream_id=token,
+            description_plan_revision=graph_after["root"].get("plan_revision"),
+            requested_plan_revision=plan_revision,
+            authenticated_route=route,
+        )
         graph_after = bind_projection_plan_generation(
             graph_after, comments_after, workstream_id=token,
             requested_plan_revision=plan_revision,
@@ -3615,6 +3638,12 @@ def main() -> int:
         )
         graph_after = add_live_child_material_history(
             graph_after, authenticated_route=route,
+            root_comments=comments_after,
+            proposal_plan_revision=(
+                final_generation_binding["selected"] or {
+                    "plan_revision": plan_revision,
+                }
+            )["plan_revision"],
         )
         graph_after = deepcopy(graph_after)
         graph_after["root"].pop("description", None)

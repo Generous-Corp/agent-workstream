@@ -1602,7 +1602,7 @@ class ProjectionTests(unittest.TestCase):
             require_projection_authority=True,
         )
         child_aware = add_live_child_material_history(
-            raw, authenticated_route=AUTHORITY,
+            raw, authenticated_route=AUTHORITY, root_comments=[],
         )
         child_context = compact_context(
             child_aware, "GEN-37", max_bytes=1024 * 1024, max_items=500,
@@ -1643,7 +1643,7 @@ class ProjectionTests(unittest.TestCase):
             "body": encode_checkpoint_comment(checkpoint),
         })
         checkpointed = add_live_child_material_history(
-            checkpointed, authenticated_route=AUTHORITY,
+            checkpointed, authenticated_route=AUTHORITY, root_comments=[],
         )
         resumed = compact_context(
             checkpointed, "GEN-37", max_bytes=cap, max_items=500,
