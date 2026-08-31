@@ -1639,20 +1639,24 @@ def compact_context(
     )
     root = clean["root"]
 
-    def history_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    def history_summary(
+        events: list[dict[str, Any]], *, include_latest: bool = True,
+    ) -> dict[str, Any]:
         encoded = json.dumps(
             events, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ).encode()
         latest = events[-1] if events else None
-        return {
+        summary = {
             "count": len(events),
             "sha256": hashlib.sha256(encoded).hexdigest(),
-            "latest": ({
+        }
+        if include_latest:
+            summary["latest"] = ({
                 key: latest[key]
                 for key in ("event_id", "kind", "key", "created_at")
                 if latest.get(key) is not None
-            } if latest else None),
-        }
+            } if latest else None)
+        return summary
 
     children = []
     child_material_item_count = 0
@@ -1701,9 +1705,12 @@ def compact_context(
     history = {
         "included": include_history,
         "material_events": history_summary(clean["material_events"]),
-        "raw_material_events": history_summary(clean["raw_material_events"]),
-        "material_semantic_repairs": history_summary(
-            clean["material_semantic_repairs"]
+        # Raw events are an audit surface.  Their count and digest prove which
+        # validated history was compacted; the normalized material summary
+        # already carries the actionable latest-event pointer.  Full-history
+        # mode still emits every raw event verbatim.
+        "raw_material_events": history_summary(
+            clean["raw_material_events"], include_latest=False,
         ),
         "projection_events": history_summary(clean["projection_events"]),
         "projection_history": history_summary(clean["projection_history"]),
