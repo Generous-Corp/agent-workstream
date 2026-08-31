@@ -390,6 +390,14 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.34 adds a reviewed, append-only origin seal for an existing
+scope-owned legacy child whose identity predates deterministic intake. The seal
+freezes its exact direct material/checkpoint prefix, route, parent, source,
+generation, scope, ownership, and immutable root identity; later state enters
+only through root-authorized proposals. Direct post-seal markers, ambiguous
+origins, stale review artifacts, native identity drift, and concurrent prefix
+or projection changes fail closed without recreating or reopening the issue.
+
 Version 0.4.33 keeps the default 24 KiB resume surface actionable as material
 repair history grows. Compact output retains the raw-history count and digest
 and the top-level semantic-repair summary without duplicating audit-only latest
@@ -676,6 +684,37 @@ deterministic existing child and writes nothing without consulting current
 workflow-state or assignee providers. Deleted provider identities therefore do
 not invalidate an old completed creation; a missing legacy child still refuses
 before any create.
+
+An older scope-owned child whose root and child IDs predate both deterministic
+intake and extension grants requires one reviewed origin seal; never invent a
+stable key or recreate the issue. Preview the authenticated route, native
+parent, active generation/source/scope, and exact root/child material and
+checkpoint frontiers, review the emitted JSON, then replay it with `--apply`:
+
+```sh
+workstreamctl child-origin-repair GEN-123 \
+  --root-issue-id <root-uuid> --child-workstream-id GEN-124 \
+  --child-issue-id <child-uuid> --plan-revision <sha256> \
+  --workspace-id <uuid> --team-id <uuid> --project-id <uuid> \
+  --created-at <reviewed-utc-time> --custodian <writer-identity> \
+  --writers-retired-at <utc-time> > child-origin-review.json
+# Review this exact file, then publish it at an immutable authenticated URL.
+workstreamctl child-origin-repair GEN-123 \
+  --root-issue-id <root-uuid> --child-workstream-id GEN-124 \
+  --child-issue-id <child-uuid> --plan-revision <sha256> \
+  --workspace-id <uuid> --team-id <uuid> --project-id <uuid> \
+  --created-at <same-reviewed-utc-time> --custodian <same-writer-identity> \
+  --writers-retired-at <same-utc-time> \
+  --review child-origin-review.json --review-identity <immutable-url> --apply
+```
+
+The writer appends exactly one immutable `existing_child_origin_seal`. Exact
+replay is a zero-write readback. Parent/route, source, generation, scope,
+ownership, projection, review artifact, or either issue's reviewed history
+drifting refuses before mutation. Every later child reduction revalidates the
+sealed direct prefix and admits new state only through root-authorized
+proposals. It never creates, reparents, reopens, or updates an issue. The final
+rereads are fail-closed preflights; they do not claim a cross-issue transaction.
 
 The direct resume helper is full-authority by default and fetches the projected
 source identity. `--plan-source` overrides the fetch location for an

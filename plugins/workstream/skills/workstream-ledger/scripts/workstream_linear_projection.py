@@ -30,12 +30,36 @@ from workstream_linear import (
 )
 from workstream_linear_events import (
     COMMENT_CREATE_MUTATION, COMMENTS_QUERY, reduce_event_comments,
+    material_frontier, validate_review_artifact_identity,
 )
 
 
 COMMENT_CREATE_CAPABILITY_QUERY = """
 query WorkstreamProjectionCommentCreateCapability {
   __type(name: "CommentCreateInput") { inputFields { name } }
+}
+"""
+CHILD_ORIGIN_NATIVE_QUERY = """
+query WorkstreamChildOriginNativeReadback($childId: String!) {
+  issue(id: $childId) {
+    id identifier description createdAt
+    parent { id identifier }
+    team { id organization { id } }
+    project { id }
+    state { id name type }
+    assignee { id }
+  }
+}
+"""
+ROOT_ORIGIN_NATIVE_QUERY = """
+query WorkstreamRootOriginNativeReadback($rootId: String!) {
+  issue(id: $rootId) {
+    id identifier description createdAt parent { id identifier }
+    team { id organization { id } }
+    project { id }
+    state { id name type }
+    assignee { id }
+  }
 }
 """
 
@@ -46,7 +70,7 @@ KINDS = {
     "provenance", "disposition", "closure_review", "lifecycle", "cas_activation",
     "quarantine_disposition", "child_closure",
     "child_extension_authorization", "child_dependency_authorization",
-    "child_mutation_authorization",
+    "child_mutation_authorization", "existing_child_origin_seal",
     "identity_history_seal",
     "generation_genesis", "generation_candidate_seal", "generation_transition",
     "generation_abort",
@@ -88,6 +112,14 @@ class LinearProjectionError(LinearTransportError):
     """The remote projection cannot be persisted or reduced without guessing."""
 
 
+def _valid_review_artifact(value: Any) -> bool:
+    try:
+        validate_review_artifact_identity(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _projection_receipt(comment: dict[str, Any]) -> dict[str, Any]:
     return {key: comment.get(key) for key in ("id", "createdAt", "updatedAt", "body")}
 
@@ -124,6 +156,38 @@ def projection_prefix_sha256(
         target.get("authority"), target["workstream_id"], target["plan_revision"],
         target["expected_revision"], prefix,
     ])).hexdigest()
+
+
+def projection_prefix_frontier(
+    state: "ReducedProjection", comments: list[dict[str, Any]],
+    *, through_event_id: str | None = None,
+) -> dict[str, Any]:
+    """Bind the complete projection prefix and exact remote receipts."""
+    events = list(state.events)
+    if not events:
+        raise LinearProjectionError("child_origin_projection_prefix_empty")
+    comments_by_remote = {
+        item.get("id"): item for item in comments
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    comments_by_event = {
+        event["event_id"]: comments_by_remote.get(
+            state.remote_ids.get(event["event_id"])
+        )
+        for event in events
+    }
+    through = through_event_id or events[-1]["event_id"]
+    matching_indexes = [
+        index for index, event in enumerate(events)
+        if event["event_id"] == through
+    ]
+    if len(matching_indexes) != 1:
+        raise LinearProjectionError("child_origin_projection_prefix_missing")
+    return {
+        "revision": matching_indexes[0] + 1,
+        "through_event_id": through,
+        "sha256": projection_prefix_sha256(events, comments_by_event, through),
+    }
 
 
 def _validated_identity_history_seals(
@@ -276,6 +340,208 @@ def _canonical(value: Any) -> bytes:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
+
+
+def child_origin_history_frontier(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+) -> dict[str, Any]:
+    """Digest the exact authoritative material/checkpoint history for review."""
+    from workstream_linear_checkpoints import reduce_checkpoint_comments
+
+    material = reduce_event_comments(comments, workstream_id=workstream_id)
+    checkpoints = reduce_checkpoint_comments(comments, workstream_id=workstream_id)
+    material_values = [
+        {
+            "event_id": item.event_id, "workstream_id": item.workstream_id,
+            "kind": item.kind, "source": item.source, "payload": item.payload,
+            "expected_revision": item.expected_revision,
+            "created_at": item.created_at,
+        }
+        for item in material.events
+    ]
+    checkpoint_values = list(checkpoints.checkpoints)
+    comments_by_id = {
+        item.get("id"): item for item in comments
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+
+    def receipts(event_ids: list[str], remote_ids: dict[str, str]) -> list[dict[str, str]]:
+        result: list[dict[str, str]] = []
+        for event_id in event_ids:
+            remote_id = remote_ids.get(event_id)
+            comment = comments_by_id.get(remote_id)
+            body = comment.get("body") if isinstance(comment, dict) else None
+            if not isinstance(remote_id, str) or not isinstance(body, str):
+                raise LinearProjectionError("child_origin_history_receipt_missing")
+            result.append({
+                "event_id": event_id, "remote_id": remote_id,
+                "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            })
+        return result
+
+    material_ids = [item["event_id"] for item in material_values]
+    checkpoint_ids = [item["event_id"] for item in checkpoint_values]
+    checkpoint_frontier = {
+        "algorithm": "checkpoint-reducer-order-v1",
+        "count": len(checkpoint_values),
+        "revision": max(
+            (item["root_revision"] for item in checkpoint_values), default=0,
+        ),
+        "event_ids_reducer_order_sha256": hashlib.sha256(
+            _canonical(checkpoint_ids)
+        ).hexdigest(),
+        "event_ids_sorted_set_sha256": hashlib.sha256(
+            _canonical(sorted(set(checkpoint_ids)))
+        ).hexdigest(),
+        "checkpoints_sha256": hashlib.sha256(
+            _canonical(checkpoint_values)
+        ).hexdigest(),
+    }
+    return {
+        "material_frontier": material_frontier(material),
+        "material_receipts": receipts(material_ids, material.remote_ids),
+        "checkpoint_frontier": checkpoint_frontier,
+        "checkpoint_receipts": receipts(checkpoint_ids, checkpoints.remote_ids),
+    }
+
+
+def canonical_child_origin_native_readback(
+    child: dict[str, Any], *, child_workstream_id: str, child_issue_id: str,
+    root_workstream_id: str, root_issue_id: str, route: dict[str, str],
+) -> dict[str, Any]:
+    """Validate and compact one authenticated native child readback."""
+    if (
+        not isinstance(child, dict) or child.get("id") != child_issue_id
+        or str(child.get("identifier", "")).upper() != child_workstream_id
+        or (child.get("parent") or {}).get("id") != root_issue_id
+        or str((child.get("parent") or {}).get("identifier", "")).upper()
+        != root_workstream_id
+    ):
+        raise LinearProjectionError("child_origin_repair_native_parent_mismatch")
+    validate_issue_route(child, **route)
+    description = child.get("description")
+    if description is None:
+        description = ""
+    state = child.get("state")
+    assignee = child.get("assignee")
+    if (
+        not isinstance(description, str)
+        or not isinstance(state, dict) or set(state) != {"id", "name", "type"}
+        or not all(isinstance(state.get(field), str) and state[field]
+                   for field in ("id", "name", "type"))
+        or (
+            assignee is not None
+            and (
+                not isinstance(assignee, dict) or set(assignee) != {"id"}
+                or not isinstance(assignee.get("id"), str) or not assignee["id"]
+            )
+        )
+        or not isinstance(child.get("createdAt"), str) or not child["createdAt"]
+    ):
+        raise LinearProjectionError("child_origin_repair_native_readback_incomplete")
+    return {
+        "id": child_issue_id, "identifier": child_workstream_id,
+        "parent": {"id": root_issue_id, "identifier": root_workstream_id},
+        "route": deepcopy(route), "state": deepcopy(state),
+        "assignee_id": assignee["id"] if assignee is not None else None,
+        "created_at": child["createdAt"],
+        "description": {
+            "bytes": len(description.encode("utf-8")),
+            "sha256": hashlib.sha256(description.encode("utf-8")).hexdigest(),
+        },
+    }
+
+
+def canonical_root_origin_native_readback(
+    root: dict[str, Any], *, root_workstream_id: str, root_issue_id: str,
+    authority: dict[str, str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate and compact the native root plus its separate prose fence."""
+    if (
+        not isinstance(root, dict) or root.get("id") != root_issue_id
+        or str(root.get("identifier", "")).upper() != root_workstream_id
+        or root.get("parent") is not None
+    ):
+        raise LinearProjectionError("child_origin_repair_root_identity_mismatch")
+    validate_issue_route(root, **{
+        key: authority[key] for key in ("workspace_id", "team_id", "project_id")
+    })
+    description = root.get("description")
+    if description is None:
+        description = ""
+    state = root.get("state")
+    assignee = root.get("assignee")
+    if (
+        not isinstance(description, str)
+        or not isinstance(state, dict) or set(state) != {"id", "name", "type"}
+        or not all(isinstance(state.get(field), str) and state[field]
+                   for field in ("id", "name", "type"))
+        or (
+            assignee is not None
+            and (
+                not isinstance(assignee, dict) or set(assignee) != {"id"}
+                or not isinstance(assignee.get("id"), str) or not assignee["id"]
+            )
+        )
+        or not isinstance(root.get("createdAt"), str) or not root["createdAt"]
+    ):
+        raise LinearProjectionError("child_origin_repair_root_readback_incomplete")
+    readback = {
+        "id": root_issue_id, "identifier": root_workstream_id, "parent": None,
+        "route": deepcopy(authority), "state": deepcopy(state),
+        "assignee_id": assignee["id"] if assignee is not None else None,
+        "created_at": root["createdAt"],
+    }
+    description_fence = {
+        "bytes": len(description.encode("utf-8")),
+        "sha256": hashlib.sha256(description.encode("utf-8")).hexdigest(),
+    }
+    return readback, description_fence
+
+
+def validate_existing_child_origin_root_snapshot(
+    client: GraphQLClient, repair: dict[str, Any],
+) -> None:
+    """Revalidate the complete reviewed native root immediately before sealing."""
+    value = repair["value"]
+    result = client.execute(
+        ROOT_ORIGIN_NATIVE_QUERY, {"rootId": value["root_issue_id"]},
+    )
+    readback, description = canonical_root_origin_native_readback(
+        result.get("issue"),
+        root_workstream_id=repair["workstream_id"],
+        root_issue_id=value["root_issue_id"], authority=value["route"],
+    )
+    if (
+        readback != value["native_root_readback"]
+        or hashlib.sha256(_canonical(readback)).hexdigest()
+        != value["native_root_readback_sha256"]
+        or description != value["root_description"]
+    ):
+        raise LinearProjectionError("child_origin_repair_native_root_drift")
+
+
+def validate_existing_child_origin_root_identity(
+    client: GraphQLClient, repair: dict[str, Any],
+) -> None:
+    """Revalidate only immutable root identity at a later consumer boundary."""
+    value = repair["value"]
+    root = client.execute(
+        ROOT_ORIGIN_NATIVE_QUERY, {"rootId": value["root_issue_id"]},
+    ).get("issue")
+    if (
+        not isinstance(root, dict)
+        or root.get("id") != value["root_issue_id"]
+        or str(root.get("identifier", "")).upper() != repair["workstream_id"]
+        or root.get("parent") is not None
+    ):
+        raise LinearProjectionError("child_origin_repair_root_identity_drift")
+    validate_issue_route(root, **{
+        key: value["route"][key]
+        for key in ("workspace_id", "team_id", "project_id")
+    })
+    if root.get("createdAt") != value["native_root_readback"]["created_at"]:
+        raise LinearProjectionError("child_origin_repair_root_identity_drift")
 
 
 def _immutable(event: dict[str, Any]) -> dict[str, Any]:
@@ -829,6 +1095,294 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             or value.get("initial_state") != "planned_pending_projection"
         ):
             raise LinearProjectionError("invalid_child_extension_authorization")
+    if event["kind"] == "existing_child_origin_seal":
+        required = {
+            "schema_version", "root_issue_id", "route",
+            "native_root_readback", "native_root_readback_sha256",
+            "root_description", "source",
+            "plan_revision", "generation_authority", "scope_event_id",
+            "scope_value_sha256", "repository_owner",
+            "child_workstream_id", "child_issue_id", "child_parent_issue_id",
+            "child_route", "native_child_readback",
+            "native_child_readback_sha256", "root_projection_prefix",
+            "root_history", "child_history", "pending_proposals",
+            "custody_writer_retirement",
+            "review_artifact", "expected_projection_revision",
+            "initial_state",
+        }
+        generation = value.get("generation_authority")
+        histories = [value.get("root_history"), value.get("child_history")]
+        native_child = value.get("native_child_readback")
+        native_root = value.get("native_root_readback")
+        root_description = value.get("root_description")
+        native_description = (
+            native_child.get("description")
+            if isinstance(native_child, dict) else None
+        )
+        native_state = (
+            native_child.get("state") if isinstance(native_child, dict) else None
+        )
+        native_valid = (
+            isinstance(native_root, dict)
+            and set(native_root) == {
+                "id", "identifier", "parent", "route", "state",
+                "assignee_id", "created_at",
+            }
+            and native_root.get("id") == value.get("root_issue_id")
+            and native_root.get("identifier") == event["workstream_id"]
+            and native_root.get("parent") is None
+            and native_root.get("route") == event["authority"]
+            and isinstance(native_root.get("state"), dict)
+            and set(native_root["state"]) == {"id", "name", "type"}
+            and all(isinstance(native_root["state"].get(field), str)
+                    and native_root["state"][field]
+                    for field in ("id", "name", "type"))
+            and (
+                native_root.get("assignee_id") is None
+                or isinstance(native_root.get("assignee_id"), str)
+                and bool(native_root["assignee_id"])
+            )
+            and isinstance(native_root.get("created_at"), str)
+            and bool(native_root["created_at"])
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(value.get("native_root_readback_sha256", "")),
+            ) is not None
+            and value.get("native_root_readback_sha256")
+            == hashlib.sha256(_canonical(native_root)).hexdigest()
+            and isinstance(root_description, dict)
+            and set(root_description) == {"bytes", "sha256"}
+            and isinstance(root_description.get("bytes"), int)
+            and not isinstance(root_description.get("bytes"), bool)
+            and root_description["bytes"] >= 0
+            and re.fullmatch(
+                r"[0-9a-f]{64}", str(root_description.get("sha256", "")),
+            ) is not None
+            and
+            isinstance(native_child, dict)
+            and set(native_child) == {
+                "id", "identifier", "parent", "route", "state",
+                "assignee_id", "created_at", "description",
+            }
+            and native_child.get("id") == value.get("child_issue_id")
+            and native_child.get("identifier") == value.get("child_workstream_id")
+            and native_child.get("parent") == {
+                "id": value.get("root_issue_id"),
+                "identifier": event["workstream_id"],
+            }
+            and native_child.get("route") == value.get("child_route")
+            and isinstance(native_state, dict)
+            and set(native_state) == {"id", "name", "type"}
+            and all(isinstance(native_state.get(field), str) and native_state[field]
+                    for field in ("id", "name", "type"))
+            and (
+                native_child.get("assignee_id") is None
+                or isinstance(native_child.get("assignee_id"), str)
+                and bool(native_child["assignee_id"])
+            )
+            and isinstance(native_child.get("created_at"), str)
+            and bool(native_child["created_at"])
+            and isinstance(native_description, dict)
+            and set(native_description) == {"bytes", "sha256"}
+            and isinstance(native_description.get("bytes"), int)
+            and not isinstance(native_description.get("bytes"), bool)
+            and native_description["bytes"] >= 0
+            and re.fullmatch(
+                r"[0-9a-f]{64}", str(native_description.get("sha256", "")),
+            ) is not None
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(value.get("native_child_readback_sha256", "")),
+            ) is not None
+            and value.get("native_child_readback_sha256")
+            == hashlib.sha256(_canonical(native_child)).hexdigest()
+        )
+        projection_prefix = value.get("root_projection_prefix")
+        inert_frontier = value.get("pending_proposals")
+        custody = value.get("custody_writer_retirement")
+        control_valid = (
+            isinstance(projection_prefix, dict)
+            and set(projection_prefix) == {
+                "revision", "through_event_id", "sha256",
+            }
+            and isinstance(projection_prefix.get("revision"), int)
+            and not isinstance(projection_prefix.get("revision"), bool)
+            and projection_prefix["revision"] >= 0
+            and re.fullmatch(
+                r"wsp_[0-9a-f]{32}",
+                str(projection_prefix.get("through_event_id", "")),
+            ) is not None
+            and re.fullmatch(
+                r"[0-9a-f]{64}", str(projection_prefix.get("sha256", "")),
+            ) is not None
+            and isinstance(inert_frontier, dict)
+            and set(inert_frontier) == {"count", "proposal_ids_sha256"}
+            and inert_frontier.get("count") == 0
+            and inert_frontier.get("proposal_ids_sha256")
+            == hashlib.sha256(_canonical([])).hexdigest()
+            and isinstance(custody, dict)
+            and set(custody) == {
+                "custodian", "previous_writers_retired", "writers_retired_at",
+            }
+            and isinstance(custody.get("custodian"), str)
+            and bool(custody["custodian"])
+            and custody.get("previous_writers_retired") is True
+            and isinstance(custody.get("writers_retired_at"), str)
+            and bool(custody["writers_retired_at"])
+        )
+        histories_valid = all(
+            isinstance(history, dict)
+            and set(history) == {
+                "material_frontier", "material_receipts",
+                "checkpoint_frontier", "checkpoint_receipts",
+            }
+            and isinstance(history.get("material_frontier"), dict)
+            and set(history["material_frontier"]) == {
+                "algorithm", "revision", "event_ids_reducer_order_sha256",
+                "events_sha256", "remote_map_sha256",
+            }
+            and history["material_frontier"].get("algorithm")
+            == "raw-reducer-order-v1"
+            and isinstance(history["material_frontier"].get("revision"), int)
+            and not isinstance(history["material_frontier"]["revision"], bool)
+            and history["material_frontier"]["revision"] >= 0
+            and isinstance(history.get("checkpoint_frontier"), dict)
+            and set(history["checkpoint_frontier"]) == {
+                "algorithm", "count", "revision",
+                "event_ids_reducer_order_sha256",
+                "event_ids_sorted_set_sha256", "checkpoints_sha256",
+            }
+            and history["checkpoint_frontier"].get("algorithm")
+            == "checkpoint-reducer-order-v1"
+            and all(
+                isinstance(history["checkpoint_frontier"].get(field), int)
+                and not isinstance(history["checkpoint_frontier"][field], bool)
+                and history["checkpoint_frontier"][field] >= 0
+                for field in ("count", "revision")
+            )
+            and all(
+                isinstance(history.get(receipt_field), list)
+                and all(
+                    isinstance(item, dict)
+                    and set(item) == {"event_id", "remote_id", "body_sha256"}
+                    and isinstance(item.get("remote_id"), str)
+                    and bool(item["remote_id"])
+                    and re.fullmatch(
+                        r"[0-9a-f]{64}", str(item.get("body_sha256", "")),
+                    ) is not None
+                    for item in history[receipt_field]
+                )
+                for receipt_field in (
+                    "material_receipts", "checkpoint_receipts",
+                )
+            )
+            and len(history["material_receipts"])
+            == history["material_frontier"]["revision"]
+            and len(history["checkpoint_receipts"])
+            == history["checkpoint_frontier"]["count"]
+            and all(re.fullmatch(r"[0-9a-f]{64}", str(frontier.get(field, "")))
+                    for frontier, fields in (
+                        (history["material_frontier"], (
+                            "event_ids_reducer_order_sha256", "events_sha256",
+                            "remote_map_sha256",
+                        )),
+                        (history["checkpoint_frontier"], (
+                            "event_ids_reducer_order_sha256",
+                            "event_ids_sorted_set_sha256", "checkpoints_sha256",
+                        )),
+                    ) for field in fields)
+            and history["material_frontier"]["event_ids_reducer_order_sha256"]
+            == hashlib.sha256(_canonical([
+                item["event_id"] for item in history["material_receipts"]
+            ])).hexdigest()
+            and history["material_frontier"]["remote_map_sha256"]
+            == hashlib.sha256(_canonical({
+                item["event_id"]: item["remote_id"]
+                for item in history["material_receipts"]
+            })).hexdigest()
+            and history["checkpoint_frontier"]["event_ids_reducer_order_sha256"]
+            == hashlib.sha256(_canonical([
+                item["event_id"] for item in history["checkpoint_receipts"]
+            ])).hexdigest()
+            and history["checkpoint_frontier"]["event_ids_sorted_set_sha256"]
+            == hashlib.sha256(_canonical(sorted({
+                item["event_id"] for item in history["checkpoint_receipts"]
+            }))).hexdigest()
+            for history in histories
+        )
+        generation_valid = (
+            isinstance(generation, dict)
+            and set(generation) == {
+                "plan_revision", "description_plan_revision",
+                "transition_tip_event_id", "activation_epoch",
+                "authority_origin", "workstream_id", "authority", "source",
+            }
+            and generation.get("plan_revision") == event["plan_revision"]
+            and generation.get("workstream_id") == event["workstream_id"]
+            and generation.get("authority") == event["authority"]
+            and generation.get("source") == value.get("source")
+            and generation.get("authority_origin") in {
+                "legacy_description", "generation_genesis",
+                "generation_transition",
+            }
+            and (
+                generation.get("transition_tip_event_id") is None
+                if generation.get("authority_origin") == "legacy_description"
+                else re.fullmatch(
+                    r"wsp_[0-9a-f]{32}",
+                    str(generation.get("transition_tip_event_id", "")),
+                ) is not None
+            )
+            and (
+                generation.get("activation_epoch") is None
+                if generation.get("authority_origin") == "legacy_description"
+                else isinstance(generation.get("activation_epoch"), int)
+                and not isinstance(generation.get("activation_epoch"), bool)
+                and generation["activation_epoch"] >= 0
+            )
+        )
+        if (
+            schema_version != 2 or tombstone or set(value) != required
+            or value.get("schema_version") != 1
+            or event["supersedes_event_id"] is not None
+            or event["key"] != value.get("child_issue_id")
+            or value.get("root_issue_id") != event["authority"]["root_issue_id"]
+            or value.get("route") != event["authority"]
+            or value.get("child_parent_issue_id") != value.get("root_issue_id")
+            or value.get("child_route") != {
+                key: event["authority"][key]
+                for key in ("workspace_id", "team_id", "project_id")
+            }
+            or value.get("plan_revision") != event["plan_revision"]
+            or value.get("expected_projection_revision")
+            != event["expected_revision"]
+            or not isinstance(value.get("source"), dict)
+            or set(value["source"]) != {"identity", "sha256"}
+            or value["source"].get("sha256") != event["plan_revision"]
+            or not re.fullmatch(
+                r"[A-Z][A-Z0-9]*-\d+",
+                str(value.get("child_workstream_id", "")),
+            )
+            or not re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+                r"[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                str(value.get("child_issue_id", "")), re.IGNORECASE,
+            )
+            or not all(isinstance(value.get(field), str) and value[field]
+                       for field in (
+                           "scope_event_id", "scope_value_sha256",
+                           "repository_owner",
+                       ))
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(value.get("scope_value_sha256", "")),
+            ) is None
+            or not _valid_review_artifact(value.get("review_artifact"))
+            or value.get("initial_state")
+            != "existing_scope_owned_legacy_child"
+            or not histories_valid or not generation_valid or not native_valid
+            or not control_valid
+        ):
+            raise LinearProjectionError("invalid_existing_child_origin_seal")
     if event["kind"] == "child_dependency_authorization":
         required_authorization = {
             "root_issue_id", "route", "plan_revision", "batch_id",
@@ -1334,8 +1888,51 @@ def child_extension_authorizations_from_comments(
     return result
 
 
+def legacy_child_origin_repairs_from_comments(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    description_plan_revision: str | None,
+    authenticated_route: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Return reviewed legacy child-origin seals from active/sealed generations."""
+    selected = select_plan_generation(
+        comments, workstream_id=workstream_id,
+        description_plan_revision=description_plan_revision,
+        authenticated_route=authenticated_route,
+    )
+    from workstream_generation import generation_controls
+
+    controls = generation_controls(comments)
+    plans = {selected["plan_revision"]}
+    plans.update(
+        frontier["plan_revision"] for control in controls
+        for frontier in (control["value"]["from"], control["value"]["to"])
+    )
+    result: list[dict[str, Any]] = []
+    for plan in plans:
+        state = reduce_projection_comments(
+            comments, workstream_id=workstream_id,
+            expected_plan_revision=plan, authenticated_route=authenticated_route,
+        )
+        events = list(state.events)
+        if plan != selected["plan_revision"]:
+            retirements = [
+                control for control in controls
+                if control["kind"] == "generation_transition"
+                and control["value"]["from"]["plan_revision"] == plan
+            ]
+            if len(retirements) != 1:
+                continue
+            events = events[:retirements[0]["value"]["from"]["projection_revision"]]
+        result.extend(
+            event for event in events
+            if event["kind"] == "existing_child_origin_seal"
+        )
+    return result
+
+
 def validate_child_origin_value(
     value: dict[str, Any], *, extension_origins: list[dict[str, Any]],
+    repair_origins: list[dict[str, Any]],
     authenticated_route: dict[str, str],
 ) -> None:
     """Validate one mutation grant's immutable child-creation provenance."""
@@ -1399,6 +1996,33 @@ def validate_child_origin_value(
         ):
             raise LinearProjectionError("child_origin_intake_marker_invalid")
         return
+    if origin.get("kind") == "existing_child_origin_seal":
+        matches = [
+            event for event in repair_origins
+            if event["event_id"] == origin.get("event_id")
+        ]
+        if len(matches) != 1:
+            raise LinearProjectionError("child_origin_repair_missing")
+        repair = matches[0]
+        repair_value = repair["value"]
+        if (
+            set(origin) != {
+                "kind", "event_id", "value_sha256", "child_workstream_id",
+            }
+            or origin.get("value_sha256")
+            != hashlib.sha256(_canonical(repair_value)).hexdigest()
+            or origin.get("child_workstream_id")
+            != repair_value.get("child_workstream_id")
+            or repair.get("authority") != authenticated_route
+            or repair_value.get("route") != authenticated_route
+            or repair_value.get("root_issue_id")
+            != authenticated_route["root_issue_id"]
+            or repair_value.get("child_issue_id") != value.get("child_issue_id")
+            or repair_value.get("child_workstream_id")
+            != value.get("child_workstream_id")
+        ):
+            raise LinearProjectionError("child_origin_repair_invalid")
+        return
     raise LinearProjectionError("child_origin_provenance_invalid")
 
 
@@ -1423,6 +2047,11 @@ def child_mutation_authorizations_from_comments(
     )
     result: list[dict[str, Any]] = []
     extension_origins = child_extension_authorizations_from_comments(
+        comments, workstream_id=workstream_id,
+        description_plan_revision=description_plan_revision,
+        authenticated_route=authenticated_route,
+    )
+    repair_origins = legacy_child_origin_repairs_from_comments(
         comments, workstream_id=workstream_id,
         description_plan_revision=description_plan_revision,
         authenticated_route=authenticated_route,
@@ -1502,6 +2131,11 @@ def child_mutation_authorizations_from_comments(
             validate_child_origin_value(
                 value, extension_origins=[
                     origin for origin in extension_origins
+                    if origin["plan_revision"] != plan
+                    or origin in events[:index]
+                ],
+                repair_origins=[
+                    origin for origin in repair_origins
                     if origin["plan_revision"] != plan
                     or origin in events[:index]
                 ],
@@ -2396,7 +3030,15 @@ class LinearProjectionAdapter:
             )
             if event["value"].get("child_issue_id") == child_issue_id
         ]
-        if len(origins) > 1:
+        repairs = [
+            event for event in legacy_child_origin_repairs_from_comments(
+                comments, workstream_id=self.workstream_id,
+                description_plan_revision=description_plan_revision,
+                authenticated_route=self.authority,
+            )
+            if event["value"].get("child_issue_id") == child_issue_id
+        ]
+        if len(origins) + len(repairs) > 1:
             raise LinearProjectionError("child_origin_authorization_ambiguous")
         child_origin = None
         if origins:
@@ -2420,6 +3062,27 @@ class LinearProjectionAdapter:
                     _canonical(origin_value)
                 ).hexdigest(),
                 "candidate_key": origin_value["reviewed_candidate_key"],
+            }
+        elif repairs:
+            repair = repairs[0]
+            repair_value = repair["value"]
+            if (
+                repair["authority"] != self.authority
+                or repair_value.get("root_issue_id") != self.root_issue_id
+                or repair_value.get("route") != self.authority
+                or repair_value.get("child_workstream_id")
+                != child_workstream_id
+                or repair_value.get("child_parent_issue_id")
+                != self.root_issue_id
+            ):
+                raise LinearProjectionError("child_origin_repair_invalid")
+            child_origin = {
+                "kind": "existing_child_origin_seal",
+                "event_id": repair["event_id"],
+                "value_sha256": hashlib.sha256(
+                    _canonical(repair_value)
+                ).hexdigest(),
+                "child_workstream_id": child_workstream_id,
             }
         scope = state.snapshot.get("scope")
         owner = (
@@ -3107,6 +3770,174 @@ class LinearProjectionAdapter:
         """Re-read the exact durable grant; later unrelated events stay valid."""
         return self._assert_child_extension_authorization(event, self._comments())
 
+    def repair_legacy_child_origin(
+        self, *, value: dict[str, Any], created_at: str,
+    ) -> dict[str, Any]:
+        """Append one reviewed seal for an existing nondeterministic child."""
+        comments = self._comments()
+        state = reduce_projection_comments(
+            comments, workstream_id=self.workstream_id,
+            expected_plan_revision=self.plan_revision,
+            authenticated_route=self.authority,
+        )
+        child_issue_id = value.get("child_issue_id")
+        matching = [
+            event for event in state.events
+            if event["kind"] == "existing_child_origin_seal"
+            and event["key"] == child_issue_id
+        ]
+        if len(matching) > 1:
+            raise LinearProjectionError("child_origin_repair_ambiguous")
+        event = build_projection_event(
+            workstream_id=self.workstream_id,
+            kind="existing_child_origin_seal", key=str(child_issue_id),
+            value=value, plan_revision=self.plan_revision,
+            expected_revision=value.get("expected_projection_revision"),
+            created_at=created_at, authority=self.authority,
+        )
+        if matching:
+            if matching[0] != event:
+                raise LinearProjectionError("child_origin_repair_conflicting")
+            remote_id = state.remote_ids.get(event["event_id"])
+            if not isinstance(remote_id, str):
+                raise LinearProjectionError("child_origin_repair_readback_missing")
+            return {
+                "event": event, "event_id": event["event_id"],
+                "remote_id": remote_id, "revision": state.revision,
+                "disposition": "existing",
+            }
+        selected = self._select_child_extension_generation(
+            comments,
+            description_plan_revision=value["generation_authority"].get(
+                "description_plan_revision"
+            ),
+            source=value["source"],
+        )
+        if selected != value["generation_authority"]:
+            raise LinearProjectionError("child_origin_repair_generation_changed")
+        scope_events = [
+            item for item in state.events
+            if item["kind"] == "scope" and item["key"] == "root"
+        ]
+        scope = scope_events[-1] if scope_events else None
+        if (
+            scope is None
+            or scope["event_id"] != value.get("scope_event_id")
+            or hashlib.sha256(_canonical(scope["value"])).hexdigest()
+            != value.get("scope_value_sha256")
+            or scope["value"].get("child_ownership", {}).get(
+                value.get("child_workstream_id")
+            ) != value.get("repository_owner")
+        ):
+            raise LinearProjectionError("child_origin_repair_scope_changed")
+        if state.snapshot.get("source") != value.get("source"):
+            raise LinearProjectionError("child_origin_repair_source_changed")
+        if state.revision != value.get("expected_projection_revision"):
+            raise LinearProjectionError("child_origin_repair_projection_changed")
+        if projection_prefix_frontier(
+            state, comments,
+        ) != value.get("root_projection_prefix"):
+            raise LinearProjectionError("child_origin_repair_projection_prefix_changed")
+        if child_origin_history_frontier(
+            comments, workstream_id=self.workstream_id,
+        ) != value.get("root_history"):
+            raise LinearProjectionError("child_origin_repair_root_history_changed")
+        native_result = self.client.execute(
+            CHILD_ORIGIN_NATIVE_QUERY, {"childId": child_issue_id},
+        )
+        native_child = native_result.get("issue")
+        expected_native = canonical_child_origin_native_readback(
+            native_child,
+            child_workstream_id=value["child_workstream_id"],
+            child_issue_id=child_issue_id,
+            root_workstream_id=self.workstream_id,
+            root_issue_id=self.root_issue_id,
+            route={key: self.authority[key] for key in (
+                "workspace_id", "team_id", "project_id",
+            )},
+        )
+        if (
+            expected_native != value.get("native_child_readback")
+            or hashlib.sha256(_canonical(expected_native)).hexdigest()
+            != value.get("native_child_readback_sha256")
+        ):
+            raise LinearProjectionError("child_origin_repair_native_readback_changed")
+        from workstream_child_proposal import _comments as child_comments, proposal_index
+
+        child_before = child_comments(self.client, value["child_workstream_id"])
+        if proposal_index(child_before):
+            raise LinearProjectionError("child_origin_preexisting_inert_proposals")
+        if child_origin_history_frontier(
+            child_before, workstream_id=value["child_workstream_id"],
+        ) != value.get("child_history"):
+            raise LinearProjectionError("child_origin_repair_child_history_changed")
+        validate_existing_child_origin_root_snapshot(self.client, event)
+        receipt = self.append(
+            event,
+            expected_material_revision=value["root_history"][
+                "material_frontier"
+            ]["revision"],
+        )
+        after_comments = self._comments()
+        after = reduce_projection_comments(
+            after_comments, workstream_id=self.workstream_id,
+            expected_plan_revision=self.plan_revision,
+            authenticated_route=self.authority,
+        )
+        observed = [
+            item for item in after.events
+            if item["kind"] == "existing_child_origin_seal"
+            and item["key"] == child_issue_id
+        ]
+        if observed != [event]:
+            raise LinearProjectionError("child_origin_repair_readback_mismatch")
+        if (
+            after.revision != value["expected_projection_revision"] + 1
+            or not after.events
+            or after.events[-1] != event
+            or projection_prefix_frontier(
+                after, after_comments,
+                through_event_id=value["root_projection_prefix"][
+                    "through_event_id"
+                ],
+            ) != value["root_projection_prefix"]
+            or child_origin_history_frontier(
+                after_comments, workstream_id=self.workstream_id,
+            ) != value["root_history"]
+        ):
+            raise LinearProjectionError(
+                "child_origin_repair_postread_root_drift_authority_changed"
+            )
+        child_after = child_comments(self.client, value["child_workstream_id"])
+        if (
+            proposal_index(child_after)
+            or child_origin_history_frontier(
+                child_after, workstream_id=value["child_workstream_id"],
+            ) != value["child_history"]
+        ):
+            raise LinearProjectionError(
+                "child_origin_repair_postread_child_drift_authority_changed"
+            )
+        native_after = canonical_child_origin_native_readback(
+            self.client.execute(
+                CHILD_ORIGIN_NATIVE_QUERY, {"childId": child_issue_id},
+            ).get("issue"),
+            child_workstream_id=value["child_workstream_id"],
+            child_issue_id=child_issue_id,
+            root_workstream_id=self.workstream_id,
+            root_issue_id=self.root_issue_id,
+            route={key: self.authority[key] for key in (
+                "workspace_id", "team_id", "project_id",
+            )},
+        )
+        if native_after != value["native_child_readback"]:
+            raise LinearProjectionError(
+                "child_origin_repair_postread_native_drift_authority_changed"
+            )
+        return {
+            **receipt, "event": event, "disposition": "created",
+        }
+
     def reserve_child_mutation(
         self, *, proposal: dict[str, Any], proposal_remote_id: str,
         child_identity: dict[str, Any], generation_authority: dict[str, Any],
@@ -3163,7 +3994,7 @@ class LinearProjectionAdapter:
             self._assert_child_mutation_proposal(event, proposal)
             return {"event": event, "disposition": "existing"}
         from workstream_child_proposal import (
-            _comments as child_comments, activated_comments,
+            _comments as child_comments, authorized_child_comments,
         )
         from workstream_linear_events import reduce_event_comments
         from workstream_linear_checkpoints import reduce_checkpoint_comments
@@ -3174,9 +4005,15 @@ class LinearProjectionAdapter:
                 "description_plan_revision"
             ), authenticated_route=self.authority,
         )
-        active_comments = activated_comments(
+        origin_repairs = legacy_child_origin_repairs_from_comments(
+            comments, workstream_id=self.workstream_id,
+            description_plan_revision=generation_authority.get(
+                "description_plan_revision"
+            ), authenticated_route=self.authority,
+        )
+        active_comments = authorized_child_comments(
             child_comments(self.client, child_identity["identifier"]),
-            existing_authorizations,
+            existing_authorizations, origin_repairs,
             child_workstream_id=child_identity["identifier"],
             child_issue_id=child_identity["id"],
         )
@@ -3339,14 +4176,32 @@ class LinearProjectionAdapter:
                 "description_plan_revision"
             ), authenticated_route=self.authority,
         )
+        repair_origins = legacy_child_origin_repairs_from_comments(
+            comments, workstream_id=self.workstream_id,
+            description_plan_revision=value["generation_authority"].get(
+                "description_plan_revision"
+            ), authenticated_route=self.authority,
+        )
         current_events = list(events)[:before_index]
         validate_child_origin_value(
             value, extension_origins=[
                 origin for origin in extension_origins
                 if origin["plan_revision"] != self.plan_revision
                 or origin in current_events
+            ], repair_origins=[
+                origin for origin in repair_origins
+                if origin["plan_revision"] != self.plan_revision
+                or origin in current_events
             ], authenticated_route=self.authority,
         )
+        if value["child_origin"].get("kind") == "existing_child_origin_seal":
+            matches = [
+                origin for origin in repair_origins
+                if origin["event_id"] == value["child_origin"].get("event_id")
+            ]
+            if len(matches) != 1:
+                raise LinearProjectionError("child_origin_repair_ambiguous")
+            validate_existing_child_origin_root_identity(self.client, matches[0])
 
     def child_mutation_authorizations(self) -> list[dict[str, Any]]:
         comments = self._comments()

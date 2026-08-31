@@ -79,6 +79,7 @@ class FakeChildStateClient:
         self.child_comments: list[dict] = []
         self.calls: list[tuple[str, dict]] = []
         self.crash_after_root_append = False
+        self.transport_error_after_root_append = False
         self.child_parent_id = ROOT_ID
 
     @staticmethod
@@ -110,14 +111,30 @@ class FakeChildStateClient:
 
     def execute(self, query, variables):
         self.calls.append((query, deepcopy(variables)))
-        if "query WorkstreamChildTarget" in query:
+        if (
+            "query WorkstreamChildTarget" in query
+            or "query WorkstreamChildOriginRepairTarget" in query
+        ):
             return {
                 "root": {
                     **self.issue("GEN-37", ROOT_ID, self.root_comments),
                     "description": f"Plan revision: {PLAN}", "parent": None,
+                    "createdAt": "2026-08-01T00:00:00Z",
+                    "state": {
+                        "id": "state-started", "name": "In Progress",
+                        "type": "started",
+                    },
+                    "assignee": {"id": "assignee"},
                 },
                 "child": {
                     **self.issue("GEN-38", CHILD_ID, self.child_comments),
+                    "description": "Legacy child description",
+                    "createdAt": "2026-08-01T00:00:00Z",
+                    "state": {
+                        "id": "state-started", "name": "In Progress",
+                        "type": "started",
+                    },
+                    "assignee": {"id": "assignee"},
                     "parent": {
                         "id": self.child_parent_id,
                         "identifier": (
@@ -126,6 +143,31 @@ class FakeChildStateClient:
                     },
                 },
             }
+        if "query WorkstreamChildOriginNativeReadback" in query:
+            return {"issue": {
+                **self.issue("GEN-38", CHILD_ID, self.child_comments),
+                "description": "Legacy child description",
+                "createdAt": "2026-08-01T00:00:00Z",
+                "state": {
+                    "id": "state-started", "name": "In Progress",
+                    "type": "started",
+                },
+                "assignee": {"id": "assignee"},
+                "parent": {"id": self.child_parent_id, "identifier": (
+                    "GEN-37" if self.child_parent_id == ROOT_ID else "GEN-99"
+                )},
+            }}
+        if "query WorkstreamRootOriginNativeReadback" in query:
+            return {"issue": {
+                **self.issue("GEN-37", ROOT_ID, self.root_comments),
+                "description": f"Plan revision: {PLAN}", "parent": None,
+                "createdAt": "2026-08-01T00:00:00Z",
+                "state": {
+                    "id": "state-started", "name": "In Progress",
+                    "type": "started",
+                },
+                "assignee": {"id": "assignee"},
+            }}
         if "query WorkstreamChildMutationTarget" in query:
             return {"issue": {
                 **self.issue("GEN-38", CHILD_ID, self.child_comments),
@@ -157,6 +199,9 @@ class FakeChildStateClient:
                 "updatedAt": "2026-08-30T00:00:00Z",
             }
             target.append(comment)
+            if item["issueId"] == "GEN-37" and self.transport_error_after_root_append:
+                self.transport_error_after_root_append = False
+                raise LinearTransportError("lost response after durable append")
             if item["issueId"] == "GEN-37" and self.crash_after_root_append:
                 self.crash_after_root_append = False
                 raise SystemExit("death after root activation")

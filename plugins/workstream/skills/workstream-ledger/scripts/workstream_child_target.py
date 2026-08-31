@@ -114,6 +114,7 @@ def authenticate_child_target(
         client, issue_id=root_token, workstream_id=root_token,
         plan_revision=args.plan_revision, **route, root_issue_id=root_issue_id,
     )
+    authority = {**route, "root_issue_id": root_issue_id}
     description_revision = parse_plan_revision(root.get("description"))
     try:
         generation = projection.select_owned_child_generation(
@@ -152,7 +153,6 @@ def authenticate_child_target(
         ).get(child_token)
         if scope is None or not isinstance(owner, str) or not owner:
             raise LinearTransportError(f"child_target_not_owned:{child_token}")
-        authority = {**route, "root_issue_id": root_issue_id}
         generation = {
             **selected, "workstream_id": root_token, "authority": authority,
             "source": state.snapshot.get("source"),
@@ -179,6 +179,38 @@ def authenticate_child_target(
         != root_token
     ):
         raise LinearTransportError("child_native_cache_drift")
+    if generation["child_origin"].get("kind") == "existing_child_origin_seal":
+        from workstream_child_proposal import (
+            _comments as child_comments, authorized_child_comments,
+        )
+        from workstream_linear_projection import (
+            child_mutation_authorizations_from_comments,
+            legacy_child_origin_repairs_from_comments,
+            validate_existing_child_origin_root_identity,
+        )
+
+        root_comments = projection._comments()
+        authorizations = child_mutation_authorizations_from_comments(
+            root_comments, workstream_id=root_token,
+            description_plan_revision=description_revision,
+            authenticated_route=authority,
+        )
+        repairs = legacy_child_origin_repairs_from_comments(
+            root_comments, workstream_id=root_token,
+            description_plan_revision=description_revision,
+            authenticated_route=authority,
+        )
+        matching_repairs = [
+            event for event in repairs
+            if event["event_id"] == generation["child_origin"].get("event_id")
+        ]
+        if len(matching_repairs) != 1:
+            raise LinearTransportError("child_origin_repair_ambiguous")
+        validate_existing_child_origin_root_identity(client, matching_repairs[0])
+        authorized_child_comments(
+            child_comments(client, child_token), authorizations, repairs,
+            child_workstream_id=child_token, child_issue_id=child_issue_id,
+        )
     return {
         "client": client, "root_workstream_id": root_token,
         "root_issue_id": root_issue_id, "child_workstream_id": child_token,
