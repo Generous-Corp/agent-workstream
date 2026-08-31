@@ -396,6 +396,12 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.38 binds reviewed child titles and durable-description digests to
+their extension authorization, fences plan prose from durable control fields,
+and makes zero-write preview disclose its exact source-access and credential
+surface. Legacy contentless grants may replay an existing child but cannot
+authorize a new create.
+
 Version 0.4.37 recovers an interrupted inactive-generation terminal evidence
 seed from the exact reviewed manifest. A canonical committed prefix is
 validated before generic target-source synchronization; divergence still
