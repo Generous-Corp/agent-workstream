@@ -4,6 +4,7 @@ import io
 import json
 import unittest
 import uuid
+from copy import deepcopy
 from unittest import mock
 
 import workstream_child_dependencies as dependency_module
@@ -20,7 +21,7 @@ from workstream_linear_projection import (
 
 
 PLAN = "a" * 64
-ROOT_ID = "10000000-0000-4000-8000-000000000001"
+ROOT_ID = "33333333-3333-4333-8333-333333333333"
 CHILD_A_ID = "20000000-0000-4000-8000-000000000001"
 CHILD_B_ID = "20000000-0000-4000-8000-000000000002"
 CHILD_C_ID = "20000000-0000-4000-8000-000000000003"
@@ -56,30 +57,40 @@ class FakeLinear:
         self.before_comment_read = None
         self.lose_next_create_response = False
         self.page_size = 250
+        self.root_plan_revision = PLAN
 
     @staticmethod
     def team():
         return {"id": "team", "organization": {"id": "workspace"}}
 
     @classmethod
-    def child(cls, identity, *, parent_id=ROOT_ID, project_id="project"):
+    def child(
+        cls, identity, *, parent_id=ROOT_ID, project_id="project",
+        plan_revision=PLAN, terminal=False,
+    ):
         return {
             "id": identity["issue_id"], "identifier": identity["identifier"],
-            "title": identity["identifier"], "description": f"Plan revision: {PLAN}",
+            "title": identity["identifier"],
+            "description": f"Plan revision: {plan_revision}",
             "url": "https://linear.test/child", "updatedAt": "now",
             "parent": {"id": parent_id, "identifier": "GEN-37"},
             "project": {"id": project_id}, "team": cls.team(), "assignee": None,
-            "state": {"id": "todo", "name": "Todo", "type": "unstarted"},
+            "state": (
+                {"id": "done", "name": "Done", "type": "completed"}
+                if terminal else
+                {"id": "todo", "name": "Todo", "type": "unstarted"}
+            ),
             "comments": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}},
         }
 
-    @classmethod
-    def root(cls):
+    def root(self):
         return {
             "id": ROOT_ID, "identifier": "GEN-37", "title": "Root",
-            "description": f"Plan revision: {PLAN}\nLedger revision: 0",
+            "description": (
+                f"Plan revision: {self.root_plan_revision}\nLedger revision: 0"
+            ),
             "url": "https://linear.test/root", "updatedAt": "now", "parent": None,
-            "project": {"id": "project"}, "team": cls.team(), "assignee": None,
+            "project": {"id": "project"}, "team": self.team(), "assignee": None,
             "state": {"id": "started", "name": "In Progress", "type": "started"},
         }
 
@@ -454,6 +465,22 @@ class ChildDependencyTests(unittest.TestCase):
                     self.apply(fake, children=children)
                 self.assertFalse(any("issueRelationCreate" in query for query, _ in fake.calls))
 
+    def test_generation_genesis_keeps_single_generation_child_protection(self):
+        fake = FakeLinear()
+        fake.children[-1] = fake.child(C, plan_revision="b" * 64)
+        with self.assertRaisesRegex(
+            ChildDependencyError, "owned_child_plan_revision_mismatch:GEN-45",
+        ):
+            self.adapter(fake)._authenticated_children(
+                [A, B, C], fake.children,
+                generation={
+                    "authority_origin": "generation_genesis",
+                    "transition_tip_event_id": "wsp_" + "1" * 32,
+                    "description_plan_revision": PLAN,
+                },
+                projection=mock.Mock(),
+            )
+
     def test_nondeterministic_duplicate_and_missing_inverse_are_planted_mutations(self):
         fake = FakeLinear()
         relation = fake.native_relation(
@@ -521,6 +548,244 @@ class ChildDependencyTests(unittest.TestCase):
                 expected_frontier=FRONTIER,
             )
         self.assertFalse(any("issueRelationCreate" in query for query, _ in fake.calls))
+
+    def test_gen37_transition_uses_only_exact_active_generation_children(self):
+        from test_workstream_generation_transition import (
+            FakeClient as GenerationClient, Loader, adapter as generation_adapter,
+            project_full,
+        )
+        from workstream_generation import (
+            GenerationTransport, build_retirement_proof,
+            reduce_generation_checkpoint_comments,
+        )
+
+        predecessor = "f38baae4441485b14e5b16ea0255e3a07e42aa94a4fb0e6e04e7aa513693719d"
+        active = "2fcce119a856ca34e509c7fe45a8f03f1a0d982c9c4d77047600805c0fcb261f"
+        old = [
+            {"issue_id": f"30000000-0000-4000-8000-{index:012d}",
+             "identifier": identifier}
+            for index, identifier in enumerate(
+                ("GEN-38", "GEN-39", "GEN-40", "GEN-41", "GEN-42", "GEN-43", "GEN-85"),
+                start=1,
+            )
+        ]
+        active_children = [
+            {"issue_id": issue_id, "identifier": identifier}
+            for issue_id, identifier in (
+                ("54dc24ca-4f37-4d7f-811d-f7cb1475f008", "GEN-91"),
+                ("46b3d402-bb5f-4bb9-b8e4-cb3e443ee731", "GEN-92"),
+                ("ab602bbb-be85-4d1d-9070-3e8df797f83e", "GEN-93"),
+                ("ef95f6b1-207d-451a-bdbe-b76f195445c5", "GEN-94"),
+            )
+        ]
+        generation_client = GenerationClient()
+        generation_client.description = f"Plan revision: {predecessor}"
+
+        def project(plan_revision, identifiers):
+            project_full(generation_client, plan_revision)
+            target = generation_adapter(generation_client, plan_revision)
+            state = target.state()
+            scope_event = next(
+                event for event in state.events
+                if event["kind"] == "scope" and event["key"] == "root"
+            )
+            scope = deepcopy(scope_event["value"])
+            scope["child_ownership"] = {
+                identifier: "github.com:id:R_repo" for identifier in identifiers
+            }
+            target.append(build_projection_event(
+                workstream_id="GEN-37", kind="scope", key="root", value=scope,
+                plan_revision=plan_revision, expected_revision=state.revision,
+                created_at=f"scope-{plan_revision[:8]}",
+                supersedes_event_id=scope_event["event_id"],
+                authority={key: AUTHORITY[key] for key in (
+                    "workspace_id", "team_id", "project_id", "root_issue_id",
+                )},
+            ))
+
+        old_identifiers = [item["identifier"] for item in old]
+        active_identifiers = [item["identifier"] for item in active_children]
+        project(predecessor, old_identifiers)
+        project(active, [*old_identifiers, *active_identifiers])
+        predecessor_state = generation_adapter(generation_client, predecessor).state()
+        checkpoints = reduce_generation_checkpoint_comments(
+            generation_client.comments, workstream_id="GEN-37",
+            authenticated_route={key: AUTHORITY[key] for key in (
+                "workspace_id", "team_id", "project_id", "root_issue_id",
+            )},
+        )
+        retirement = build_retirement_proof(
+            predecessor_plan_revision=predecessor, retired_at="now",
+            retired_writer_epoch=0,
+            provenance_event_ids=[
+                event["event_id"] for event in predecessor_state.events
+                if event["kind"] == "provenance"
+            ],
+            checkpoint_event_ids=sorted(
+                item["event_id"] for item in checkpoints.checkpoints
+                if item["plan_revision"] == predecessor
+            ),
+        )
+        GenerationTransport(
+            generation_client, issue_id="GEN-37", workstream_id="GEN-37",
+            authority={key: AUTHORITY[key] for key in (
+                "workspace_id", "team_id", "project_id", "root_issue_id",
+            )},
+            candidate_loader=Loader(generation_client),
+            legacy_description_plan_revision=predecessor,
+        ).activate(
+            target_plan_revision=active, created_at="now", retirement=retirement,
+        )
+
+        fake = FakeLinear()
+        fake.root_plan_revision = predecessor
+        fake.comments["GEN-37"] = deepcopy(generation_client.comments)
+        fake.children = [
+            *(fake.child(item, plan_revision=predecessor, terminal=True) for item in old),
+            *(fake.child(item, plan_revision=active) for item in active_children),
+        ]
+        adapter = LinearChildDependencyAdapter(
+            fake, workspace_id="workspace", team_id="team", project_id="project",
+            root_issue_id=ROOT_ID, root_identifier="GEN-37", plan_revision=active,
+        )
+        relations = [
+            self.relation(active_children[0], "blocks", active_children[1]),
+            self.relation(active_children[1], "blocks", active_children[3]),
+            self.relation(active_children[2], "blocks", active_children[3]),
+        ]
+        frontier, _graph, owned = adapter._read(active_children)
+        self.assertCountEqual(
+            {identity["identifier"] for identity in owned.values()},
+            set(active_identifiers),
+        )
+
+        scope_mutations = (
+            ("unowned_children:GEN-38", lambda scope: scope["child_ownership"].pop("GEN-38")),
+            ("child_repository_not_participating:GEN-91", lambda scope: scope[
+                "child_ownership"
+            ].__setitem__("GEN-91", "github.com:id:R_missing")),
+            ("unknown_owned_children:GEN-999", lambda scope: scope[
+                "child_ownership"
+            ].__setitem__("GEN-999", "github.com:id:R_repo")),
+        )
+        for index, (error, mutate) in enumerate(scope_mutations):
+            with self.subTest(scope_error=error):
+                target = generation_adapter(generation_client, active)
+                state = target.state()
+                scope_event = next(
+                    event for event in reversed(state.events)
+                    if event["kind"] == "scope" and event["key"] == "root"
+                )
+                valid_scope = deepcopy(scope_event["value"])
+                invalid_scope = deepcopy(valid_scope)
+                mutate(invalid_scope)
+                target.append(build_projection_event(
+                    workstream_id="GEN-37", kind="scope", key="root",
+                    value=invalid_scope, plan_revision=active,
+                    expected_revision=state.revision,
+                    created_at=f"invalid-scope-{index}",
+                    supersedes_event_id=scope_event["event_id"],
+                    authority={key: AUTHORITY[key] for key in (
+                        "workspace_id", "team_id", "project_id", "root_issue_id",
+                    )},
+                ))
+                fake.comments["GEN-37"] = deepcopy(generation_client.comments)
+                fake.calls.clear()
+                with self.assertRaisesRegex(ChildDependencyError, error):
+                    adapter.apply_batch(
+                        owned_children=active_children, relations=relations,
+                        expected_frontier=frontier,
+                    )
+                self.assertFalse(any(
+                    "issueRelationCreate" in query or "commentCreate" in query
+                    for query, _ in fake.calls
+                ))
+                state = target.state()
+                invalid_event = next(
+                    event for event in reversed(state.events)
+                    if event["kind"] == "scope" and event["key"] == "root"
+                )
+                target.append(build_projection_event(
+                    workstream_id="GEN-37", kind="scope", key="root",
+                    value=valid_scope, plan_revision=active,
+                    expected_revision=state.revision,
+                    created_at=f"restore-scope-{index}",
+                    supersedes_event_id=invalid_event["event_id"],
+                    authority={key: AUTHORITY[key] for key in (
+                        "workspace_id", "team_id", "project_id", "root_issue_id",
+                    )},
+                ))
+                fake.comments["GEN-37"] = deepcopy(generation_client.comments)
+
+        frontier, _graph, _owned = adapter._read(active_children)
+        result = adapter.apply_batch(
+            owned_children=active_children, relations=relations,
+            expected_frontier=frontier,
+        )
+        self.assertEqual(result["writes"], 3)
+        self.assertCountEqual(
+            [(item["blocker"]["identifier"], item["blocked"]["identifier"])
+             for item in result["relations"]],
+            [("GEN-91", "GEN-92"), ("GEN-92", "GEN-94"), ("GEN-93", "GEN-94")],
+        )
+        fake.calls.clear()
+        replay = adapter.apply_batch(
+            owned_children=active_children, relations=relations,
+            expected_frontier=frontier,
+        )
+        self.assertEqual(replay["writes"], 0)
+        self.assertFalse(any("issueRelationCreate" in query for query, _ in fake.calls))
+
+        fake.calls.clear()
+        with self.assertRaisesRegex(ChildDependencyError, "source_not_owned_by_root"):
+            adapter.apply_batch(
+                owned_children=active_children,
+                relations=[self.relation(old[0], "blocks", active_children[0])],
+                expected_frontier=frontier,
+            )
+        self.assertFalse(any("issueRelationCreate" in query for query, _ in fake.calls))
+
+        for declared, error in (
+            (active_children[:-1], "incomplete_owned_child_identity_set"),
+            (active_children, "active_generation_scope_invalid:unowned_children:GEN-95"),
+        ):
+            with self.subTest(error=error):
+                if error.startswith("active_generation"):
+                    unowned = {
+                        "issue_id": "95000000-0000-4000-8000-000000000095",
+                        "identifier": "GEN-95",
+                    }
+                    fake.children.append(fake.child(unowned, plan_revision=active))
+                fake.calls.clear()
+                with self.assertRaisesRegex(ChildDependencyError, error):
+                    adapter.apply_batch(
+                        owned_children=declared, relations=relations,
+                        expected_frontier=frontier,
+                    )
+                self.assertFalse(any(
+                    "issueRelationCreate" in query or "commentCreate" in query
+                    for query, _ in fake.calls
+                ))
+                if error.startswith("active_generation"):
+                    fake.children.pop()
+
+        stale_adapter = LinearChildDependencyAdapter(
+            fake, workspace_id="workspace", team_id="team", project_id="project",
+            root_issue_id=ROOT_ID, root_identifier="GEN-37",
+            plan_revision=predecessor,
+        )
+        fake.calls.clear()
+        with self.assertRaisesRegex(
+            ChildDependencyError, "dependency_plan_generation_not_selected",
+        ):
+            stale_adapter.apply_batch(
+                owned_children=old, relations=[self.relation(old[0], "blocks", old[1])],
+                expected_frontier=frontier,
+            )
+        self.assertFalse(any(
+            "issueRelationCreate" in query or "commentCreate" in query
+            for query, _ in fake.calls
+        ))
 
     def test_supported_json_cli_requires_exact_request_and_emits_receipt(self):
         fake = FakeLinear()

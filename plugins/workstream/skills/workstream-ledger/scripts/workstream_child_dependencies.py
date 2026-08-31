@@ -28,7 +28,10 @@ from workstream_linear import (
 )
 from workstream_config import load_linear_api_key
 from workstream_linear_events import LinearCommentEventAdapter, reduce_event_comments
-from workstream_linear_projection import LinearProjectionAdapter, reduce_projection_comments
+from workstream_linear_projection import (
+    LinearProjectionAdapter, reduce_projection_comments, select_plan_generation,
+)
+from workstream_scope import ScopeError, validate_scope
 
 
 ISSUE_TOKEN = re.compile(r"[A-Z][A-Z0-9]*-\d+")
@@ -474,12 +477,11 @@ class LinearChildDependencyAdapter:
             root, workspace_id=self.authority["workspace_id"],
             team_id=self.authority["team_id"], project_id=self.authority["project_id"],
         )
-        if parse_plan_revision(root.get("description")) != self.plan_revision:
-            raise ChildDependencyError("dependency_root_plan_revision_mismatch")
         return root, children
 
     def _authenticated_children(
-        self, declared: list[dict[str, Any]], live: list[dict[str, Any]],
+        self, declared: list[dict[str, Any]], live: list[dict[str, Any]], *,
+        generation: dict[str, Any], projection: Any,
     ) -> dict[str, dict[str, str]]:
         if not isinstance(declared, list):
             raise ChildDependencyError("invalid_owned_child_set")
@@ -501,7 +503,42 @@ class LinearChildDependencyAdapter:
                 raise ChildDependencyError("ambiguous_live_child_identity")
             live_by_id[identity["issue_id"]] = child
             live_identifiers.add(identity["identifier"])
-        if set(ids) != set(live_by_id):
+            if (child.get("parent") or {}).get("id") != self.authority["root_issue_id"]:
+                raise ChildDependencyError(
+                    f"cross_root_dependency:{identity['identifier']}"
+                )
+            validate_issue_route(
+                child, workspace_id=self.authority["workspace_id"],
+                team_id=self.authority["team_id"], project_id=self.authority["project_id"],
+            )
+
+        if generation.get("authority_origin") != "generation_transition":
+            if generation.get("description_plan_revision") != self.plan_revision:
+                raise ChildDependencyError("dependency_root_plan_revision_mismatch")
+            expected_ids = set(live_by_id)
+        else:
+            scope = projection.snapshot.get("scope")
+            if not isinstance(scope, dict):
+                raise ChildDependencyError("active_generation_scope_invalid:missing")
+            try:
+                validate_scope(
+                    scope, root_id=self.authority["root_identifier"],
+                    child_ids=live_identifiers,
+                )
+            except ScopeError as error:
+                raise ChildDependencyError(
+                    f"active_generation_scope_invalid:{error}"
+                ) from error
+            if any(
+                scope["linear"].get(field) != self.authority[field]
+                for field in ("workspace_id", "team_id", "project_id", "root_issue_id")
+            ):
+                raise ChildDependencyError("active_generation_scope_route_mismatch")
+            expected_ids = {
+                issue_id for issue_id, child in live_by_id.items()
+                if parse_plan_revision(child.get("description")) == self.plan_revision
+            }
+        if set(ids) != expected_ids:
             raise ChildDependencyError("incomplete_owned_child_identity_set")
         result: dict[str, dict[str, str]] = {}
         for identity in identities:
@@ -510,12 +547,6 @@ class LinearChildDependencyAdapter:
                 raise ChildDependencyError(
                     f"owned_child_identity_mismatch:{identity['identifier']}"
                 )
-            if (child.get("parent") or {}).get("id") != self.authority["root_issue_id"]:
-                raise ChildDependencyError(f"cross_root_dependency:{identity['identifier']}")
-            validate_issue_route(
-                child, workspace_id=self.authority["workspace_id"],
-                team_id=self.authority["team_id"], project_id=self.authority["project_id"],
-            )
             if parse_plan_revision(child.get("description")) != self.plan_revision:
                 raise ChildDependencyError(
                     f"owned_child_plan_revision_mismatch:{identity['identifier']}"
@@ -578,8 +609,18 @@ class LinearChildDependencyAdapter:
         self, declared_children: list[dict[str, Any]],
     ) -> tuple[dict[str, int], DependencyGraph, dict[str, dict[str, str]]]:
         root, live_children = self._root_and_children()
-        owned = self._authenticated_children(declared_children, live_children)
         root_comments = self._root_comments()
+        description_plan_revision = parse_plan_revision(root.get("description"))
+        generation = select_plan_generation(
+            root_comments, workstream_id=self.authority["root_identifier"],
+            description_plan_revision=description_plan_revision,
+            authenticated_route={
+                key: self.authority[key]
+                for key in ("workspace_id", "team_id", "project_id", "root_issue_id")
+            },
+        )
+        if generation["plan_revision"] != self.plan_revision:
+            raise ChildDependencyError("dependency_plan_generation_not_selected")
         material = reduce_event_comments(
             root_comments, workstream_id=self.authority["root_identifier"],
         )
@@ -591,15 +632,28 @@ class LinearChildDependencyAdapter:
                 for key in ("workspace_id", "team_id", "project_id", "root_issue_id")
             },
         )
+        owned = self._authenticated_children(
+            declared_children, live_children,
+            generation=generation, projection=projection,
+        )
         graph = reduce_dependency_readback(
             self._relations(owned), authority=self.authority, owned_children=owned,
         )
         final_root, final_children = self._root_and_children()
-        final_owned = self._authenticated_children(declared_children, final_children)
-        if final_root.get("id") != root.get("id") or final_owned != owned:
-            raise ChildDependencyError("dependency_issue_graph_changed_during_read")
         final_comments = self._root_comments()
         try:
+            final_generation = select_plan_generation(
+                final_comments, workstream_id=self.authority["root_identifier"],
+                description_plan_revision=parse_plan_revision(
+                    final_root.get("description")
+                ),
+                authenticated_route={
+                    key: self.authority[key]
+                    for key in (
+                        "workspace_id", "team_id", "project_id", "root_issue_id",
+                    )
+                },
+            )
             final_material = reduce_event_comments(
                 final_comments, workstream_id=self.authority["root_identifier"],
             )
@@ -617,6 +671,16 @@ class LinearChildDependencyAdapter:
             raise ChildDependencyError(
                 "dependency_root_frontier_changed_during_read"
             ) from error
+        final_owned = self._authenticated_children(
+            declared_children, final_children,
+            generation=final_generation, projection=final_projection,
+        )
+        if (
+            final_root.get("id") != root.get("id")
+            or final_generation != generation
+            or final_owned != owned
+        ):
+            raise ChildDependencyError("dependency_issue_graph_changed_during_read")
         final_graph = reduce_dependency_readback(
             self._relations(owned), authority=self.authority, owned_children=owned,
         )
