@@ -390,6 +390,11 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.37 recovers an interrupted inactive-generation terminal evidence
+seed from the exact reviewed manifest. A canonical committed prefix is
+validated before generic target-source synchronization; divergence still
+refuses, and exact replay remains zero-write.
+
 Version 0.4.36 keeps inactive target projection, ordinary resume, and their
 prewrite/final fences on the same child-proposal authority. Each live child
 join uses its paired root snapshot; inactive targets explicitly retain the

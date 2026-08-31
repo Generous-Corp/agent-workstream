@@ -3475,6 +3475,15 @@ def main() -> int:
             )["plan_revision"],
         )
         projection_state = adapter.state()
+        # A seed batch may have committed a canonical prefix before the client
+        # died or lost its response. Normalize the reviewed contract through
+        # the seed prefix validator before generic inactive-source sync compares
+        # it with the live target frontier. Divergent prefixes still refuse.
+        if manifest.get("terminal_child_evidence_seeds"):
+            manifest = prepare_terminal_child_evidence_seeds(
+                manifest, graph, projection_state, remote_head=args.remote_head,
+                comments=comments,
+            )
         manifest, authenticated_source = synchronize_manifest_source(
             manifest, description, authenticated_source,
             projection_state.snapshot.get("source"),
