@@ -7931,12 +7931,203 @@ class ProjectionTests(unittest.TestCase):
                     "partial_terminal_closure_required",
                 )
                 self.assertEqual(len(client.comments), expected_writes)
-                manifest.update(payload["projection_contract"])
+                # Replay the exact originally reviewed manifest. A caller that
+                # died before receiving the first receipt has no newer contract.
         self.assertEqual(len(json.loads(output.getvalue())["writes"]), 0)
         self.assertFalse(any(
             "issueCreate" in query or "issueUpdate" in query
             for query, _variables in client.calls
         ))
+
+    def test_inactive_candidate_seed_cli_recovers_exact_crash_prefix(self):
+        def case():
+            client, current, source, graph, _children, manifest, _binding = (
+                self.mixed_head_plan_generation_fixture(current_secondary=True)
+            )
+            predecessor = "b" * 64
+            graph = deepcopy(graph)
+            graph["root"].update({
+                "description": f"Canonical plan: {source['identity']}",
+                "plan_revision": predecessor,
+            })
+            route = dict(AUTHORITY)
+            comments = mock.Mock()
+            comments.comments.side_effect = lambda: [
+                dict(item) for item in client.comments
+            ]
+            transport = mock.Mock()
+            transport.snapshot_for_root.return_value = (
+                live_graph_with_empty_child_comments(graph)
+            )
+            bound = workstream_projection.bind_projection_plan_generation(
+                live_graph_with_empty_child_comments(graph), client.comments,
+                workstream_id="GEN-37", requested_plan_revision=PLAN,
+                authenticated_route=route,
+            )
+            bound = add_live_child_material_history(
+                bound, authenticated_route=route,
+                root_comments=client.comments,
+                proposal_plan_revision=predecessor,
+            )
+            desired_scope = next(
+                item["value"] for item in manifest["projection"]
+                if (item["kind"], item["key"]) == ("scope", "root")
+            )
+            desired_contracts = {
+                item["key"]: item["value"]
+                for item in manifest["projection"]
+                if item["kind"] == "evidence_contract"
+            }
+            binding, _authorities = (
+                terminal_child_evidence_seed_predecessor_contract(
+                    bound, current.state(), client.comments,
+                    workstream_id="GEN-37",
+                    predecessor_plan_revision=predecessor,
+                    desired_scope=desired_scope,
+                    seeds=manifest["terminal_child_evidence_seeds"],
+                    desired_contracts=desired_contracts,
+                )
+            )
+            manifest["terminal_child_evidence_seed_predecessor"] = binding
+            directory = tempfile.TemporaryDirectory()
+            self.addCleanup(directory.cleanup)
+            manifest_path = Path(directory.name) / "manifest.json"
+            argv = [
+                "workstream_projection.py", "GEN-37", str(manifest_path),
+                "--remote-head", HEAD, "--plan-source", "ignored",
+                "--plan-identity", source["identity"],
+                "--max-bytes", "65536", "--max-items", "500",
+            ]
+
+            def invoke(reviewed=manifest):
+                manifest_path.write_text(json.dumps(reviewed))
+                output, error = io.StringIO(), io.StringIO()
+                with mock.patch.object(workstream_projection.sys, "argv", argv), \
+                     mock.patch.object(workstream_projection.sys, "stdout", output), \
+                     mock.patch.object(workstream_projection.sys, "stderr", error), \
+                     mock.patch.object(workstream_projection, "plan_payload", return_value={"source": source}), \
+                     mock.patch.object(workstream_projection, "load_linear_api_key", return_value="secret"), \
+                     mock.patch.object(workstream_projection, "HttpGraphQLClient", return_value=client), \
+                     mock.patch.object(workstream_projection, "resolve_linear_route", return_value=(route, None)), \
+                     mock.patch.object(workstream_projection, "resolve_authenticated_issue_route", return_value=route), \
+                     mock.patch.object(workstream_projection, "LinearGraphQLTransport", return_value=transport), \
+                     mock.patch.object(workstream_projection, "LinearCommentEventAdapter", return_value=comments):
+                    code = workstream_projection.main()
+                return code, output.getvalue(), error.getvalue()
+
+            return client, current, manifest, invoke
+
+        def crash_after(client, invoke, append_limit):
+            original_execute = client.execute
+            append_count = 0
+
+            def interrupted_execute(query, variables):
+                nonlocal append_count
+                response = original_execute(query, variables)
+                if "commentCreate" in query:
+                    append_count += 1
+                    if append_count == append_limit:
+                        raise SystemExit("simulated caller death")
+                return response
+
+            client.execute = interrupted_execute
+            try:
+                with self.assertRaisesRegex(
+                    SystemExit, "simulated caller death",
+                ):
+                    invoke()
+            finally:
+                client.execute = original_execute
+
+        client, current, manifest, invoke = case()
+        crash_after(client, invoke, 3)
+        self.assertEqual(current.state().revision, 3)
+        code, output, error = invoke()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(current.state().revision, 10)
+        self.assertFalse(json.loads(output)["resume_authority_verified"])
+        writes = len(client.comments)
+        code, output, error = invoke()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(len(client.comments), writes)
+        self.assertEqual(json.loads(output)["writes"], [])
+
+        def stale_source(reviewed):
+            next(
+                item for item in reviewed["projection"]
+                if item["kind"] == "source"
+            )["value"]["sha256"] = "c" * 64
+
+        def stale_scope(reviewed):
+            next(
+                item for item in reviewed["projection"]
+                if item["kind"] == "scope"
+            )["value"]["repositories"][0]["exact_head"] = "f" * 40
+
+        def stale_provenance(reviewed):
+            next(
+                item for item in reviewed["projection"]
+                if item["kind"] == "provenance"
+            )["value"]["session_id"] = "stale"
+
+        def quarantine_drift(reviewed):
+            reviewed["expected_projection_quarantine_count"] = 1
+            reviewed["expected_projection_quarantine_sha256"] = "f" * 64
+
+        for label, append_limit, mutate, expected_error in (
+            (
+                "stale_source", 3, stale_source,
+                "generation_candidate_source_review_mismatch",
+            ),
+            (
+                "stale_scope", 10, stale_scope,
+                "terminal_child_evidence_seed_primary_head_transition_invalid",
+            ),
+            (
+                "stale_provenance", 8, stale_provenance,
+                "projection_review_stale_reload_required",
+            ),
+            (
+                "quarantine", 3, quarantine_drift,
+                "terminal_child_evidence_seed_scope_missing",
+            ),
+        ):
+            with self.subTest(label=label):
+                drift_client, _current, reviewed, drift_invoke = case()
+                crash_after(drift_client, drift_invoke, append_limit)
+                reviewed = deepcopy(reviewed)
+                mutate(reviewed)
+                writes_before = len(drift_client.comments)
+                code, _output, error = drift_invoke(reviewed)
+                self.assertEqual(code, 2)
+                self.assertIn(expected_error, error)
+                self.assertEqual(len(drift_client.comments), writes_before)
+
+        for label, kind, key, value in (
+            ("wrong_order", "source", "root", {
+                "identity": "https://example.test/plan", "sha256": PLAN,
+            }),
+            ("unrelated", "provenance", "unexpected", {
+                "agent": "codex", "machine": "M5", "session_id": "unexpected",
+                "worktree": {"state": "safe", "head": HEAD},
+            }),
+        ):
+            with self.subTest(label=label):
+                drift_client, drift_current, reviewed, drift_invoke = case()
+                crash_after(drift_client, drift_invoke, 3)
+                drift_current.append(build_projection_event(
+                    workstream_id="GEN-37", kind=kind, key=key, value=value,
+                    plan_revision=PLAN,
+                    expected_revision=drift_current.state().revision,
+                    created_at="2026-08-29T23:00:00Z", authority=AUTHORITY,
+                ))
+                writes_before = len(drift_client.comments)
+                code, _output, error = drift_invoke(reviewed)
+                self.assertEqual(code, 2)
+                self.assertIn(
+                    "projection_review_stale_reload_required", error,
+                )
+                self.assertEqual(len(drift_client.comments), writes_before)
 
     def test_final_live_readback_refuses_concurrent_graph_or_checkpoint_change(self):
         graph = {"root": {"identifier": "GEN-37"}, "children": []}
