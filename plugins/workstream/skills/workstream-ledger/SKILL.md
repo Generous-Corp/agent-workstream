@@ -83,7 +83,8 @@ refuses while the current root has an active `blocked_by` relation.
 
 Dependencies between already-owned children use the separately bounded
 `scripts/workstream_child_dependencies.py` transport. It authenticates the
-declared route, immutable root, and both direct-child identities, fences the
+declared route, immutable root, selected plan generation, and both direct-child
+identities, fences the
 root material/projection frontier plus the child dependency graph, reserves a
 deterministic append-only `child_dependency_authorization` projection slot,
 then projects that immutable authority into a native `blocks` cache relation
@@ -112,9 +113,12 @@ The supported invocation is
 `python3 scripts/workstream_child_dependencies.py --request REQUEST.json --apply`.
 The JSON object must contain exactly `schema_version`, `authority` (including
 the explicit workspace/team/project/root UUID and root identifier),
-`plan_revision`, the complete `owned_children` identity set, `relations`, and
-the reviewed `expected_frontier`. The command does not infer a route or child
-set and emits the complete JSON receipt on stdout.
+`plan_revision`, the complete active-generation `owned_children` identity set,
+`relations`, and the reviewed `expected_frontier`. After a generation transition,
+retired-generation children remain as immutable root history but are excluded by
+their plan revision; every active child must still have projected ownership. The
+command does not infer a route or child set and emits the complete JSON receipt
+on stdout.
 
 The live Linear graph transport verifies the declared workspace/team/project
 relationship, fences reads to that project, and assigns the project on creates.
