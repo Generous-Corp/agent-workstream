@@ -30,7 +30,8 @@ from workstream_generation import (
 )
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
-    LinearProjectionError, projection_slot_id, reduce_projection_comments, TOMBSTONE,
+    LinearProjectionError, projection_slot_id, reduce_projection_comments,
+    select_plan_generation, TOMBSTONE,
 )
 from workstream_resume import (
     add_child_material_history, add_live_child_material_history,
@@ -682,7 +683,9 @@ class ProjectionTests(unittest.TestCase):
             "children": [],
         }
 
-    def mixed_head_plan_generation_fixture(self, *, current_secondary=False):
+    def mixed_head_plan_generation_fixture(
+        self, *, current_secondary=False, activation_ready=False,
+    ):
         predecessor_plan = "b" * 64
         first_head = "1" * 40
         second_head = "2" * 40
@@ -855,6 +858,18 @@ class ProjectionTests(unittest.TestCase):
                 "child_readback_sha256": canonical_digest(readback),
             })
             contracts[contract["slice_id"]] = contract
+        if activation_ready:
+            append("disposition", "root", {
+                "disposition": "attach", "remote_head": second_head,
+                "recovered_from_checkpoint": None,
+            })
+            while predecessor.state().revision < 85:
+                revision = predecessor.state().revision
+                append("provenance", f"production-padding-{revision}", {
+                    "agent": "codex", "machine": "M5",
+                    "session_id": f"production-padding-{revision}",
+                    "worktree": {"state": "safe", "head": second_head},
+                })
 
         material = Delta(
             "plan-transition", "GEN-37", "requirement", "agent",
@@ -1093,9 +1108,11 @@ class ProjectionTests(unittest.TestCase):
             legacy_unresolved_relation_heads=unresolved,
         )
 
-    def mixed_head_repair_reconcile_fixture(self):
+    def mixed_head_repair_reconcile_fixture(self, *, activation_ready=False):
         client, adapter, source, graph, children, manifest, binding = (
-            self.mixed_head_plan_generation_fixture()
+            self.mixed_head_plan_generation_fixture(
+                activation_ready=activation_ready,
+            )
         )
         self.run_mixed_head_seed_reconcile(
             client, adapter, source, graph, manifest, binding,
@@ -2573,6 +2590,345 @@ class ProjectionTests(unittest.TestCase):
         )
         self.assertEqual(context["resume_authority"], "full")
         self.assertEqual(len(context["child_closures"]), 5)
+
+    def test_generation_activation_post_read_accepts_exact_predecessor_control(self):
+        fixture = self.mixed_head_repair_reconcile_fixture(
+            activation_ready=True,
+        )
+        client, target, source, graph = fixture[:4]
+        self.run_mixed_head_repair_reconcile(fixture)
+        predecessor_plan = "b" * 64
+        activation_checkpoint = build_checkpoint(
+            workstream_id="GEN-37", boundary_id="activate-target",
+            root_revision=1, plan_revision=PLAN,
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai",
+                "session_id": "activate-target", "machine": "M5",
+                "worktree": {
+                    "state": "safe", "path": "/tmp/target",
+                    "branch": "target", "head": HEAD,
+                },
+            },
+            exact_head=HEAD, evidence=[], blocker=None,
+            next_action="Continue the activated target generation.",
+        )
+
+        def candidate_loader(plan_revision):
+            self.assertEqual(plan_revision, PLAN)
+            state = target.state()
+            candidate_graph = deepcopy(graph)
+            selected = select_plan_generation(
+                client.comments, workstream_id="GEN-37",
+                description_plan_revision=predecessor_plan,
+                authenticated_route=AUTHORITY,
+            )
+            candidate_comments = client.comments
+            if selected["plan_revision"] == plan_revision:
+                candidate_graph["root"].update({
+                    "generation_transition_tip_event_id": selected[
+                        "transition_tip_event_id"
+                    ],
+                    "generation_activation_epoch": selected[
+                        "activation_epoch"
+                    ],
+                    "generation_authority_origin": selected[
+                        "authority_origin"
+                    ],
+                    "description_plan_revision": predecessor_plan,
+                })
+            else:
+                candidate_comments = [*client.comments, {
+                    "id": "00000000-0000-4000-8000-000000000000",
+                    "body": encode_checkpoint_comment(activation_checkpoint),
+                }]
+            material = reduce_event_comments(
+                candidate_comments, workstream_id="GEN-37",
+            )
+            checkpoint_ids = sorted(
+                checkpoint["event_id"]
+                for checkpoint in reduce_checkpoint_comments(
+                    candidate_comments, workstream_id="GEN-37",
+                ).checkpoints
+                if checkpoint["plan_revision"] == plan_revision
+            )
+            checkpoint_ids = sorted(set([
+                *checkpoint_ids, activation_checkpoint["event_id"],
+            ]))
+            context = compact_context(
+                add_material_history(
+                    candidate_graph, candidate_comments, "GEN-37",
+                    authenticated_route=AUTHORITY,
+                    authenticated_source=source,
+                ),
+                "GEN-37", require_projection_authority=True,
+            )
+            return {
+                "resume_authority": context["resume_authority"],
+                "plan_revision": plan_revision,
+                "authenticated_route": AUTHORITY,
+                "source": source,
+                "material_revision": material.revision,
+                "checkpoint_event_ids": checkpoint_ids,
+                "projection_revision": state.revision,
+                "graph_frontier_sha256": generation_digest({
+                    "root": graph["root"], "children": graph["children"],
+                    "decisions": graph.get("decisions", []),
+                }),
+                "snapshot_sha256": generation_digest({
+                    "resume_authority": context["resume_authority"],
+                    "projection_event_ids": [
+                        event["event_id"] for event in state.events
+                    ],
+                }),
+                "quarantined_legacy_writes": generation_quarantine_metadata(
+                    client.comments, workstream_id="GEN-37",
+                ),
+            }
+
+        predecessor = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=predecessor_plan, **AUTHORITY,
+        ).state()
+        checkpoint_ids = sorted(
+            checkpoint["event_id"]
+            for checkpoint in reduce_checkpoint_comments(
+                client.comments, workstream_id="GEN-37",
+            ).checkpoints
+            if checkpoint["plan_revision"] == predecessor_plan
+        )
+        retirement = build_retirement_proof(
+            predecessor_plan_revision=predecessor_plan,
+            retired_at="2026-08-31T17:00:00Z", retired_writer_epoch=0,
+            provenance_event_ids=sorted(
+                event["event_id"] for event in predecessor.events
+                if event["kind"] == "provenance"
+            ),
+            checkpoint_event_ids=checkpoint_ids,
+        )
+        disposition = next(
+            event for event in reversed(target.state().events)
+            if event["kind"] == "disposition" and event["key"] == "root"
+        )
+        target.append(build_projection_event(
+            workstream_id="GEN-37", kind="disposition", key="root",
+            value={
+                "disposition": "attach", "remote_head": HEAD,
+                "recovered_from_checkpoint": activation_checkpoint["event_id"],
+            },
+            plan_revision=PLAN, expected_revision=target.state().revision,
+            created_at="2026-08-31T16:15:00Z",
+            supersedes_event_id=disposition["event_id"], authority=AUTHORITY,
+        ))
+        while target.state().revision < 17:
+            revision = target.state().revision
+            target.append(build_projection_event(
+                workstream_id="GEN-37", kind="provenance",
+                key=f"target-production-padding-{revision}",
+                value={
+                    "agent": "codex", "machine": "M5",
+                    "session_id": f"target-production-padding-{revision}",
+                    "worktree": {"state": "safe", "head": HEAD},
+                },
+                plan_revision=PLAN, expected_revision=revision,
+                created_at=f"2026-08-31T16:{revision:02d}:00Z",
+                authority=AUTHORITY,
+            ))
+        before_target_revision = target.state().revision
+        before_predecessor_revision = predecessor.revision
+        before_writes = len(client.comments)
+        self.assertEqual(before_target_revision, 17)
+        self.assertEqual(before_predecessor_revision, 85)
+        transport = GenerationTransport(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            authority=AUTHORITY, candidate_loader=candidate_loader,
+            legacy_description_plan_revision=predecessor_plan,
+        )
+        transport._capability_checked = True
+        result = transport.activate(
+            target_plan_revision=PLAN,
+            created_at="2026-08-31T17:00:00Z", retirement=retirement,
+            activation_checkpoint=activation_checkpoint, remote_head=HEAD,
+        )
+
+        self.assertEqual(len(client.comments), before_writes + 3)
+        self.assertEqual(target.state().revision, 18)
+        self.assertEqual(
+            LinearProjectionAdapter(
+                client, issue_id="GEN-37", workstream_id="GEN-37",
+                plan_revision=predecessor_plan, **AUTHORITY,
+            ).state().revision,
+            86,
+        )
+        self.assertEqual(result["activated_plan_revision"], PLAN)
+        self.assertEqual(candidate_loader(PLAN)["resume_authority"], "full")
+
+        selected = select_plan_generation(
+            client.comments, workstream_id="GEN-37",
+            description_plan_revision=predecessor_plan,
+            authenticated_route=AUTHORITY,
+        )
+        post_graph = deepcopy(graph)
+        post_graph["root"].update({
+            "generation_transition_tip_event_id": selected[
+                "transition_tip_event_id"
+            ],
+            "generation_activation_epoch": selected["activation_epoch"],
+            "generation_authority_origin": selected["authority_origin"],
+            "description_plan_revision": predecessor_plan,
+        })
+        post_snapshot = add_material_history(
+            post_graph, client.comments, "GEN-37",
+            authenticated_route=AUTHORITY, authenticated_source=source,
+        )
+        self.assertEqual(compact_context(
+            post_snapshot, "GEN-37", require_projection_authority=True,
+        )["resume_authority"], "full")
+
+        def set_value(path, replacement):
+            def mutate(event):
+                target_value = event
+                for field in path[:-1]:
+                    target_value = target_value[field]
+                old = target_value[path[-1]]
+                target_value[path[-1]] = (
+                    replacement(old) if callable(replacement) else replacement
+                )
+            return mutate
+
+        def change_checkpoints(side):
+            def mutate(event):
+                frontier = event["value"][side]
+                frontier["checkpoint_event_ids"] = sorted([
+                    *frontier["checkpoint_event_ids"], "checkpoint-other",
+                ])
+                frontier["checkpoint_events_sha256"] = generation_digest(
+                    frontier["checkpoint_event_ids"]
+                )
+            return mutate
+
+        def change_retirement(event):
+            retirement = event["value"]["retirement"]
+            retirement["retired_at"] = "changed"
+            retirement["declaration_sha256"] = generation_digest({
+                key: value for key, value in retirement.items()
+                if key != "declaration_sha256"
+            })
+
+        mutations = {
+            "terminal_event": set_value(("created_at",), "changed"),
+            "from_projection_revision": set_value(
+                ("value", "from", "projection_revision"), lambda value: value + 1,
+            ),
+            "from_projection_digest": set_value(
+                ("value", "from", "projection_events_sha256"), "0" * 64,
+            ),
+            "from_projection_frontier": set_value(
+                ("value", "from", "projection_frontier_event_id"),
+                "wsp_" + "0" * 32,
+            ),
+            "from_material": set_value(
+                ("value", "from", "material_revision"), lambda value: value + 1,
+            ),
+            "from_checkpoints": change_checkpoints("from"),
+            "from_source_event": set_value(
+                ("value", "from", "source_event_id"), "wsp_" + "0" * 32,
+            ),
+            "from_source_identity": set_value(
+                ("value", "from", "source_identity"), "https://wrong.test/plan",
+            ),
+            "from_source_sha": set_value(
+                ("value", "from", "source_sha256"), "0" * 64,
+            ),
+            "to_projection_revision": set_value(
+                ("value", "to", "projection_revision"), lambda value: value + 1,
+            ),
+            "to_projection_digest": set_value(
+                ("value", "to", "projection_events_sha256"), "0" * 64,
+            ),
+            "to_projection_frontier": set_value(
+                ("value", "to", "projection_frontier_event_id"),
+                "wsp_" + "0" * 32,
+            ),
+            "to_material": set_value(
+                ("value", "to", "material_revision"), lambda value: value + 1,
+            ),
+            "to_checkpoints": change_checkpoints("to"),
+            "to_source_event": set_value(
+                ("value", "to", "source_event_id"), "wsp_" + "0" * 32,
+            ),
+            "to_source_identity": set_value(
+                ("value", "to", "source_identity"), "https://wrong.test/plan",
+            ),
+            "to_source_sha": set_value(
+                ("value", "to", "source_sha256"), "0" * 64,
+            ),
+            "source": set_value(
+                ("value", "source", "identity"), "https://wrong.test/plan",
+            ),
+            "reservation_id": set_value(
+                ("value", "reservation_id"), "wsgr_" + "0" * 32,
+            ),
+            "reservation_sha": set_value(
+                ("value", "reservation_sha256"), "0" * 64,
+            ),
+            "graph_frontier": set_value(
+                ("value", "graph_frontier_sha256"), "0" * 64,
+            ),
+            "candidate_resume": set_value(
+                ("value", "candidate_resume_sha256"), "0" * 64,
+            ),
+            "candidate_seal_id": set_value(
+                ("value", "candidate_seal_event_id"), "wsp_" + "0" * 32,
+            ),
+            "candidate_seal_sha": set_value(
+                ("value", "candidate_seal_sha256"), "0" * 64,
+            ),
+            "activation_epoch": set_value(
+                ("value", "activation_epoch"), lambda value: value + 1,
+            ),
+            "retirement": change_retirement,
+            "previous_control": set_value(
+                ("value", "previous_control_event_id"), "wsp_" + "0" * 32,
+            ),
+            "activation_checkpoint": set_value(
+                ("value", "activation_checkpoint", "next_action"), "changed",
+            ),
+            "activation_checkpoint_sha": set_value(
+                ("value", "activation_checkpoint_sha256"), "0" * 64,
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(authoritative_field=name):
+                changed = deepcopy(post_snapshot)
+                transition = next(
+                    event for event in changed["projection_history"]
+                    if event["event_id"] == selected["transition_tip_event_id"]
+                )
+                mutate(transition)
+                transition["event_id"] = projection_module._event_id(transition)
+                with self.assertRaises(ResumeError):
+                    compact_context(
+                        changed, "GEN-37", require_projection_authority=True,
+                    )
+
+        additional = deepcopy(post_snapshot)
+        additional["projection_history"].append(build_projection_event(
+            workstream_id="GEN-37", kind="provenance", key="late-suffix",
+            value={
+                "agent": "codex", "machine": "M5", "session_id": "late",
+                "worktree": {"state": "safe", "head": HEAD},
+            },
+            plan_revision=predecessor_plan, expected_revision=86,
+            created_at="2026-08-31T18:00:00Z", authority=AUTHORITY,
+        ))
+        additional["projection_recovery"]["stale_plan_count"] += 1
+        with self.assertRaisesRegex(
+            ResumeError, "carried_evidence_authority_invalid",
+        ):
+            compact_context(
+                additional, "GEN-37", require_projection_authority=True,
+            )
 
     def test_mixed_head_predecessor_binding_refuses_omission_and_drift(self):
         def omit_child(manifest):

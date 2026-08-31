@@ -396,6 +396,11 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.42 preserves carried predecessor evidence after activation only
+when the sole history suffix is the exact terminal generation transition
+already validated by active-generation selection. The reviewed predecessor
+prefix remains digest-exact; altered, arbitrary, or additional suffixes refuse.
+
 Version 0.4.41 keeps checkpoint-bound generation activation within the standard
 resume budget by digesting only the predecessor child-ledger prefix already
 acknowledged by a stale checkpoint. Current child state and every post-fence
