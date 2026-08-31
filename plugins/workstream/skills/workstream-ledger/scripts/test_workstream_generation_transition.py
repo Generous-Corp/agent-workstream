@@ -632,6 +632,397 @@ class GenerationTransitionTests(unittest.TestCase):
         self.assertEqual(replay["event_id"], receipt["event_id"])
         self.assertEqual(len(self.client.mutations), count)
 
+    def test_activation_preview_and_apply_reject_historical_provenance_frontier(self):
+        project_full(self.client, NEW)
+        predecessor = adapter(self.client, OLD)
+        state = predecessor.state()
+        historical = next(
+            event for event in state.events
+            if event["kind"] == "provenance" and event["key"] == "generation"
+        )
+        replacement = build_projection_event(
+            workstream_id=WORKSTREAM, kind="provenance", key="generation",
+            value={
+                "agent": "codex", "machine": "M3", "session_id": "current",
+                "worktree": {"state": "safe", "head": "e" * 40},
+            },
+            plan_revision=OLD, expected_revision=state.revision,
+            created_at="replacement",
+            supersedes_event_id=historical["event_id"], authority=AUTHORITY,
+        )
+        predecessor.append(replacement)
+        current = predecessor.state().events[-1]
+        for provenance_ids in (
+            [historical["event_id"]],
+            sorted([historical["event_id"], current["event_id"]]),
+        ):
+            with self.subTest(provenance_ids=provenance_ids):
+                stale = build_retirement_proof(
+                    predecessor_plan_revision=OLD, retired_at="now",
+                    retired_writer_epoch=0,
+                    provenance_event_ids=provenance_ids,
+                    checkpoint_event_ids=[],
+                )
+                writes = len(self.client.mutations)
+                with self.assertRaisesRegex(
+                    WorkstreamGenerationError,
+                    "generation_retirement_frontier_mismatch",
+                ):
+                    self.transport.preview_activate(
+                        target_plan_revision=NEW, created_at="now",
+                        retirement=stale,
+                    )
+                with self.assertRaisesRegex(
+                    WorkstreamGenerationError,
+                    "generation_retirement_frontier_mismatch",
+                ):
+                    self.transport.activate(
+                        target_plan_revision=NEW, created_at="now",
+                        retirement=stale,
+                    )
+                self.assertEqual(len(self.client.mutations), writes)
+
+    def test_activation_retirement_ignores_child_checkpoint_but_refuses_contamination(self):
+        project_full(self.client, NEW)
+        child_checkpoint = build_checkpoint(
+            workstream_id="GEN-38", boundary_id="child-only",
+            root_revision=0, plan_revision=OLD,
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai",
+                "session_id": "child", "machine": "M5",
+                "worktree": {"state": "unknown"},
+            }, exact_head=None, evidence=[], blocker=None,
+            next_action="Continue child work.",
+        )
+        # This checkpoint belongs to a child-local comment collection, not the
+        # root stream used to derive generation retirement authority.
+        child_comments = [{
+            "id": "child-checkpoint",
+            "body": encode_checkpoint_comment(child_checkpoint),
+        }]
+        self.assertEqual(
+            reduce_checkpoint_comments(
+                child_comments, workstream_id="GEN-38",
+            ).checkpoints[0]["event_id"],
+            child_checkpoint["event_id"],
+        )
+        valid = self.retirement()
+        writes = len(self.client.mutations)
+        preview = self.transport.preview_activate(
+            target_plan_revision=NEW, created_at="now", retirement=valid,
+        )
+        self.assertEqual(preview["retirement_frontier"]["checkpoint_event_ids"], [])
+        self.assertEqual(len(self.client.mutations), writes)
+
+        contaminated = build_retirement_proof(
+            predecessor_plan_revision=OLD, retired_at="now",
+            retired_writer_epoch=0,
+            provenance_event_ids=valid["provenance_event_ids"],
+            checkpoint_event_ids=[child_checkpoint["event_id"]],
+        )
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_retirement_frontier_mismatch",
+        ):
+            self.transport.preview_activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=contaminated,
+            )
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_retirement_frontier_mismatch",
+        ):
+            self.transport.activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=contaminated,
+            )
+        self.assertEqual(len(self.client.mutations), writes)
+
+    def test_activation_checkpoint_preview_simulates_exact_apply_candidate(self):
+        project_full(self.client, NEW)
+        checkpoint = self.activation_checkpoint()
+        retirement = self.retirement()
+        with patch("workstream_generation.plan_payload", return_value={
+            "source": {
+                "identity": f"https://example.test/{NEW}", "sha256": NEW,
+            },
+        }):
+            strict = strict_candidate_loader(
+                self.client, token=WORKSTREAM, authority=AUTHORITY,
+                plan_source="plan", plan_identity=None,
+                activation_checkpoint=checkpoint,
+                activation_remote_head="e" * 40,
+                activation_created_at="checkpoint-preview",
+            )
+            observed = []
+
+            def recording_loader(plan):
+                receipt = strict(plan)
+                observed.append(deepcopy(receipt))
+                return receipt
+
+            transport = GenerationTransport(
+                self.client, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
+                authority=AUTHORITY, candidate_loader=recording_loader,
+                legacy_description_plan_revision=OLD,
+            )
+            writes = len(self.client.mutations)
+            preview = transport.preview_activate(
+                target_plan_revision=NEW, created_at="checkpoint-preview",
+                retirement=retirement, activation_checkpoint=checkpoint,
+                remote_head="e" * 40,
+            )
+            self.assertEqual(len(self.client.mutations), writes)
+            self.assertEqual(preview["candidate"], observed[-1])
+            self.assertEqual(preview["prospective_target_disposition"], {
+                "disposition": "attach", "remote_head": "e" * 40,
+                "recovered_from_checkpoint": checkpoint["event_id"],
+            })
+            prospective = preview["prospective_target_disposition_event"]
+            self.assertEqual(prospective["expected_revision"], 4)
+            observed.clear()
+            transport.activate(
+                target_plan_revision=NEW, created_at="checkpoint-preview",
+                retirement=retirement, activation_checkpoint=checkpoint,
+                remote_head="e" * 40,
+            )
+
+        self.assertEqual(observed[0], preview["candidate"])
+        actual = next(
+            event for event in adapter(self.client, NEW).state().events
+            if event["event_id"] == prospective["event_id"]
+        )
+        self.assertEqual(actual, prospective)
+
+    def test_activation_cli_preview_validates_retirement_and_writes_nothing(self):
+        project_full(self.client, NEW)
+        checkpoint = self.activation_checkpoint()
+        retirement = self.retirement()
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as proof, \
+                tempfile.NamedTemporaryFile("w", suffix=".json") as checkpoint_file:
+            json.dump(retirement, proof)
+            proof.flush()
+            json.dump(checkpoint, checkpoint_file)
+            checkpoint_file.flush()
+            argv = [
+                "workstream_generation.py", "activate", WORKSTREAM,
+                "--plan-source", "plan", "--plan-identity", "plan",
+                "--retirement-proof", proof.name,
+                "--activation-checkpoint", checkpoint_file.name,
+                "--remote-head", "e" * 40,
+                "--created-at", "checkpoint-preview",
+            ]
+            stdout, stderr = io.StringIO(), io.StringIO()
+            writes = len(self.client.mutations)
+            with patch.object(sys, "argv", argv), patch(
+                "workstream_generation._route_and_client",
+                return_value=(self.client, AUTHORITY),
+            ), patch("workstream_generation.plan_payload", return_value={
+                "source": {
+                    "identity": f"https://example.test/{NEW}",
+                    "sha256": NEW,
+                },
+            }), patch.object(sys, "stdout", stdout), patch.object(
+                sys, "stderr", stderr,
+            ):
+                self.assertEqual(main(), 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(len(self.client.mutations), writes)
+        output = json.loads(stdout.getvalue())
+        self.assertFalse(output["apply"])
+        self.assertEqual(output["retirement_frontier"], {
+            "provenance_event_ids": retirement["provenance_event_ids"],
+            "checkpoint_event_ids": [],
+        })
+        self.assertEqual(
+            output["prospective_target_disposition"][
+                "recovered_from_checkpoint"
+            ],
+            checkpoint["event_id"],
+        )
+
+    def test_activation_preview_refuses_unrelated_pending_boundary(self):
+        project_full(self.client, NEW)
+        project_full(self.client, OTHER)
+        retirement = self.retirement()
+        candidate = self.transport._candidate(NEW, self.client.comments)
+        reservation = self.transport._reservation(
+            comments=self.client.comments, mode="activate", from_plan=OLD,
+            to_plan=NEW, epoch=0, previous_control=None,
+            candidate=candidate, retirement=retirement,
+            created_at="competing",
+        )
+        self.transport._append_reservation(reservation)
+        writes = len(self.client.mutations)
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_boundary_reserved|ledger_boundary_reserved",
+        ):
+            self.transport.preview_activate(
+                target_plan_revision=OTHER, created_at="now",
+                retirement=retirement,
+            )
+        self.assertEqual(len(self.client.mutations), writes)
+
+    def test_activation_preview_rejects_exact_aborted_reservation_like_apply(self):
+        project_full(self.client, NEW)
+        retirement = self.retirement()
+        candidate = self.transport._candidate(NEW, self.client.comments)
+        reservation = self.transport._reservation(
+            comments=self.client.comments, mode="activate", from_plan=OLD,
+            to_plan=NEW, epoch=0, previous_control=None,
+            candidate=candidate, retirement=retirement, created_at="now",
+        )
+        stored = self.transport._append_reservation(reservation)
+        self.transport.abort(
+            reservation_id=stored["reservation_id"],
+            reservation_sha256=stored["reservation_sha256"],
+            reason="reviewed cancellation", created_at="abort",
+        )
+        writes = len(self.client.mutations)
+        for operation in (
+            self.transport.preview_activate,
+            self.transport.activate,
+        ):
+            with self.subTest(operation=operation.__name__):
+                with self.assertRaisesRegex(
+                    WorkstreamGenerationError,
+                    "generation_reservation_aborted_or_completed",
+                ):
+                    operation(
+                        target_plan_revision=NEW, created_at="now",
+                        retirement=retirement,
+                    )
+                self.assertEqual(len(self.client.mutations), writes)
+
+    def test_checkpoint_retry_rejects_aborted_plain_reservation_before_disposition(self):
+        project_full(self.client, NEW)
+        retirement = self.retirement()
+        candidate = self.transport._candidate(NEW, self.client.comments)
+        plain = self.transport._reservation(
+            comments=self.client.comments, mode="activate", from_plan=OLD,
+            to_plan=NEW, epoch=0, previous_control=None,
+            candidate=candidate, retirement=retirement, created_at="now",
+        )
+        stored = self.transport._append_reservation(plain)
+        self.transport.abort(
+            reservation_id=stored["reservation_id"],
+            reservation_sha256=stored["reservation_sha256"],
+            reason="replace with checkpoint activation", created_at="abort",
+        )
+        checkpoint = self.activation_checkpoint()
+        writes = len(self.client.mutations)
+        with patch("workstream_generation.plan_payload", return_value={
+            "source": {
+                "identity": f"https://example.test/{NEW}", "sha256": NEW,
+            },
+        }):
+            self.transport.candidate_loader = strict_candidate_loader(
+                self.client, token=WORKSTREAM, authority=AUTHORITY,
+                plan_source="plan", plan_identity=None,
+                activation_checkpoint=checkpoint,
+                activation_remote_head="e" * 40,
+                activation_created_at="now",
+            )
+            for operation in (
+                self.transport.preview_activate,
+                self.transport.activate,
+            ):
+                with self.subTest(operation=operation.__name__):
+                    with self.assertRaisesRegex(
+                        WorkstreamGenerationError,
+                        "generation_reservation_aborted_or_completed",
+                    ):
+                        operation(
+                            target_plan_revision=NEW, created_at="now",
+                            retirement=retirement,
+                            activation_checkpoint=checkpoint,
+                            remote_head="e" * 40,
+                        )
+                    self.assertEqual(len(self.client.mutations), writes)
+                    self.assertEqual(
+                        adapter(self.client, NEW).state().snapshot["disposition"],
+                        {
+                            "disposition": "attach", "remote_head": "e" * 40,
+                            "recovered_from_checkpoint": None,
+                        },
+                    )
+
+    def test_activation_preview_returns_exact_completed_historical_replay(self):
+        project_full(self.client, NEW)
+        retirement = self.retirement()
+        applied = self.transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=retirement,
+        )
+        writes = len(self.client.mutations)
+        preview = self.transport.preview_activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=retirement,
+        )
+        replay = self.transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=retirement,
+        )
+        self.assertEqual(preview, replay)
+        self.assertEqual(preview["event_id"], applied["event_id"])
+        self.assertTrue(preview["replay"])
+        self.assertEqual(len(self.client.mutations), writes)
+
+    def test_prepared_disposition_rejects_checkpoint_from_predecessor_generation(self):
+        project_full(self.client, NEW)
+        predecessor_checkpoint = build_checkpoint(
+            workstream_id=WORKSTREAM, boundary_id="predecessor-only",
+            root_revision=0, plan_revision=OLD,
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai",
+                "session_id": "old", "machine": "M5",
+                "worktree": {"state": "unknown"},
+            }, exact_head=None, evidence=[], blocker=None,
+            next_action="Retire the predecessor.",
+        )
+        LinearCheckpointAdapter(
+            self.client, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
+            workspace_id="workspace", team_id="team", project_id="project",
+        ).persist(predecessor_checkpoint)
+        target = adapter(self.client, NEW)
+        state = target.state()
+        disposition = next(
+            event for event in state.events
+            if event["kind"] == "disposition" and event["key"] == "root"
+        )
+        target.append(build_projection_event(
+            workstream_id=WORKSTREAM, kind="disposition", key="root",
+            value={
+                "disposition": "attach", "remote_head": "e" * 40,
+                "recovered_from_checkpoint": predecessor_checkpoint["event_id"],
+            },
+            plan_revision=NEW, expected_revision=state.revision,
+            created_at="prepared",
+            supersedes_event_id=disposition["event_id"], authority=AUTHORITY,
+        ))
+        retirement = self.retirement()
+        writes = len(self.client.mutations)
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_prepared_activation_checkpoint_required",
+        ):
+            self.transport.preview_activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=retirement,
+            )
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_prepared_activation_checkpoint_required",
+        ):
+            self.transport.activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=retirement,
+            )
+        self.assertEqual(len(self.client.mutations), writes)
+
     def test_activation_checkpoint_crash_after_disposition_keeps_old_active(self):
         project_full(self.client, NEW)
         checkpoint = self.activation_checkpoint()
@@ -1859,6 +2250,8 @@ class GenerationTransitionTests(unittest.TestCase):
                 self.client, token=WORKSTREAM, authority=AUTHORITY,
                 plan_source="plan", plan_identity=None,
                 activation_checkpoint=checkpoint,
+                activation_remote_head="e" * 40,
+                activation_created_at="checkpoint-preview",
             )(NEW)
 
         self.assertEqual(receipt["resume_authority"], "full")

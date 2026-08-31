@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import gc
 import importlib.util
 import io
 import json
@@ -9,6 +10,7 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -44,6 +46,16 @@ class WorkstreamIngressTests(unittest.TestCase):
         second = MODULE.event_record(payload, "codex")
         self.assertEqual(first["event_id"], second["event_id"])
         self.assertEqual(first["workstream_id"], "ABC-12")
+
+    def test_discarded_connection_closes_without_resource_warning(self):
+        with warnings.catch_warnings(record=True) as observed:
+            warnings.simplefilter("always", ResourceWarning)
+            connection = MODULE.connect()
+            del connection
+            gc.collect()
+        self.assertFalse([
+            item for item in observed if item.category is ResourceWarning
+        ])
 
     def test_redacts_credentials_and_oauth_query_values(self):
         prompt, count, truncated = MODULE.redact_prompt(

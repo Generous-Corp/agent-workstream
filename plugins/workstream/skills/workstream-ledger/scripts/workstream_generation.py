@@ -171,6 +171,66 @@ def _validate_candidate_receipt(
         )
 
 
+def _prospective_activation_checkpoint(
+    checkpoint: dict[str, Any], *, workstream_id: str,
+    target_plan_revision: str, material_revision: int,
+    target_state: Any, remote_head: str | None, created_at: str,
+    authority: dict[str, str],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Validate and model the checkpoint-bound target projection in memory."""
+    validate_checkpoint(checkpoint)
+    if (
+        checkpoint["workstream_id"] != workstream_id
+        or checkpoint["plan_revision"] != target_plan_revision
+        or checkpoint["root_revision"] != material_revision
+        or checkpoint["acknowledgement"] != {
+            "state": "pending", "remote_id": None,
+            "applied_revision": None,
+        }
+        or not isinstance(remote_head, str)
+        or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", remote_head)
+    ):
+        raise WorkstreamGenerationError(
+            "generation_activation_checkpoint_mismatch"
+        )
+    source = target_state.snapshot.get("source") or {}
+    if source.get("sha256") != target_plan_revision:
+        raise WorkstreamGenerationError(
+            "generation_activation_checkpoint_source_incomplete"
+        )
+    synthetic = acknowledge_checkpoint(
+        checkpoint, remote_id="00000000-0000-4000-8000-000000000000",
+        applied_revision=material_revision,
+    )
+    recovered = recover_latest(
+        [synthetic], workstream_id,
+        expected_plan_revision=target_plan_revision,
+    )
+    decision = choose_disposition({
+        "root": {"identifier": workstream_id},
+        "latest_checkpoint": recovered,
+    }, remote_head=remote_head)
+    desired = {
+        "disposition": decision["disposition"],
+        "remote_head": remote_head,
+        "recovered_from_checkpoint": checkpoint["event_id"],
+    }
+    disposition_head = next((
+        event for event in reversed(target_state.events)
+        if event["kind"] == "disposition" and event["key"] == "root"
+    ), None)
+    if disposition_head is not None and disposition_head["value"] == desired:
+        return desired, None
+    return desired, build_projection_event(
+        workstream_id=workstream_id, kind="disposition", key="root",
+        value=desired, plan_revision=target_plan_revision,
+        expected_revision=target_state.revision, created_at=created_at,
+        supersedes_event_id=(
+            disposition_head["event_id"] if disposition_head else None
+        ), authority=authority,
+    )
+
+
 def _validate_reservation(value: dict[str, Any]) -> None:
     fields = {
         "schema_version", "reservation_id", "workstream_id", "authority",
@@ -742,30 +802,19 @@ class GenerationTransport:
         return {"state": state, "source": source, "receipt": receipt,
                 "material": material, "checkpoint_ids": checkpoint_ids}
 
-    def _reservation(
-        self, *, comments: list[dict[str, Any]], mode: str, from_plan: str,
-        to_plan: str, epoch: int, previous_control: str | None,
-        candidate: dict[str, Any], retirement: dict[str, Any], created_at: str,
-    ) -> dict[str, Any]:
-        checkpoints = reduce_generation_checkpoint_comments(
-            comments, workstream_id=self.workstream_id,
-            authenticated_route=self.authority,
-        )
-        all_checkpoint_ids = sorted(item["event_id"] for item in checkpoints.checkpoints)
-        assert_no_pending_ledger_reservation(
-            comments, workstream_id=self.workstream_id,
-            authenticated_route=self.authority, current_plan_revision=from_plan,
-        )
-        assert_no_pending_generation_reservation(
-            comments, workstream_id=self.workstream_id,
-            authenticated_route=self.authority,
-        )
-        frontier = ledger_serialization_frontier(
-            all_checkpoint_ids, comments, workstream_id=self.workstream_id,
-            authenticated_route=self.authority, current_plan_revision=from_plan,
-            material_revision=candidate["material"].revision,
-        )
-        from_state, to_state = self._states(comments, from_plan, to_plan)
+    def _validate_retirement_frontier(
+        self, comments: list[dict[str, Any]], *, from_plan: str,
+        retirement: dict[str, Any], from_state: Any | None = None,
+        checkpoints: Any | None = None,
+    ) -> dict[str, list[str]]:
+        """Fence the exact active predecessor writers before any append."""
+        if from_state is None:
+            from_state = self._states(comments, from_plan)[0]
+        if checkpoints is None:
+            checkpoints = reduce_generation_checkpoint_comments(
+                comments, workstream_id=self.workstream_id,
+                authenticated_route=self.authority,
+            )
         provenance_heads: dict[str, dict[str, Any]] = {}
         for event in from_state.events:
             if event["kind"] == "provenance":
@@ -786,6 +835,76 @@ class GenerationTransport:
             raise WorkstreamGenerationError(
                 "generation_retirement_frontier_mismatch"
             )
+        return {
+            "provenance_event_ids": expected_provenance_ids,
+            "checkpoint_event_ids": expected_predecessor_checkpoints,
+        }
+
+    def _prepared_activation_checkpoint_id(
+        self, comments: list[dict[str, Any]], *, target_plan_revision: str,
+        target_state: Any,
+        activation_checkpoint: dict[str, Any] | None,
+    ) -> str | None:
+        target_disposition = target_state.snapshot.get("disposition")
+        prepared = (
+            target_disposition.get("recovered_from_checkpoint")
+            if isinstance(target_disposition, dict) else None
+        )
+        target_checkpoint_ids = {
+            item["event_id"]
+            for item in reduce_generation_checkpoint_comments(
+                comments, workstream_id=self.workstream_id,
+                authenticated_route=self.authority,
+            ).checkpoints
+            if item["plan_revision"] == target_plan_revision
+        }
+        if (
+            isinstance(prepared, str)
+            and prepared not in target_checkpoint_ids
+            and (
+                activation_checkpoint is None
+                or activation_checkpoint.get("event_id") != prepared
+                or activation_checkpoint.get("plan_revision")
+                != target_plan_revision
+            )
+        ):
+            raise WorkstreamGenerationError(
+                "generation_prepared_activation_checkpoint_required"
+            )
+        return prepared
+
+    def _reservation(
+        self, *, comments: list[dict[str, Any]], mode: str, from_plan: str,
+        to_plan: str, epoch: int, previous_control: str | None,
+        candidate: dict[str, Any], retirement: dict[str, Any], created_at: str,
+    ) -> dict[str, Any]:
+        checkpoints = reduce_generation_checkpoint_comments(
+            comments, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+        )
+        all_checkpoint_ids = sorted(
+            item["event_id"] for item in checkpoints.checkpoints
+        )
+        assert_no_pending_ledger_reservation(
+            comments, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+            current_plan_revision=from_plan,
+        )
+        assert_no_pending_generation_reservation(
+            comments, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+        )
+        frontier = ledger_serialization_frontier(
+            all_checkpoint_ids, comments, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+            current_plan_revision=from_plan,
+            material_revision=candidate["material"].revision,
+        )
+        from_state, to_state = self._states(comments, from_plan, to_plan)
+        self._validate_retirement_frontier(
+            comments, from_plan=from_plan, retirement=retirement,
+            from_state=from_state, checkpoints=checkpoints,
+        )
         unsigned = {
             "schema_version": 2, "workstream_id": self.workstream_id,
             "authority": self.authority, "mode": mode,
@@ -1168,6 +1287,127 @@ class GenerationTransport:
             "replay": False,
         }
 
+    def preview_activate(
+        self, *, target_plan_revision: str, created_at: str,
+        retirement: dict[str, Any],
+        activation_checkpoint: dict[str, Any] | None = None,
+        remote_head: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate activation inputs without creating a remote artifact."""
+        comments = self._comments()
+        replay_from = (
+            retirement.get("predecessor_plan_revision")
+            if isinstance(retirement, dict) else None
+        )
+        if isinstance(replay_from, str):
+            replay = self._historical_replay(
+                comments, from_plan=replay_from,
+                to_plan=target_plan_revision,
+                expected_retirement=retirement,
+                expected_created_at=created_at,
+                validate_activation_inputs=True,
+                expected_activation_checkpoint=activation_checkpoint,
+                expected_remote_head=remote_head,
+            )
+            if replay:
+                return replay
+        selected = select_plan_generation(
+            comments, workstream_id=self.workstream_id,
+            description_plan_revision=self.legacy_description_plan_revision,
+            authenticated_route=self.authority,
+        )
+        from_plan = selected["plan_revision"]
+        if from_plan == target_plan_revision:
+            raise WorkstreamGenerationError("generation_target_already_active")
+        epoch = (
+            selected["activation_epoch"]
+            if selected["activation_epoch"] is not None else -1
+        ) + 1
+        _validate_retirement(retirement, from_plan, epoch)
+        retirement_frontier = self._validate_retirement_frontier(
+            comments, from_plan=from_plan, retirement=retirement,
+        )
+        material = reduce_event_comments(
+            comments, workstream_id=self.workstream_id,
+        )
+        target_state = self._states(comments, target_plan_revision)[0]
+        self._prepared_activation_checkpoint_id(
+            comments, target_plan_revision=target_plan_revision,
+            target_state=target_state,
+            activation_checkpoint=activation_checkpoint,
+        )
+        prospective_disposition = None
+        prospective_event = None
+        if activation_checkpoint is not None:
+            prospective_disposition, prospective_event = (
+                _prospective_activation_checkpoint(
+                    activation_checkpoint, workstream_id=self.workstream_id,
+                    target_plan_revision=target_plan_revision,
+                    material_revision=material.revision,
+                    target_state=target_state, remote_head=remote_head,
+                    created_at=created_at, authority=self.authority,
+                )
+            )
+        checkpoint_ids = sorted(
+            item["event_id"]
+            for item in reduce_generation_checkpoint_comments(
+                comments, workstream_id=self.workstream_id,
+                authenticated_route=self.authority,
+            ).checkpoints
+            if item["plan_revision"] == target_plan_revision
+        )
+        if activation_checkpoint is not None:
+            checkpoint_ids = sorted(set([
+                *checkpoint_ids, activation_checkpoint["event_id"],
+            ]))
+        source = target_state.snapshot.get("source") or {}
+        source = {
+            "identity": source.get("identity") or source.get("url"),
+            "sha256": source.get("sha256"),
+        }
+        receipt = self.candidate_loader(target_plan_revision)
+        _validate_candidate_receipt(
+            receipt, plan_revision=target_plan_revision,
+            authority=self.authority, source=source,
+            material_revision=material.revision,
+            checkpoint_event_ids=checkpoint_ids,
+            projection_revision=(
+                target_state.revision + int(prospective_event is not None)
+            ),
+        )
+        previous_control = selected["transition_tip_event_id"]
+        matching = self._matching_reservation(
+            comments, mode="activate", from_plan=from_plan,
+            to_plan=target_plan_revision, epoch=epoch,
+            previous_control=previous_control, retirement=retirement,
+            created_at=created_at,
+        )
+        if matching is not None:
+            self._assert_reservation_live(comments, matching)
+        else:
+            assert_no_pending_ledger_reservation(
+                comments, workstream_id=self.workstream_id,
+                authenticated_route=self.authority,
+                current_plan_revision=from_plan,
+            )
+            assert_no_pending_generation_reservation(
+                comments, workstream_id=self.workstream_id,
+                authenticated_route=self.authority,
+            )
+        return {
+            "apply": False,
+            "command": "activate",
+            "from_plan_revision": from_plan,
+            "target_plan_revision": target_plan_revision,
+            "activation_epoch": epoch,
+            "retirement_frontier": retirement_frontier,
+            "prospective_target_disposition": prospective_disposition,
+            "prospective_target_disposition_event": deepcopy(
+                prospective_event
+            ),
+            "candidate": receipt,
+        }
+
     def activate(
         self, *, target_plan_revision: str, created_at: str,
         retirement: dict[str, Any], activation_checkpoint: dict[str, Any] | None = None,
@@ -1198,78 +1438,48 @@ class GenerationTransport:
             raise WorkstreamGenerationError("generation_target_already_active")
         epoch = (selected["activation_epoch"] if selected["activation_epoch"] is not None else -1) + 1
         _validate_retirement(retirement, from_plan, epoch)
-        target_state = self._states(comments, target_plan_revision)[0]
-        target_disposition = target_state.snapshot.get("disposition")
-        prepared_checkpoint_id = (
-            target_disposition.get("recovered_from_checkpoint")
-            if isinstance(target_disposition, dict) else None
+        # The retirement declaration gates every activation-side append,
+        # including a prepared target disposition. Validate it against active
+        # predecessor heads and root checkpoints before the first write.
+        self._validate_retirement_frontier(
+            comments, from_plan=from_plan, retirement=retirement,
         )
-        durable_checkpoint_ids = {
-            item["event_id"] for item in reduce_generation_checkpoint_comments(
-                comments, workstream_id=self.workstream_id,
-                authenticated_route=self.authority,
-            ).checkpoints
-        }
-        if (
-            isinstance(prepared_checkpoint_id, str)
-            and prepared_checkpoint_id not in durable_checkpoint_ids
-            and (
-                activation_checkpoint is None
-                or activation_checkpoint.get("event_id") != prepared_checkpoint_id
-            )
-        ):
-            raise WorkstreamGenerationError(
-                "generation_prepared_activation_checkpoint_required"
-            )
+        target_state = self._states(comments, target_plan_revision)[0]
+        self._prepared_activation_checkpoint_id(
+            comments, target_plan_revision=target_plan_revision,
+            target_state=target_state,
+            activation_checkpoint=activation_checkpoint,
+        )
+        previous_control = selected["transition_tip_event_id"]
         if activation_checkpoint is not None:
-            validate_checkpoint(activation_checkpoint)
             material = reduce_event_comments(comments, workstream_id=self.workstream_id)
-            if (
-                activation_checkpoint["workstream_id"] != self.workstream_id
-                or activation_checkpoint["plan_revision"] != target_plan_revision
-                or activation_checkpoint["root_revision"] != material.revision
-                or activation_checkpoint["acknowledgement"] != {
-                    "state": "pending", "remote_id": None,
-                    "applied_revision": None,
-                }
-                or not isinstance(remote_head, str)
-                or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", remote_head)
-            ):
-                raise WorkstreamGenerationError("generation_activation_checkpoint_mismatch")
-            target_state = self._states(comments, target_plan_revision)[0]
-            source = target_state.snapshot.get("source") or {}
-            if source.get("sha256") != target_plan_revision:
-                raise WorkstreamGenerationError("generation_activation_checkpoint_source_incomplete")
-            synthetic = acknowledge_checkpoint(
-                activation_checkpoint,
-                remote_id="00000000-0000-4000-8000-000000000000",
-                applied_revision=material.revision,
+            _desired_disposition, event = _prospective_activation_checkpoint(
+                activation_checkpoint, workstream_id=self.workstream_id,
+                target_plan_revision=target_plan_revision,
+                material_revision=material.revision,
+                target_state=target_state, remote_head=remote_head,
+                created_at=created_at, authority=self.authority,
             )
-            recovered = recover_latest(
-                [synthetic], self.workstream_id,
-                expected_plan_revision=target_plan_revision,
-            )
-            decision = choose_disposition({
-                "root": {"identifier": self.workstream_id},
-                "latest_checkpoint": recovered,
-            }, remote_head=remote_head)
-            desired_disposition = {
-                "disposition": decision["disposition"],
-                "remote_head": remote_head,
-                "recovered_from_checkpoint": activation_checkpoint["event_id"],
-            }
-            disposition_head = next((
-                event for event in reversed(target_state.events)
-                if event["kind"] == "disposition" and event["key"] == "root"
-            ), None)
-            if disposition_head is None or disposition_head["value"] != desired_disposition:
-                event = build_projection_event(
-                    workstream_id=self.workstream_id, kind="disposition", key="root",
-                    value=desired_disposition, plan_revision=target_plan_revision,
-                    expected_revision=target_state.revision, created_at=created_at,
-                    supersedes_event_id=(
-                        disposition_head["event_id"] if disposition_head else None
-                    ), authority=self.authority,
+            if event is not None:
+                broad_match = self._matching_reservation(
+                    comments, mode="activate", from_plan=from_plan,
+                    to_plan=target_plan_revision, epoch=epoch,
+                    previous_control=previous_control,
+                    retirement=retirement, created_at=created_at,
+                )
+                if broad_match is not None:
+                    self._assert_reservation_live(comments, broad_match)
+                # A canonical replay can only have a reservation after this
+                # disposition exists. Refuse unrelated boundary custody before
+                # creating the prospective target event.
+                assert_no_pending_ledger_reservation(
+                    comments, workstream_id=self.workstream_id,
+                    authenticated_route=self.authority,
+                    current_plan_revision=from_plan,
+                )
+                assert_no_pending_generation_reservation(
+                    comments, workstream_id=self.workstream_id,
+                    authenticated_route=self.authority,
                 )
                 LinearProjectionAdapter(
                     self.client, issue_id=self.issue_id,
@@ -1281,7 +1491,6 @@ class GenerationTransport:
             target_plan_revision, comments,
             activation_checkpoint=activation_checkpoint,
         )
-        previous_control = selected["transition_tip_event_id"]
         reservation = self._matching_reservation(
             comments, mode="activate", from_plan=from_plan,
             to_plan=target_plan_revision, epoch=epoch,
@@ -1449,6 +1658,8 @@ def strict_candidate_loader(
     plan_source: str, plan_identity: str | None,
     max_bytes: int = DEFAULT_RESUME_MAX_BYTES, max_items: int = 100,
     activation_checkpoint: dict[str, Any] | None = None,
+    activation_remote_head: str | None = None,
+    activation_created_at: str | None = None,
 ) -> CandidateLoader:
     authenticated_source = plan_payload(
         plan_source, plan_identity or plan_source,
@@ -1576,6 +1787,36 @@ def strict_candidate_loader(
                 raise WorkstreamGenerationError(
                     "generation_activation_checkpoint_conflict"
                 )
+            if not isinstance(activation_created_at, str) or not activation_created_at:
+                raise WorkstreamGenerationError(
+                    "generation_activation_checkpoint_mismatch"
+                )
+            material = reduce_event_comments(
+                comments, workstream_id=token,
+            )
+            target_state = reduce_projection_comments(
+                comments, workstream_id=token,
+                expected_plan_revision=plan_revision,
+                authenticated_route=authority,
+            )
+            _desired, prospective = _prospective_activation_checkpoint(
+                activation_checkpoint, workstream_id=token,
+                target_plan_revision=plan_revision,
+                material_revision=material.revision,
+                target_state=target_state,
+                remote_head=activation_remote_head,
+                created_at=activation_created_at, authority=authority,
+            )
+            if prospective is not None:
+                comments = [*comments, {
+                    "id": projection_slot_id(
+                        token, plan_revision,
+                        prospective["expected_revision"], authority,
+                    ),
+                    "body": encode_projection_comment(prospective),
+                    "createdAt": activation_created_at,
+                    "updatedAt": activation_created_at,
+                }]
         material = reduce_event_comments(comments, workstream_id=token)
         joined = add_material_history(
             graph, comments, token, authenticated_route=authority,
@@ -1777,6 +2018,8 @@ def main() -> int:
             plan_source=args.plan_source, plan_identity=args.plan_identity,
             max_bytes=args.max_bytes, max_items=args.max_items,
             activation_checkpoint=activation_checkpoint,
+            activation_remote_head=getattr(args, "remote_head", None),
+            activation_created_at=args.created_at,
         )
         description_plan_revision = LinearGraphQLTransport(
             client, team_id=authority["team_id"],
@@ -1788,7 +2031,18 @@ def main() -> int:
             authority=authority, candidate_loader=loader,
             legacy_description_plan_revision=description_plan_revision,
         )
-        if not args.apply:
+        retirement = None
+        if args.command == "activate":
+            with open(args.retirement_proof, encoding="utf-8") as handle:
+                retirement = json.load(handle)
+        if not args.apply and args.command == "activate":
+            output = transport.preview_activate(
+                target_plan_revision=source["sha256"],
+                created_at=args.created_at, retirement=retirement,
+                activation_checkpoint=activation_checkpoint,
+                remote_head=args.remote_head,
+            )
+        elif not args.apply:
             receipt = loader(source["sha256"])
             output = {"apply": False, "command": args.command, "candidate": receipt}
         elif args.command == "bootstrap":
@@ -1796,8 +2050,6 @@ def main() -> int:
                 target_plan_revision=source["sha256"], created_at=args.created_at,
             )
         else:
-            with open(args.retirement_proof, encoding="utf-8") as handle:
-                retirement = json.load(handle)
             output = transport.activate(
                 target_plan_revision=source["sha256"], created_at=args.created_at,
                 retirement=retirement,
