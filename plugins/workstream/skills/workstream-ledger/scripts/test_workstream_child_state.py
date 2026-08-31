@@ -157,6 +157,17 @@ class FakeChildStateClient:
                     "GEN-37" if self.child_parent_id == ROOT_ID else "GEN-99"
                 )},
             }}
+        if "query WorkstreamRootOriginNativeReadback" in query:
+            return {"issue": {
+                **self.issue("GEN-37", ROOT_ID, self.root_comments),
+                "description": f"Plan revision: {PLAN}", "parent": None,
+                "createdAt": "2026-08-01T00:00:00Z",
+                "state": {
+                    "id": "state-started", "name": "In Progress",
+                    "type": "started",
+                },
+                "assignee": {"id": "assignee"},
+            }}
         if "query WorkstreamChildMutationTarget" in query:
             return {"issue": {
                 **self.issue("GEN-38", CHILD_ID, self.child_comments),

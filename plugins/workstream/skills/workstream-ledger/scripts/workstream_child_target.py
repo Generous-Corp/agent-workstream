@@ -186,6 +186,7 @@ def authenticate_child_target(
         from workstream_linear_projection import (
             child_mutation_authorizations_from_comments,
             legacy_child_origin_repairs_from_comments,
+            validate_existing_child_origin_root_native,
         )
 
         root_comments = projection._comments()
@@ -199,6 +200,13 @@ def authenticate_child_target(
             description_plan_revision=description_revision,
             authenticated_route=authority,
         )
+        matching_repairs = [
+            event for event in repairs
+            if event["event_id"] == generation["child_origin"].get("event_id")
+        ]
+        if len(matching_repairs) != 1:
+            raise LinearTransportError("child_origin_repair_ambiguous")
+        validate_existing_child_origin_root_native(client, matching_repairs[0])
         authorized_child_comments(
             child_comments(client, child_token), authorizations, repairs,
             child_workstream_id=child_token, child_issue_id=child_issue_id,

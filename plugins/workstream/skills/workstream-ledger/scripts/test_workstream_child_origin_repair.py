@@ -5,6 +5,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -15,12 +16,15 @@ from workstream_checkpoint import build_checkpoint
 from workstream_delta import Delta
 import workstream_child_event
 import workstream_child_checkpoint
+import workstream_child_proposal_activate
 import workstream_child_origin_repair
 from workstream_linear_events import encode_event_comment
 from workstream_linear_checkpoints import encode_checkpoint_comment
 from workstream_linear_projection import (
-    build_projection_event, encode_projection_comment, projection_slot_id,
+    build_projection_event, encode_projection_comment, LinearProjectionAdapter,
+    legacy_child_origin_repairs_from_comments, projection_slot_id,
 )
+from workstream_child_proposal import append_proposal, build_proposal
 from workstream_resume import add_child_material_history, compact_context
 
 
@@ -546,6 +550,191 @@ class LegacyChildOriginRepairTests(unittest.TestCase):
                 with self.assertRaisesRegex(Exception, error):
                     self.apply_preview(client, preview)
                 self.assertTrue(client.injected)
+
+    def test_root_native_race_before_seal_refuses_without_write(self):
+        class RootNativeRaceClient(FakeChildStateClient):
+            def execute(self, query, variables):
+                result = super().execute(query, variables)
+                if "query WorkstreamRootOriginNativeReadback" in query:
+                    result["issue"]["state"]["id"] = "changed-state"
+                return result
+
+        client = self.populate_legacy_history(RootNativeRaceClient())
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch:
+            preview = workstream_child_origin_repair.run(
+                self.common(), client_factory=lambda _token: client,
+            )
+        with self.assertRaisesRegex(Exception, "native_root_drift"):
+            self.apply_preview(client, preview)
+        self.assertEqual(len(client.root_comments), 2)
+
+    def test_post_seal_direct_checkpoint_refuses_target_reserve_and_activation(self):
+        client = self.client()
+        preview, _result = self.seal(client)
+        event = Delta(
+            event_id="authorized-candidate", workstream_id="GEN-38",
+            kind="progress", source="agent_discovery",
+            payload={"next_action": "must not activate"},
+            expected_revision=48, created_at="later",
+        )
+        record = {
+            "event_id": event.event_id, "workstream_id": event.workstream_id,
+            "kind": event.kind, "source": event.source,
+            "payload": event.payload,
+            "expected_revision": event.expected_revision,
+            "created_at": event.created_at,
+        }
+        proposal = build_proposal(
+            "event", record, child_workstream_id="GEN-38",
+            child_issue_id=CHILD_ID, plan_revision=PLAN,
+        )
+        proposal_receipt = append_proposal(client, proposal)
+        checkpoint = build_checkpoint(
+            workstream_id="GEN-38", boundary_id="direct-bypass",
+            root_revision=48, plan_revision=PLAN,
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "legacy", "provider": "legacy",
+                "session_id": "retired", "machine": "M3",
+                "worktree": {
+                    "state": "safe", "path": "/repo/legacy",
+                    "branch": "legacy", "head": "b" * 40,
+                },
+            }, exact_head="b" * 40, evidence=[], blocker=None,
+            next_action="must not reduce",
+            predecessor_event_id=(
+                preview["value"]["child_history"]
+                ["checkpoint_receipts"][-1]["event_id"]
+            ),
+        )
+        client.child_comments.append({
+            "id": "direct-checkpoint",
+            "body": encode_checkpoint_comment(checkpoint),
+            "createdAt": "later", "updatedAt": "later",
+        })
+        before_root = len(client.root_comments)
+        before_child = len(client.child_comments)
+
+        target_args = [
+            "GEN-37", "--root-issue-id", ROOT_ID,
+            "--child-workstream-id", "GEN-38", "--child-issue-id", CHILD_ID,
+            "--plan-revision", PLAN, "--workspace-id", "workspace",
+            "--team-id", "team", "--project-id", "project", "--apply",
+            "--kind", "progress", "--source", "agent_discovery",
+            "--expected-revision", "48", "--created-at", "later",
+            "--payload-json", "{}",
+        ]
+        with mock.patch(
+            "workstream_child_target.resolve_linear_route",
+            return_value=(ROUTE, None),
+        ), mock.patch(
+            "workstream_child_target.load_linear_api_key", return_value="secret",
+        ), self.assertRaisesRegex(
+            Exception, "child_legacy_write_after_origin_seal",
+        ):
+            workstream_child_event.run(
+                target_args, client_factory=lambda _token: client,
+            )
+
+        projection = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **ROUTE, root_issue_id=ROOT_ID,
+        )
+        selected = projection.select_owned_child_generation(
+            description_plan_revision=PLAN, child_workstream_id="GEN-38",
+            child_issue_id=CHILD_ID, proposal_id=proposal["proposal_id"],
+        )
+        generation = {
+            key: selected[key] for key in (
+                "plan_revision", "description_plan_revision",
+                "transition_tip_event_id", "activation_epoch",
+                "authority_origin", "workstream_id", "authority", "source",
+            )
+        }
+        with self.assertRaisesRegex(
+            Exception, "child_legacy_write_after_origin_seal",
+        ):
+            projection.reserve_child_mutation(
+                proposal=proposal,
+                proposal_remote_id=proposal_receipt["remote_id"],
+                child_identity={
+                    "identifier": "GEN-38", "id": CHILD_ID,
+                    "parent_issue_id": ROOT_ID, "route": ROUTE,
+                },
+                generation_authority=generation,
+                scope_event_id=selected["scope_event_id"],
+                scope_value_sha256=selected["scope_value_sha256"],
+                repository_owner=selected["child_repository_owner"],
+                child_origin=selected["child_origin"],
+                expected_projection_revision=selected["projection_revision"],
+            )
+
+        activation_args = [
+            "GEN-37", "--root-issue-id", ROOT_ID,
+            "--child-workstream-id", "GEN-38", "--child-issue-id", CHILD_ID,
+            "--plan-revision", PLAN, "--workspace-id", "workspace",
+            "--team-id", "team", "--project-id", "project", "--apply",
+            "--proposal-id", proposal["proposal_id"],
+            "--proposal-remote-id", proposal_receipt["remote_id"],
+        ]
+        with mock.patch(
+            "workstream_child_target.resolve_linear_route",
+            return_value=(ROUTE, None),
+        ), mock.patch(
+            "workstream_child_target.load_linear_api_key", return_value="secret",
+        ), self.assertRaisesRegex(
+            Exception, "child_legacy_write_after_origin_seal",
+        ):
+            workstream_child_proposal_activate.run(
+                activation_args, client_factory=lambda _token: client,
+            )
+        self.assertEqual(len(client.root_comments), before_root)
+        self.assertEqual(len(client.child_comments), before_child)
+
+    def test_origin_seal_survives_authenticated_generation_retirement(self):
+        client = self.client()
+        self.seal(client)
+        authority = {**ROUTE, "root_issue_id": ROOT_ID}
+        seals = legacy_child_origin_repairs_from_comments(
+            client.root_comments, workstream_id="GEN-37",
+            description_plan_revision=PLAN, authenticated_route=authority,
+        )
+        self.assertEqual(len(seals), 1)
+        retired = seals[0]
+        current_plan = "d" * 64
+        transition = {
+            "kind": "generation_transition",
+            "value": {
+                "from": {
+                    "plan_revision": PLAN,
+                    "projection_revision": retired["expected_revision"] + 1,
+                },
+                "to": {"plan_revision": current_plan},
+            },
+        }
+
+        def reduced(_comments, *, expected_plan_revision, **_kwargs):
+            return SimpleNamespace(
+                events=[retired] if expected_plan_revision == PLAN else [],
+            )
+
+        with mock.patch(
+            "workstream_linear_projection.select_plan_generation",
+            return_value={"plan_revision": current_plan},
+        ), mock.patch(
+            "workstream_generation.generation_controls",
+            return_value=[transition],
+        ), mock.patch(
+            "workstream_linear_projection.reduce_projection_comments",
+            side_effect=reduced,
+        ):
+            recovered = legacy_child_origin_repairs_from_comments(
+                client.root_comments, workstream_id="GEN-37",
+                description_plan_revision=current_plan,
+                authenticated_route=authority,
+            )
+        self.assertEqual(recovered, [retired])
 
 
 if __name__ == "__main__":
