@@ -43,6 +43,11 @@ AUTHORITY = {
     "workspace_id": "workspace", "team_id": "team", "project_id": "project",
     "root_issue_id": "33333333-3333-4333-8333-333333333333",
 }
+CHILD_CONTENT = {
+    "schema_version": 1,
+    "title": "New child",
+    "description_sha256": "1" * 64,
+}
 
 
 class FakeClient:
@@ -403,6 +408,7 @@ class GenerationTransitionTests(unittest.TestCase):
             },
             generation_authority=generation_authority,
             native_validation_sha256="0" * 64,
+            child_content=CHILD_CONTENT,
         )
         mutation_count = len(self.client.mutations)
 
@@ -416,6 +422,7 @@ class GenerationTransitionTests(unittest.TestCase):
             },
             generation_authority=generation_authority,
             native_validation_sha256="0" * 64,
+            child_content=CHILD_CONTENT,
         )
 
         self.assertEqual(first["event"], second["event"])
@@ -443,6 +450,7 @@ class GenerationTransitionTests(unittest.TestCase):
             expected_projection_revision=target.state().revision,
             native_initialization=native, generation_authority=authority,
             native_validation_sha256="0" * 64,
+            child_content=CHILD_CONTENT,
         )
         self.activate(target=LATER, predecessor=NEW, epoch=1)
         mutation_count = len(self.client.mutations)
@@ -454,6 +462,7 @@ class GenerationTransitionTests(unittest.TestCase):
             expected_projection_revision=target.state().revision,
             native_initialization=native, generation_authority=authority,
             native_validation_sha256="0" * 64,
+            child_content=CHILD_CONTENT,
         )
         target.assert_child_extension_authorized(grant["event"])
 
@@ -470,6 +479,7 @@ class GenerationTransitionTests(unittest.TestCase):
                 expected_projection_revision=target.state().revision,
                 native_initialization=native, generation_authority=authority,
                 native_validation_sha256="0" * 64,
+                child_content=CHILD_CONTENT,
             )
 
     def test_preactivation_old_grant_cannot_be_laundered_after_activation(self):
@@ -511,6 +521,7 @@ class GenerationTransitionTests(unittest.TestCase):
                 },
                 generation_authority=authority,
                 native_validation_sha256="0" * 64,
+                child_content=CHILD_CONTENT,
             )
 
     def test_child_create_linearizes_before_planted_later_generation(self):
@@ -526,6 +537,8 @@ class GenerationTransitionTests(unittest.TestCase):
             "children": [{
                 "key": "new-child", "title": "Ready child",
                 "next_action": "Write the child-local checkpoint.",
+                "description": "**Ready child.** Write the child-local checkpoint.",
+                "content_schema_version": 1,
             }],
         }
         material = reduce_event_comments(

@@ -358,6 +358,57 @@ time.sleep(60)
             [item["key"] for item in second],
         )
 
+    def test_numbered_item_preserves_full_paragraph_and_concise_bold_title(self):
+        markdown = """# Work
+
+## Gate
+1. **Local inventory.** Expose a bounded,
+   deterministic items view with immutable identity.
+2. **Remote inventory.** Query the recorded custody host.
+"""
+        items = [
+            item for item in MODULE.extract_children(markdown)
+            if item["kind"] == "numbered_item"
+        ]
+        self.assertEqual(
+            [item["title"] for item in items],
+            ["Local inventory", "Remote inventory"],
+        )
+        self.assertEqual(
+            items[0]["description"],
+            "**Local inventory.** Expose a bounded, deterministic items view "
+            "with immutable identity.",
+        )
+        self.assertEqual(
+            items[0]["next_action"],
+            "Implement and verify this plan slice: Local inventory",
+        )
+        self.assertEqual(items[0]["content_schema_version"], 1)
+        self.assertEqual(
+            items[0]["key"], MODULE.stable_key(
+                "item", ["work", "gate"],
+                "**Local inventory.** Expose a bounded,", 1,
+            ),
+        )
+
+    def test_numbered_item_preserves_commonmark_lazy_continuation(self):
+        markdown = """# Work
+
+1. **Task.** First line
+second line
+2. **Next.** End
+"""
+        items = [
+            item for item in MODULE.extract_children(markdown)
+            if item["kind"] == "numbered_item"
+        ]
+
+        self.assertEqual(
+            items[0]["description"],
+            "**Task.** First line second line",
+        )
+        self.assertEqual(items[1]["title"], "Next")
+
     def test_title_ignores_headings_in_fenced_examples(self):
         markdown = "```md\n# Example\n```\n\n# Actual plan\n"
         self.assertEqual(MODULE.first_heading(markdown).group(2), "Actual plan")

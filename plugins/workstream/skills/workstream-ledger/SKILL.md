@@ -211,8 +211,14 @@ both live frontiers, a canonical native state UUID, and exactly one of
 `--assignee-id` or `--unassigned`. Before the grant, authenticated Linear
 readback proves the state belongs to the exact team and an active assignee
 belongs to the workspace/team; the grant binds that validation digest. The
-append-only grant binds the current generation selection proof and native setup
-before one atomic deterministic child create. A sealed
+append-only grant also binds the reviewed content-parser schema, exact title,
+and exact durable-description SHA-256 together with the current generation
+selection proof and native setup before one atomic deterministic child create.
+Omitting `--apply` still reads and validates the plan source, so an HTTP source
+may use HTTP or the bounded GitHub SSH fallback, but it performs no Linear
+authentication, Linear read, or Linear write. Configured GitHub source
+credentials may still authenticate that source read. The preview reports that source
+transport and normalizes the same static UUID inputs used by apply. A sealed
 retirement prefix preserves an exact granted create/replay while refusing new
 retired-generation grants. Readback must match state and assignee. A replay
 converges; it never updates an issue, root, or project. Project the child's
@@ -389,6 +395,12 @@ scope, or resistance to an authorized person editing/deleting comments. No
 live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
+
+Version 0.4.38 binds reviewed child titles and durable-description digests to
+their extension authorization, fences plan prose from durable control fields,
+and makes zero-write preview disclose its exact source-access and credential
+surface. Legacy contentless grants may replay an existing child but cannot
+authorize a new create.
 
 Version 0.4.37 recovers an interrupted inactive-generation terminal evidence
 seed from the exact reviewed manifest. A canonical committed prefix is
@@ -699,7 +711,10 @@ Legacy 0.4.29 `child_extension_authorization` replay validates the exact
 deterministic existing child and writes nothing without consulting current
 workflow-state or assignee providers. Deleted provider identities therefore do
 not invalidate an old completed creation; a missing legacy child still refuses
-before any create.
+before any create. A later historical grant that binds native initialization
+but predates the content binding follows the same existing-child-only rule and
+also revalidates its recorded native readback. Neither contentless grant can
+authorize a fresh create or be silently upgraded into a content-bound grant.
 
 An older scope-owned child whose root and child IDs predate both deterministic
 intake and extension grants requires one reviewed origin seal; never invent a

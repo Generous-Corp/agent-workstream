@@ -26,9 +26,11 @@ from urllib.request import Request, urlopen
 from workstream_http import default_ssl_context
 
 SCHEMA_VERSION = 1
+NUMBERED_ITEM_CONTENT_SCHEMA_VERSION = 1
 HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 NUMBERED = re.compile(r"^\s*(\d+)[.)]\s+(.+?)\s*$")
 FENCE = re.compile(r"^\s*(```|~~~)")
+BOLD_ITEM_TITLE = re.compile(r"^\*\*(.+?)\*\*(?:\s+.*)?$")
 GITHUB_OWNER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
 GITHUB_REPOSITORY = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?"
@@ -36,6 +38,9 @@ GITHUB_REPOSITORY = re.compile(
 GITHUB_PATH_SEGMENT = re.compile(r"[A-Za-z0-9._+@,-]+")
 EXACT_GIT_COMMIT = re.compile(r"[0-9a-f]{40}")
 HTTPS_URL = re.compile(r"https://[^\s<>\])]+")
+GITHUB_HTTP_AUTH_HOSTS = frozenset({
+    "github.com", "raw.githubusercontent.com", "api.github.com",
+})
 CANONICAL_PLAN_LINE = re.compile(r"^\s*Canonical plan\s*:\s*(.+?)\s*$", re.I | re.M)
 GIT_FETCH_TIMEOUT_SECONDS = 30
 GIT_SHOW_TIMEOUT_SECONDS = 5
@@ -46,6 +51,24 @@ import sys
 
 os.execvp("ssh", ["ssh", "-oBatchMode=yes", *sys.argv[1:]])
 """
+
+
+def source_access_classification(source: str) -> dict[str, str]:
+    """Describe network and credential access used to read one plan source."""
+    parsed = urlparse(source)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return {"source": "none", "source_authentication": "none"}
+    host = parsed.netloc.lower()
+    return {
+        "source": (
+            "http_with_optional_github_ssh_fallback"
+            if host == "github.com" else "http"
+        ),
+        "source_authentication": (
+            "github_environment_optional"
+            if host in GITHUB_HTTP_AUTH_HOSTS else "none"
+        ),
+    }
 
 
 def _github_ssh_blob(source: str) -> tuple[str, str, str, str] | None:
@@ -236,9 +259,12 @@ def source_bytes(source: str, identity: str | None = None) -> tuple[bytes, str]:
                 )
         headers = {"User-Agent": "workstream-ledger/1"}
         github_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-        if github_token and urlparse(fetch_url).netloc.lower() in {
-            "github.com", "raw.githubusercontent.com", "api.github.com",
-        }:
+        source_access = source_access_classification(source)
+        if (
+            github_token
+            and source_access["source_authentication"]
+            == "github_environment_optional"
+        ):
             headers["Authorization"] = f"Bearer {github_token}"
         request = Request(fetch_url, headers=headers)
         try:
@@ -259,6 +285,30 @@ def clean_title(text: str) -> str:
     title = text.lstrip("#").strip()
     title = re.sub(r"^(?:plan|project)\s*:\s*", "", title, flags=re.I)
     return title or "Untitled workstream"
+
+
+def numbered_item_title(text: str) -> str:
+    """Return a concise display title without changing stable-key material."""
+    bold = BOLD_ITEM_TITLE.match(text.strip())
+    title = bold.group(1) if bold else text
+    return title.strip().rstrip(".") or "Untitled work item"
+
+
+def numbered_item_description(
+    lines: list[str], start: int, numbered: re.Match[str],
+) -> str:
+    """Collect one numbered item's contiguous Markdown paragraph."""
+    base_indent = len(lines[start]) - len(lines[start].lstrip())
+    parts = [numbered.group(2).strip()]
+    for line in lines[start + 1:]:
+        if not line.strip() or HEADING.match(line) or FENCE.match(line):
+            break
+        following = NUMBERED.match(line)
+        indent = len(line) - len(line.lstrip())
+        if following and indent <= base_indent:
+            break
+        parts.append(line.strip())
+    return " ".join(parts)
 
 
 def first_heading(markdown: str) -> re.Match[str] | None:
@@ -298,7 +348,8 @@ def extract_children(markdown: str) -> list[dict[str, object]]:
     heading_path: list[str] = []
     occurrences: dict[tuple[str, ...], int] = {}
     fence_marker: str | None = None
-    for index, line in enumerate(lines, 1):
+    for offset, line in enumerate(lines):
+        index = offset + 1
         fence = FENCE.match(line)
         if fence:
             marker = fence.group(1)
@@ -330,15 +381,27 @@ def extract_children(markdown: str) -> list[dict[str, object]]:
             continue
         numbered = NUMBERED.match(line)
         if numbered:
-            title = numbered.group(2)
-            occurrence_key = ("item", *heading_path, clean_title(title).casefold())
+            stable_title = numbered.group(2)
+            title = numbered_item_title(stable_title)
+            occurrence_key = (
+                "item", *heading_path, clean_title(stable_title).casefold(),
+            )
             occurrence = occurrences.get(occurrence_key, 0) + 1
             occurrences[occurrence_key] = occurrence
             children.append(
                 {
-                    "key": stable_key("item", heading_path, title, occurrence),
+                    "key": stable_key(
+                        "item", heading_path, stable_title, occurrence,
+                    ),
                     "kind": "numbered_item",
                     "title": title,
+                    "content_schema_version": (
+                        NUMBERED_ITEM_CONTENT_SCHEMA_VERSION
+                    ),
+                    "description": numbered_item_description(
+                        lines, offset, numbered,
+                    ),
+                    "next_action": f"Implement and verify this plan slice: {title}",
                     "line": index,
                 }
             )

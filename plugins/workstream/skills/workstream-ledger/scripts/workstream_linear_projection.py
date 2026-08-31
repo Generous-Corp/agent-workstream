@@ -999,9 +999,12 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             "expected_material_revision", "expected_projection_revision",
             "initial_state",
         }
-        current_authorization = {
+        contentless_authorization = {
             *legacy_authorization, "native_initialization",
             "generation_authority", "native_validation_sha256",
+        }
+        current_authorization = {
+            *contentless_authorization, "child_content",
         }
         route = value.get("route") if isinstance(value, dict) else None
         source = value.get("source") if isinstance(value, dict) else None
@@ -1048,26 +1051,28 @@ def validate_projection_event(event: dict[str, Any]) -> None:
                 or isinstance(generation["description_plan_revision"], str)
             )
         )
-        native_valid = (
-            set(value) == legacy_authorization
-            or (
-                set(value) == current_authorization
-                and isinstance(native, dict)
-                and set(native) == {"state_id", "assignee_id"}
-                and isinstance(native.get("state_id"), str)
-                and bool(native["state_id"].strip())
-                and (
-                    native.get("assignee_id") is None
-                    or (
-                        isinstance(native["assignee_id"], str)
-                        and bool(native["assignee_id"].strip())
-                    )
+        from workstream_linear import valid_child_content_authority
+        native_valid = set(value) == legacy_authorization or (
+            set(value) in (contentless_authorization, current_authorization)
+            and isinstance(native, dict)
+            and set(native) == {"state_id", "assignee_id"}
+            and isinstance(native.get("state_id"), str)
+            and bool(native["state_id"].strip())
+            and (
+                native.get("assignee_id") is None
+                or (
+                    isinstance(native["assignee_id"], str)
+                    and bool(native["assignee_id"].strip())
                 )
-                and generation_valid
-                and re.fullmatch(
-                    r"[0-9a-f]{64}",
-                    str(value.get("native_validation_sha256", "")),
-                ) is not None
+            )
+            and generation_valid
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(value.get("native_validation_sha256", "")),
+            ) is not None
+            and (
+                set(value) == contentless_authorization
+                or valid_child_content_authority(value.get("child_content"))
             )
         )
         if (
@@ -3528,6 +3533,7 @@ class LinearProjectionAdapter:
         expected_projection_revision: int,
         native_initialization: dict[str, Any],
         generation_authority: dict[str, Any], native_validation_sha256: str,
+        child_content: dict[str, Any],
         require_existing: bool = False,
     ) -> dict[str, Any]:
         """Win one durable projection-CAS authorization before child creation."""
@@ -3559,6 +3565,9 @@ class LinearProjectionAdapter:
             raise LinearProjectionError(
                 "invalid_child_extension_native_initialization"
             )
+        from workstream_linear import valid_child_content_authority
+        if not valid_child_content_authority(child_content):
+            raise LinearProjectionError("invalid_child_extension_content")
         before_comments = self._comments()
         from workstream_linear_events import reduce_event_comments
 
@@ -3581,6 +3590,7 @@ class LinearProjectionAdapter:
             "native_initialization": deepcopy(native_initialization),
             "generation_authority": deepcopy(generation_authority),
             "native_validation_sha256": native_validation_sha256,
+            "child_content": deepcopy(child_content),
         }
         matching = [
             item for item in before.events
@@ -3631,6 +3641,32 @@ class LinearProjectionAdapter:
                     "event": event, "remote_id": remote_id,
                     "revision": before.revision,
                     "disposition": "legacy_existing",
+                }
+            contentless_fields = {
+                *static_value.keys(),
+                "expected_material_revision", "expected_projection_revision",
+            } - {"child_content"}
+            if isinstance(value, dict) and set(value) == contentless_fields:
+                if not require_existing:
+                    raise LinearProjectionError(
+                        "legacy_content_authorization_requires_existing_child"
+                    )
+                expected_contentless = {
+                    key: static_value[key] for key in static_value
+                    if key != "child_content"
+                }
+                if {
+                    key: value.get(key) for key in expected_contentless
+                } != expected_contentless:
+                    raise LinearProjectionError(
+                        "child_extension_authorization_superseded_or_conflicting"
+                    )
+                receipt = self._assert_child_extension_authorization(
+                    event, before_comments,
+                )
+                return {
+                    **receipt,
+                    "disposition": "legacy_content_existing",
                 }
             if (
                 not isinstance(value, dict)
@@ -3749,11 +3785,20 @@ class LinearProjectionAdapter:
             "expected_material_revision", "expected_projection_revision",
             "initial_state",
         }
-        if not isinstance(value, dict) or set(value) != legacy_fields:
+        contentless_fields = {
+            *legacy_fields, "native_initialization", "generation_authority",
+            "native_validation_sha256",
+        }
+        if (
+            not isinstance(value, dict)
+            or set(value) not in (legacy_fields, contentless_fields)
+        ):
             return None
         if not require_existing:
             raise LinearProjectionError(
                 "legacy_authorization_requires_existing_child"
+                if set(value) == legacy_fields
+                else "legacy_content_authorization_requires_existing_child"
             )
         expected = {
             "root_issue_id": self.root_issue_id, "route": self.authority,
@@ -3766,6 +3811,11 @@ class LinearProjectionAdapter:
             raise LinearProjectionError(
                 "child_extension_authorization_superseded_or_conflicting"
             )
+        if set(value) == contentless_fields:
+            receipt = self._assert_child_extension_authorization(event, comments)
+            return {
+                **receipt, "disposition": "legacy_content_existing",
+            }
         remote_id = state.remote_ids.get(event["event_id"])
         if not isinstance(remote_id, str) or not any(
             comment.get("id") == remote_id for comment in comments

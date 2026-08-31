@@ -11,7 +11,8 @@ from typing import Any, Callable
 from workstream_config import load_linear_api_key, resolve_linear_route
 from workstream_graph import GraphReviewRequired
 from workstream_linear import (
-    HttpGraphQLClient,
+    canonical_native_uuid, child_content_authority,
+    deterministic_existing_root_child_id, durable_description, HttpGraphQLClient,
     LinearGraphQLTransport,
     LinearTransportError,
 )
@@ -19,7 +20,7 @@ from workstream_linear_projection import (
     LinearProjectionAdapter,
     LinearProjectionError,
 )
-from workstream_plan import plan_payload
+from workstream_plan import plan_payload, source_access_classification
 
 
 def parser() -> argparse.ArgumentParser:
@@ -65,8 +66,12 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--team-id")
     value.add_argument("--project-id")
     value.add_argument(
-        "--apply", action="store_true", required=True,
-        help="required acknowledgement that this invocation may create one child",
+        "--apply", action="store_true",
+        help=(
+            "apply the reviewed child extension; omission avoids Linear "
+            "authentication/access, but URL source retrieval may use HTTP/SSH "
+            "and configured source credentials"
+        ),
     )
     return value
 
@@ -87,6 +92,12 @@ def run(
         raise ValueError("native child state ID must be non-empty")
     if args.assignee_id is not None and not args.assignee_id.strip():
         raise ValueError("native child assignee ID must be non-empty")
+    canonical_state_id = canonical_native_uuid(args.state_id, kind="state")
+    canonical_assignee_id = (
+        canonical_native_uuid(args.assignee_id, kind="assignee")
+        if args.assignee_id is not None else None
+    )
+    source_access = source_access_classification(args.source)
 
     plan = plan_payload(args.source, args.identity)
     if plan["root"]["plan_revision"] != args.plan_revision:
@@ -114,6 +125,44 @@ def run(
         raise ValueError(
             "child extension requires an exact Linear workspace/team/project route"
         )
+    candidate = candidates[0]
+    child_id = deterministic_existing_root_child_id(
+        workspace_id=route["workspace_id"], team_id=route["team_id"],
+        project_id=route["project_id"], root_issue_id=args.root_issue_id,
+        child_stable_key=args.candidate_key,
+    )
+    description = durable_description(
+        args.candidate_key, args.plan_revision,
+        next_action=candidate.get("next_action"),
+        details=candidate.get("description"),
+    )
+    content_authority = child_content_authority(
+        title=candidate["title"], description=description,
+        schema_version=candidate.get("content_schema_version"),
+    )
+    if not args.apply:
+        return {
+            "schema_version": 1, "mode": "preview", "would_write": False,
+            "network_access": {
+                **source_access,
+                "linear": "none", "linear_authentication": "none",
+            },
+            "workstream_id": args.workstream_id.upper(),
+            "source": plan["source"], "plan_revision": args.plan_revision,
+            "route": {**route, "root_issue_id": args.root_issue_id},
+            "frontier": {
+                "material_revision": args.material_revision,
+                "projection_revision": args.projection_revision,
+            },
+            "candidate": {
+                "key": args.candidate_key, "issue_id": child_id,
+                "title": candidate["title"], "description": description,
+                "content_authority": content_authority,
+                "state_id": canonical_state_id,
+                "assignee_id": canonical_assignee_id,
+                "unassigned": args.unassigned,
+            },
+        }
     token = load_linear_api_key()
     if not token:
         raise ValueError(
@@ -146,8 +195,8 @@ def run(
             "material_revision": args.material_revision,
             "projection_revision": args.projection_revision,
         },
-        state_id=args.state_id,
-        assignee_id=args.assignee_id,
+        state_id=canonical_state_id,
+        assignee_id=canonical_assignee_id,
         unassigned=args.unassigned,
         authorization_adapter=authorization,
     )
