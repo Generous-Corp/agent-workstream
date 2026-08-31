@@ -396,6 +396,11 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.39 recovers an interrupted terminal-closure projection batch from
+the exact reviewed manifest. Canonical closure prefixes are validated before
+inactive target-source synchronization, while source synchronization and the
+normal second repair validation remain mandatory.
+
 Version 0.4.38 binds reviewed child titles and durable-description digests to
 their extension authorization, fences plan prose from durable control fields,
 and makes zero-write preview disclose its exact source-access and credential
