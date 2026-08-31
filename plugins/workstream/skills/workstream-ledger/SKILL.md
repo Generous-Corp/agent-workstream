@@ -396,6 +396,11 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.43 makes projection repair fence the same uniquely selected,
+authenticated generation-transition checkpoint used by full resume. Altered,
+ambiguous, stale, or cross-generation checkpoint authority refuses before the
+first projection write.
+
 Version 0.4.42 preserves carried predecessor evidence after activation only
 when the sole history suffix is the exact terminal generation transition
 already validated by active-generation selection. The reviewed predecessor
