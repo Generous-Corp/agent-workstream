@@ -400,6 +400,11 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.44 makes child-dependency apply select and validate the same active
+generation as full resume. Historical children remain preserved, while stale,
+ambiguous, incomplete, or incorrectly owned dependency graphs refuse before
+the first relation or metadata write.
+
 Version 0.4.43 makes projection repair fence the same uniquely selected,
 authenticated generation-transition checkpoint used by full resume. Altered,
 ambiguous, stale, or cross-generation checkpoint authority refuses before the
