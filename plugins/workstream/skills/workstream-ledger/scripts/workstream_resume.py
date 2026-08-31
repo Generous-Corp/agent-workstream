@@ -404,6 +404,7 @@ def add_child_material_history(
     snapshot: dict[str, Any], child_comments: dict[str, list[dict[str, Any]]],
     *, authenticated_route: dict[str, str],
     root_comments: list[dict[str, Any]] | None = None,
+    proposal_plan_revision: str | None = None,
 ) -> dict[str, Any]:
     """Reduce every nonterminal child log without mixing child/root authority."""
     if not isinstance(child_comments, dict):
@@ -418,6 +419,11 @@ def add_child_material_history(
     if set(child_comments) != nonterminal_tokens:
         raise ResumeError("incomplete_child_comment_collection")
     plan_revision = (snapshot.get("root") or {}).get("plan_revision")
+    # Ordinary resume classifies proposals against the active plan. Projection
+    # preparation can explicitly select the still-active predecessor while it
+    # evaluates an inactive target; description provenance cannot distinguish
+    # that case from a completed structured transition.
+    selected_proposal_plan_revision = proposal_plan_revision or plan_revision
     authorizations: list[dict[str, Any]] = []
     origin_repairs: list[dict[str, Any]] = []
     if root_comments is not None:
@@ -458,7 +464,8 @@ def add_child_material_history(
         )
         pending_proposals = pending_proposal_obligations(
             comments, authorizations, child_workstream_id=token,
-            child_issue_id=child["id"], plan_revision=plan_revision,
+            child_issue_id=child["id"],
+            plan_revision=selected_proposal_plan_revision,
         )
         if pending_proposals:
             child["pending_child_proposals"] = pending_proposals
@@ -515,19 +522,21 @@ def add_child_material_history(
 
 def add_live_child_material_history(
     snapshot: dict[str, Any], *, authenticated_route: dict[str, str],
-    root_comments: list[dict[str, Any]] | None = None,
+    root_comments: list[dict[str, Any]],
+    proposal_plan_revision: str | None = None,
 ) -> dict[str, Any]:
     """Join the transport's complete nonterminal-child comment collection.
 
     ``LinearGraphQLTransport.snapshot_for_root(include_child_comments=True)``
     is the single transport boundary for ordinary resume and every strict
-    projection validation. Keeping the join here prevents those consumers
-    from validating the root log while omitting child material and checkpoint
-    authority.
+    projection validation. Requiring the paired root comments prevents those
+    consumers from omitting child-mutation authorizations while joining child
+    material and checkpoint authority.
     """
     return add_child_material_history(
         snapshot, snapshot.get("child_comments"),
         authenticated_route=authenticated_route, root_comments=root_comments,
+        proposal_plan_revision=proposal_plan_revision,
     )
 
 

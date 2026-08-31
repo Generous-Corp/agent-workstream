@@ -353,6 +353,22 @@ class WorkstreamChildStateTests(unittest.TestCase):
             child["latest_checkpoint"]["checkpoint_event_id"],
             checkpoint["event_id"],
         )
+        inactive_target = deepcopy(snapshot)
+        inactive_target["root"].update({
+            "plan_revision": "c" * 64,
+            "description_plan_revision": PLAN,
+        })
+        target_child = add_child_material_history(
+            inactive_target, {"GEN-38": deepcopy(client.child_comments)},
+            authenticated_route={**ROUTE, "root_issue_id": ROOT_ID},
+            root_comments=deepcopy(client.root_comments),
+            proposal_plan_revision=PLAN,
+        )["children"][0]
+        self.assertEqual(target_child["material_event_revision"], 1)
+        self.assertEqual(
+            target_child["next_action"], "Run the child acceptance proof.",
+        )
+        self.assertNotIn("pending_child_proposals", target_child)
 
     def test_child_target_identity_mismatch_refuses_before_comment_write(self):
         client = FakeChildStateClient()
@@ -521,6 +537,79 @@ class WorkstreamChildStateTests(unittest.TestCase):
         self.assertEqual(replay["authorization"]["disposition"], "existing")
         self.assertEqual(len(client.root_comments), root_writes)
         self.assertEqual(len(client.child_comments), child_writes)
+
+    def test_inactive_target_projection_classifies_predecessor_proposal(self):
+        client = FakeChildStateClient()
+        proposal = build_proposal(
+            "event", {
+                "event_id": "predecessor-proposal", "workstream_id": "GEN-38",
+                "kind": "progress", "source": "agent",
+                "payload": {"next_action": "recover predecessor proposal"},
+                "expected_revision": 0, "created_at": "now",
+            }, child_workstream_id="GEN-38", child_issue_id=CHILD_ID,
+            plan_revision=PLAN,
+        )
+        _append_proposal(client, proposal)
+        target_plan = "b" * 64
+        snapshot = {
+            "root": {
+                "identifier": "GEN-37", "plan_revision": target_plan,
+                "description_plan_revision": PLAN,
+                "url": "https://linear.test/GEN-37", "revision": 0,
+                "status": "In Progress", "status_type": "started",
+                "next_action": "prepare inactive target",
+            },
+            "children": [{
+                "id": CHILD_ID, "identifier": "GEN-38", "title": "Child",
+                "url": "https://linear.test/GEN-38", "status": "In Progress",
+                "status_type": "started", "next_action": "issue action",
+                "parent": {"id": ROOT_ID}, "project": {"id": "project"},
+                "team": {"id": "team", "organization": {"id": "workspace"}},
+            }],
+        }
+
+        child = add_child_material_history(
+            snapshot, {"GEN-38": deepcopy(client.child_comments)},
+            authenticated_route={**ROUTE, "root_issue_id": ROOT_ID},
+            root_comments=deepcopy(client.root_comments),
+            proposal_plan_revision=PLAN,
+        )["children"][0]
+
+        self.assertEqual(
+            [item["proposal_id"] for item in child["pending_child_proposals"]],
+            [proposal["proposal_id"]],
+        )
+        genesis = deepcopy(snapshot)
+        genesis["root"].update({
+            "plan_revision": PLAN,
+            "description_plan_revision": None,
+        })
+        genesis_child = add_child_material_history(
+            genesis, {"GEN-38": deepcopy(client.child_comments)},
+            authenticated_route={**ROUTE, "root_issue_id": ROOT_ID},
+            root_comments=None,
+        )["children"][0]
+        self.assertEqual(
+            [item["proposal_id"] for item in genesis_child["pending_child_proposals"]],
+            [proposal["proposal_id"]],
+        )
+        transitioned = deepcopy(snapshot)
+        transitioned["root"].update({
+            "plan_revision": PLAN,
+            "description_plan_revision": "d" * 64,
+        })
+        transitioned_child = add_child_material_history(
+            transitioned, {"GEN-38": deepcopy(client.child_comments)},
+            authenticated_route={**ROUTE, "root_issue_id": ROOT_ID},
+            root_comments=None,
+        )["children"][0]
+        self.assertEqual(
+            [
+                item["proposal_id"]
+                for item in transitioned_child["pending_child_proposals"]
+            ],
+            [proposal["proposal_id"]],
+        )
 
     def test_reparent_race_cannot_transfer_root_authority_and_resume_reports_drift(self):
         client = FakeChildStateClient()
