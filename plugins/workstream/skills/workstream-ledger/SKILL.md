@@ -787,12 +787,27 @@ authenticated checkout; `--plan-identity` preserves its durable identity. It
 refuses success unless those exact bytes match the root and projection.
 The default bounded context validates the complete Linear history, preserves
 current child identity, status, next action, blockers, worktree/checkpoint
-identity, and exact uncheckpointed requirements, decisions, and follow-ups.
+identity, and actionable uncheckpointed requirements, decisions, and follow-ups.
 Its `context_schema` is `agent-workstream.resume-context` version 2 with
 `representation: compact_validated`; verbose descriptions, receipt bodies,
 checkpoint evidence, provenance, and terminal readbacks are represented by
 counts, digests, exact repository heads, and active projection-head bindings
 instead of being duplicated into every agent prompt.
+If validated current state would still exceed 24 KiB, ordinary resume emits
+actionable head/tail excerpts or a fixed-column frontier after every semantic
+and contradiction check has passed. `deferred_audit_detail` binds deferred
+fields by JSON Pointer, byte count, and SHA-256 and supplies the exact
+full-history audit command. In the fixed envelope, a cell ending in the
+declared digest marker requires hydration: combine the audit command with its
+collection's `hydration_selectors` entry, verify the owning top-level digest,
+then act. `resume_authority: full` describes authenticated validation;
+`authority_scope` explicitly prevents treating hashed excerpts as exact
+instructions. The Shipyard loader performs a second authenticated, digest-
+verified compact hydration automatically rather than interpreting envelope
+rows as checkpoints; a mismatch refuses before profile construction.
+A checkpoint can acknowledge material-event history, but cannot structurally
+bound open-child state, decisions, dependencies, pending proposals, or other
+active projection surfaces, so it is not a complete no-stranding repair.
 Compact provenance uses the same candidate predicate as full history: every
 provenance item with a truthy worktree is a candidate. Exactly one is preserved,
 including a dirty or stale predecessor; multiple candidates refuse, and
@@ -801,8 +816,7 @@ After initial bounded recovery, an explicitly requested audit or closure pass
 may use a second `--include-history` invocation and raise the explicit byte/item
 caps when that complete history is known to exceed the normal resume budget.
 That response uses the same schema version with `representation:
-full_validated` and preserves the complete validated values; required current
-state is never truncated.
+full_validated` and preserves the complete validated values.
 For an immutable `github.com/.../blob/<40-hex-commit>/<path>` source, HTTPS is
 tried first; a 404 may fall back to existing noninteractive GitHub SSH access
 in a temporary isolated repository. A synchronized living plan may use the

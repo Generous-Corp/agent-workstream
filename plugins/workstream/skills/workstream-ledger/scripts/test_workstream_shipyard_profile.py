@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from copy import deepcopy
+import hashlib
 import io
 import json
 import os
@@ -203,6 +204,34 @@ class ShipyardProfileTests(unittest.TestCase):
                 model="gpt-5.6-sol", reasoning_effort="medium",
             )
             self.assertEqual(first, second)
+
+    def test_digest_bound_resume_envelope_requires_exact_hydration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            context = self.context(root)
+            context["context_schema"] = {
+                "name": "agent-workstream.resume-context", "version": 2,
+                "representation": "compact_validated",
+                "envelope": "fixed_frontier_authority_v1",
+            }
+            context["deferred_audit_detail"] = {
+                "state": "fixed_frontier_authority_envelope",
+                "audit_route": {
+                    "command": (
+                        "workstreamctl resume GEN-37 --include-history "
+                        "--max-bytes 2147483647 --max-items 2147483647"
+                    ),
+                    "representation": "full_validated",
+                },
+            }
+            with self.assertRaisesRegex(
+                MODULE.ShipyardProfileError,
+                "resume_envelope_requires_full_validated_hydration",
+            ):
+                MODULE.build_launch_profile(
+                    context, "GEN-37", self.git(root),
+                    model="gpt-5.6-sol", reasoning_effort="medium",
+                )
 
     def test_claude_profile_uses_prompt_free_native_grammar(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -436,6 +465,60 @@ class ShipyardProfileTests(unittest.TestCase):
         self.assertEqual(command[2], "GEN-37")
         self.assertIn("--max-bytes", command)
         self.assertIn("--max-items", command)
+
+    def test_authenticated_resume_hydrates_envelope_for_profile_without_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            hydrated = self.context(root)
+            envelope = {
+                "context_schema": {
+                    "name": "agent-workstream.resume-context", "version": 2,
+                    "representation": "compact_validated",
+                    "envelope": "fixed_frontier_authority_v1",
+                },
+                "workstream_id": "GEN-37", "plan_revision": PLAN,
+                "root_revision": hydrated["root_revision"],
+                "resume_authority": "full",
+                "deferred_audit_detail": {
+                    "full_context_sha256": hashlib.sha256(
+                        MODULE._canonical(hydrated)
+                    ).hexdigest(),
+                    "audit_route": {
+                        "command": "workstreamctl resume GEN-37 --include-history",
+                        "representation": "full_validated",
+                    },
+                },
+            }
+            results = [
+                subprocess.CompletedProcess(
+                    args=[], returncode=0,
+                    stdout=json.dumps(envelope).encode(), stderr=b"",
+                ),
+                subprocess.CompletedProcess(
+                    args=[], returncode=0,
+                    stdout=json.dumps(hydrated).encode(), stderr=b"",
+                ),
+            ]
+            with mock.patch.object(
+                MODULE.subprocess, "run", side_effect=results,
+            ) as run:
+                observed = MODULE.load_authenticated_resume(
+                    "GEN-37", repo_path=root,
+                )
+            profile = MODULE.build_launch_profile(
+                observed, "GEN-37", self.git(root),
+                model="gpt-5.6-sol", reasoning_effort="medium",
+            )
+
+        self.assertEqual(observed, hydrated)
+        self.assertEqual(profile["schema_version"], 1)
+        self.assertEqual(run.call_count, 2)
+        hydration_command = run.call_args_list[1].args[0]
+        self.assertEqual(
+            hydration_command[hydration_command.index("--max-bytes") + 1],
+            str(MODULE.HYDRATED_RESUME_MAX_BYTES),
+        )
+        self.assertNotIn("--include-history", hydration_command)
 
     def test_output_must_be_outside_worktree(self):
         with tempfile.TemporaryDirectory() as directory:

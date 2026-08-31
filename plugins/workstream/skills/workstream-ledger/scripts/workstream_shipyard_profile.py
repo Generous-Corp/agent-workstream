@@ -28,6 +28,8 @@ from workstream_scope import ScopeError, canonical_repository
 RESUME_MAX_BYTES = DEFAULT_RESUME_MAX_BYTES
 RESUME_MAX_ITEMS = 100
 RESUME_OUTPUT_MAX_BYTES = 64 * 1024
+HYDRATED_RESUME_MAX_BYTES = 2**31 - 1
+HYDRATED_RESUME_OUTPUT_MAX_BYTES = 16 * 1024 * 1024
 PROFILE_MAX_BYTES = 64 * 1024
 COMMAND_TIMEOUT_SECONDS = 120
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
@@ -74,6 +76,7 @@ def _authority_digest(domain: str, value: Any) -> str:
 
 def _resume_context_digest(context: dict[str, Any]) -> str:
     """Digest resume authority with set-like child issues in stable ID order."""
+    _require_hydrated_resume(context)
     children = context.get("children")
     if not isinstance(children, list):
         raise ShipyardProfileError("resume_children_missing")
@@ -92,6 +95,33 @@ def _resume_context_digest(context: dict[str, Any]) -> str:
         child for _, child in sorted(keyed_children, key=lambda item: item[0])
     ]
     return _authority_digest("agent-workstream-resume-context-v1", normalized)
+
+
+def _require_hydrated_resume(context: dict[str, Any]) -> None:
+    envelope = (context.get("context_schema") or {}).get("envelope")
+    deferred = context.get("deferred_audit_detail")
+    deferred_state = deferred.get("state") if isinstance(deferred, dict) else None
+    if envelope is None and deferred_state in {None, "none"}:
+        return
+    route = deferred.get("audit_route") if isinstance(deferred, dict) else None
+    if (
+        (envelope is not None and envelope not in {
+            "bounded_authority_v1", "fixed_frontier_authority_v1",
+        })
+        or deferred_state not in {
+            "verbose_current_detail_deferred",
+            "bounded_authority_envelope",
+            "fixed_frontier_authority_envelope",
+        }
+        or not isinstance(route, dict)
+        or route.get("representation") != "full_validated"
+        or not isinstance(route.get("command"), str)
+        or not route["command"]
+    ):
+        raise ShipyardProfileError("resume_envelope_hydration_route_missing")
+    # Profile construction binds exact checkpoint/worktree/scope values. It
+    # must never reinterpret digest-bound excerpts as those exact values.
+    raise ShipyardProfileError("resume_envelope_requires_full_validated_hydration")
 
 
 def _positive_int(value: Any, label: str, *, allow_zero: bool = False) -> int:
@@ -249,15 +279,17 @@ def _resume_command(
     linear_endpoint: str,
     plan_source: str | None,
     plan_identity: str | None,
+    max_bytes: int = RESUME_MAX_BYTES,
+    max_items: int = RESUME_MAX_ITEMS,
 ) -> list[str]:
     command = [
         sys.executable,
         str(Path(__file__).with_name("workstream_resume.py")),
         token,
         "--max-bytes",
-        str(RESUME_MAX_BYTES),
+        str(max_bytes),
         "--max-items",
-        str(RESUME_MAX_ITEMS),
+        str(max_items),
         "--linear-endpoint",
         linear_endpoint,
     ]
@@ -281,36 +313,62 @@ def load_authenticated_resume(
     plan_identity: str | None = None,
 ) -> dict[str, Any]:
     """Run the existing full-authority resume path without an inspection fallback."""
-    command = _resume_command(
-        token,
-        config=config,
-        linear_endpoint=linear_endpoint,
-        plan_source=plan_source,
-        plan_identity=plan_identity,
+    def run(command: list[str], output_limit: int) -> dict[str, Any]:
+        try:
+            result = subprocess.run(
+                command, cwd=Path(repo_path).expanduser(), check=False,
+                capture_output=True, timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ShipyardProfileError("authenticated_resume_unavailable") from error
+        if result.returncode != 0:
+            detail = result.stderr.decode(
+                "utf-8", "replace",
+            ).strip().replace("\n", " ")[:2048]
+            raise ShipyardProfileError(
+                f"authenticated_resume_refused:{detail or result.returncode}"
+            )
+        if len(result.stdout) > output_limit:
+            raise ShipyardProfileError("authenticated_resume_over_budget")
+        try:
+            observed = json.loads(result.stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ShipyardProfileError("authenticated_resume_malformed") from error
+        if not isinstance(observed, dict):
+            raise ShipyardProfileError("authenticated_resume_malformed")
+        return observed
+
+    command_kwargs = {
+        "config": config, "linear_endpoint": linear_endpoint,
+        "plan_source": plan_source, "plan_identity": plan_identity,
+    }
+    context = run(
+        _resume_command(token, **command_kwargs), RESUME_OUTPUT_MAX_BYTES,
     )
-    try:
-        result = subprocess.run(
-            command,
-            cwd=Path(repo_path).expanduser(),
-            check=False,
-            capture_output=True,
-            timeout=COMMAND_TIMEOUT_SECONDS,
+    envelope = (context.get("context_schema") or {}).get("envelope")
+    deferred = context.get("deferred_audit_detail")
+    deferred_state = deferred.get("state") if isinstance(deferred, dict) else None
+    if envelope is not None or deferred_state not in {None, "none"}:
+        expected_digest = (
+            deferred.get("full_context_sha256")
+            if isinstance(deferred, dict) else None
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise ShipyardProfileError("authenticated_resume_unavailable") from error
-    if result.returncode != 0:
-        detail = result.stderr.decode("utf-8", "replace").strip().replace("\n", " ")[:2048]
-        raise ShipyardProfileError(
-            f"authenticated_resume_refused:{detail or result.returncode}"
-        )
-    if len(result.stdout) > RESUME_OUTPUT_MAX_BYTES:
-        raise ShipyardProfileError("authenticated_resume_over_budget")
-    try:
-        context = json.loads(result.stdout)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ShipyardProfileError("authenticated_resume_malformed") from error
-    if not isinstance(context, dict):
-        raise ShipyardProfileError("authenticated_resume_malformed")
+        if not isinstance(expected_digest, str) or not SHA256.fullmatch(expected_digest):
+            raise ShipyardProfileError("resume_envelope_hydration_digest_missing")
+        hydrated = run(_resume_command(
+            token, **command_kwargs,
+            max_bytes=HYDRATED_RESUME_MAX_BYTES,
+            max_items=RESUME_MAX_ITEMS,
+        ), HYDRATED_RESUME_OUTPUT_MAX_BYTES)
+        if (hydrated.get("context_schema") or {}).get("envelope") is not None:
+            raise ShipyardProfileError("resume_envelope_hydration_malformed")
+        observed_digest = hashlib.sha256(_canonical(hydrated)).hexdigest()
+        if observed_digest != expected_digest or any(
+            hydrated.get(field) != context.get(field)
+            for field in ("workstream_id", "plan_revision", "root_revision")
+        ):
+            raise ShipyardProfileError("resume_envelope_hydration_mismatch")
+        context = hydrated
     return context
 
 
@@ -339,6 +397,7 @@ def _validate_scope(context: dict[str, Any], git: GitIdentity) -> None:
 def _validate_current_resume(
     context: dict[str, Any], token: str, git: GitIdentity,
 ) -> tuple[dict[str, Any], str, str, int, str]:
+    _require_hydrated_resume(context)
     if context.get("resume_authority") != "full":
         raise ShipyardProfileError("resume_is_not_full_authority")
     if context.get("workstream_id") != token:

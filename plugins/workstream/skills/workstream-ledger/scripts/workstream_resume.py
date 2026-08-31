@@ -1681,6 +1681,405 @@ def validate_snapshot(
 
 DEFAULT_RESUME_MAX_BYTES = 24 * 1024
 
+_VERBOSE_CURRENT_TEXT_KEYS = {
+    "blocker", "blockers", "body", "cons", "context", "decision",
+    "decisions", "description", "detail", "details", "followup",
+    "followups", "message", "next_action", "note", "notes", "pros",
+    "rationale", "reason", "recommendation", "requirement", "requirements",
+    "review_condition", "summary", "text", "title",
+}
+_CURRENT_DETAIL_EXCERPT_LIMITS = (768, 384, 192, 96, 48)
+
+
+def _utf8_head_tail(value: str, limit: int) -> str:
+    """Return a deterministic, UTF-8-safe actionable excerpt."""
+    marker = " …[audit detail deferred]… "
+    if len(value.encode("utf-8")) <= limit:
+        return value
+    # Character slicing cannot split UTF-8. Tighten until the encoded excerpt
+    # fits the selected tier; the fixed marker makes omission unambiguous.
+    retained = max(2, limit - len(marker.encode("utf-8")))
+    head = retained // 2
+    tail = retained - head
+    excerpt = value[:head] + marker + value[-tail:]
+    while len(excerpt.encode("utf-8")) > limit and (head > 1 or tail > 1):
+        if head >= tail and head > 1:
+            head -= 1
+        elif tail > 1:
+            tail -= 1
+        excerpt = value[:head] + marker + value[-tail:]
+    return excerpt
+
+
+def _compact_verbose_current_detail(
+    context: dict[str, Any], *, excerpt_limit: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Bound verbose current prose without weakening validated authority.
+
+    This runs only after ``validate_snapshot`` has authenticated and checked the
+    complete immutable history. Exact identifiers, revisions, routes, digests,
+    heads, statuses, and collection membership are never candidates. Long
+    current prose retains its actionable head and tail; the omitted exact bytes
+    remain available through the explicit full-history audit invocation.
+    """
+    deferred: list[dict[str, Any]] = []
+
+    def pointer(path: tuple[str, ...]) -> str:
+        return "/" + "/".join(
+            component.replace("~", "~0").replace("/", "~1")
+            for component in path
+        )
+
+    def visit(value: Any, path: tuple[str, ...], eligible: bool = False) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: visit(
+                    item, (*path, str(key)),
+                    str(key).lower() in _VERBOSE_CURRENT_TEXT_KEYS,
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [visit(item, (*path, str(index)), eligible)
+                    for index, item in enumerate(value)]
+        if not eligible or not isinstance(value, str):
+            return value
+        encoded = value.encode("utf-8")
+        if len(encoded) <= excerpt_limit:
+            return value
+        excerpt = _utf8_head_tail(value, excerpt_limit)
+        deferred.append({
+            "path": list(path), "json_pointer": pointer(path),
+            "utf8_bytes": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+        })
+        return excerpt
+
+    compacted = visit(context, ())
+    deferred_bytes = sum(item["utf8_bytes"] for item in deferred)
+    retained_bytes = sum(
+        len(_value_at_path(compacted, item["path"]).encode("utf-8"))
+        for item in deferred
+    )
+    fields_manifest = [{
+        "json_pointer": item["json_pointer"],
+        "utf8_bytes": item["utf8_bytes"],
+        "sha256": item["sha256"],
+    } for item in deferred]
+    summary = {
+        "state": "verbose_current_detail_deferred",
+        "algorithm": "utf8-actionable-head-tail-v1",
+        "field_count": len(deferred),
+        "original_utf8_bytes": deferred_bytes,
+        "retained_utf8_bytes": retained_bytes,
+        "fields_sha256": hashlib.sha256(json.dumps(
+            fields_manifest, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode()).hexdigest(),
+        "fields": fields_manifest,
+    }
+    return compacted, summary
+
+
+def _value_at_path(value: Any, path: list[str]) -> Any:
+    for component in path:
+        value = value[int(component)] if isinstance(value, list) else value[component]
+    return value
+
+
+def _bounded_semantic(value: Any, *, text_limit: int) -> Any:
+    """Keep executable semantics from one already-validated current record."""
+    semantic_keys = {
+        "acknowledgement", "agent", "assignee", "blocker", "branch",
+        "checkpoint_event_id", "child_identifier", "decision", "decisions",
+        "disposition", "event_id", "exact_head", "followup", "followups",
+        "head", "id", "identifier", "key", "kind", "machine", "mode",
+        "name", "next_action", "owner", "path", "payload", "reason",
+        "recommendation", "recovered_from_checkpoint", "remote_head",
+        "repository", "repository_key", "requirement", "requirements",
+        "review_condition", "root_revision", "session_id", "state",
+        "status", "status_type", "target", "text", "title", "type",
+        "url", "workstream_id", "worktree",
+    }
+    if isinstance(value, str):
+        return _utf8_head_tail(value, text_limit)
+    if isinstance(value, list):
+        return [_bounded_semantic(item, text_limit=text_limit) for item in value]
+    if isinstance(value, dict):
+        selected = {
+            key: _bounded_semantic(item, text_limit=text_limit)
+            for key, item in value.items() if str(key).lower() in semantic_keys
+        }
+        if selected:
+            return selected
+        # Unknown structured prose has no executable key. Its exact canonical
+        # value is still digest-bound by the deferred field manifest.
+        return {"deferred_structured_detail": True}
+    return value
+
+
+def _canonical_field_record(path: str, value: Any) -> dict[str, Any]:
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode()
+    record = {
+        "json_pointer": path, "utf8_bytes": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+    if isinstance(value, (list, dict)):
+        record["item_count"] = len(value)
+    return record
+
+
+def _bounded_authority_envelope(
+    context: dict[str, Any], *, text_limit: int,
+) -> dict[str, Any]:
+    """Return a small full-authority execution frontier plus audit locators."""
+    scope = context.get("scope") or {}
+    ownership = scope.get("child_ownership") or {}
+    children = []
+    for child in context.get("children", []):
+        summary = _bounded_semantic(child, text_limit=text_limit)
+        identifier = child.get("identifier") if isinstance(child, dict) else None
+        if isinstance(summary, dict) and identifier in ownership:
+            summary["repository_key"] = ownership[identifier]
+        children.append(summary)
+    frontier = {
+        "root": _bounded_semantic({
+            key: context.get(key) for key in (
+                "workstream_id", "status", "next_action", "blocker",
+            )
+        }, text_limit=text_limit),
+        "children": children,
+        "obligations": _bounded_semantic(
+            context.get("uncheckpointed_material_obligations", []),
+            text_limit=text_limit,
+        ),
+        "decisions": _bounded_semantic(
+            context.get("decisions", []), text_limit=text_limit,
+        ),
+        "choices": _bounded_semantic(
+            context.get("choice_events", []), text_limit=text_limit,
+        ),
+        "dependencies": _bounded_semantic(
+            context.get("relations", []), text_limit=text_limit,
+        ),
+        "checkpoint": _bounded_semantic(
+            context.get("latest_checkpoint"), text_limit=text_limit,
+        ),
+        "disposition": _bounded_semantic(
+            context.get("disposition"), text_limit=text_limit,
+        ),
+    }
+    keep = (
+        "context_schema", "workstream_id", "context_url", "plan_revision",
+        "description_plan_revision", "generation_transition_tip_event_id",
+        "generation_activation_epoch", "generation_authority_origin",
+        "quarantined_legacy_writes", "root_revision", "issue_revision",
+        "status", "material_event_revision", "checkpoint_recovery",
+        "surface_availability", "projection_revision", "projection_recovery",
+        "lifecycle_recovery", "projection_quarantine", "authenticated_route",
+        "authenticated_source", "history", "resume_authority",
+    )
+    deferred_names = sorted(
+        set(context) - set(keep) - {"deferred_audit_detail"}
+    )
+    deferred = [
+        _canonical_field_record("/" + name, context.get(name))
+        for name in deferred_names
+    ]
+    result = {key: context.get(key) for key in keep if key in context}
+    result["context_schema"] = dict(result["context_schema"])
+    result["context_schema"]["envelope"] = "bounded_authority_v1"
+    result["execution_frontier"] = frontier
+    result["deferred_audit_detail"] = {
+        "state": "bounded_authority_envelope",
+        "algorithm": "validated-current-frontier-v1",
+        "full_context_sha256": hashlib.sha256(json.dumps(
+            context, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest(),
+        "fields": deferred,
+        "fields_sha256": hashlib.sha256(json.dumps(
+            deferred, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest(),
+    }
+    return result
+
+
+def _fixed_frontier_authority_envelope(
+    context: dict[str, Any], *, token: str,
+) -> dict[str, Any]:
+    """Hard-bound the complete <=100-item execution frontier.
+
+    Each variable current record maps to one fixed-schema record with at most
+    six bounded text slots. Thus cardinality cannot reintroduce an unbounded
+    recursive object after the validated item gate has passed.
+    """
+    limit = 24
+    truncated_cell_count = 0
+
+    def brief(value: Any) -> Any:
+        nonlocal truncated_cell_count
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if not isinstance(value, str):
+            value = json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+        encoded = value.encode("utf-8")
+        if len(encoded) <= limit:
+            return value
+        truncated_cell_count += 1
+        marker = "…#" + hashlib.sha256(encoded).hexdigest()[:8]
+        prefix = value
+        while prefix and len((prefix + marker).encode("utf-8")) > limit:
+            prefix = prefix[:-1]
+        return prefix + marker
+
+    def field(record: Any, *names: str) -> Any:
+        if not isinstance(record, dict):
+            return None
+        for name in names:
+            if record.get(name) is not None:
+                return record[name]
+        return None
+
+    children = [[
+        brief(field(item, "identifier", "id")),
+        brief(field(item, "status_type", "status")),
+        brief(field(item, "owner", "assignee")),
+        brief((context.get("scope") or {}).get(
+            "child_ownership", {},
+        ).get(field(item, "identifier"))),
+        brief(field(item, "next_action")),
+        brief(field(item, "blocker")),
+    ] for item in context.get("children", [])]
+    obligations = [[
+        None, brief(field(item, "event_id")), brief(field(item, "kind")),
+        brief(field(item, "payload")),
+    ] for item in context.get("uncheckpointed_material_obligations", [])]
+    for child in context.get("children", []):
+        child_id = brief(field(child, "identifier", "id"))
+        for item in child.get("uncheckpointed_material_obligations", []):
+            obligations.append([
+                child_id, brief(field(item, "event_id")),
+                brief(field(item, "kind")), brief(field(item, "payload")),
+            ])
+        for item in child.get("pending_child_proposals", []):
+            obligations.append([
+                child_id, brief(field(item, "event_id", "proposal_id", "id")),
+                "pending_child_proposal", brief(item),
+            ])
+    decisions = [[
+        brief(field(item, "id", "event_id", "key")),
+        brief(field(item, "status")),
+        brief(field(
+            item, "decision", "recommendation", "text", "reason", "payload",
+        )),
+    ] for item in context.get("decisions", [])]
+    choices = [[
+        brief(field(item, "choice_id", "id", "event_id", "key")),
+        brief(field(item, "status")),
+        brief(field(
+            item, "decision", "recommendation", "text", "reason", "payload",
+        )),
+    ] for item in context.get("choice_events", [])]
+    dependencies = [[
+        brief(field(item, "type", "kind")),
+        brief(field(field(item, "target"), "identifier", "issue_id", "id")),
+    ] for item in context.get("relations", [])]
+    all_fields = [
+        _canonical_field_record("/" + name, value)
+        for name, value in sorted(context.items())
+        if name != "deferred_audit_detail"
+    ]
+    root = {
+        "status": brief(context.get("status")),
+        "next": brief(context.get("next_action")),
+        "blocker": brief(context.get("blocker")),
+    }
+    checkpoint_brief = brief(context.get("latest_checkpoint"))
+    disposition_brief = brief(context.get("disposition"))
+    route_brief = {
+        key: brief(value)
+        for key, value in (context.get("authenticated_route") or {}).items()
+    }
+    source_brief = {
+        key: brief(value)
+        for key, value in (context.get("authenticated_source") or {}).items()
+        if key in {"identity", "sha256"}
+    }
+    result = {
+        "context_schema": {
+            "name": "agent-workstream.resume-context", "version": 2,
+            "representation": "compact_validated",
+            "envelope": "fixed_frontier_authority_v1",
+        },
+        "workstream_id": token,
+        "context_url": brief(context.get("context_url")),
+        "plan_revision": context.get("plan_revision"),
+        "root_revision": context.get("root_revision"),
+        "material_event_revision": context.get("material_event_revision"),
+        "resume_authority": context.get("resume_authority"),
+        "authority_scope": {
+            "history_validation": "complete_authenticated",
+            "execution_frontier": "complete_digest_bound_excerpts",
+            "item_count": (
+                1 + len(children) + len(obligations) + len(decisions)
+                + len(choices) + len(dependencies)
+            ),
+            "omitted_items_claimed_executable": False,
+            "truncated_cell_count": truncated_cell_count,
+            "truncated_cell_marker": "…#<sha256-prefix>",
+            "truncated_cell_rule": "hydrate selected source row before action",
+        },
+        "execution_frontier": {
+            "root": root, "children": children, "obligations": obligations,
+            "decisions": decisions, "choices": choices,
+            "dependencies": dependencies,
+            "columns": {
+                "children": ["id", "status", "owner", "repository", "next", "blocker"],
+                "obligations": ["child", "id", "kind", "action"],
+                "decisions": ["id", "status", "action"],
+                "choices": ["id", "status", "action"],
+                "dependencies": ["type", "target"],
+            },
+            "checkpoint": checkpoint_brief,
+            "disposition": disposition_brief,
+        },
+        "authenticated_route": route_brief,
+        "authenticated_source": source_brief,
+        "deferred_audit_detail": {
+            "state": "fixed_frontier_authority_envelope",
+            "algorithm": "fixed-six-slot-frontier-v1",
+            "fields": all_fields,
+            "fields_sha256": hashlib.sha256(json.dumps(
+                all_fields, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode()).hexdigest(),
+            "full_context_sha256": hashlib.sha256(json.dumps(
+                context, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode()).hexdigest(),
+            "hydration_selectors": {
+                "root": "{status:.status,next_action:.next_action,blocker:.blocker}",
+                "children": ".children[<row>]",
+                "obligations": ".uncheckpointed_material_obligations[<row>]",
+                "decisions": ".decisions[<row>]",
+                "choices": ".choice_events[<row>]",
+                "dependencies": ".relations[<row>]",
+                "checkpoint": ".latest_checkpoint",
+                "disposition": ".disposition",
+            },
+            "hydration_recipe": (
+                "run audit_route.command, pipe its full_validated JSON to "
+                "jq -c '<hydration_selectors entry with row substituted>', "
+                "then verify the owning top-level field SHA-256"
+            ),
+        },
+    }
+    return result
+
 
 def compact_context(
     snapshot: dict[str, Any], token: str, max_bytes: int = DEFAULT_RESUME_MAX_BYTES,
@@ -1880,6 +2279,7 @@ def compact_context(
             if expected_missing_terminal_closures
             else ("full" if require_projection_authority else "inspection_only")
         ),
+        "deferred_audit_detail": {"state": "none"},
     }
     if include_history:
         context["material_events"] = clean["material_events"]
@@ -1915,6 +2315,73 @@ def compact_context(
     if max_items < 0 or item_count > max_items:
         raise ResumeError(f"resume_context_over_item_budget:{item_count}>{max_items}")
     encoded = json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    if (
+        len(encoded) > max_bytes
+        and not include_history
+        and max_bytes == DEFAULT_RESUME_MAX_BYTES
+    ):
+        original_bytes = len(encoded)
+        audit_route = {
+            "command": (
+                f"workstreamctl resume {normalized_token} --include-history "
+                "--max-bytes 2147483647 --max-items 2147483647"
+            ),
+            "representation": "full_validated",
+            "locator_format": "RFC6901 JSON Pointer",
+        }
+        for excerpt_limit in _CURRENT_DETAIL_EXCERPT_LIMITS:
+            candidate, summary = _compact_verbose_current_detail(
+                context, excerpt_limit=excerpt_limit,
+            )
+            if summary["field_count"] == 0:
+                break
+            summary["original_context_bytes"] = original_bytes
+            summary["full_context_sha256"] = hashlib.sha256(json.dumps(
+                context, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode()).hexdigest()
+            summary["audit_route"] = audit_route
+            candidate["deferred_audit_detail"] = summary
+            candidate_encoded = json.dumps(
+                candidate, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            if len(candidate_encoded) <= max_bytes:
+                context = candidate
+                encoded = candidate_encoded
+                break
+        if len(encoded) > max_bytes:
+            for excerpt_limit in (128, 96, 64, 48):
+                candidate = _bounded_authority_envelope(
+                    context, text_limit=excerpt_limit,
+                )
+                candidate["deferred_audit_detail"]["original_context_bytes"] = (
+                    original_bytes
+                )
+                candidate["deferred_audit_detail"]["audit_route"] = audit_route
+                candidate_encoded = json.dumps(
+                    candidate, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                if len(candidate_encoded) <= max_bytes:
+                    context = candidate
+                    encoded = candidate_encoded
+                    break
+        if len(encoded) > max_bytes:
+            candidate = _fixed_frontier_authority_envelope(
+                context, token=normalized_token,
+            )
+            candidate["deferred_audit_detail"]["original_context_bytes"] = (
+                original_bytes
+            )
+            candidate["deferred_audit_detail"]["audit_route"] = audit_route
+            candidate_encoded = json.dumps(
+                candidate, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            if len(candidate_encoded) <= max_bytes:
+                context = candidate
+                encoded = candidate_encoded
     if len(encoded) > max_bytes:
         raise ResumeError(f"resume_context_over_budget:{len(encoded)}>{max_bytes}")
     return context

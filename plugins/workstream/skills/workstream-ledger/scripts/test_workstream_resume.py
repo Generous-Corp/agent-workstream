@@ -43,6 +43,100 @@ class ResumeTests(unittest.TestCase):
         }
         return snapshot
 
+    def full_authority_snapshot(self, snapshot):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project",
+            "root_issue_id": "33333333-3333-4333-8333-333333333333",
+        }
+        plan_revision = "a" * 64
+        snapshot["root"]["plan_revision"] = plan_revision
+        snapshot["root"]["issue_revision"] = snapshot["root"]["revision"]
+        repository_key = "github.com:id:R_agent_workstream"
+        scope = {
+            "namespace": "agent-workstream",
+            "linear": {
+                **route,
+                "route_verification": {
+                    **route, "observed_at": "2026-08-31T12:00:00Z",
+                    "evidence": [{
+                        "kind": "authenticated_linear_readback",
+                        "authenticated": True, **route,
+                    }],
+                },
+            },
+            "primary_repository": repository_key,
+            "repositories": [{
+                "slug": "github.com/generous-corp/agent-workstream",
+                "exact_head": "b" * 40,
+                "provider_repository_id": "R_agent_workstream",
+                "aliases": [],
+                "identity_resolution": {
+                    "provider_repository_id": "R_agent_workstream",
+                    "resolved_slug": "github.com/generous-corp/agent-workstream",
+                    "observed_at": "2026-08-31T12:00:00Z",
+                    "evidence": [{
+                        "kind": "authenticated_provider_readback",
+                        "authenticated": True,
+                        "provider_repository_id": "R_agent_workstream",
+                        "resolved_slug": "github.com/generous-corp/agent-workstream",
+                    }],
+                },
+                "identity_updates": [], "evidence": [],
+            }],
+            "child_ownership": {
+                child["identifier"]: repository_key
+                for child in snapshot["children"]
+            },
+        }
+        source = {
+            "identity": "https://example.test/immutable-plan",
+            "sha256": plan_revision,
+        }
+        provenance = [{
+            "agent": "codex", "machine": "M5", "session_id": "session",
+            "worktree": {
+                "state": "safe", "path": "/repo/worktree",
+                "branch": "fix/no-stranding", "head": "b" * 40,
+            },
+        }]
+        disposition = {
+            "disposition": "attach", "recovered_from_checkpoint": None,
+            "remote_head": "b" * 40,
+        }
+        values = (
+            ("scope", "root", scope), ("source", "root", source),
+            ("provenance", "primary", provenance[0]),
+            ("disposition", "root", disposition),
+        )
+        projection_events = []
+        projected_values = [*values, *(
+            ("relation", f"{relation['type']}:{relation['target']['identifier']}", relation)
+            for relation in snapshot.get("relations", [])
+        )]
+        for index, (kind, key, value) in enumerate(projected_values):
+            projection_events.append(build_projection_event(
+                workstream_id="GEN-37", kind=kind, key=key, value=value,
+                plan_revision=plan_revision, expected_revision=index,
+                created_at=f"2026-08-31T12:00:0{index}Z", authority=route,
+            ))
+        snapshot.update({
+            "scope": scope, "source": source, "provenance": provenance,
+            "disposition": disposition,
+            "relations": snapshot.get("relations", []), "choice_events": [],
+            "evidence_contracts": [], "child_closures": [],
+            "closure_reviews": [], "projection_events": projection_events,
+            "projection_history": [], "projection_quarantined": [],
+            "projection_unresolved_quarantine": [],
+            "quarantine_disposition": None,
+            "projection_revision": len(projection_events),
+            "projection_recovery": {"state": "current", "stale_plan_count": 0},
+            "authenticated_route": route, "authenticated_source": source,
+            "latest_checkpoint": None,
+            "checkpoint_recovery": {"state": "not_found", "stale_plan_count": 0},
+        })
+        return snapshot
+
     def test_repair_graph_frontier_binds_native_status_and_state_identity(self):
         snapshot = self.snapshot()
         snapshot["root"].update({
@@ -1110,6 +1204,270 @@ class ResumeTests(unittest.TestCase):
             ).encode()),
             MODULE.DEFAULT_RESUME_MAX_BYTES,
         )
+
+    def test_mature_full_authority_resume_compacts_without_stranding(self):
+        snapshot = self.snapshot()
+        snapshot["children"] = []
+        for index in range(6):
+            snapshot["children"].append({
+                "identifier": f"GEN-{38 + index}",
+                "title": f"Open delivery slice {index}",
+                "status": "In Progress",
+                "next_action": (
+                    f"Continue slice {index}: verify the exact landing boundary. "
+                    + (chr(97 + index) * 3300)
+                ),
+                "blocker": {
+                    "text": f"Retain blocker semantics for slice {index}. "
+                    + (chr(65 + index) * 1700),
+                },
+            })
+        snapshot["decisions"] = [{
+            "id": "D-budget", "status": "accepted",
+            "decision": "Keep the fixed 24 KiB default. " + ("d" * 4000),
+        }]
+        snapshot["material_events"] = [{
+            "event_id": "requirement-current", "workstream_id": "GEN-37",
+            "kind": "requirement", "source": "user_turn",
+            "payload": {
+                "requirement": "Preserve full resume authority. " + ("r" * 4000),
+            },
+            "expected_revision": 0, "created_at": "2026-08-31T12:01:00Z",
+        }, {
+            "event_id": "followup-current", "workstream_id": "GEN-37",
+            "kind": "followup", "source": "user_turn",
+            "payload": {
+                "followup": "Run the deferred audit after recovery. " + ("f" * 3000),
+            },
+            "expected_revision": 1, "created_at": "2026-08-31T12:02:00Z",
+        }]
+        snapshot["material_event_revision"] = 2
+        snapshot["root"]["revision"] = 2
+        snapshot = self.full_authority_snapshot(snapshot)
+        before = copy.deepcopy(snapshot)
+
+        unbounded = MODULE.compact_context(
+            snapshot, "GEN-37", max_bytes=64 * 1024,
+            require_projection_authority=True,
+        )
+        unbounded_bytes = len(json.dumps(
+            unbounded, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode())
+        self.assertGreater(unbounded_bytes, 46_879)
+        self.assertLess(unbounded_bytes, 49_000)
+        with mock.patch.object(MODULE, "_CURRENT_DETAIL_EXCERPT_LIMITS", ()), \
+             mock.patch.object(
+                 MODULE, "_bounded_authority_envelope",
+                 side_effect=lambda current, **_kwargs: current,
+             ), mock.patch.object(
+                 MODULE, "_fixed_frontier_authority_envelope",
+                 side_effect=lambda current, **_kwargs: current,
+             ):
+            with self.assertRaisesRegex(
+                MODULE.ResumeError,
+                f"resume_context_over_budget:{unbounded_bytes}>"
+                f"{MODULE.DEFAULT_RESUME_MAX_BYTES}",
+            ):
+                MODULE.compact_context(
+                    snapshot, "GEN-37", require_projection_authority=True,
+                )
+
+        first = MODULE.compact_context(
+            snapshot, "GEN-37", require_projection_authority=True,
+        )
+        second = MODULE.compact_context(
+            snapshot, "GEN-37", require_projection_authority=True,
+        )
+        encoded = json.dumps(
+            first, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()
+        self.assertLessEqual(len(encoded), MODULE.DEFAULT_RESUME_MAX_BYTES)
+        self.assertEqual(first, second)
+        self.assertEqual(snapshot, before)
+        self.assertEqual(first["resume_authority"], "full")
+        self.assertEqual(
+            first["deferred_audit_detail"]["state"],
+            "verbose_current_detail_deferred",
+        )
+        self.assertGreater(first["deferred_audit_detail"]["field_count"], 0)
+        self.assertRegex(
+            first["deferred_audit_detail"]["fields_sha256"], r"^[0-9a-f]{64}$",
+        )
+        self.assertEqual(
+            first["deferred_audit_detail"]["audit_route"]["command"],
+            "workstreamctl resume GEN-37 --include-history "
+            "--max-bytes 2147483647 --max-items 2147483647",
+        )
+        for field in first["deferred_audit_detail"]["fields"]:
+            self.assertTrue(field["json_pointer"].startswith("/"))
+            self.assertRegex(field["sha256"], r"^[0-9a-f]{64}$")
+            self.assertGreater(field["utf8_bytes"], 0)
+        self.assertEqual(
+            first["uncheckpointed_material_obligations"][0]["kind"],
+            "requirement",
+        )
+        self.assertIn(
+            "Preserve full resume authority",
+            first["uncheckpointed_material_obligations"][0]["payload"]
+            ["requirement"],
+        )
+        self.assertEqual(
+            first["uncheckpointed_material_obligations"][1]["kind"],
+            "followup",
+        )
+        self.assertEqual(first["decisions"][0]["id"], "D-budget")
+        self.assertIn("Keep the fixed 24 KiB", first["decisions"][0]["decision"])
+        self.assertEqual(len(first["children"]), 6)
+        self.assertTrue(all(child["next_action"] for child in first["children"]))
+
+    def test_high_cardinality_structured_state_uses_bounded_authority_envelope(self):
+        snapshot = self.snapshot()
+        snapshot["children"] = snapshot["children"][:1]
+        snapshot["children"][0]["owner"] = "codex-owner"
+        snapshot["relations"] = [{
+            "type": "blocked_by", "target": {
+                "workspace_id": "external-workspace",
+                "issue_id": "11111111-1111-4111-8111-111111111111",
+                "identifier": "OPS-900",
+            },
+        }]
+        snapshot["decisions"] = [{
+            "id": f"D-{index:02d}", "status": "accepted",
+            "decision": f"Execute reviewed decision {index}",
+            **{
+                key: f"{key} semantics for {index} " + (key * 300)
+                for key in (
+                    "blocker", "followup", "message", "next_action", "notes",
+                    "rationale", "reason", "recommendation", "requirement",
+                    "review_condition", "summary", "text", "title",
+                )
+            },
+            "implementation": {
+                "steps": [{
+                    "ordinal": step,
+                    "opaque_audit_detail": (f"{index:02d}-{step:02d}-" * 800),
+                } for step in range(8)],
+            },
+        } for index in range(96)]
+        snapshot = self.full_authority_snapshot(snapshot)
+        unbounded = MODULE.compact_context(
+            snapshot, "GEN-37", max_bytes=8 * 1024 * 1024,
+            require_projection_authority=True,
+        )
+        self.assertGreater(len(json.dumps(
+            unbounded, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()), 2 * 1024 * 1024)
+
+        context = MODULE.compact_context(
+            snapshot, "GEN-37", require_projection_authority=True,
+        )
+        encoded = json.dumps(
+            context, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()
+        self.assertLessEqual(len(encoded), MODULE.DEFAULT_RESUME_MAX_BYTES)
+        self.assertEqual(context["resume_authority"], "full")
+        self.assertEqual(
+            context["context_schema"]["envelope"],
+            "fixed_frontier_authority_v1",
+        )
+        self.assertEqual(
+            context["deferred_audit_detail"]["state"],
+            "fixed_frontier_authority_envelope",
+        )
+        self.assertEqual(
+            context["authority_scope"]["execution_frontier"],
+            "complete_digest_bound_excerpts",
+        )
+        self.assertEqual(
+            [decision[0] for decision in context["execution_frontier"]["decisions"]],
+            [f"D-{index:02d}" for index in range(96)],
+        )
+        self.assertTrue(all(
+            decision[1] == "accepted" and decision[2]
+            for decision in context["execution_frontier"]["decisions"]
+        ))
+        decision_field = next(
+            field for field in context["deferred_audit_detail"]["fields"]
+            if field["json_pointer"] == "/decisions"
+        )
+        self.assertEqual(decision_field["item_count"], 96)
+        self.assertEqual(
+            decision_field["sha256"], hashlib.sha256(json.dumps(
+                unbounded["decisions"], ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode()).hexdigest(),
+        )
+        child = context["execution_frontier"]["children"][0]
+        self.assertEqual(child[1], "In Progress")
+        self.assertEqual(child[2], "codex-owner")
+        self.assertEqual(child[4], "adapter")
+        self.assertEqual(
+            context["execution_frontier"]["dependencies"],
+            [["blocked_by", "OPS-900"]],
+        )
+
+    def test_mature_resume_contradiction_refuses_before_compaction(self):
+        snapshot = self.snapshot()
+        snapshot["material_events"] = [{
+            "event_id": "action-a", "workstream_id": "GEN-37",
+            "kind": "requirement", "source": "user_turn",
+            "payload": {"next_action": "take route A " + ("a" * 26000)},
+            "expected_revision": 0, "created_at": "2026-08-31T12:01:00Z",
+        }, {
+            "event_id": "action-b", "workstream_id": "GEN-37",
+            "kind": "requirement", "source": "user_turn",
+            "payload": {"next_action": "take route B " + ("b" * 26000)},
+            "expected_revision": 0, "created_at": "2026-08-31T12:02:00Z",
+        }]
+        snapshot["material_event_revision"] = 2
+        snapshot["root"]["revision"] = 2
+        snapshot = self.full_authority_snapshot(snapshot)
+        with self.assertRaisesRegex(
+            MODULE.ResumeError, "conflicting_concurrent_next_action:0",
+        ):
+            MODULE.compact_context(
+                snapshot, "GEN-37", require_projection_authority=True,
+            )
+
+    def test_max_item_child_frontier_cannot_reintroduce_byte_refusal(self):
+        snapshot = self.snapshot()
+        snapshot["decisions"] = []
+        snapshot["children"] = [{
+            "identifier": f"GEN-{38 + index}",
+            "title": f"Executable child {index} " + ("t" * 500),
+            "status": "In Progress", "status_type": "started",
+            "owner": f"owner-{index}",
+            "next_action": f"Execute child {index} next " + ("n" * 1200),
+            "blocker": {"text": f"blocker-{index} " + ("b" * 900)},
+            "review_condition": f"review-{index} " + ("v" * 700),
+            "reconciliation_blockers": [{
+                "kind": "drift", "field": "state", "expected": "x" * 800,
+                "observed": "y" * 800, "reconciliation_required": True,
+            }],
+        } for index in range(99)]
+        snapshot = self.full_authority_snapshot(snapshot)
+
+        context = MODULE.compact_context(
+            snapshot, "GEN-37", require_projection_authority=True,
+        )
+        encoded = json.dumps(
+            context, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()
+        self.assertLessEqual(len(encoded), MODULE.DEFAULT_RESUME_MAX_BYTES)
+        self.assertEqual(context["resume_authority"], "full")
+        self.assertEqual(
+            context["context_schema"]["envelope"],
+            "fixed_frontier_authority_v1",
+        )
+        self.assertEqual(context["authority_scope"]["item_count"], 100)
+        self.assertEqual(len(context["execution_frontier"]["children"]), 99)
+        self.assertEqual(
+            context["execution_frontier"]["columns"]["children"],
+            ["id", "status", "owner", "repository", "next", "blocker"],
+        )
+        self.assertEqual(context["execution_frontier"]["children"][0][:3], [
+            "GEN-38", "started", "owner-0",
+        ])
 
     def test_checkpoint_fence_uses_ordered_position_not_stale_writer_revision(self):
         prefix = {
