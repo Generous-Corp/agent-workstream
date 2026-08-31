@@ -390,6 +390,14 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.34 adds a reviewed, append-only origin seal for an existing
+scope-owned legacy child whose identity predates deterministic intake. The seal
+freezes its exact direct material/checkpoint prefix, route, parent, source,
+generation, scope, ownership, and immutable root identity; later state enters
+only through root-authorized proposals. Direct post-seal markers, ambiguous
+origins, stale review artifacts, native identity drift, and concurrent prefix
+or projection changes fail closed without recreating or reopening the issue.
+
 Version 0.4.33 keeps the default 24 KiB resume surface actionable as material
 repair history grows. Compact output retains the raw-history count and digest
 and the top-level semantic-repair summary without duplicating audit-only latest
