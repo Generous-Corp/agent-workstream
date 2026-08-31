@@ -173,11 +173,30 @@ def _latest_acknowledged_checkpoint_id(snapshot: dict[str, Any]) -> str | None:
 
 def latest_acknowledged_checkpoint_id_from_comments(
     comments: list[dict[str, Any]], *, workstream_id: str,
-    plan_revision: str,
+    plan_revision: str, authenticated_route: dict[str, str],
 ) -> str | None:
-    """Recover the exact acknowledged checkpoint chain tip from remote comments."""
+    """Recover the selected generation's acknowledged checkpoint chain tip."""
+    from workstream_generation import (
+        generation_controls, selected_activation_checkpoints,
+    )
+
+    selected_checkpoints = None
+    if generation_controls(comments):
+        selected = select_plan_generation(
+            comments, workstream_id=workstream_id,
+            description_plan_revision=None,
+            authenticated_route=authenticated_route,
+        )
+        if selected["plan_revision"] == plan_revision:
+            selected_checkpoints = selected_activation_checkpoints(
+                comments, workstream_id=workstream_id,
+                transition_event_id=selected["transition_tip_event_id"],
+                active_plan_revision=selected["plan_revision"],
+                authenticated_route=authenticated_route,
+            )
     checkpoint_log = reduce_checkpoint_comments(
         comments, workstream_id=workstream_id,
+        selected_activation_checkpoints=selected_checkpoints,
     )
     matching = [
         checkpoint for checkpoint in checkpoint_log.checkpoints
@@ -3607,6 +3626,7 @@ def main() -> int:
             return latest_acknowledged_checkpoint_id_from_comments(
                 comments_after, workstream_id=token,
                 plan_revision=plan_revision,
+                authenticated_route=route,
             )
 
         description_before_write = transport.snapshot_for_root(

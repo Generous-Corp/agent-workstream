@@ -18,7 +18,8 @@ from workstream_choices import record_choice
 from workstream_delta import Delta
 from workstream_evidence import evidence_errors
 from workstream_linear_checkpoints import (
-    encode_checkpoint_comment, reduce_checkpoint_comments,
+    encode_checkpoint_comment, LinearCheckpointError,
+    reduce_checkpoint_comments,
 )
 from workstream_linear import bootstrap_linear_route, LinearGraphQLTransport
 from workstream_linear_events import (
@@ -26,7 +27,7 @@ from workstream_linear_events import (
 )
 from workstream_generation import (
     _digest as generation_digest, build_retirement_proof, GenerationTransport,
-    generation_quarantine_metadata,
+    generation_quarantine_metadata, reduce_generation_checkpoint_comments,
 )
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
@@ -6445,6 +6446,423 @@ class ProjectionTests(unittest.TestCase):
             compact_context(snapshot, "GEN-37", require_projection_authority=True)
         inspected = compact_context(snapshot, "GEN-37")
         self.assertEqual(inspected["resume_authority"], "inspection_only")
+
+    def generation_checkpoint_ownership_repair_fixture(self):
+        predecessor_plan = "b" * 64
+        client = FakeProjectionClient()
+
+        def projection_adapter(plan_revision):
+            return LinearProjectionAdapter(
+                client, issue_id="GEN-37", workstream_id="GEN-37",
+                plan_revision=plan_revision, **AUTHORITY,
+            )
+
+        def project_generation(plan_revision):
+            target = projection_adapter(plan_revision)
+            generation_scope = scope()
+            generation_scope["child_ownership"] = {}
+            source = {
+                "identity": f"https://example.test/{plan_revision}",
+                "sha256": plan_revision,
+            }
+            values = [
+                ("scope", "root", generation_scope),
+                ("source", "root", source),
+                ("provenance", "generation", {
+                    "agent": "codex", "machine": "M5",
+                    "session_id": plan_revision[:8],
+                    "worktree": {"state": "safe", "head": HEAD},
+                }),
+                ("disposition", "root", {
+                    "disposition": "attach", "remote_head": HEAD,
+                    "recovered_from_checkpoint": None,
+                }),
+            ]
+            for revision, (kind, key, value) in enumerate(values):
+                target.append(build_projection_event(
+                    workstream_id="GEN-37", kind=kind, key=key,
+                    value=value, plan_revision=plan_revision,
+                    expected_revision=revision, created_at=str(revision),
+                    authority=AUTHORITY,
+                ))
+            return source
+
+        project_generation(predecessor_plan)
+        source = project_generation(PLAN)
+        target = projection_adapter(PLAN)
+        while target.state().revision < 16:
+            revision = target.state().revision
+            target.append(build_projection_event(
+                workstream_id="GEN-37", kind="provenance",
+                key=f"target-padding-{revision}", value={
+                    "agent": "codex", "machine": "M5",
+                    "session_id": f"target-padding-{revision}",
+                    "worktree": {"state": "safe", "head": HEAD},
+                }, plan_revision=PLAN, expected_revision=revision,
+                created_at=f"target-{revision}", authority=AUTHORITY,
+            ))
+        activation_checkpoint = build_checkpoint(
+            workstream_id="GEN-37", boundary_id="activate-target",
+            root_revision=0, plan_revision=PLAN,
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai",
+                "session_id": "activate-target", "machine": "M5",
+                "worktree": {
+                    "state": "safe", "path": "/tmp/target",
+                    "branch": "target", "head": HEAD,
+                },
+            }, exact_head=HEAD, evidence=[], blocker=None,
+            next_action="Continue the activated target generation.",
+        )
+
+        def candidate_loader(plan_revision):
+            state = projection_adapter(plan_revision).state()
+            checkpoints = reduce_generation_checkpoint_comments(
+                client.comments, workstream_id="GEN-37",
+                authenticated_route=AUTHORITY,
+            )
+            checkpoint_ids = sorted(
+                checkpoint["event_id"]
+                for checkpoint in checkpoints.checkpoints
+                if checkpoint["plan_revision"] == plan_revision
+            )
+            if plan_revision == PLAN:
+                checkpoint_ids = sorted({
+                    *checkpoint_ids, activation_checkpoint["event_id"],
+                })
+            material = reduce_event_comments(
+                client.comments, workstream_id="GEN-37",
+            )
+            return {
+                "resume_authority": "full",
+                "plan_revision": plan_revision,
+                "authenticated_route": AUTHORITY,
+                "source": state.snapshot["source"],
+                "material_revision": material.revision,
+                "checkpoint_event_ids": checkpoint_ids,
+                "projection_revision": state.revision,
+                "graph_frontier_sha256": generation_digest("stable-graph"),
+                "snapshot_sha256": generation_digest({
+                    "projection_event_ids": [
+                        event["event_id"] for event in state.events
+                    ],
+                    "checkpoint_event_ids": checkpoint_ids,
+                }),
+                "quarantined_legacy_writes": generation_quarantine_metadata(
+                    client.comments, workstream_id="GEN-37",
+                ),
+            }
+
+        predecessor = projection_adapter(predecessor_plan).state()
+        generation = GenerationTransport(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            authority=AUTHORITY, candidate_loader=candidate_loader,
+            legacy_description_plan_revision=predecessor_plan,
+        )
+        generation._capability_checked = True
+        generation.activate(
+            target_plan_revision=PLAN, created_at="activate",
+            retirement=build_retirement_proof(
+                predecessor_plan_revision=predecessor_plan,
+                retired_at="activate", retired_writer_epoch=0,
+                provenance_event_ids=[
+                    event["event_id"] for event in predecessor.events
+                    if event["kind"] == "provenance"
+                ], checkpoint_event_ids=[],
+            ),
+            activation_checkpoint=activation_checkpoint, remote_head=HEAD,
+        )
+        self.assertEqual(target.state().revision, 18)
+        selected = select_plan_generation(
+            client.comments, workstream_id="GEN-37",
+            description_plan_revision=predecessor_plan,
+            authenticated_route=AUTHORITY,
+        )
+        transition = next(
+            event for event in projection_adapter(predecessor_plan).state().events
+            if event["event_id"] == selected["transition_tip_event_id"]
+        )
+        self.assertEqual(transition["value"]["schema_version"], 3)
+
+        for child_number in range(91, 95):
+            revision = target.state().revision
+            child_issue_id = f"child-uuid-{child_number}"
+            target.append(build_projection_event(
+                workstream_id="GEN-37",
+                kind="child_extension_authorization", key=child_issue_id,
+                value={
+                    "root_issue_id": ROOT_UUID, "route": AUTHORITY,
+                    "source": source, "plan_revision": PLAN,
+                    "reviewed_candidate_key": f"child-{child_number}",
+                    "child_issue_id": child_issue_id,
+                    "expected_material_revision": 0,
+                    "expected_projection_revision": revision,
+                    "initial_state": "planned_pending_projection",
+                }, plan_revision=PLAN, expected_revision=revision,
+                created_at=f"child-{child_number}", authority=AUTHORITY,
+            ))
+        state = target.state()
+        self.assertEqual(state.revision, 22)
+        desired_scope = deepcopy(state.snapshot["scope"])
+        desired_scope["child_ownership"].update({
+            f"GEN-{child_number}": "github.com:id:R_agent_workstream"
+            for child_number in range(91, 95)
+        })
+        manifest = {
+            **projection_review_contract(state), "retirements": [],
+            "projection": [
+                {"kind": "scope", "key": "root", "value": desired_scope},
+                {"kind": "source", "key": "root", "value": source},
+                {"kind": "provenance", "key": "generation", "value": (
+                    state.snapshot["provenance"][0]
+                )},
+            ],
+        }
+        graph = {
+            "root": {
+                "identifier": "GEN-37", "url": "https://linear/GEN-37",
+                "description_plan_revision": predecessor_plan,
+                "plan_revision": PLAN, "revision": 0,
+                "status": "In Progress", "next_action": "continue",
+                "generation_transition_tip_event_id": selected[
+                    "transition_tip_event_id"
+                ],
+                "generation_activation_epoch": selected["activation_epoch"],
+                "generation_authority_origin": selected["authority_origin"],
+            },
+            "children": [{
+                "identifier": f"GEN-{child_number}",
+                "title": f"Child {child_number}",
+                "url": f"https://linear/GEN-{child_number}",
+                "status": "In Progress", "status_type": "started",
+                "next_action": "continue",
+            } for child_number in range(91, 95)],
+            "decisions": [],
+        }
+        snapshot, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", manifest, target,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD, relation_target_resolver=lambda _relations: {},
+        )
+        return {
+            "client": client, "target": target, "source": source,
+            "manifest": manifest, "graph": graph, "snapshot": snapshot,
+            "unresolved": unresolved, "checkpoint": activation_checkpoint,
+        }
+
+    def test_generation_activation_checkpoint_fences_ownership_only_repair(self):
+        fixture = self.generation_checkpoint_ownership_repair_fixture()
+        checkpoint_id = fixture["checkpoint"]["event_id"]
+        self.assertEqual(
+            fixture["snapshot"]["latest_checkpoint"]["checkpoint_event_id"],
+            checkpoint_id,
+        )
+
+        def checkpoint_fence():
+            return workstream_projection.latest_acknowledged_checkpoint_id_from_comments(
+                fixture["client"].comments, workstream_id="GEN-37",
+                plan_revision=PLAN, authenticated_route=AUTHORITY,
+            )
+
+        self.assertEqual(checkpoint_fence(), checkpoint_id)
+        self.assertIsNone(
+            workstream_projection.latest_acknowledged_checkpoint_id_from_comments(
+                fixture["client"].comments, workstream_id="GEN-37",
+                plan_revision="b" * 64, authenticated_route=AUTHORITY,
+            )
+        )
+        before = len(fixture["client"].comments)
+        result = reconcile_required_projection(
+            fixture["target"], fixture["snapshot"], fixture["manifest"],
+            remote_head=HEAD, created_at="ownership-repair",
+            authenticated_source=fixture["source"],
+            checkpoint_fence=checkpoint_fence,
+            legacy_unresolved_relation_heads=fixture["unresolved"],
+        )
+        self.assertEqual(len(result["writes"]), 1)
+        self.assertEqual(len(fixture["client"].comments), before + 1)
+        self.assertEqual(fixture["target"].state().revision, 23)
+        self.assertEqual(
+            (fixture["target"].state().events[-1]["kind"],
+             fixture["target"].state().events[-1]["key"]),
+            ("scope", "root"),
+        )
+        self.assertEqual(
+            result["disposition"]["recovered_from_checkpoint"], checkpoint_id,
+        )
+        after_first_write = len(fixture["client"].comments)
+        replay_manifest = {
+            **projection_review_contract(fixture["target"].state()),
+            "retirements": [],
+            "projection": deepcopy(fixture["manifest"]["projection"]),
+        }
+        replay = reconcile_required_projection(
+            fixture["target"], fixture["snapshot"], replay_manifest,
+            remote_head=HEAD, created_at="ownership-repair-replay",
+            authenticated_source=fixture["source"],
+            checkpoint_fence=checkpoint_fence,
+            legacy_unresolved_relation_heads=fixture["unresolved"],
+        )
+        self.assertEqual(replay["writes"], [])
+        self.assertEqual(len(fixture["client"].comments), after_first_write)
+
+    def test_generation_checkpoint_wrong_plan_fence_refuses_zero_write(self):
+        fixture = self.generation_checkpoint_ownership_repair_fixture()
+        before = len(fixture["client"].comments)
+
+        def wrong_plan_fence():
+            return workstream_projection.latest_acknowledged_checkpoint_id_from_comments(
+                fixture["client"].comments, workstream_id="GEN-37",
+                plan_revision="b" * 64, authenticated_route=AUTHORITY,
+            )
+
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "checkpoint_authority_changed_reload_required",
+        ):
+            reconcile_required_projection(
+                fixture["target"], fixture["snapshot"], fixture["manifest"],
+                remote_head=HEAD, created_at="wrong-plan-fence",
+                authenticated_source=fixture["source"],
+                checkpoint_fence=wrong_plan_fence,
+                legacy_unresolved_relation_heads=fixture["unresolved"],
+            )
+        self.assertEqual(len(fixture["client"].comments), before)
+
+    def test_generation_checkpoint_duplicate_carried_evidence_refuses_zero_write(self):
+        fixture = self.generation_checkpoint_ownership_repair_fixture()
+        fixture["client"].comments.append({
+            "id": "contradictory-carried-checkpoint",
+            "body": encode_checkpoint_comment(fixture["checkpoint"]),
+        })
+        before = len(fixture["client"].comments)
+
+        def contradictory_fence():
+            return workstream_projection.latest_acknowledged_checkpoint_id_from_comments(
+                fixture["client"].comments, workstream_id="GEN-37",
+                plan_revision=PLAN, authenticated_route=AUTHORITY,
+            )
+
+        with self.assertRaisesRegex(
+            LinearCheckpointError, "duplicate_checkpoint_event_id",
+        ):
+            reconcile_required_projection(
+                fixture["target"], fixture["snapshot"], fixture["manifest"],
+                remote_head=HEAD, created_at="contradictory-carried-evidence",
+                authenticated_source=fixture["source"],
+                checkpoint_fence=contradictory_fence,
+                legacy_unresolved_relation_heads=fixture["unresolved"],
+            )
+        self.assertEqual(len(fixture["client"].comments), before)
+
+    def test_generation_checkpoint_ownership_repair_refuses_changed_authority_zero_write(self):
+        def checkpoint_fence(fixture):
+            return workstream_projection.latest_acknowledged_checkpoint_id_from_comments(
+                fixture["client"].comments, workstream_id="GEN-37",
+                plan_revision=PLAN, authenticated_route=AUTHORITY,
+            )
+
+        def successor(fixture, boundary_id):
+            checkpoint = fixture["checkpoint"]
+            return build_checkpoint(
+                workstream_id="GEN-37", boundary_id=boundary_id,
+                root_revision=1, plan_revision=PLAN,
+                before_status="In Progress", after_status="In Progress",
+                execution=deepcopy(checkpoint["execution"]), exact_head=HEAD,
+                evidence=[], blocker=None, next_action="Continue newer work.",
+                predecessor_event_id=checkpoint["event_id"],
+            )
+
+        def alter_selected_transition(fixture):
+            for comment in fixture["client"].comments:
+                matches = projection_module.PROJECTION_RE.findall(
+                    comment.get("body") or ""
+                )
+                if not matches:
+                    continue
+                event = projection_module._decode_projection(matches[0])
+                if event["kind"] != "generation_transition":
+                    continue
+                previous = event["value"]["activation_checkpoint"]
+                replacement = build_checkpoint(
+                    workstream_id=previous["workstream_id"],
+                    boundary_id=previous["boundary_id"],
+                    root_revision=previous["root_revision"],
+                    plan_revision=previous["plan_revision"],
+                    before_status=previous["status"]["before"],
+                    after_status=previous["status"]["after"],
+                    execution=deepcopy(previous["execution"]),
+                    exact_head=previous["exact_head"],
+                    evidence=deepcopy(previous["evidence"]),
+                    blocker=deepcopy(previous["blocker"]),
+                    next_action="Altered checkpoint authority.",
+                    predecessor_event_id=previous["predecessor_event_id"],
+                )
+                event["value"]["activation_checkpoint"] = replacement
+                ids = event["value"]["to"]["checkpoint_event_ids"]
+                event["value"]["to"]["checkpoint_event_ids"] = [
+                    replacement["event_id"] if item == previous["event_id"] else item
+                    for item in ids
+                ]
+                event["value"]["to"]["checkpoint_events_sha256"] = hashlib.sha256(
+                    json.dumps(
+                        event["value"]["to"]["checkpoint_event_ids"],
+                        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                event["value"]["activation_checkpoint_sha256"] = hashlib.sha256(
+                    json.dumps(
+                        replacement, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                event["event_id"] = projection_module._event_id(event)
+                comment["body"] = encode_projection_comment(event)
+                return
+            self.fail("generation transition missing from fixture")
+
+        def append_ambiguous_successors(fixture):
+            for index in range(2):
+                checkpoint = successor(fixture, f"competing-{index}")
+                fixture["client"].comments.append({
+                    "id": f"competing-checkpoint-{index}",
+                    "body": encode_checkpoint_comment(checkpoint),
+                })
+
+        def append_stale_successor(fixture):
+            checkpoint = successor(fixture, "newer-authority")
+            fixture["client"].comments.append({
+                "id": "newer-checkpoint",
+                "body": encode_checkpoint_comment(checkpoint),
+            })
+
+        cases = (
+            ("altered", alter_selected_transition,
+             "checkpoint_authority_changed_reload_required"),
+            ("ambiguous", append_ambiguous_successors,
+             "checkpoint_revision_not_monotonic"),
+            ("stale", append_stale_successor,
+             "checkpoint_authority_changed_reload_required"),
+        )
+        for name, mutate, expected_error in cases:
+            with self.subTest(authority=name):
+                fixture = self.generation_checkpoint_ownership_repair_fixture()
+                mutate(fixture)
+                before = len(fixture["client"].comments)
+                with self.assertRaisesRegex(
+                    (LinearProjectionError, LinearCheckpointError),
+                    expected_error,
+                ):
+                    reconcile_required_projection(
+                        fixture["target"], fixture["snapshot"],
+                        fixture["manifest"], remote_head=HEAD,
+                        created_at=f"refuse-{name}",
+                        authenticated_source=fixture["source"],
+                        checkpoint_fence=lambda: checkpoint_fence(fixture),
+                        legacy_unresolved_relation_heads=fixture["unresolved"],
+                    )
+                self.assertEqual(len(fixture["client"].comments), before)
 
     def test_product_reconcile_appends_disposition_reads_back_and_replays_zero_write(self):
         client = FakeProjectionClient()
