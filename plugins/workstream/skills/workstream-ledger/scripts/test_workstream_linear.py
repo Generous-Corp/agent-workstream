@@ -1326,6 +1326,26 @@ class LinearTransportTests(unittest.TestCase):
         ):
             transport.recover_authorized_children(snapshot, authorizations)
 
+    def test_recover_authorized_children_refuses_native_uuid_token_mismatch(self):
+        child_id = "22222222-2222-4222-8222-222222222222"
+        transport = LinearGraphQLTransport(
+            mock.Mock(), team_id="team", workspace_id="workspace",
+            project_id="project",
+        )
+        snapshot = {
+            "root": {"identifier": "GEN-37"},
+            "children": [{"id": child_id, "identifier": "GEN-44"}],
+            "child_comments": {},
+        }
+        authorization = {"value": {
+            "child_issue_id": child_id, "child_workstream_id": "GEN-43",
+        }}
+
+        with self.assertRaisesRegex(
+            LinearTransportError, "authorized_child_identity_ambiguous",
+        ):
+            transport.recover_authorized_children(snapshot, [authorization])
+
     def test_resume_refuses_null_child_connection(self):
         client = mock.Mock()
         client.execute.return_value = {"issue": {

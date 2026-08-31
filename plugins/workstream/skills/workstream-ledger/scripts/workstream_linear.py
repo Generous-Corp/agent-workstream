@@ -633,7 +633,6 @@ class LinearGraphQLTransport:
         result = deepcopy(snapshot)
         children = result.setdefault("children", [])
         child_comments = result.setdefault("child_comments", {})
-        existing = {item.get("id") for item in children}
         expected: dict[str, str] = {}
         expected_ids_by_token: dict[str, str] = {}
         for event in authorizations:
@@ -648,6 +647,20 @@ class LinearGraphQLTransport:
                 raise LinearTransportError("authorized_child_identity_ambiguous")
             expected[issue_id] = token
             expected_ids_by_token[token] = issue_id
+        existing: set[str] = set()
+        for child in children:
+            issue_id = child.get("id")
+            token = str(child.get("identifier", "")).upper()
+            if (
+                (issue_id in expected and expected[issue_id] != token)
+                or (
+                    token in expected_ids_by_token
+                    and expected_ids_by_token[token] != issue_id
+                )
+            ):
+                raise LinearTransportError("authorized_child_identity_ambiguous")
+            if isinstance(issue_id, str):
+                existing.add(issue_id)
         for issue_id, token in sorted(expected.items()):
             if issue_id in existing:
                 continue

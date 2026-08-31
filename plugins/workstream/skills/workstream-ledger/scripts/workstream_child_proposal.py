@@ -268,7 +268,11 @@ def activated_comments(comments: list[dict[str, Any]],
                 or proposal["kind"] != value["mutation_kind"]
                 or proposal["child_workstream_id"] != child_workstream_id
                 or proposal["child_issue_id"] != child_issue_id
-                or proposal["plan_revision"] != value["plan_revision"]):
+                or proposal["plan_revision"] != value["plan_revision"]
+                or _proposal_authorization_frontier(proposal) != (
+                    value.get("expected_material_revision"),
+                    value.get("predecessor_event_id"),
+                )):
             raise LinearTransportError("activated_child_proposal_mismatch")
         body = (encode_event_comment(Delta(**proposal["record"]))
                 if proposal["kind"] == "event"
@@ -358,6 +362,8 @@ def pending_proposal_obligations(
             event["value"]["plan_revision"],
             event["value"]["child_workstream_id"],
             event["value"]["child_issue_id"],
+            event["value"].get("expected_material_revision"),
+            event["value"].get("predecessor_event_id"),
         )
         for event in authorizations
         if event["value"].get("child_workstream_id") == child_workstream_id
@@ -372,6 +378,7 @@ def pending_proposal_obligations(
             proposal["proposal_id"], expected_remote, proposal["kind"],
             proposal["record_sha256"], proposal["plan_revision"],
             proposal["child_workstream_id"], proposal["child_issue_id"],
+            *_proposal_authorization_frontier(proposal),
         )
         if activation_identity in activated:
             continue
@@ -390,6 +397,15 @@ def pending_proposal_obligations(
             "child_issue_id": child_issue_id,
         })
     return sorted(result, key=lambda item: item["proposal_id"])
+
+
+def _proposal_authorization_frontier(
+    proposal: dict[str, Any],
+) -> tuple[int, str | None]:
+    record = proposal["record"]
+    if proposal["kind"] == "event":
+        return record["expected_revision"], None
+    return record["root_revision"], record.get("predecessor_event_id")
 
 
 def proposal_index(

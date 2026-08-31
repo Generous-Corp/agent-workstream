@@ -46,12 +46,24 @@ class ChildProposalTests(unittest.TestCase):
         )
 
     def authorization(self, proposal, remote_id):
+        record = proposal["record"]
+        expected_material_revision = 0
+        predecessor_event_id = None
+        if isinstance(record, dict):
+            expected_material_revision = (
+                record["expected_revision"] if proposal["kind"] == "event"
+                else record["root_revision"]
+            )
+            if proposal["kind"] == "checkpoint":
+                predecessor_event_id = record.get("predecessor_event_id")
         return {"value": {
             "proposal_id": proposal["proposal_id"],
             "proposal_remote_id": remote_id,
             "record_sha256": proposal["record_sha256"],
             "mutation_kind": "event", "child_workstream_id": "GEN-38",
             "child_issue_id": CHILD, "plan_revision": PLAN,
+            "expected_material_revision": expected_material_revision,
+            "predecessor_event_id": predecessor_event_id,
         }}
 
     def malformed_body(self, kind, record):
@@ -128,6 +140,8 @@ class ChildProposalTests(unittest.TestCase):
             "record_sha256": other["record_sha256"],
             "mutation_kind": "event", "child_workstream_id": "GEN-39",
             "child_issue_id": other_child, "plan_revision": "b" * 64,
+            "expected_material_revision": other_record["expected_revision"],
+            "predecessor_event_id": None,
         }}
         authorizations = [self.authorization(retired, retired_remote), other_auth]
 
@@ -150,6 +164,29 @@ class ChildProposalTests(unittest.TestCase):
                 [mismatched], child_workstream_id="GEN-38",
                 child_issue_id=CHILD, plan_revision="b" * 64,
             )
+
+    def test_altered_authorization_frontier_cannot_activate_or_suppress(self):
+        proposal = self.proposal()
+        remote = proposal_slot_id(CHILD, proposal["proposal_id"])
+        comment = {"id": remote, "body": encode_proposal(proposal)}
+        for field, value in (
+            ("expected_material_revision", 1),
+            ("predecessor_event_id", "wsc_wrong"),
+        ):
+            with self.subTest(field=field):
+                authorization = self.authorization(proposal, remote)
+                authorization["value"][field] = value
+                with self.assertRaisesRegex(
+                    LinearTransportError, "activated_child_proposal_mismatch",
+                ):
+                    activated_comments(
+                        [comment], [authorization],
+                        child_workstream_id="GEN-38", child_issue_id=CHILD,
+                    )
+                self.assertEqual(len(pending_proposal_obligations(
+                    [comment], [authorization], child_workstream_id="GEN-38",
+                    child_issue_id=CHILD, plan_revision=PLAN,
+                )), 1)
 
     def test_wrapper_and_record_identity_must_match_before_encoding(self):
         with self.assertRaisesRegex(ValueError, "child proposal identity mismatch"):
