@@ -576,6 +576,43 @@ def _uncheckpointed_material_obligations(
     return result
 
 
+def _compact_stale_plan_obligations(
+    events: list[dict[str, Any]], checkpoint_history: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Fence acknowledged predecessor intent without granting stale authority.
+
+    A stale checkpoint cannot supply current status or next action, but its
+    root revision still proves which prefix of the same validated child ledger
+    was acknowledged.  Digest that acknowledged prefix and keep every event
+    after the fence exact.  The native child graph remains current execution
+    authority, and full-history mode remains the lossless audit surface.
+    """
+    checkpoint_revision = max(
+        (checkpoint["root_revision"] for checkpoint in checkpoint_history),
+        default=0,
+    )
+    if checkpoint_revision > len(events):
+        raise ResumeError(
+            "child_stale_checkpoint_ahead_of_material_event_log:"
+            f"{checkpoint_revision}>{len(events)}"
+        )
+    acknowledged = _uncheckpointed_material_obligations(
+        events[:checkpoint_revision], 0,
+    )
+    obligations = _uncheckpointed_material_obligations(
+        events, checkpoint_revision,
+    )
+    encoded = json.dumps(
+        acknowledged, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode()
+    return obligations, {
+        "checkpoint_root_revision": checkpoint_revision,
+        "acknowledged_count": len(acknowledged),
+        "uncheckpointed_count": len(obligations),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
 def _compact_checkpoint(checkpoint: dict[str, Any] | None) -> dict[str, Any] | None:
     if checkpoint is None:
         return None
@@ -1690,11 +1727,27 @@ def compact_context(
             obligations = _uncheckpointed_material_obligations(
                 child["material_events"], checkpoint_revision,
             )
+            obligation_summary = None
+            if (
+                not include_history
+                and child.get("checkpoint_recovery", {}).get("state")
+                == "stale_plan"
+            ):
+                obligations, obligation_summary = (
+                    _compact_stale_plan_obligations(
+                        child["material_events"],
+                        child.get("checkpoint_history", []),
+                    )
+                )
             compact_child["latest_checkpoint"] = (
                 child.get("latest_checkpoint") if include_history
                 else _compact_checkpoint(child.get("latest_checkpoint"))
             )
             compact_child["uncheckpointed_material_obligations"] = obligations
+            if obligation_summary is not None:
+                compact_child["stale_plan_material_obligations"] = (
+                    obligation_summary
+                )
             compact_child["history"] = {
                 "included": include_history,
                 "material_events": history_summary(child["material_events"]),
