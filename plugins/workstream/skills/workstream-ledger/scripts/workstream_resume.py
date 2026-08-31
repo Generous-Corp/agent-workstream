@@ -53,6 +53,7 @@ from workstream_child_closure import (
 )
 from workstream_child_dependencies import (
     ChildDependencyError, LinearChildDependencyAdapter,
+    dependency_root_readback_sha256,
     validate_authorized_dependency_graph_surface,
 )
 from workstream_scope import (
@@ -1444,6 +1445,8 @@ def validate_snapshot(
                     "disposition_checkpoint_stale_reconcile_required"
                 )
     dependency_graph = snapshot.get("dependency_graph")
+    if require_projection_authority and dependency_graph is None:
+        raise ResumeError("authenticated_dependency_graph_missing")
     if dependency_graph is not None:
         if not isinstance(authenticated_route, dict):
             raise ResumeError("dependency_graph_authenticated_route_missing")
@@ -1455,6 +1458,23 @@ def validate_snapshot(
                     "root_identifier": identifier.upper(),
                 },
                 plan_revision=root["plan_revision"],
+                expected_frontier={
+                    "material_revision": (
+                        material_revision
+                        if isinstance(material_revision, int)
+                        else len(material_events)
+                    ),
+                    "projection_revision": (
+                        projection_revision
+                        if isinstance(projection_revision, int)
+                        else len(projection_events)
+                    ),
+                    "graph_revision": dependency_graph.get("revision"),
+                    "graph_sha256": dependency_graph.get("sha256"),
+                },
+                expected_root_readback_sha256=(
+                    dependency_root_readback_sha256(root)
+                ),
             )
         except ChildDependencyError as error:
             raise ResumeError(str(error)) from error
@@ -1654,7 +1674,7 @@ def validate_snapshot(
             else "transport_unimplemented"
             for field in (
                 "scope", "relations", "choice_events", "evidence_contracts",
-                "material_events",
+                "material_events", "dependency_graph",
             )
         }
         availability["child_closures"] = "available"
@@ -2117,7 +2137,13 @@ def main() -> int:
                     root_issue_id=route["root_issue_id"],
                     root_identifier=token,
                     plan_revision=generation["plan_revision"],
-                ).read_authorized_graph()
+                ).read_authorized_graph(
+                    expected_material_revision=snapshot["material_event_revision"],
+                    expected_projection_revision=snapshot["projection_revision"],
+                    expected_root_readback_sha256=(
+                        dependency_root_readback_sha256(snapshot["root"])
+                    ),
+                )
             else:
                 snapshot["authenticated_source"] = authenticated_source
         output = compact_context(

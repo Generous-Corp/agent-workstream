@@ -716,9 +716,16 @@ empty rather than fabricated. Ordinary full-authority resume also emits
 `dependency_graph` separately from the root's projected `relations`. Every
 dependency edge is reduced from both native `relations` and
 `inverseRelations` readback over the exact active-plan children, then bound to
-the ordered active-generation `child_dependency_authorization` grants.
-Contradictory, ambiguous, unauthorized, stale-frontier, or cross-generation
-evidence refuses resume.
+the ordered active-generation `child_dependency_authorization` grants. The
+authenticated graph read must match the same native root digest and exact
+material/projection frontier as the resume snapshot. Grant receipts bind the
+remote comment order: material events beyond a grant's reviewed frontier must
+have a strictly later server creation time. A relation may have only one active
+grant; replacement requires an explicit validated supersession/reconciliation
+protocol. Contradictory, duplicate, ambiguous, unauthorized, stale-frontier,
+cross-generation, or misordered evidence refuses resume. Full authority always
+requires this authenticated surface, including an explicit empty graph; a
+missing or null graph is never full authority.
 When no local config is available, authenticated token-only bootstrap resolves
 the root's exact workspace/team/project route before the fenced read.
 

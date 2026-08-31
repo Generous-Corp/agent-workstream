@@ -28,6 +28,16 @@ class ResumeTests(unittest.TestCase):
                 "decisions": [{"id": "D1", "status": "accepted"}], "provenance": [{"machine": "M3"}]}
 
     def live_snapshot(self, snapshot, route):
+        snapshot["root"].update({
+            "id": route["root_issue_id"], "title": snapshot["root"].get("title", "Root"),
+            "description": snapshot["root"].get("description", "Plan revision: sha"),
+            "url": snapshot["root"].get("url", "https://linear/GEN-37"),
+            "updatedAt": snapshot["root"].get("updatedAt", "now"), "parent": None,
+            "team": {"id": route["team_id"],
+                     "organization": {"id": route["workspace_id"]}},
+            "project": {"id": route["project_id"]}, "assignee": None,
+            "state": {"id": "started", "name": "In Progress", "type": "started"},
+        })
         for index, child in enumerate(snapshot["children"]):
             child.update({
                 "id": f"child-{index}",
@@ -1234,7 +1244,24 @@ class ResumeTests(unittest.TestCase):
             "relations": [],
             "native_readback": "relations_and_inverseRelations",
             "ignored_non_dependency_count": 0,
+            "observed_frontier": {
+                "material_revision": 0, "projection_revision": 0,
+                "graph_revision": 0,
+                "graph_sha256": hashlib.sha256(b"[]").hexdigest(),
+            },
+            "root_readback_sha256": "0" * 64,
         }
+        snapshot["root"].update({
+            "id": snapshot["authenticated_route"]["root_issue_id"],
+            "title": "Root", "description": "Plan revision: sha",
+            "url": "https://linear/GEN-37", "updatedAt": "now", "parent": None,
+            "team": {"id": "team", "organization": {"id": "ws"}},
+            "project": {"id": "project"}, "assignee": None,
+            "state": {"id": "started", "name": "In Progress", "type": "started"},
+        })
+        snapshot["dependency_graph"]["root_readback_sha256"] = (
+            MODULE.dependency_root_readback_sha256(snapshot["root"])
+        )
         snapshot["root"]["issue_revision"] = snapshot["root"]["revision"]
         snapshot["root"]["revision"] = 0
         snapshot["latest_checkpoint"] = None
@@ -1248,6 +1275,31 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(context["relations"][0]["target"]["identifier"], "GEN-50")
         self.assertEqual(context["dependency_graph"]["relations"], [])
         self.assertTrue(all(value == "available" for value in context["surface_availability"].values()))
+
+        mutated = copy.deepcopy(snapshot)
+        mutated["dependency_graph"]["observed_frontier"]["material_revision"] = 999
+        with self.assertRaisesRegex(
+            MODULE.ResumeError, "dependency_resume_frontier_mismatch",
+        ):
+            MODULE.compact_context(mutated, "GEN-37")
+        mutated = copy.deepcopy(snapshot)
+        mutated["dependency_graph"]["root_readback_sha256"] = "f" * 64
+        with self.assertRaisesRegex(
+            MODULE.ResumeError, "dependency_resume_root_mismatch",
+        ):
+            MODULE.compact_context(mutated, "GEN-37")
+
+    def test_full_authority_requires_explicit_authenticated_dependency_graph(self):
+        for mutation in ("missing", "null"):
+            snapshot = self.snapshot()
+            if mutation == "null":
+                snapshot["dependency_graph"] = None
+            with self.assertRaisesRegex(
+                MODULE.ResumeError, "authenticated_dependency_graph_missing",
+            ):
+                MODULE.validate_snapshot(
+                    snapshot, "GEN-37", require_projection_authority=True,
+                )
 
     def test_legacy_live_snapshot_exposes_untransported_factory_surfaces(self):
         context = MODULE.compact_context(self.snapshot(), "GEN-37")
@@ -1412,6 +1464,14 @@ class ResumeTests(unittest.TestCase):
             "relations": [],
             "native_readback": "relations_and_inverseRelations",
             "ignored_non_dependency_count": 0,
+            "observed_frontier": {
+                "material_revision": 0, "projection_revision": 1,
+                "graph_revision": 0,
+                "graph_sha256": hashlib.sha256(b"[]").hexdigest(),
+            },
+            "root_readback_sha256": MODULE.dependency_root_readback_sha256(
+                before["root"],
+            ),
         }
         dependency_adapter = mock.Mock()
         dependency_adapter.read_authorized_graph.return_value = dependency_graph

@@ -319,6 +319,8 @@ class ChildDependencyTests(unittest.TestCase):
             authorized_dependency_graph(
                 graph, projection.events, authority=AUTHORITY,
                 plan_revision=PLAN,
+                observed_frontier=surface["observed_frontier"],
+                root_readback_sha256=surface["root_readback_sha256"],
             )
 
         stale = deepcopy(projection.events)
@@ -333,6 +335,8 @@ class ChildDependencyTests(unittest.TestCase):
             authorized_dependency_graph(
                 DependencyGraph(tuple(surface["relations"]), 0), stale,
                 authority=AUTHORITY, plan_revision=PLAN,
+                observed_frontier=surface["observed_frontier"],
+                root_readback_sha256=surface["root_readback_sha256"],
             )
 
         cross_generation = deepcopy(projection.events)
@@ -347,7 +351,92 @@ class ChildDependencyTests(unittest.TestCase):
             authorized_dependency_graph(
                 DependencyGraph(tuple(surface["relations"]), 0),
                 cross_generation, authority=AUTHORITY, plan_revision=PLAN,
+                observed_frontier=surface["observed_frontier"],
+                root_readback_sha256=surface["root_readback_sha256"],
             )
+
+    def test_resume_graph_rejects_stale_material_frontier_and_pregrant_event(self):
+        fake = FakeLinear()
+        native = fake.native_relation(A, B)
+        fake.relations.append(native)
+        relation = {
+            "id": native["id"], "type": "blocks", "blocker": A,
+            "blocked": B, "inverse_type": "blocked_by",
+        }
+        route = {key: AUTHORITY[key] for key in (
+            "workspace_id", "team_id", "project_id", "root_issue_id",
+        )}
+        batch_id = "wsdb_" + "9" * 32
+        stale_grant = build_projection_event(
+            workstream_id="GEN-37", kind="child_dependency_authorization",
+            key=batch_id, value={
+                "root_issue_id": ROOT_ID, "route": route,
+                "plan_revision": PLAN, "batch_id": batch_id,
+                "relation_ids": [relation["id"]],
+                "relations_sha256": graph_sha256([relation]),
+                "expected_material_revision": 999,
+                "expected_projection_revision": 0,
+                "expected_graph_revision": 0,
+                "expected_graph_sha256": graph_sha256([]),
+                "initial_state": "owned_children_validated",
+            }, plan_revision=PLAN, expected_revision=0,
+            created_at="2026-08-29T00:00:00Z", authority=route,
+        )
+        fake.comments["GEN-37"].append({
+            "id": projection_slot_id("GEN-37", PLAN, 0, route),
+            "body": encode_projection_comment(stale_grant),
+            "createdAt": "2026-08-29T00:00:00Z",
+            "updatedAt": "2026-08-29T00:00:00Z",
+        })
+        adapter = self.adapter(fake)
+        with self.assertRaisesRegex(
+            ChildDependencyError, "stale_dependency_material_frontier",
+        ):
+            adapter.read_authorized_graph()
+
+        fake = FakeLinear()
+        self.apply(fake)
+        adapter = self.adapter(fake)
+        fake.add_material()
+        fake.comments["GEN-37"][-1]["createdAt"] = "2026-08-28T23:59:59Z"
+        fake.comments["GEN-37"][-1]["updatedAt"] = "2026-08-28T23:59:59Z"
+        with self.assertRaisesRegex(
+            ChildDependencyError,
+            "dependency_material_event_not_ordered_after_authorization",
+        ):
+            adapter.read_authorized_graph()
+
+    def test_resume_graph_rejects_duplicate_relation_authorization(self):
+        fake = FakeLinear()
+        self.apply(fake)
+        adapter = self.adapter(fake)
+        projection = adapter.authorization.state()
+        first = next(
+            event for event in projection.events
+            if event["kind"] == "child_dependency_authorization"
+        )
+        second_batch = "wsdb_" + "1" * 32
+        value = deepcopy(first["value"])
+        value["batch_id"] = second_batch
+        value["expected_projection_revision"] = 1
+        second = build_projection_event(
+            workstream_id="GEN-37", kind="child_dependency_authorization",
+            key=second_batch, value=value, plan_revision=PLAN,
+            expected_revision=1, created_at="2026-08-29T00:00:01Z",
+            authority={key: AUTHORITY[key] for key in (
+                "workspace_id", "team_id", "project_id", "root_issue_id",
+            )},
+        )
+        fake.comments["GEN-37"].append({
+            "id": projection_slot_id("GEN-37", PLAN, 1, second["authority"]),
+            "body": encode_projection_comment(second),
+            "createdAt": "2026-08-29T00:00:01Z",
+            "updatedAt": "2026-08-29T00:00:01Z",
+        })
+        with self.assertRaisesRegex(
+            ChildDependencyError, "duplicate_dependency_authorization",
+        ):
+            adapter.read_authorized_graph()
 
     def test_blocked_by_input_preserves_exact_direction(self):
         result = self.apply(FakeLinear(), [self.relation(B, "blocked_by", A)])
