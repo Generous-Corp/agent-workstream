@@ -73,6 +73,16 @@ class SkillContractTests(unittest.TestCase):
             resume,
         )
 
+    def test_execution_verb_proceeds_after_full_authority_without_reconfirmation(self):
+        resume = " ".join(self.resume_skill().split())
+        full = resume.index("After full authority")
+        verbs = resume.index("`execute`, `continue`, `finish`, or `resume`")
+        proceed = resume.index("perform the current next action immediately")
+        no_confirmation = resume.index("Never stop for redundant confirmation")
+        self.assertLess(full, verbs)
+        self.assertLess(verbs, proceed)
+        self.assertLess(proceed, no_confirmation)
+
     def test_resume_entry_is_small_and_owns_fresh_handle_trigger(self):
         resume = self.resume_skill()
         ledger = self.skill()

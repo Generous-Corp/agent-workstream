@@ -419,11 +419,20 @@ def add_child_material_history(
         raise ResumeError("incomplete_child_comment_collection")
     plan_revision = (snapshot.get("root") or {}).get("plan_revision")
     authorizations: list[dict[str, Any]] = []
+    origin_repairs: list[dict[str, Any]] = []
     if root_comments is not None:
         from workstream_linear_projection import (
             child_mutation_authorizations_from_comments,
+            legacy_child_origin_repairs_from_comments,
         )
         authorizations = child_mutation_authorizations_from_comments(
+            root_comments,
+            workstream_id=(snapshot.get("root") or {})["identifier"],
+            description_plan_revision=(snapshot.get("root") or {}).get(
+                "description_plan_revision", plan_revision
+            ), authenticated_route=authenticated_route,
+        )
+        origin_repairs = legacy_child_origin_repairs_from_comments(
             root_comments,
             workstream_id=(snapshot.get("root") or {})["identifier"],
             description_plan_revision=(snapshot.get("root") or {}).get(
@@ -445,7 +454,7 @@ def add_child_material_history(
         if not isinstance(comments, list):
             raise ResumeError(f"invalid_child_comment_collection:{token}")
         from workstream_child_proposal import (
-            activated_comments, pending_proposal_obligations,
+            authorized_child_comments, pending_proposal_obligations,
         )
         pending_proposals = pending_proposal_obligations(
             comments, authorizations, child_workstream_id=token,
@@ -453,11 +462,10 @@ def add_child_material_history(
         )
         if pending_proposals:
             child["pending_child_proposals"] = pending_proposals
-        if authorizations:
-
-            comments = activated_comments(
-                comments, authorizations, child_workstream_id=token,
-                child_issue_id=child["id"],
+        if authorizations or origin_repairs:
+            comments = authorized_child_comments(
+                comments, authorizations, origin_repairs,
+                child_workstream_id=token, child_issue_id=child["id"],
             )
         event_log = reduce_event_comments(comments, workstream_id=token)
         checkpoint_log = reduce_checkpoint_comments(comments, workstream_id=token)

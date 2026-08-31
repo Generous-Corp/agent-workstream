@@ -46,11 +46,11 @@ are separate namespaces. Claim visible-title success only when the explicit
 adapter returns `updated` or `unchanged` plus exact title readback. Resume
 refusal denies execution authority; display unavailability only skips binding.
 
-Report and retain the authenticated route/source, open children, current next
-action, checkpoint, and attach-or-successor disposition. Do not claim live
-repository or landing truth from the resume snapshot alone. For a status-only
-request, report the bounded snapshot and stop; do not load `workstream-ledger`
-or inspect repository, PR, or local state unless the user separately asks for
-live reconciliation. If the request continues into execution, mutation,
-checkpointing, audit, or closure, then load `workstream-ledger` and reconcile
-only the named live surfaces.
+Retain the authenticated route/source, open children, next action, checkpoint,
+and attach-or-successor disposition. The snapshot is not live repository or
+landing truth. For a status-only request, report the bounded snapshot and stop;
+do not load `workstream-ledger` or inspect live surfaces unless separately
+asked. After full authority, `execute`, `continue`, `finish`, or `resume`
+authorizes immediate action: load `workstream-ledger`, reconcile named live
+surfaces, and perform the current next action immediately. Never stop for
+redundant confirmation or ask the user to restate the recovered handle.

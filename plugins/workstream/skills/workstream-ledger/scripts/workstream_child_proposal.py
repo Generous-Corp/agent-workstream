@@ -18,9 +18,9 @@ from workstream_delta import Delta
 from workstream_linear import LinearTransportError
 from workstream_linear_events import (
     COMMENT_CREATE_CAPABILITY_QUERY, COMMENT_CREATE_MUTATION, COMMENTS_QUERY,
-    encode_event_comment,
+    encode_event_comment, EVENT_PREFIX,
 )
-from workstream_linear_checkpoints import encode_checkpoint_comment
+from workstream_linear_checkpoints import encode_checkpoint_comment, CHECKPOINT_PREFIX
 
 
 PREFIX = "<!-- workstream-child-proposal:v1:"
@@ -205,6 +205,73 @@ def activated_comments(comments: list[dict[str, Any]],
                 else encode_checkpoint_comment(proposal["record"]))
         synthetic.append({**comment, "body": body})
     return [*comments, *synthetic]
+
+
+def authorized_child_comments(
+    comments: list[dict[str, Any]], authorizations: list[dict[str, Any]],
+    origin_repairs: list[dict[str, Any]], *, child_workstream_id: str,
+    child_issue_id: str,
+) -> list[dict[str, Any]]:
+    """Admit a sealed legacy prefix plus root-authorized synthetic proposals."""
+    repairs = [
+        event for event in origin_repairs
+        if event["value"].get("child_workstream_id") == child_workstream_id
+        and event["value"].get("child_issue_id") == child_issue_id
+    ]
+    if len(repairs) > 1:
+        raise LinearTransportError("child_origin_repair_ambiguous")
+    if not repairs:
+        return activated_comments(
+            comments, authorizations,
+            child_workstream_id=child_workstream_id,
+            child_issue_id=child_issue_id,
+        )
+    history = repairs[0]["value"]["child_history"]
+    receipts = [
+        *history["material_receipts"], *history["checkpoint_receipts"],
+    ]
+    sealed_ids = [item["remote_id"] for item in receipts]
+    if len(sealed_ids) != len(set(sealed_ids)):
+        raise LinearTransportError("child_origin_sealed_receipt_ambiguous")
+    by_remote_id: dict[str, list[dict[str, Any]]] = {}
+    for comment in comments:
+        remote_id = comment.get("id")
+        if isinstance(remote_id, str):
+            by_remote_id.setdefault(remote_id, []).append(comment)
+    for receipt in receipts:
+        found = by_remote_id.get(receipt["remote_id"], [])
+        if len(found) != 1:
+            raise LinearTransportError("child_origin_sealed_receipt_missing")
+        body = found[0].get("body")
+        if (
+            not isinstance(body, str)
+            or hashlib.sha256(body.encode("utf-8")).hexdigest()
+            != receipt["body_sha256"]
+        ):
+            raise LinearTransportError("child_origin_sealed_receipt_changed")
+    sealed = set(sealed_ids)
+    for comment in comments:
+        body = comment.get("body")
+        if (
+            isinstance(body, str)
+            and (EVENT_PREFIX in body or CHECKPOINT_PREFIX in body)
+            and comment.get("id") not in sealed
+        ):
+            raise LinearTransportError("child_legacy_write_after_origin_seal")
+    from workstream_linear_projection import child_origin_history_frontier
+
+    sealed_comments = [
+        comment for comment in comments if comment.get("id") in sealed
+    ]
+    if child_origin_history_frontier(
+        sealed_comments, workstream_id=child_workstream_id,
+    ) != history:
+        raise LinearTransportError("child_origin_sealed_prefix_invalid")
+    return activated_comments(
+        comments, authorizations,
+        child_workstream_id=child_workstream_id,
+        child_issue_id=child_issue_id,
+    )
 
 
 def pending_proposal_obligations(

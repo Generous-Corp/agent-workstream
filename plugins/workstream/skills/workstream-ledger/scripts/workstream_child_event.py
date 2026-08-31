@@ -13,10 +13,13 @@ from workstream_delta import Delta, event_id_for
 from workstream_linear import HttpGraphQLClient, LinearTransportError
 from workstream_linear_events import LinearCommentEventAdapter
 from workstream_child_proposal import (
-    activated_comments, append_proposal, build_proposal,
+    authorized_child_comments, append_proposal, build_proposal,
 )
 from workstream_linear_events import reduce_event_comments
-from workstream_linear_projection import child_mutation_authorizations_from_comments
+from workstream_linear_projection import (
+    child_mutation_authorizations_from_comments,
+    legacy_child_origin_repairs_from_comments,
+)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -88,14 +91,20 @@ def run(
         plan_revision=target["plan_revision"], root_issue_id=target["child_issue_id"],
         **target["route"],
     ).comments()
+    root_comments = target["projection"]._comments()
     authorizations = child_mutation_authorizations_from_comments(
-        target["projection"]._comments(),
+        root_comments,
         workstream_id=target["root_workstream_id"],
         description_plan_revision=selected["description_plan_revision"],
         authenticated_route={**target["route"], "root_issue_id": target["root_issue_id"]},
     )
-    active = activated_comments(
-        comments, authorizations,
+    repairs = legacy_child_origin_repairs_from_comments(
+        root_comments, workstream_id=target["root_workstream_id"],
+        description_plan_revision=selected["description_plan_revision"],
+        authenticated_route={**target["route"], "root_issue_id": target["root_issue_id"]},
+    )
+    active = authorized_child_comments(
+        comments, authorizations, repairs,
         child_workstream_id=target["child_workstream_id"],
         child_issue_id=target["child_issue_id"],
     )

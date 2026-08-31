@@ -677,6 +677,37 @@ workflow-state or assignee providers. Deleted provider identities therefore do
 not invalidate an old completed creation; a missing legacy child still refuses
 before any create.
 
+An older scope-owned child whose root and child IDs predate both deterministic
+intake and extension grants requires one reviewed origin seal; never invent a
+stable key or recreate the issue. Preview the authenticated route, native
+parent, active generation/source/scope, and exact root/child material and
+checkpoint frontiers, review the emitted JSON, then replay it with `--apply`:
+
+```sh
+workstreamctl child-origin-repair GEN-123 \
+  --root-issue-id <root-uuid> --child-workstream-id GEN-124 \
+  --child-issue-id <child-uuid> --plan-revision <sha256> \
+  --workspace-id <uuid> --team-id <uuid> --project-id <uuid> \
+  --created-at <reviewed-utc-time> --custodian <writer-identity> \
+  --writers-retired-at <utc-time> > child-origin-review.json
+# Review this exact file, then publish it at an immutable authenticated URL.
+workstreamctl child-origin-repair GEN-123 \
+  --root-issue-id <root-uuid> --child-workstream-id GEN-124 \
+  --child-issue-id <child-uuid> --plan-revision <sha256> \
+  --workspace-id <uuid> --team-id <uuid> --project-id <uuid> \
+  --created-at <same-reviewed-utc-time> --custodian <same-writer-identity> \
+  --writers-retired-at <same-utc-time> \
+  --review child-origin-review.json --review-identity <immutable-url> --apply
+```
+
+The writer appends exactly one immutable `existing_child_origin_seal`. Exact
+replay is a zero-write readback. Parent/route, source, generation, scope,
+ownership, projection, review artifact, or either issue's reviewed history
+drifting refuses before mutation. Every later child reduction revalidates the
+sealed direct prefix and admits new state only through root-authorized
+proposals. It never creates, reparents, reopens, or updates an issue. The final
+rereads are fail-closed preflights; they do not claim a cross-issue transaction.
+
 The direct resume helper is full-authority by default and fetches the projected
 source identity. `--plan-source` overrides the fetch location for an
 authenticated checkout; `--plan-identity` preserves its durable identity. It
