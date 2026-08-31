@@ -994,10 +994,79 @@ class ResumeTests(unittest.TestCase):
         compact = MODULE.compact_context(snapshot, "GEN-37")
         self.assertEqual(compact["next_action"], "normalized")
         self.assertEqual(compact["material_semantic_repair"]["count"], 1)
+        self.assertNotIn("material_semantic_repairs", compact["history"])
+        self.assertEqual(compact["history"]["raw_material_events"]["count"], 2)
+        self.assertRegex(
+            compact["history"]["raw_material_events"]["sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertNotIn("latest", compact["history"]["raw_material_events"])
         self.assertNotIn("raw_material_events", compact)
         full = MODULE.compact_context(snapshot, "GEN-37", include_history=True)
         self.assertEqual(full["raw_material_events"], raw)
         self.assertEqual(full["material_semantic_repairs"], [binding])
+
+    def test_repair_audit_metadata_does_not_crowd_out_exact_obligations(self):
+        snapshot = self.snapshot()
+        snapshot["children"] = []
+        snapshot["root"]["revision"] = 3
+        effective = [{
+            "event_id": "flat", "workstream_id": "GEN-37",
+            "kind": "material_boundary", "source": "system",
+            "payload": {"boundary_id": "repair:flat", "changes": [{
+                "kind": "progress", "payload": {"next_action": "normalized"},
+            }]},
+            "expected_revision": 0, "created_at": "2026-08-30T00:00:00Z",
+        }, {
+            "event_id": "repair", "workstream_id": "GEN-37",
+            "kind": "material_semantic_repair", "source": "system",
+            "payload": {}, "expected_revision": 1,
+            "created_at": "2026-08-30T00:01:00Z",
+        }, {
+            "event_id": "requirement", "workstream_id": "GEN-37",
+            "kind": "requirement", "source": "user_turn",
+            "payload": {"requirement": ""}, "expected_revision": 2,
+            "created_at": "2026-08-30T00:02:00Z",
+        }]
+        raw = copy.deepcopy(effective)
+        raw[0]["payload"] = {"next_action": "normalized", "progress": "flat"}
+        binding = {"event_id": "flat", "remote_comment_id": "remote-flat"}
+        snapshot.update({
+            "material_events": effective, "raw_material_events": raw,
+            "material_semantic_repairs": [binding],
+            "material_event_revision": 3,
+        })
+
+        encode = lambda value: json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()
+        baseline = MODULE.compact_context(
+            snapshot, "GEN-37", max_bytes=1024 * 1024,
+        )
+        exact_requirement = "x" * (
+            MODULE.DEFAULT_RESUME_MAX_BYTES - len(encode(baseline)) - 64
+        )
+        effective[-1]["payload"]["requirement"] = exact_requirement
+        raw[-1]["payload"]["requirement"] = exact_requirement
+        compact = MODULE.compact_context(snapshot, "GEN-37")
+        self.assertEqual(
+            compact["uncheckpointed_material_obligations"][-1]["payload"]
+            ["requirement"],
+            exact_requirement,
+        )
+        self.assertLessEqual(len(encode(compact)), MODULE.DEFAULT_RESUME_MAX_BYTES)
+
+        # Reconstruct the redundant PR #48 metadata: it alone pushes the same
+        # validated actionable context over the default contract.
+        legacy = copy.deepcopy(compact)
+        legacy["history"]["material_semantic_repairs"] = compact[
+            "material_semantic_repair"
+        ]
+        legacy["history"]["raw_material_events"]["latest"] = {
+            "event_id": "requirement", "kind": "requirement",
+            "created_at": "2026-08-30T00:02:00Z",
+        }
+        self.assertGreater(len(encode(legacy)), MODULE.DEFAULT_RESUME_MAX_BYTES)
 
     def test_uncheckpointed_requirement_payload_is_not_replaced_by_digest(self):
         snapshot = self.snapshot()

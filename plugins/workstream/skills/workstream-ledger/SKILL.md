@@ -390,6 +390,12 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.33 keeps the default 24 KiB resume surface actionable as material
+repair history grows. Compact output retains the raw-history count and digest
+and the top-level semantic-repair summary without duplicating audit-only latest
+metadata; `--include-history` continues to return every validated raw and
+repaired event.
+
 Version 0.4.32 keeps material-repair source authority to the immutable identity
 and SHA-256 pair. The repair CLI authenticates the complete plan bytes but
 normalizes the diagnostic byte count out of reviewed seeds and every live
