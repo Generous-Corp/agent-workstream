@@ -13,7 +13,7 @@ from workstream_delta import Delta, event_id_for
 from workstream_linear import HttpGraphQLClient, LinearTransportError
 from workstream_linear_events import LinearCommentEventAdapter
 from workstream_child_proposal import (
-    authorized_child_comments, append_proposal, build_proposal,
+    authorized_child_comments, append_proposal, build_proposal, proposal_slot_id,
 )
 from workstream_linear_events import reduce_event_comments
 from workstream_linear_projection import (
@@ -68,7 +68,6 @@ def run(
         args, proposal_id=proposal["proposal_id"],
         client_factory=client_factory,
     )
-    proposal_receipt = append_proposal(target["client"], proposal)
     selected = target["generation_authority"]
     generation = {
         key: selected[key] for key in (
@@ -77,6 +76,29 @@ def run(
             "workstream_id", "authority", "source",
         )
     }
+    proposal_remote_id = proposal_slot_id(
+        target["child_issue_id"], proposal["proposal_id"],
+    )
+    intent = target["projection"].reserve_child_mutation(
+        proposal=proposal, proposal_remote_id=proposal_remote_id,
+        child_identity=target["child_identity"], generation_authority=generation,
+        scope_event_id=selected["scope_event_id"],
+        scope_value_sha256=selected["scope_value_sha256"],
+        repository_owner=selected["child_repository_owner"],
+        child_origin=selected["child_origin"],
+        expected_projection_revision=selected["projection_revision"],
+        publish_intent=True,
+    )
+    proposal_receipt = (
+        append_proposal(
+            target["client"], proposal, reservation=intent["reservation"],
+        )
+        if "reservation" in intent
+        else {
+            "proposal": proposal, "remote_id": proposal_remote_id,
+            "disposition": "existing",
+        }
+    )
     authorization = target["projection"].reserve_child_mutation(
         proposal=proposal, proposal_remote_id=proposal_receipt["remote_id"],
         child_identity=target["child_identity"], generation_authority=generation,

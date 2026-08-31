@@ -86,8 +86,36 @@ def build_proposal(kind: str, record: Any, *, child_workstream_id: str,
         "record": deepcopy(record),
         "record_sha256": hashlib.sha256(_canonical(record)).hexdigest(),
     }
+    _validate_proposal_identity(value)
     value["proposal_id"] = proposal_id(kind, record)
     return value
+
+
+def _validate_proposal_identity(value: dict[str, Any]) -> None:
+    """Bind the wrapper route to the business record before either is stored."""
+    child_workstream_id = value.get("child_workstream_id")
+    child_issue_id = value.get("child_issue_id")
+    plan_revision = value.get("plan_revision")
+    record = value.get("record")
+    try:
+        parsed_child_issue_id = uuid.UUID(str(child_issue_id))
+        canonical_child_issue_id = str(parsed_child_issue_id) == child_issue_id
+    except ValueError:
+        canonical_child_issue_id = False
+    if (
+        not isinstance(child_workstream_id, str)
+        or not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", child_workstream_id)
+        or not canonical_child_issue_id
+        or not isinstance(plan_revision, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", plan_revision)
+        or not isinstance(record, dict)
+        or record.get("workstream_id") != child_workstream_id
+        or (
+            value.get("kind") == "checkpoint"
+            and record.get("plan_revision") != plan_revision
+        )
+    ):
+        raise ValueError("child proposal identity mismatch")
 
 
 def encode_proposal(value: dict[str, Any]) -> str:
@@ -98,6 +126,7 @@ def encode_proposal(value: dict[str, Any]) -> str:
     if set(value) != expected or value["schema_version"] != 1:
         raise ValueError("invalid child proposal")
     _validate_proposal_record(value.get("kind"), value.get("record"))
+    _validate_proposal_identity(value)
     if value["proposal_id"] != proposal_id(value["kind"], value["record"]):
         raise ValueError("invalid child proposal ID")
     if value["record_sha256"] != hashlib.sha256(
@@ -131,7 +160,48 @@ def decode_proposal(body: str) -> dict[str, Any] | None:
         raise LinearTransportError("malformed_child_proposal") from error
 
 
-def append_proposal(client: Any, value: dict[str, Any]) -> dict[str, Any]:
+def append_proposal(
+    client: Any, value: dict[str, Any], *, reservation: dict[str, Any],
+) -> dict[str, Any]:
+    """Publish only while the matching root serialization intent is live."""
+    from workstream_linear_events import (
+        encode_ledger_reservation, pending_ledger_reservations,
+    )
+
+    try:
+        encode_ledger_reservation(reservation)
+        event = reservation["intent_event"]
+        event_value = event["value"]
+        expected_remote = proposal_slot_id(
+            value["child_issue_id"], value["proposal_id"],
+        )
+        if (
+            reservation["intent_kind"] != "child_mutation_projection"
+            or event["kind"] != "child_mutation_authorization"
+            or event_value["proposal_id"] != value["proposal_id"]
+            or event_value["proposal_remote_id"] != expected_remote
+            or event_value["record_sha256"] != value["record_sha256"]
+            or event_value["mutation_kind"] != value["kind"]
+            or event_value["child_workstream_id"] != value["child_workstream_id"]
+            or event_value["child_issue_id"] != value["child_issue_id"]
+            or event_value["plan_revision"] != value["plan_revision"]
+        ):
+            raise ValueError
+    except (KeyError, TypeError, ValueError) as error:
+        raise LinearTransportError("child_proposal_reservation_mismatch") from error
+    root_comments = _comments(client, reservation["workstream_id"])
+    pending = pending_ledger_reservations(
+        root_comments, workstream_id=reservation["workstream_id"],
+        authenticated_route=reservation["authority"],
+        current_plan_revision=reservation["plan_revision"],
+    )
+    if [item for item in pending if item == reservation] != [reservation]:
+        raise LinearTransportError("child_proposal_reservation_not_live")
+    return _append_proposal(client, value)
+
+
+def _append_proposal(client: Any, value: dict[str, Any]) -> dict[str, Any]:
+    """Low-level deterministic child write; callers must hold root intent."""
     remote_id = proposal_slot_id(value["child_issue_id"], value["proposal_id"])
     comments = _comments(client, value["child_workstream_id"])
     indexed = proposal_index(comments)
@@ -198,7 +268,11 @@ def activated_comments(comments: list[dict[str, Any]],
                 or proposal["kind"] != value["mutation_kind"]
                 or proposal["child_workstream_id"] != child_workstream_id
                 or proposal["child_issue_id"] != child_issue_id
-                or proposal["plan_revision"] != value["plan_revision"]):
+                or proposal["plan_revision"] != value["plan_revision"]
+                or _proposal_authorization_frontier(proposal) != (
+                    value.get("expected_material_revision"),
+                    value.get("predecessor_event_id"),
+                )):
             raise LinearTransportError("activated_child_proposal_mismatch")
         body = (encode_event_comment(Delta(**proposal["record"]))
                 if proposal["kind"] == "event"
@@ -280,7 +354,18 @@ def pending_proposal_obligations(
 ) -> list[dict[str, Any]]:
     """Expose inert recovery handles without treating proposal payload as state."""
     activated = {
-        event["value"]["proposal_id"] for event in authorizations
+        (
+            event["value"]["proposal_id"],
+            event["value"]["proposal_remote_id"],
+            event["value"]["mutation_kind"],
+            event["value"]["record_sha256"],
+            event["value"]["plan_revision"],
+            event["value"]["child_workstream_id"],
+            event["value"]["child_issue_id"],
+            event["value"].get("expected_material_revision"),
+            event["value"].get("predecessor_event_id"),
+        )
+        for event in authorizations
         if event["value"].get("child_workstream_id") == child_workstream_id
         and event["value"].get("child_issue_id") == child_issue_id
     }
@@ -289,7 +374,13 @@ def pending_proposal_obligations(
         expected_remote = proposal_slot_id(child_issue_id, proposal["proposal_id"])
         if comment.get("id") != expected_remote:
             raise LinearTransportError("child_proposal_slot_mismatch")
-        if proposal["proposal_id"] in activated:
+        activation_identity = (
+            proposal["proposal_id"], expected_remote, proposal["kind"],
+            proposal["record_sha256"], proposal["plan_revision"],
+            proposal["child_workstream_id"], proposal["child_issue_id"],
+            *_proposal_authorization_frontier(proposal),
+        )
+        if activation_identity in activated:
             continue
         if (
             proposal["child_workstream_id"] != child_workstream_id
@@ -306,6 +397,15 @@ def pending_proposal_obligations(
             "child_issue_id": child_issue_id,
         })
     return sorted(result, key=lambda item: item["proposal_id"])
+
+
+def _proposal_authorization_frontier(
+    proposal: dict[str, Any],
+) -> tuple[int, str | None]:
+    record = proposal["record"]
+    if proposal["kind"] == "event":
+        return record["expected_revision"], None
+    return record["root_revision"], record.get("predecessor_event_id")
 
 
 def proposal_index(
