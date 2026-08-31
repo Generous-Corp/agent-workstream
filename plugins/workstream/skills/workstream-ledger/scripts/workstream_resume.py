@@ -51,6 +51,10 @@ from workstream_child_closure import (
     canonical_digest, evidence_receipts_sha256, terminal_child_readback,
     ChildClosureError,
 )
+from workstream_child_dependencies import (
+    ChildDependencyError, LinearChildDependencyAdapter,
+    validate_authorized_dependency_graph_surface,
+)
 from workstream_scope import (
     repository_key, ScopeError, validate_relations, validate_scope,
 )
@@ -1439,6 +1443,21 @@ def validate_snapshot(
                 raise ResumeError(
                     "disposition_checkpoint_stale_reconcile_required"
                 )
+    dependency_graph = snapshot.get("dependency_graph")
+    if dependency_graph is not None:
+        if not isinstance(authenticated_route, dict):
+            raise ResumeError("dependency_graph_authenticated_route_missing")
+        try:
+            dependency_graph = validate_authorized_dependency_graph_surface(
+                dependency_graph, projection_events,
+                authority={
+                    **authenticated_route,
+                    "root_identifier": identifier.upper(),
+                },
+                plan_revision=root["plan_revision"],
+            )
+        except ChildDependencyError as error:
+            raise ResumeError(str(error)) from error
     try:
         choice_view = reduce_choices(choice_events)
         scope = snapshot.get("scope")
@@ -1642,7 +1661,7 @@ def validate_snapshot(
         availability["latest_checkpoint"] = (
             "available" if "latest_checkpoint" in snapshot else "transport_unimplemented"
         )
-    except (ChoiceError, ScopeError) as error:
+    except (ChildDependencyError, ChoiceError, ScopeError) as error:
         raise ResumeError(str(error)) from error
     if require_projection_authority:
         if not projection_events:
@@ -1676,6 +1695,7 @@ def validate_snapshot(
             "projection_recovery": projection_recovery,
             "lifecycle_recovery": lifecycle_recovery,
             "authenticated_route": authenticated_route,
+            "dependency_graph": dependency_graph,
             "authenticated_source": snapshot.get("authenticated_source")}
 
 
@@ -1832,6 +1852,7 @@ def compact_context(
         "choice_events": clean["choice_events"],
         "scope": clean["scope"] if include_history else _compact_scope(clean["scope"]),
         "relations": clean["relations"],
+        "dependency_graph": clean["dependency_graph"],
         "evidence_contracts": (
             clean["evidence_contracts"] if include_history
             else _compact_evidence_contracts(
@@ -1911,7 +1932,10 @@ def compact_context(
             context.get("projection_quarantined", []),
             context.get("projection_unresolved_quarantine", []),
         )
-    ) + len(clean["provenance"])
+    ) + len(clean["provenance"]) + (
+        len((clean["dependency_graph"] or {}).get("relations", []))
+        + len((clean["dependency_graph"] or {}).get("authorization_batches", []))
+    )
     if max_items < 0 or item_count > max_items:
         raise ResumeError(f"resume_context_over_item_budget:{item_count}>{max_items}")
     encoded = json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
@@ -2085,6 +2109,15 @@ def main() -> int:
                         client, relations,
                     ),
                 )
+                snapshot["dependency_graph"] = LinearChildDependencyAdapter(
+                    client,
+                    workspace_id=route["workspace_id"],
+                    team_id=route["team_id"],
+                    project_id=route["project_id"],
+                    root_issue_id=route["root_issue_id"],
+                    root_identifier=token,
+                    plan_revision=generation["plan_revision"],
+                ).read_authorized_graph()
             else:
                 snapshot["authenticated_source"] = authenticated_source
         output = compact_context(

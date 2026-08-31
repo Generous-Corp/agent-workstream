@@ -1219,6 +1219,22 @@ class ResumeTests(unittest.TestCase):
         snapshot["evidence_contracts"] = []
         snapshot["material_events"] = []
         snapshot["material_event_revision"] = 0
+        snapshot["authenticated_route"] = {
+            "workspace_id": "ws", "team_id": "team", "project_id": "project",
+            "root_issue_id": "33333333-3333-4333-8333-333333333333",
+        }
+        snapshot["dependency_graph"] = {
+            "schema_version": 1,
+            "authority": "child_dependency_authorization",
+            "plan_revision": "sha",
+            "route": snapshot["authenticated_route"],
+            "revision": 0,
+            "sha256": hashlib.sha256(b"[]").hexdigest(),
+            "authorization_batches": [],
+            "relations": [],
+            "native_readback": "relations_and_inverseRelations",
+            "ignored_non_dependency_count": 0,
+        }
         snapshot["root"]["issue_revision"] = snapshot["root"]["revision"]
         snapshot["root"]["revision"] = 0
         snapshot["latest_checkpoint"] = None
@@ -1230,6 +1246,7 @@ class ResumeTests(unittest.TestCase):
         self.assertNotIn("route_verification", context["scope"]["linear"])
         self.assertRegex(context["scope"]["validated_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(context["relations"][0]["target"]["identifier"], "GEN-50")
+        self.assertEqual(context["dependency_graph"]["relations"], [])
         self.assertTrue(all(value == "available" for value in context["surface_availability"].values()))
 
     def test_legacy_live_snapshot_exposes_untransported_factory_surfaces(self):
@@ -1384,6 +1401,21 @@ class ResumeTests(unittest.TestCase):
         })
         comments = mock.Mock()
         comments.comments.return_value = comments_payload
+        dependency_graph = {
+            "schema_version": 1,
+            "authority": "child_dependency_authorization",
+            "plan_revision": "a" * 64,
+            "route": route,
+            "revision": 0,
+            "sha256": hashlib.sha256(b"[]").hexdigest(),
+            "authorization_batches": [],
+            "relations": [],
+            "native_readback": "relations_and_inverseRelations",
+            "ignored_non_dependency_count": 0,
+        }
+        dependency_adapter = mock.Mock()
+        dependency_adapter.read_authorized_graph.return_value = dependency_graph
+        dependency_constructor = mock.Mock(return_value=dependency_adapter)
         stdout = io.StringIO()
 
         def verified_context(snapshot, *_args, **_kwargs):
@@ -1392,6 +1424,7 @@ class ResumeTests(unittest.TestCase):
                 "Landed — acceptance review required",
             )
             self.assertNotIn("lifecycle_recovery", snapshot)
+            self.assertEqual(snapshot["dependency_graph"], dependency_graph)
             return {"status": snapshot["root"]["status"]}
 
         with mock.patch.object(MODULE, "resolve_linear_route", return_value=(None, None)), \
@@ -1399,6 +1432,9 @@ class ResumeTests(unittest.TestCase):
              mock.patch.object(MODULE, "HttpGraphQLClient", return_value=mock.Mock()), \
              mock.patch.object(MODULE, "LinearGraphQLTransport", return_value=transport), \
              mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
+             mock.patch.object(
+                 MODULE, "LinearChildDependencyAdapter", dependency_constructor,
+             ), \
              mock.patch.object(MODULE, "load_linear_api_key", return_value="secret"), \
              mock.patch.object(
                  MODULE, "plan_payload", return_value={"source": authenticated_source},
@@ -1421,6 +1457,12 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(first["status"], "Landed — acceptance review required")
         self.assertEqual(transport.snapshot_for_root.call_count, 2)
         self.assertEqual(comments.comments.call_count, 2)
+        self.assertEqual(dependency_constructor.call_count, 2)
+        dependency_constructor.assert_called_with(
+            mock.ANY, workspace_id="workspace", team_id="team",
+            project_id="project", root_issue_id=route["root_issue_id"],
+            root_identifier="GEN-37", plan_revision="a" * 64,
+        )
         graph["root"]["next_action"] = "new material state after reconciliation"
         with self.assertRaisesRegex(
             MODULE.ResumeError, "lifecycle_snapshot_stale_reconcile_required",

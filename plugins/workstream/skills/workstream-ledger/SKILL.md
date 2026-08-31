@@ -712,7 +712,13 @@ the authority used to choose attach versus successor after live remote-head
 verification. The recorded disposition is always the explicit `attach` or
 `create_successor` result and must reconcile with that checkpoint and live head;
 an ambiguous placeholder is not executable. An empty surface is reported as
-empty rather than fabricated.
+empty rather than fabricated. Ordinary full-authority resume also emits
+`dependency_graph` separately from the root's projected `relations`. Every
+dependency edge is reduced from both native `relations` and
+`inverseRelations` readback over the exact active-plan children, then bound to
+the ordered active-generation `child_dependency_authorization` grants.
+Contradictory, ambiguous, unauthorized, stale-frontier, or cross-generation
+evidence refuses resume.
 When no local config is available, authenticated token-only bootstrap resolves
 the root's exact workspace/team/project route before the fenced read.
 

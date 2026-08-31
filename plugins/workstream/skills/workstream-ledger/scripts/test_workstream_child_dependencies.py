@@ -9,8 +9,9 @@ from unittest import mock
 
 import workstream_child_dependencies as dependency_module
 from workstream_child_dependencies import (
-    ChildDependencyError, LinearChildDependencyAdapter,
-    dependency_relation_id, reduce_dependency_readback,
+    authorized_dependency_graph, ChildDependencyError, DependencyGraph,
+    LinearChildDependencyAdapter, dependency_relation_id,
+    reduce_dependency_readback, validate_authorized_dependency_graph_surface,
 )
 from workstream_delta import Delta, event_id_for
 from workstream_linear import LinearTransportError
@@ -282,6 +283,71 @@ class ChildDependencyTests(unittest.TestCase):
         })
         self.assertFalse(any("issueCreate" in query or "projectCreate" in query
                              for query, _ in mutations))
+
+    def test_resume_graph_binds_native_readback_to_active_authorization(self):
+        fake = FakeLinear()
+        self.apply(fake)
+        adapter = self.adapter(fake)
+
+        surface = adapter.read_authorized_graph()
+
+        self.assertEqual(surface["authority"], "child_dependency_authorization")
+        self.assertEqual(surface["revision"], 1)
+        self.assertEqual(surface["relations"][0]["blocker"], A)
+        self.assertEqual(surface["relations"][0]["blocked"], B)
+        self.assertEqual(len(surface["authorization_batches"]), 1)
+        projection = adapter.authorization.state()
+        self.assertEqual(
+            validate_authorized_dependency_graph_surface(
+                surface, projection.events, authority=AUTHORITY,
+                plan_revision=PLAN,
+            ),
+            surface,
+        )
+
+        unauthorized = fake.native_relation(A, C)
+        graph = DependencyGraph(
+            relations=tuple([*surface["relations"], {
+                "id": unauthorized["id"], "type": "blocks",
+                "blocker": A, "blocked": C, "inverse_type": "blocked_by",
+            }]),
+            ignored_non_dependency_count=0,
+        )
+        with self.assertRaisesRegex(
+            ChildDependencyError, "unauthorized_native_dependency",
+        ):
+            authorized_dependency_graph(
+                graph, projection.events, authority=AUTHORITY,
+                plan_revision=PLAN,
+            )
+
+        stale = deepcopy(projection.events)
+        authorization = next(
+            event for event in stale
+            if event["kind"] == "child_dependency_authorization"
+        )
+        authorization["value"]["expected_graph_revision"] = 1
+        with self.assertRaisesRegex(
+            ChildDependencyError, "stale_dependency_authorization_frontier",
+        ):
+            authorized_dependency_graph(
+                DependencyGraph(tuple(surface["relations"]), 0), stale,
+                authority=AUTHORITY, plan_revision=PLAN,
+            )
+
+        cross_generation = deepcopy(projection.events)
+        authorization = next(
+            event for event in cross_generation
+            if event["kind"] == "child_dependency_authorization"
+        )
+        authorization["plan_revision"] = "b" * 64
+        with self.assertRaisesRegex(
+            ChildDependencyError, "cross_generation_dependency_authorization",
+        ):
+            authorized_dependency_graph(
+                DependencyGraph(tuple(surface["relations"]), 0),
+                cross_generation, authority=AUTHORITY, plan_revision=PLAN,
+            )
 
     def test_blocked_by_input_preserves_exact_direction(self):
         result = self.apply(FakeLinear(), [self.relation(B, "blocked_by", A)])
