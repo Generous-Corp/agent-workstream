@@ -62,6 +62,16 @@ SENSITIVE_QUERY_KEYS = re.compile(
 )
 
 
+class IngressConnection(sqlite3.Connection):
+    """Close a discarded outbox handle before Python reports a resource leak."""
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except sqlite3.Error:
+            pass
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -205,7 +215,7 @@ def connect() -> sqlite3.Connection:
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(root, 0o700)
     db = root / "outbox.sqlite3"
-    conn = sqlite3.connect(db, timeout=2)
+    conn = sqlite3.connect(db, timeout=2, factory=IngressConnection)
     os.chmod(db, 0o600)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=2000")
