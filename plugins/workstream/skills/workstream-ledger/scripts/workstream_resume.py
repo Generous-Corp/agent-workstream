@@ -1474,6 +1474,9 @@ def validate_snapshot(
                 historical_evidence_event_ids = (
                     closure_bound_historical_evidence(
                         projection_events, scope, projection_history,
+                        selected_transition_tip_event_id=root.get(
+                            "generation_transition_tip_event_id"
+                        ),
                     )
                 )
             except ProjectionHistoryError as error:

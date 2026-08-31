@@ -51,9 +51,61 @@ def _generation(
     )
 
 
+def _bound_predecessor_generation(
+    event: dict[str, Any], projection_history: list[dict[str, Any]],
+    authority: dict[str, Any],
+    selected_transition_tip_event_id: str | None,
+) -> list[dict[str, Any]]:
+    """Recover the exact reviewed prefix across its final activation append."""
+    predecessor = _generation(
+        projection_history, authority["predecessor_plan_revision"],
+    )
+    revision = authority["predecessor_projection_revision"]
+    if _digest(projection_history) == authority["projection_history_sha256"]:
+        return predecessor
+
+    # Activation changes authority by appending one generation transition to
+    # the predecessor's deterministic final CAS slot. Carried evidence was
+    # reviewed before that append, so accept only the exact terminal control
+    # already validated by generation selection, then replay the bound digest.
+    if len(predecessor) != revision + 1:
+        raise ProjectionHistoryError("carried_evidence_authority_invalid")
+    transition = predecessor[-1]
+    bound_history = [
+        item for item in projection_history
+        if item.get("event_id") != transition.get("event_id")
+    ]
+    value = transition.get("value")
+    from_frontier = value.get("from") if isinstance(value, dict) else None
+    to_frontier = value.get("to") if isinstance(value, dict) else None
+    if (
+        not isinstance(selected_transition_tip_event_id, str)
+        or transition.get("event_id") != selected_transition_tip_event_id
+        or transition.get("kind") != "generation_transition"
+        or transition.get("workstream_id") != event.get("workstream_id")
+        or transition.get("plan_revision")
+        != authority["predecessor_plan_revision"]
+        or transition.get("expected_revision") != revision
+        or not isinstance(from_frontier, dict)
+        or not isinstance(to_frontier, dict)
+        or from_frontier.get("plan_revision")
+        != authority["predecessor_plan_revision"]
+        or from_frontier.get("projection_revision") != revision
+        or from_frontier.get("projection_events_sha256")
+        != authority["predecessor_projection_events_sha256"]
+        or from_frontier.get("projection_frontier_event_id")
+        != authority["predecessor_projection_frontier_event_id"]
+        or to_frontier.get("plan_revision") != event.get("plan_revision")
+        or _digest(bound_history) != authority["projection_history_sha256"]
+    ):
+        raise ProjectionHistoryError("carried_evidence_authority_invalid")
+    return predecessor[:revision]
+
+
 def _carried_predecessor_authority(
     event: dict[str, Any], projection_history: list[dict[str, Any]],
     current_scope: dict[str, Any],
+    selected_transition_tip_event_id: str | None = None,
 ) -> dict[str, Any] | None:
     contract = event.get("value")
     authority = (
@@ -112,12 +164,11 @@ def _carried_predecessor_authority(
                 "predecessor_projection_frontier_event_id",
             )
         )
-        or authority.get("projection_history_sha256")
-        != _digest(projection_history)
     ):
         raise ProjectionHistoryError("carried_evidence_authority_invalid")
-    predecessor = _generation(
-        projection_history, authority.get("predecessor_plan_revision"),
+    predecessor = _bound_predecessor_generation(
+        event, projection_history, authority,
+        selected_transition_tip_event_id,
     )
     if (
         not predecessor
@@ -187,17 +238,20 @@ def _carried_predecessor_authority(
 
 def carried_predecessor_evidence_authority(
     event: dict[str, Any], projection_history: list[dict[str, Any]],
-    current_scope: dict[str, Any],
+    current_scope: dict[str, Any], *,
+    selected_transition_tip_event_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Validate and return one persisted predecessor-closure carry proof."""
     return _carried_predecessor_authority(
         event, projection_history, current_scope,
+        selected_transition_tip_event_id,
     )
 
 
 def closure_bound_historical_evidence(
     projection_events: list[dict[str, Any]], current_scope: dict[str, Any],
     projection_history: list[dict[str, Any]] | None = None,
+    *, selected_transition_tip_event_id: str | None = None,
 ) -> frozenset[str]:
     """Return active evidence event IDs authorized at a closed child's old head.
 
@@ -215,6 +269,7 @@ def closure_bound_historical_evidence(
                 continue
             authority = _carried_predecessor_authority(
                 event, projection_history, current_scope,
+                selected_transition_tip_event_id,
             )
             if authority is not None:
                 carried[event["event_id"]] = authority
