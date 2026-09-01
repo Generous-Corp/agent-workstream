@@ -88,6 +88,7 @@ class FakeClient:
         self.issue_update_count = 0
         self.comment_updates_root = False
         self.comment_clock = 0
+        self.expanded_resume_project = False
 
     def root_issue(self):
         return {
@@ -146,7 +147,10 @@ class FakeClient:
         if "CommentCreateCapability" in query:
             return {"__type": {"inputFields": [{"name": "id"}]}}
         if "query WorkstreamResumeRoot" in query:
-            return {"issue": {**self.root_issue(), "children": {
+            root = self.root_issue()
+            if self.expanded_resume_project:
+                root["project"] = {**root["project"], "name": "Project"}
+            return {"issue": {**root, "children": {
                 "nodes": [], "pageInfo": {
                     "hasNextPage": False, "endCursor": None,
                 },
@@ -1423,6 +1427,10 @@ class GenerationTransitionTests(unittest.TestCase):
             client = FakeClient()
             client.allow_issue_update = True
             client.comment_updates_root = True
+            # The bounded root query and full resume query legitimately have
+            # different project selections. Native custody must replay the
+            # exact full operator-snapshot shape that was originally bound.
+            client.expanded_resume_project = True
             client.graph_state_id = "done-state"
             client.graph_status = "Done"
             client.graph_status_type = "completed"
@@ -1562,16 +1570,28 @@ class GenerationTransitionTests(unittest.TestCase):
             retirement = contract["retirement_proof"]
 
             def activation_transport(current, candidate_loader=None):
+                native_transport = LinearGraphQLTransport(
+                    current, workspace_id="workspace", team_id="team",
+                    project_id="project",
+                )
                 return GenerationTransport(
                     current, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
                     authority=AUTHORITY,
                     candidate_loader=candidate_loader or Loader(current),
                     legacy_description_plan_revision=OLD,
-                    native_root_loader=lambda: graph_for(current),
+                    # Match the production CLI's full operator-snapshot query
+                    # shape. Durable reopen custody currently binds fields such
+                    # as project.name that the bounded root query omits.
+                    native_root_loader=lambda: (
+                        workstream_generation._activation_native_root_snapshot(
+                            native_transport, WORKSTREAM,
+                        )
+                    ),
                     source_loader=lambda: deepcopy(source),
                     operator_validator=lambda: operator_validation(current),
                     operator_snapshot_validator=operator_snapshot_validation,
                     operator_contract_sha256=_digest(contract),
+                    operator_remote_head="e" * 40,
                 )
 
             def reviewed_sha(current):
@@ -1584,12 +1604,14 @@ class GenerationTransitionTests(unittest.TestCase):
                 recovered = activation_transport(current).activate(
                     target_plan_revision=NEW, created_at=created_at,
                     retirement=retirement,
+                    remote_head="e" * 40,
                     expected_native_root_sha256=expected_sha,
                 )
                 replay_writes = len(current.mutations)
                 replayed = activation_transport(current).activate(
                     target_plan_revision=NEW, created_at=created_at,
                     retirement=retirement,
+                    remote_head="e" * 40,
                     expected_native_root_sha256=expected_sha,
                 )
                 self.assertEqual(replayed["event_id"], recovered["event_id"])
@@ -1607,6 +1629,21 @@ class GenerationTransitionTests(unittest.TestCase):
                     reservations[0]["root_transition_receipt_sha256"],
                     root_receipt["sha256"],
                 )
+                self.assertIsNone(reservations[0]["activation_checkpoint"])
+                self.assertIsNone(reservations[0]["remote_head"])
+                refused_writes = len(current.mutations)
+                refused_comments = deepcopy(current.comments)
+                with self.assertRaisesRegex(
+                    WorkstreamGenerationError,
+                    "generation_operator_remote_head_mismatch",
+                ):
+                    activation_transport(current).activate(
+                        target_plan_revision=NEW, created_at=created_at,
+                        retirement=retirement, remote_head="f" * 40,
+                        expected_native_root_sha256=expected_sha,
+                    )
+                self.assertEqual(len(current.mutations), refused_writes)
+                self.assertEqual(current.comments, refused_comments)
                 return recovered
 
             checkpoint = self.activation_checkpoint()
@@ -1793,6 +1830,7 @@ class GenerationTransitionTests(unittest.TestCase):
                 reservation_transport.activate(
                     target_plan_revision=NEW, created_at=created_at,
                     retirement=retirement,
+                    remote_head="e" * 40,
                     expected_native_root_sha256=reservation_sha,
                 )
             for field, value in (
@@ -1811,6 +1849,7 @@ class GenerationTransitionTests(unittest.TestCase):
                     activation_transport(drifted).activate(
                         target_plan_revision=NEW, created_at=created_at,
                         retirement=retirement,
+                        remote_head="e" * 40,
                         expected_native_root_sha256=reservation_sha,
                     )
                 self.assertEqual(len(drifted.mutations), writes)
@@ -1838,6 +1877,7 @@ class GenerationTransitionTests(unittest.TestCase):
                     transport.activate(
                         target_plan_revision=NEW, created_at=created_at,
                         retirement=retirement,
+                        remote_head="e" * 40,
                         expected_native_root_sha256=expected_sha,
                     )
                 retry_and_assert(current, expected_sha)
@@ -1858,6 +1898,7 @@ class GenerationTransitionTests(unittest.TestCase):
                 final_transport.activate(
                     target_plan_revision=NEW, created_at=created_at,
                     retirement=retirement,
+                    remote_head="e" * 40,
                     expected_native_root_sha256=final_sha,
                 )
             retry_and_assert(after_finalization, final_sha)
