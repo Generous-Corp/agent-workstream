@@ -352,9 +352,12 @@ def authorized_dependency_graph(
                 )
             except LinearProjectionError as error:
                 raise ChildDependencyError(str(error)) from error
+            recorded_material_frontier = value.get(
+                "expected_material_frontier_sha256"
+            )
             if (
-                value.get("expected_material_frontier_sha256")
-                != material_frontier_sha256
+                recorded_material_frontier is not None
+                and recorded_material_frontier != material_frontier_sha256
             ):
                 raise ChildDependencyError("dependency_material_frontier_mismatch")
             grant_remote_id = projection_remote_ids.get(event.get("event_id"))
@@ -403,8 +406,10 @@ def authorized_dependency_graph(
             "relation_ids": list(authorized_ids),
             "relations_sha256": value.get("relations_sha256"),
             "expected_material_revision": value.get("expected_material_revision"),
-            "expected_material_frontier_sha256": value.get(
-                "expected_material_frontier_sha256"
+            "expected_material_frontier_sha256": (
+                material_frontier_sha256
+                if material_events is not None
+                else value.get("expected_material_frontier_sha256")
             ),
             "expected_projection_revision": value.get("expected_projection_revision"),
             "expected_graph_revision": value.get("expected_graph_revision"),

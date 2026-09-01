@@ -1964,6 +1964,43 @@ def encode_projection_comment(event: dict[str, Any]) -> str:
     return f"{PROJECTION_PREFIX}{encoded} -->"
 
 
+def _validate_legacy_child_dependency_authorization(
+    event: dict[str, Any],
+) -> None:
+    """Admit the one pre-frontier-digest dependency schema for readback only.
+
+    Version 0.4.43 wrote schema-v2 dependency grants before
+    ``expected_material_frontier_sha256`` was added to that same schema.  The
+    immutable event cannot be rewritten.  Keep the normal validator and every
+    writer strict; this decoder-only compatibility path accepts exactly the
+    former value shape and lets the dependency reducer derive and authenticate
+    the missing digest from the bound material receipts.
+    """
+    value = event.get("value")
+    required = {
+        "root_issue_id", "route", "plan_revision", "batch_id",
+        "relation_ids", "relations_sha256", "expected_material_revision",
+        "expected_projection_revision", "expected_graph_revision",
+        "expected_graph_sha256", "initial_state",
+    }
+    if (
+        event.get("kind") != "child_dependency_authorization"
+        or event.get("schema_version") != 2
+        or not isinstance(value, dict)
+        or set(value) != required
+        or event.get("event_id") != _event_id(event)
+    ):
+        raise LinearProjectionError("invalid_child_dependency_authorization")
+
+    # Reuse the current strict validator for every other field.  The temporary
+    # digest and event ID exist only in this validation copy; the immutable
+    # historical event remains byte-for-byte unchanged.
+    candidate = deepcopy(event)
+    candidate["value"]["expected_material_frontier_sha256"] = "0" * 64
+    candidate["event_id"] = _event_id(candidate)
+    validate_projection_event(candidate)
+
+
 def _decode_projection(encoded: str) -> dict[str, Any]:
     try:
         envelope = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
@@ -1975,13 +2012,38 @@ def _decode_projection(encoded: str) -> dict[str, Any]:
             raise ValueError("invalid envelope")
         if not hmac.compare_digest(digest, hashlib.sha256(_canonical(event)).hexdigest()):
             raise ValueError("digest mismatch")
-        validate_projection_event(event)
+        try:
+            validate_projection_event(event)
+        except LinearProjectionError as error:
+            if str(error) != "invalid_child_dependency_authorization":
+                raise
+            _validate_legacy_child_dependency_authorization(event)
         return event
     except (
         binascii.Error, json.JSONDecodeError, KeyError, TypeError, ValueError,
         LinearProjectionError,
     ) as error:
-        raise LinearProjectionError("malformed_projection_marker") from error
+        raise LinearProjectionError(
+            f"malformed_projection_marker:{error}"
+        ) from error
+
+
+def decode_projection_receipt(
+    comment: dict[str, Any], encoded: str,
+) -> dict[str, Any]:
+    """Decode one marker while retaining its immutable remote receipt in errors."""
+    remote_id = comment.get("id")
+    receipt = remote_id if isinstance(remote_id, str) and remote_id else "remote_id_missing"
+    try:
+        return _decode_projection(encoded)
+    except LinearProjectionError as error:
+        detail = str(error)
+        prefix = "malformed_projection_marker:"
+        if detail.startswith(prefix):
+            detail = detail[len(prefix):]
+        raise LinearProjectionError(
+            f"malformed_projection_marker:{receipt}:{detail}"
+        ) from error
 
 
 @dataclass(frozen=True)
@@ -2308,7 +2370,7 @@ def _reduce_projection_comments_impl(
         matches = PROJECTION_RE.findall(body)
         if len(matches) != 1 or body.count(PROJECTION_PREFIX) != 1:
             raise LinearProjectionError("malformed_projection_marker")
-        event = _decode_projection(matches[0])
+        event = decode_projection_receipt(comment, matches[0])
         if event["workstream_id"] != workstream_id:
             raise LinearProjectionError("workstream_id_mismatch")
         signature = _canonical(event)
@@ -2603,7 +2665,7 @@ def _generation_checkpoint_ids(
             matches = PROJECTION_RE.findall(body)
             if len(matches) != 1 or body.count(PROJECTION_PREFIX) != 1:
                 raise LinearProjectionError("malformed_projection_marker")
-            event = _decode_projection(matches[0])
+            event = decode_projection_receipt(comment, matches[0])
             if event["event_id"] not in authorized_activation_event_ids:
                 continue
             checkpoint = event.get("value", {}).get("activation_checkpoint")
@@ -2719,7 +2781,7 @@ def select_plan_generation(
         matches = PROJECTION_RE.findall(body)
         if len(matches) != 1 or body.count(PROJECTION_PREFIX) != 1:
             raise LinearProjectionError("malformed_projection_marker")
-        event = _decode_projection(matches[0])
+        event = decode_projection_receipt(comment, matches[0])
         if event["workstream_id"] != workstream_id:
             raise LinearProjectionError("workstream_id_mismatch")
         encoded_events.append(event)
@@ -3367,7 +3429,7 @@ class LinearProjectionAdapter:
                 matches = PROJECTION_RE.findall(body)
                 if len(matches) != 1 or body.count(PROJECTION_PREFIX) != 1:
                     raise LinearProjectionError("malformed_projection_marker")
-                event = _decode_projection(matches[0])
+                event = decode_projection_receipt(comment, matches[0])
                 if event["event_id"] == tip_id:
                     controls.append(event)
             if len(controls) != 1:

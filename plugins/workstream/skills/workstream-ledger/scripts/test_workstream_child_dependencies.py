@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import hashlib
+import base64
 import io
 import json
 import unittest
@@ -21,8 +22,10 @@ from workstream_delta import Delta, event_id_for
 from workstream_linear import LinearTransportError, parse_plan_revision
 from workstream_linear_events import encode_event_comment
 from workstream_linear_projection import (
-    build_projection_event, dependency_material_frontier_sha256,
-    encode_projection_comment, projection_slot_id,
+    _canonical, _decode_projection, _event_id, build_projection_event,
+    dependency_material_frontier_sha256, encode_projection_comment,
+    LinearProjectionError, PROJECTION_PREFIX, PROJECTION_RE,
+    projection_slot_id, validate_projection_event,
 )
 
 
@@ -263,6 +266,22 @@ class FakeLinear:
 
 
 class ChildDependencyTests(unittest.TestCase):
+    @staticmethod
+    def legacy_dependency_comment(event, remote_id="legacy-dependency-comment"):
+        envelope = {
+            "event": event,
+            "sha256": hashlib.sha256(_canonical(event)).hexdigest(),
+        }
+        encoded = base64.urlsafe_b64encode(
+            _canonical(envelope)
+        ).decode("ascii").rstrip("=")
+        return {
+            "id": remote_id,
+            "body": f"{PROJECTION_PREFIX}{encoded} -->",
+            "createdAt": "2026-08-31T21:56:35.148Z",
+            "updatedAt": "2026-08-31T21:56:35.123Z",
+        }
+
     def adapter(self, fake):
         return LinearChildDependencyAdapter(
             fake, workspace_id="workspace", team_id="team", project_id="project",
@@ -370,6 +389,114 @@ class ChildDependencyTests(unittest.TestCase):
                 cross_generation, authority=AUTHORITY, plan_revision=PLAN,
                 observed_frontier=surface["observed_frontier"],
                 root_readback_sha256=surface["root_readback_sha256"],
+            )
+
+    def test_gen37_legacy_dependency_receipt_derives_missing_material_digest(self):
+        fake = FakeLinear()
+        self.apply(fake)
+        authorization_comment = next(
+            comment for comment in fake.comments["GEN-37"]
+            if PROJECTION_PREFIX in comment["body"]
+        )
+        encoded = PROJECTION_RE.findall(authorization_comment["body"])[0]
+        legacy = deepcopy(_decode_projection(encoded))
+        del legacy["value"]["expected_material_frontier_sha256"]
+        legacy["event_id"] = _event_id(legacy)
+        authorization_comment.update(self.legacy_dependency_comment(
+            legacy, projection_slot_id("GEN-37", PLAN, 0, {
+                key: AUTHORITY[key] for key in (
+                    "workspace_id", "team_id", "project_id", "root_issue_id",
+                )
+            }),
+        ))
+        mutation_count = len(fake.calls)
+
+        first = self.adapter(fake).read_authorized_graph()
+        second = self.adapter(fake).read_authorized_graph()
+
+        expected = dependency_material_frontier_sha256(
+            [], {}, fake.comments["GEN-37"], revision=0,
+        )
+        self.assertEqual(
+            first["authorization_batches"][0][
+                "expected_material_frontier_sha256"
+            ], expected,
+        )
+        self.assertEqual(first, second)
+        self.assertFalse(any(
+            "commentCreate" in query or "issueCreate" in query
+            or "projectCreate" in query or "issueRelationCreate" in query
+            for query, _variables in fake.calls[mutation_count:]
+        ))
+
+    def test_exact_gen37_receipt_is_legacy_only_and_current_writer_stays_strict(self):
+        event = {
+            "authority": {
+                "project_id": "eea2522b-187d-4f5b-af27-fc833d4fd1cb",
+                "root_issue_id": "409c1423-f949-4655-9f5f-d3213d7b434f",
+                "team_id": "d59c5509-8d96-4093-b7d5-0437ced5c679",
+                "workspace_id": "d830b5ae-5616-492d-a71d-3313387e8b6f",
+            },
+            "created_at": "1970-01-01T00:00:00Z",
+            "event_id": "wsp_77550af475172f2173b3b1dd442571dc",
+            "expected_revision": 24,
+            "key": "wsdb_0a84d29cb3edf7403d9d546d11e3da9c",
+            "kind": "child_dependency_authorization",
+            "plan_revision": "2fcce119a856ca34e509c7fe45a8f03f1a0d982c9c4d77047600805c0fcb261f",
+            "schema_version": 2,
+            "supersedes_event_id": None,
+            "value": {
+                "batch_id": "wsdb_0a84d29cb3edf7403d9d546d11e3da9c",
+                "expected_graph_revision": 0,
+                "expected_graph_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+                "expected_material_revision": 58,
+                "expected_projection_revision": 24,
+                "initial_state": "owned_children_validated",
+                "plan_revision": "2fcce119a856ca34e509c7fe45a8f03f1a0d982c9c4d77047600805c0fcb261f",
+                "relation_ids": [
+                    "342e53e5-6c3f-46e1-a429-381b8ea25726",
+                    "db4f06f8-594b-4f0d-a46a-a9d7643304c9",
+                    "ea314d41-9a0a-4175-98b7-debd28196831",
+                ],
+                "relations_sha256": "a2474eb433ca5004085425895eed60d57b8bd884e22fe66f2fbc0465a95da64a",
+                "root_issue_id": "409c1423-f949-4655-9f5f-d3213d7b434f",
+                "route": {
+                    "project_id": "eea2522b-187d-4f5b-af27-fc833d4fd1cb",
+                    "root_issue_id": "409c1423-f949-4655-9f5f-d3213d7b434f",
+                    "team_id": "d59c5509-8d96-4093-b7d5-0437ced5c679",
+                    "workspace_id": "d830b5ae-5616-492d-a71d-3313387e8b6f",
+                },
+            },
+            "workstream_id": "GEN-37",
+        }
+        comment = self.legacy_dependency_comment(
+            event, "10c42da3-f61c-4276-94b6-25175676f610",
+        )
+        self.assertEqual(
+            hashlib.sha256(comment["body"].encode()).hexdigest(),
+            "5d96ce2086a02933b3b26c5fcb5656644343742f76a28a9d50039985a5f605ba",
+        )
+        self.assertEqual(
+            _decode_projection(PROJECTION_RE.findall(comment["body"])[0]),
+            event,
+        )
+        with self.assertRaisesRegex(
+            LinearProjectionError, "invalid_child_dependency_authorization",
+        ):
+            validate_projection_event(event)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "malformed_projection_marker:10c42da3.*invalid_child_dependency_authorization",
+        ):
+            malformed = deepcopy(event)
+            malformed["value"]["initial_state"] = "forged"
+            malformed["event_id"] = _event_id(malformed)
+            receipt = self.legacy_dependency_comment(
+                malformed, "10c42da3-f61c-4276-94b6-25175676f610",
+            )
+            from workstream_linear_projection import decode_projection_receipt
+            decode_projection_receipt(
+                receipt, PROJECTION_RE.findall(receipt["body"])[0],
             )
 
     def test_legacy_no_edge_root_authenticates_canonical_empty_graph(self):

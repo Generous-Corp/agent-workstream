@@ -20,7 +20,7 @@ from workstream_linear_events import (
     reduce_ledger_reservations,
 )
 from workstream_linear_projection import (
-    _decode_projection, _inspect_unsealed_identity_history,
+    decode_projection_receipt, _inspect_unsealed_identity_history,
     build_projection_event, encode_projection_comment,
     inspect_unsealed_identity_history, LinearProjectionAdapter,
     LinearProjectionError, PROJECTION_PREFIX, PROJECTION_RE,
@@ -138,7 +138,7 @@ def _scope_event(comments: list[dict[str, Any]], event_id: str) -> dict[str, Any
         encoded = PROJECTION_RE.findall(body)
         if len(encoded) != 1:
             continue
-        event = _decode_projection(encoded[0])
+        event = decode_projection_receipt(comment, encoded[0])
         if event["kind"] == "scope" and event["key"] == "root" and event["event_id"] == event_id:
             matches.append(event)
     if len(matches) != 1:
