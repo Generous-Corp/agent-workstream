@@ -5,17 +5,12 @@ description: Use first whenever a request carries exactly one existing workstrea
 
 # Workstream resume
 
-Recover the authenticated, bounded current view before broader project context.
-
 After any mandatory host/session bootstrap that runs independently of this
 request, the first functional command is:
 
 ```sh
 python3 "<absolute directory of this SKILL.md>/scripts/workstream_resume.py" GEN-123
 ```
-
-Only host-injected commands independent of the model decision and the mandatory
-exact read of this `SKILL.md` count as bootstrap.
 
 Substitute the runtime-supplied directory and the single token from the current
 user message directly. That message is the only handle source. Hook or developer
@@ -26,7 +21,11 @@ the skill, inspect the environment, or execute a placeholder or unset variable.
 Before repository, memory, worktree, PR, or plan exploration, run that command
 exactly once. Do not probe `workstreamctl` on `PATH`. Never add
 `--include-history` during initial recovery. The default validates full history
-and returns `context_schema` v2 `compact_validated` authority.
+and returns v2 `compact_validated` authority. If
+`deferred_audit_detail.state` is not `none`, hydrate via compact route and
+selector before acting; `full` validates history, not excerpt exactness.
+Resolve launcher `current_workstream_resume_skill_script` as current Python plus
+this SKILL's absolute resume script, then append `args`; never use PATH.
 
 If recovery refuses, report its exact error and stop. Do not fall back to local
 context or load the lifecycle skill. Success requires `resume_authority` to be
@@ -40,11 +39,10 @@ python3 "<absolute directory of this SKILL.md>/scripts/workstream_tab.py" GEN-12
 ```
 
 An unresolved cmux/Herdr surface is an optional no-op and never downgrades
-`resume_authority: full`. Use Herdr only with exact inherited identity. A
-conflicting token refuses; do not rename. Codex session titles and visible tabs
-are separate namespaces. Claim visible-title success only when the explicit
-adapter returns `updated` or `unchanged` plus exact title readback. Resume
-refusal denies execution authority; display unavailability only skips binding.
+`resume_authority: full`. Use exact inherited identity; conflicts refuse. Codex
+session titles and visible tabs are separate namespaces. Claim success only if
+the adapter returns `updated` or `unchanged` plus exact title readback. Resume
+refusal denies execution authority.
 
 Retain the authenticated route/source, open children, next action, checkpoint,
 and attach-or-successor disposition. The snapshot is not live repository or

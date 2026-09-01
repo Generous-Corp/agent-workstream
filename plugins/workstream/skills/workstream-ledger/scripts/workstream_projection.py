@@ -3720,7 +3720,10 @@ def main() -> int:
                 max_items=args.max_items, require_projection_authority=True,
                 expected_missing_terminal_closures=expected_pending,
             )
-            choose_disposition(context, remote_head=args.remote_head)
+            # The bounded resume gate may return a fixed-schema authority
+            # envelope. Disposition uses the same already-validated snapshot,
+            # not a presentation representation of it.
+            choose_disposition(verified, remote_head=args.remote_head)
             result.update({
                 "operation_status": "partial",
                 "resume_authority": "partial_terminal_closure_required",
@@ -3768,7 +3771,7 @@ def main() -> int:
                 max_items=args.max_items,
                 require_projection_authority=True,
             )
-            choose_disposition(validated_context, remote_head=args.remote_head)
+            choose_disposition(validation_snapshot, remote_head=args.remote_head)
             result["pending_terminal_closure"] = sorted(expected_pending)
             result["operation_status"] = "partial"
             result["resume_authority"] = "partial_terminal_closure_required"
@@ -3784,7 +3787,7 @@ def main() -> int:
                 max_items=args.max_items,
                 require_projection_authority=True,
             )
-            choose_disposition(context, remote_head=args.remote_head)
+            choose_disposition(verified, remote_head=args.remote_head)
             result["source_sync"] = {
                 "identity": authenticated_source["identity"],
                 "sha256": authenticated_source["sha256"],

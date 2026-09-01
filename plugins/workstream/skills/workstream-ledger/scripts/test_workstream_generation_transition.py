@@ -873,7 +873,9 @@ class GenerationTransitionTests(unittest.TestCase):
         def capture_compact(snapshot, token, **kwargs):
             result = real_compact_context(snapshot, token, **kwargs)
             contexts.append(deepcopy(result))
-            return result
+            # Generation receipts must use the already-validated joined state,
+            # not fields that a bounded presentation envelope may omit.
+            return {"resume_authority": result["resume_authority"]}
 
         with patch("workstream_generation.plan_payload", return_value={
             "source": {
