@@ -97,9 +97,15 @@ def snapshot_sha256(snapshot: dict[str, Any]) -> str:
     return _digest(_root_view(snapshot))
 
 
-def _preserved_root(snapshot: dict[str, Any], operation: str) -> dict[str, Any]:
+def _root_without_updated_at(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Return the material root fields unaffected by comment creation."""
     value = _root_view(snapshot)
     value.pop("updated_at", None)
+    return value
+
+
+def _preserved_root(snapshot: dict[str, Any], operation: str) -> dict[str, Any]:
+    value = _root_without_updated_at(snapshot)
     value.pop(
         "description"
         if operation in {"plan-url", "reconcile-plan-url"} else "state",
@@ -557,16 +563,25 @@ class RootTransitionTransport:
         )
 
     @staticmethod
-    def _assert_reservation(
+    def _reservation_receipt(
         comments: list[dict[str, Any]], *, slot: str, body: str,
-    ) -> None:
+    ) -> dict[str, str]:
         matches = [item for item in comments if item.get("id") == slot]
         if len(matches) != 1 or matches[0].get("body") != body:
             raise RootTransitionError("root_transition_reservation_changed_or_missing")
+        receipt = {
+            field: matches[0].get(field)
+            for field in ("id", "body", "createdAt", "updatedAt")
+        }
+        if (
+            not all(isinstance(value, str) and value for value in receipt.values())
+        ):
+            raise RootTransitionError("root_transition_reservation_receipt_invalid")
+        return receipt  # type: ignore[return-value]
 
     def _reserve(
         self, reservation: dict[str, Any], slot: str,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, dict[str, str]]:
         capability = self.client.execute(COMMENT_CREATE_CAPABILITY_QUERY, {})
         fields = {
             item.get("name") for item in
@@ -583,7 +598,10 @@ class RootTransitionTransport:
             observed = self.comments.comments()
             matches = [item for item in observed if item.get("id") == slot]
             if len(matches) == 1 and matches[0].get("body") == body:
-                return "existing_or_unknown", body
+                return (
+                    "existing_or_unknown", body,
+                    self._reservation_receipt(observed, slot=slot, body=body),
+                )
             raise RootTransitionError("root_transition_reservation_slot_conflict")
         created = response.get("commentCreate")
         returned = (created or {}).get("comment") if isinstance(created, dict) else None
@@ -591,10 +609,22 @@ class RootTransitionTransport:
             not isinstance(created, dict) or created.get("success") is not True
             or not isinstance(returned, dict) or returned.get("id") != slot
             or returned.get("body") != body
+            or not isinstance(returned.get("createdAt"), str)
+            or not returned.get("createdAt")
+            or not isinstance(returned.get("updatedAt"), str)
+            or not returned.get("updatedAt")
         ):
             raise RootTransitionError("root_transition_reservation_create_unproven")
-        self._assert_reservation(self.comments.comments(), slot=slot, body=body)
-        return "created", body
+        observed = self._reservation_receipt(
+            self.comments.comments(), slot=slot, body=body,
+        )
+        returned_receipt = {
+            field: returned[field]
+            for field in ("id", "body", "createdAt", "updatedAt")
+        }
+        if observed != returned_receipt:
+            raise RootTransitionError("root_transition_reservation_receipt_changed")
+        return "created", body, returned_receipt
 
     def preview(self, *, operation: str, target: str) -> dict[str, Any]:
         snapshot, comments = self._read()
@@ -703,6 +733,49 @@ class RootTransitionTransport:
         reserved = [item for item in comments if item.get("id") == slot]
         # Rebuild the original reviewed intent only while the original snapshot is present.
         replayed = snapshot_sha256(snapshot) != expected_snapshot_sha256
+        if replayed and len(reserved) == 1:
+            reservation_body = str(reserved[0].get("body") or "")
+            pending = _decode(reservation_body)
+            if isinstance(pending, dict):
+                unsigned = {
+                    key: deepcopy(value) for key, value in pending.items()
+                    if key != "intent_sha256"
+                }
+                receipt = self._reservation_receipt(
+                    comments, slot=slot, body=reservation_body,
+                )
+                root = snapshot.get("root") or {}
+                update = pending.get("update") or {}
+                target_applied = (
+                    root.get("description") == update.get("description")
+                    if operation in {"plan-url", "reconcile-plan-url"}
+                    else (root.get("state") or {}).get("id") == target
+                )
+                reservation_only = (
+                    pending.get("operation") == operation
+                    and pending.get("expected_snapshot_sha256")
+                    == expected_snapshot_sha256
+                    and pending.get("expected_frontier_sha256")
+                    == expected_frontier_sha256
+                    and pending.get("authority") == self.authority
+                    and pending.get("intent_sha256") == expected_intent_sha256
+                    and pending.get("intent_sha256") == _digest(unsigned)
+                    and pending.get("operator_authorization")
+                    == current_authorization
+                    and _reservation_matches_request(
+                        pending, operation=operation, target=target,
+                    )
+                    and root.get("updatedAt") == receipt["updatedAt"]
+                    and _preserved_root(snapshot, operation)
+                    == pending.get("preserved_root")
+                    and comment_frontier_sha256(comments, exclude_id=slot)
+                    == expected_frontier_sha256
+                    and not target_applied
+                )
+                if reservation_only:
+                    raise RootTransitionError(
+                        "root_transition_reservation_pending_review_new_preview_required"
+                    )
         if (
             operation == "reconcile-plan-url"
             and not replayed
@@ -752,7 +825,9 @@ class RootTransitionTransport:
             if preview["intent_sha256"] != expected_intent_sha256:
                 raise RootTransitionError("root_transition_intent_mismatch")
             reservation = {**preview["intent"], "intent_sha256": preview["intent_sha256"]}
-            reservation_result, reservation_body = self._reserve(reservation, slot)
+            reservation_result, reservation_body, reservation_receipt = self._reserve(
+                reservation, slot,
+            )
             if reservation_result != "created":
                 raise RootTransitionError(
                     "root_transition_reservation_not_owned_by_this_process"
@@ -763,15 +838,23 @@ class RootTransitionTransport:
             immediate_authorization = self._authorize(
                 immediate, immediate_comments,
             )
-            self._assert_reservation(
+            immediate_receipt = self._reservation_receipt(
                 immediate_comments, slot=slot, body=reservation_body,
             )
             if (
-                immediate_authorization
+                immediate_receipt != reservation_receipt
+                or (immediate.get("root") or {}).get("updatedAt")
+                != reservation_receipt["updatedAt"]
+                or immediate_authorization
                 != reservation.get("operator_authorization")
                 or current_authorization
                 != reservation.get("operator_authorization")
-                or snapshot_sha256(immediate) != expected_snapshot_sha256
+                # Linear advances the root issue's updatedAt when a comment is
+                # created.  Compare every material root field to the exact
+                # pre-reservation read, but do not let our own reservation
+                # invalidate its reviewed snapshot solely through that clock.
+                or _root_without_updated_at(immediate)
+                != _root_without_updated_at(snapshot)
                 or comment_frontier_sha256(immediate_comments, exclude_id=slot)
                 != expected_frontier_sha256
             ):
@@ -823,7 +906,9 @@ class RootTransitionTransport:
         final, final_comments = self._read()
         final_authorization = self._authorize(final, final_comments)
         reservation_body = _encode(reservation)
-        self._assert_reservation(final_comments, slot=slot, body=reservation_body)
+        self._reservation_receipt(
+            final_comments, slot=slot, body=reservation_body,
+        )
         if final_authorization != reservation.get("operator_authorization"):
             raise RootTransitionError("root_transition_postwrite_operator_drift")
         final_root = final["root"]

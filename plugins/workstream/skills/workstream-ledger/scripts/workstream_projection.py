@@ -76,6 +76,12 @@ PREDECESSOR_SEED_BINDING_FIELDS = {
 GEN14_SPLIT_PREFIX_SHA256 = (
     "180e178d1732b914edce564ba1d6411e229ceaaecd48cbcb5422de2736d56c28"
 )
+GEN14_SPLIT_STORED_FRONTIER_SHA256 = (
+    "e0317b7cda88262a7baf0df28b13c4c27af8a4e171156147f304f62e104cfc23"
+)
+GEN14_SPLIT_RECOMPUTED_FRONTIER_SHA256 = (
+    "7c53170bb0ba8434182809f23f40f893b279f3b88a14face18326fd737b41240"
+)
 
 
 def bind_projection_plan_generation(
@@ -883,16 +889,19 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         disposition = seed_head_transition.get("disposition") if isinstance(
             seed_head_transition, dict
         ) else None
+        head_transition_fields = {
+            "repository_key", "from_exact_head", "to_exact_head",
+            "from_scope_event_id", "from_scope_value_sha256",
+            "from_disposition_event_id", "from_disposition_value_sha256",
+            "disposition", "input_frontier_sha256",
+        }
         if (
             not seeds
             or not isinstance(seed_head_transition, dict)
-            or set(seed_head_transition) != {
-                "repository_key", "from_exact_head", "to_exact_head",
-                "from_scope_event_id", "from_scope_value_sha256",
-                "from_disposition_event_id",
-                "from_disposition_value_sha256",
-                "disposition", "input_frontier_sha256",
-            }
+            or set(seed_head_transition) not in (
+                head_transition_fields,
+                head_transition_fields | {"created_at"},
+            )
             or not isinstance(seed_head_transition.get("repository_key"), str)
             or not seed_head_transition["repository_key"]
             or not re.fullmatch(
@@ -924,6 +933,13 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             or not re.fullmatch(
                 r"[0-9a-f]{64}",
                 str(seed_head_transition.get("input_frontier_sha256", "")),
+            )
+            or (
+                "created_at" in seed_head_transition
+                and (
+                    not isinstance(seed_head_transition["created_at"], str)
+                    or not seed_head_transition["created_at"]
+                )
             )
             or not isinstance(disposition, dict)
             or set(disposition) != {
@@ -1673,6 +1689,21 @@ def _validate_gen14_legacy_split_repair_prefix(
         )
         for event in prefix[:2]
     }
+    if len(prefix) != 6 or not hmac.compare_digest(
+        canonical_digest(prefix), GEN14_SPLIT_PREFIX_SHA256,
+    ):
+        raise LinearProjectionError("legacy_split_head_repair_prefix_mismatch")
+    if frontiers != {GEN14_SPLIT_STORED_FRONTIER_SHA256}:
+        raise LinearProjectionError(
+            "legacy_split_head_repair_stored_frontier_mismatch"
+        )
+    if not hmac.compare_digest(
+        transition["input_frontier_sha256"],
+        GEN14_SPLIT_RECOMPUTED_FRONTIER_SHA256,
+    ):
+        raise LinearProjectionError(
+            "legacy_split_head_repair_recomputed_frontier_mismatch"
+        )
     if (
         len(prefix) != 6
         or not hmac.compare_digest(
@@ -1703,7 +1734,6 @@ def _validate_gen14_legacy_split_repair_prefix(
             transition["from_exact_head"],
             transition["from_disposition_exact_head"],
         }
-        or transition["input_frontier_sha256"] not in frontiers
         or transition["from_scope_event_id"] != prefix[5].get("event_id")
         or transition["from_disposition_event_id"] != prefix[4].get("event_id")
         or transition["from_scope_value_sha256"]
@@ -1730,6 +1760,137 @@ def _validate_gen14_legacy_split_repair_prefix(
         raise LinearProjectionError(
             "legacy_split_head_repair_noncanonical_progress"
         )
+
+
+def _gen14_completed_split_migration(state: Any) -> bool:
+    """Recognize only the authenticated D6/S7 completion of the captured prefix."""
+    if len(state.events) != 8:
+        return False
+    prefix = list(state.events[:6])
+    if not hmac.compare_digest(
+        canonical_digest(prefix), GEN14_SPLIT_PREFIX_SHA256,
+    ):
+        return False
+    frontiers = {
+        event.get("value", {}).get("predecessor_closure_authority", {}).get(
+            "input_frontier_sha256"
+        )
+        for event in prefix[:2]
+    }
+    disposition, scope = state.events[6:8]
+    primary_key = prefix[5].get("value", {}).get("primary_repository")
+    desired_scope = deepcopy(prefix[5].get("value", {}))
+    primary = next((
+        repository for repository in desired_scope.get("repositories", [])
+        if repository_key(repository) == primary_key
+    ), None)
+    remote_head = disposition.get("value", {}).get("remote_head")
+    if (
+        frontiers != {GEN14_SPLIT_STORED_FRONTIER_SHA256}
+        or primary is None
+        or not isinstance(remote_head, str)
+        or remote_head in {
+            primary.get("exact_head"),
+            prefix[4].get("value", {}).get("remote_head"),
+        }
+        or disposition.get("created_at") != scope.get("created_at")
+    ):
+        return False
+    primary["exact_head"] = remote_head
+    expected = [
+        build_projection_event(
+            workstream_id="GEN-14", kind="disposition", key="root",
+            value={
+                "disposition": "create_successor", "remote_head": remote_head,
+                "recovered_from_checkpoint": None,
+            },
+            plan_revision=prefix[0]["plan_revision"], expected_revision=6,
+            created_at=disposition["created_at"],
+            supersedes_event_id=prefix[4]["event_id"],
+            authority=prefix[0]["authority"],
+        ),
+        build_projection_event(
+            workstream_id="GEN-14", kind="scope", key="root",
+            value=desired_scope,
+            plan_revision=prefix[0]["plan_revision"], expected_revision=7,
+            created_at=disposition["created_at"],
+            supersedes_event_id=prefix[5]["event_id"],
+            authority=prefix[0]["authority"],
+        ),
+    ]
+    return list(state.events[6:8]) == expected
+
+
+def _gen14_frontier_only_evidence_normalization(
+    current: dict[str, Any], desired: dict[str, Any], *, enabled: bool,
+) -> bool:
+    if not enabled:
+        return False
+    migrated = deepcopy(current)
+    authority = migrated.get("predecessor_closure_authority")
+    if (
+        not isinstance(authority, dict)
+        or authority.get("input_frontier_sha256")
+        != GEN14_SPLIT_STORED_FRONTIER_SHA256
+    ):
+        return False
+    authority["input_frontier_sha256"] = (
+        GEN14_SPLIT_RECOMPUTED_FRONTIER_SHA256
+    )
+    return migrated == desired
+
+
+def _gen14_completed_normalization_replay(
+    state: Any, manifest: dict[str, Any], desired: list[dict[str, Any]], *,
+    created_at: str,
+) -> bool:
+    """Accept only the deterministic ordinary tail following exact D6/S7."""
+    ordinary_transition = manifest.get(
+        "terminal_child_evidence_seed_head_transition"
+    )
+    if (
+        len(state.events) < 8
+        or not isinstance(ordinary_transition, dict)
+        or ordinary_transition.get("created_at") != created_at
+        or manifest.get("terminal_child_evidence_seed_legacy_split_head_repair")
+        is not None
+    ):
+        return False
+    base = SimpleNamespace(
+        revision=8, events=tuple(state.events[:8]), snapshot=deepcopy(state.snapshot),
+    )
+    if not _gen14_completed_split_migration(base):
+        return False
+    active = _active_heads(base)
+    seeds = manifest.get("terminal_child_evidence_seeds") or []
+    seed_keys = {key for seed in seeds for key in seed.get("evidence_keys", [])}
+    candidates = [
+        item for item in desired
+        if (
+            (item["kind"] == "evidence_contract" and item["key"] in seed_keys)
+            or (item["kind"], item["key"])
+            in {("disposition", "root"), ("scope", "root")}
+        )
+        and (
+            active.get((item["kind"], item["key"])) is None
+            or active[(item["kind"], item["key"])]["value"] != item["value"]
+        )
+    ]
+    ordered = sorted(candidates, key=lambda item: (
+        0 if item["kind"] == "evidence_contract"
+        else 1 if item["kind"] == "disposition" else 2,
+        item["key"],
+    ))
+    expected = [build_projection_event(
+        workstream_id="GEN-14", kind=item["kind"], key=item["key"],
+        value=item["value"], plan_revision=state.events[0]["plan_revision"],
+        expected_revision=8 + index, created_at=created_at,
+        supersedes_event_id=(
+            active.get((item["kind"], item["key"])) or {}
+        ).get("event_id"), authority=state.events[0]["authority"],
+    ) for index, item in enumerate(ordered)]
+    tail = list(state.events[8:])
+    return len(tail) <= len(expected) and tail == expected[:len(tail)]
 
 
 def prepare_terminal_child_evidence_seeds(
@@ -1769,6 +1930,7 @@ def prepare_terminal_child_evidence_seeds(
     predecessor_binding = result.get(
         "terminal_child_evidence_seed_predecessor"
     )
+    completed_split_normalization = False
     predecessor_authorities: dict[str, dict[str, Any]] = {}
     if predecessor_binding is not None:
         if legacy_split is not None:
@@ -1832,8 +1994,19 @@ def prepare_terminal_child_evidence_seeds(
                 if not key.startswith("predecessor_evidence_")
                 and not key.startswith("predecessor_closure_")
             }
+            migrated_observed_binding = deepcopy(observed_binding)
+            captured_frontier_migration = (
+                observed_binding["input_frontier_sha256"]
+                == GEN14_SPLIT_STORED_FRONTIER_SHA256
+                and predecessor_binding.get("input_frontier_sha256")
+                == GEN14_SPLIT_RECOMPUTED_FRONTIER_SHA256
+            )
+            if captured_frontier_migration:
+                migrated_observed_binding["input_frontier_sha256"] = (
+                    GEN14_SPLIT_RECOMPUTED_FRONTIER_SHA256
+                )
             if (
-                observed_binding != predecessor_binding
+                migrated_observed_binding != predecessor_binding
                 or any({
                     key: value for key, value in authority.items()
                     if not key.startswith("predecessor_evidence_")
@@ -1912,6 +2085,27 @@ def prepare_terminal_child_evidence_seeds(
                     "closure_value_sha256"
                 ],
             }
+        ordinary_transition = result.get(
+            "terminal_child_evidence_seed_head_transition"
+        )
+        completed_split_normalization = False
+        if legacy_split is None and ordinary_transition is not None:
+            replay_desired = [*deepcopy(desired), {
+                "kind": "disposition", "key": "root",
+                "value": deepcopy(ordinary_transition["disposition"]),
+            }]
+            ordinary_created_at = ordinary_transition.get("created_at")
+            completed_split_normalization = (
+                isinstance(ordinary_created_at, str)
+                and bool(ordinary_created_at)
+                and (
+                    _gen14_completed_split_migration(state)
+                    or _gen14_completed_normalization_replay(
+                        state, result, replay_desired,
+                        created_at=ordinary_created_at,
+                    )
+                )
+            )
     bootstrap = bootstrap or _terminal_seed_bootstrap_prefix(
         original_contract, state, desired, remote_head=remote_head,
     )
@@ -2144,7 +2338,14 @@ def prepare_terminal_child_evidence_seeds(
                     f"terminal_child_evidence_seed_contract_invalid:{child_id}:{key}"
                 )
             current = active.get(identity)
-            if current is not None and current["value"] != contract:
+            if (
+                current is not None
+                and current["value"] != contract
+                and not _gen14_frontier_only_evidence_normalization(
+                    current["value"], contract,
+                    enabled=completed_split_normalization,
+                )
+            ):
                 raise LinearProjectionError(
                     f"terminal_child_evidence_seed_replacement_forbidden:{child_id}:{key}"
                 )
@@ -2173,6 +2374,21 @@ def prepare_terminal_child_evidence_seeds(
         raise LinearProjectionError("terminal_child_evidence_seed_projection_not_canonical")
     current_contract = projection_review_contract(state)
     if current_contract != original_contract:
+        ordinary_transition = result.get(
+            "terminal_child_evidence_seed_head_transition"
+        )
+        replay_desired = [*deepcopy(desired)]
+        if ordinary_transition is not None:
+            replay_desired.append({
+                "kind": "disposition", "key": "root",
+                "value": deepcopy(ordinary_transition["disposition"]),
+            })
+        if ordinary_transition is not None and _gen14_completed_normalization_replay(
+            state, result, replay_desired,
+            created_at=ordinary_transition.get("created_at", ""),
+        ):
+            result.update(current_contract)
+            return result
         if legacy_split is not None:
             # The exact legacy validator above has already proven that the
             # only intervening events are the deterministic D6/S7 repair
@@ -3200,10 +3416,14 @@ def reconcile_required_projection(
     )
     if observed_contract != reviewed_contract:
         if legacy_split is None:
-            raise LinearProjectionError("projection_review_stale_reload_required")
-        _validate_gen14_legacy_split_repair_prefix(
-            manifest, initial, scope_item["value"],
-        )
+            if not _gen14_completed_normalization_replay(
+                initial, manifest, desired, created_at=created_at,
+            ):
+                raise LinearProjectionError("projection_review_stale_reload_required")
+        else:
+            _validate_gen14_legacy_split_repair_prefix(
+                manifest, initial, scope_item["value"],
+            )
     active_heads = _active_heads(initial)
     _require_repairs_for_changed_child_closures(
         desired, active_heads, manifest.get("terminal_child_repairs") or [],
@@ -3215,6 +3435,21 @@ def reconcile_required_projection(
         manifest.get("terminal_child_evidence_seed_head_transition")
         or manifest.get(
             "terminal_child_evidence_seed_legacy_split_head_repair"
+        )
+    )
+    completed_split_normalization = (
+        legacy_split is None
+        and isinstance(
+            manifest.get("terminal_child_evidence_seed_head_transition"), dict,
+        )
+        and manifest["terminal_child_evidence_seed_head_transition"].get(
+            "created_at"
+        ) == created_at
+        and (
+            _gen14_completed_split_migration(initial)
+            or _gen14_completed_normalization_replay(
+                initial, manifest, desired, created_at=created_at,
+            )
         )
     )
     if legacy_split is not None and (
@@ -3315,7 +3550,10 @@ def reconcile_required_projection(
             for field in REVIEW_CONTRACT_FIELDS:
                 prepared_body.pop(field, None)
                 reviewed_body.pop(field, None)
-            if legacy_split is None or prepared_body != reviewed_body:
+            if (
+                (legacy_split is None and not completed_split_normalization)
+                or prepared_body != reviewed_body
+            ):
                 raise LinearProjectionError(
                     "terminal_child_evidence_seed_review_stale_reload_required"
                 )
@@ -3390,7 +3628,14 @@ def reconcile_required_projection(
                 continue
             current = active_heads.get(identity)
             if identity[0] == "evidence_contract" and identity[1] in seed_keys:
-                if current is not None and current["value"] != item["value"]:
+                if (
+                    current is not None
+                    and current["value"] != item["value"]
+                    and not _gen14_frontier_only_evidence_normalization(
+                        current["value"], item["value"],
+                        enabled=completed_split_normalization,
+                    )
+                ):
                     raise LinearProjectionError(
                         f"terminal_child_evidence_seed_replacement_forbidden:"
                         f"{identity[1]}"

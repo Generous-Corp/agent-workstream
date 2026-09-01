@@ -66,6 +66,7 @@ LOCATOR_AUTHORIZATION = {
 
 class FakeClient:
     def __init__(self):
+        self.token = TOKEN
         self.description = (
             "Human context before.\n\nCanonical plan: " + PINNED
             + "\n\nPlan revision: " + "f" * 64 + "\nHuman context after."
@@ -78,11 +79,13 @@ class FakeClient:
         self.calls: list[tuple[str, dict]] = []
         self.after_issue_update = None
         self.before_comment_create = None
+        self.comment_updates_root = True
+        self.lose_issue_update_response_once = False
 
     def root(self):
         return {
-            "id": ROOT_ID, "identifier": TOKEN, "title": "Root",
-            "description": self.description, "url": "https://linear.test/GEN-14",
+            "id": ROOT_ID, "identifier": self.token, "title": "Root",
+            "description": self.description, "url": f"https://linear.test/{self.token}",
             "updatedAt": self.updated_at, "archivedAt": None, "parent": None,
             "project": {"id": "project"},
             "team": {"id": "team", "organization": {"id": "workspace"}},
@@ -108,7 +111,7 @@ class FakeClient:
             }}}
         if "WorkstreamDeltaComments" in query:
             return {"issue": {
-                "id": ROOT_ID, "identifier": TOKEN,
+                "id": ROOT_ID, "identifier": self.token,
                 "team": {"id": "team", "organization": {"id": "workspace"}},
                 "project": {"id": "project"},
                 "comments": {"nodes": deepcopy(self.comments), "pageInfo": {
@@ -127,9 +130,12 @@ class FakeClient:
                 raise LinearTransportError("comment id collision")
             existing = {
                 "id": value["id"], "body": value["body"],
-                "createdAt": "reservation", "updatedAt": "reservation",
+                "createdAt": "reservation-created",
+                "updatedAt": "reservation-root-clock",
             }
             self.comments.append(existing)
+            if self.comment_updates_root:
+                self.updated_at = "reservation-root-clock"
             return {"commentCreate": {"success": True, "comment": deepcopy(existing)}}
         if "WorkstreamRootTransitionState" in query:
             return {
@@ -148,6 +154,9 @@ class FakeClient:
             self.updated_at = "after"
             if self.after_issue_update is not None:
                 self.after_issue_update()
+            if self.lose_issue_update_response_once:
+                self.lose_issue_update_response_once = False
+                raise LinearTransportError("response lost after accepted issue update")
             return {"issueUpdate": {"success": True, "issue": self.root()}}
         raise AssertionError(query)
 
@@ -289,6 +298,109 @@ class RootTransitionTests(unittest.TestCase):
         self.assertEqual(current.comments, comments_before)
         self.assertFalse(any(
             "WorkstreamRootTransition(" in query for query, _ in current.calls
+        ))
+
+    def test_locator_reconcile_tolerates_only_its_own_updated_at_drift(self):
+        def production_transport(fake):
+            fake.token = "GEN-37"
+            fake.comment_updates_root = True
+            return RootTransitionTransport(
+                fake, token="GEN-37", authority=AUTHORITY,
+                operator_authorization=LOCATOR_AUTHORIZATION,
+            )
+
+        applied = FakeClient()
+        transport = production_transport(applied)
+        preview = transport.preview(
+            operation="reconcile-plan-url", target=ACTIVE_PINNED,
+        )
+        result = transport.apply(
+            operation="reconcile-plan-url", target=ACTIVE_PINNED,
+            expected_snapshot_sha256=preview["expected_snapshot_sha256"],
+            expected_frontier_sha256=preview["expected_frontier_sha256"],
+            expected_intent_sha256=preview["intent_sha256"],
+        )
+        self.assertEqual(result["result"], "applied_or_exact_replay")
+        self.assertIn("Canonical plan: " + ACTIVE_PINNED, applied.description)
+        self.assertEqual(len([
+            item for item in applied.comments
+            if item["id"] == preview["reservation_slot_id"]
+        ]), 1)
+
+        response_lost = FakeClient()
+        replay_transport = production_transport(response_lost)
+        replay_preview = replay_transport.preview(
+            operation="reconcile-plan-url", target=ACTIVE_PINNED,
+        )
+        replay_args = {
+            "operation": "reconcile-plan-url", "target": ACTIVE_PINNED,
+            "expected_snapshot_sha256": replay_preview["expected_snapshot_sha256"],
+            "expected_frontier_sha256": replay_preview["expected_frontier_sha256"],
+            "expected_intent_sha256": replay_preview["intent_sha256"],
+        }
+        response_lost.lose_issue_update_response_once = True
+        with self.assertRaisesRegex(LinearTransportError, "response lost"):
+            replay_transport.apply(**replay_args)
+        issue_writes = sum(
+            "WorkstreamRootTransition(" in query for query, _ in response_lost.calls
+        )
+        replay = replay_transport.apply(**replay_args)
+        self.assertEqual(replay["result"], "applied_or_exact_replay")
+        self.assertEqual(sum(
+            "WorkstreamRootTransition(" in query for query, _ in response_lost.calls
+        ), issue_writes)
+        self.assertEqual(len([
+            item for item in response_lost.comments
+            if item["id"] == replay_preview["reservation_slot_id"]
+        ]), 1)
+
+        concurrent = FakeClient()
+        concurrent_transport = production_transport(concurrent)
+        concurrent_preview = concurrent_transport.preview(
+            operation="reconcile-plan-url", target=ACTIVE_PINNED,
+        )
+
+        def external_drift():
+            concurrent.description += "\nConcurrent external edit."
+            concurrent.updated_at = "external"
+
+        concurrent_transport.after_reservation_created = external_drift
+        with self.assertRaisesRegex(
+            RootTransitionError, "root_transition_prewrite_drift",
+        ):
+            concurrent_transport.apply(
+                operation="reconcile-plan-url", target=ACTIVE_PINNED,
+                expected_snapshot_sha256=concurrent_preview["expected_snapshot_sha256"],
+                expected_frontier_sha256=concurrent_preview["expected_frontier_sha256"],
+                expected_intent_sha256=concurrent_preview["intent_sha256"],
+            )
+        self.assertFalse(any(
+            "WorkstreamRootTransition(" in query for query, _ in concurrent.calls
+        ))
+        self.assertEqual(len([
+            item for item in concurrent.comments
+            if item["id"] == concurrent_preview["reservation_slot_id"]
+        ]), 1)
+
+        clock_only = FakeClient()
+        clock_transport = production_transport(clock_only)
+        clock_preview = clock_transport.preview(
+            operation="reconcile-plan-url", target=ACTIVE_PINNED,
+        )
+        clock_transport.after_reservation_created = lambda: setattr(
+            clock_only, "updated_at", "external-clock-only",
+        )
+        with self.assertRaisesRegex(
+            RootTransitionError, "root_transition_prewrite_drift",
+        ):
+            clock_transport.apply(
+                operation="reconcile-plan-url", target=ACTIVE_PINNED,
+                expected_snapshot_sha256=clock_preview["expected_snapshot_sha256"],
+                expected_frontier_sha256=clock_preview["expected_frontier_sha256"],
+                expected_intent_sha256=clock_preview["intent_sha256"],
+            )
+        self.assertFalse(any(
+            "WorkstreamRootTransition(" in query for query, _ in clock_only.calls
         ))
 
     def test_locator_reconcile_preserves_one_markdown_link(self):
@@ -761,6 +873,14 @@ class RootTransitionTests(unittest.TestCase):
                 operator_authorization=OPERATOR_AUTHORIZATION,
                 after_reservation_created=crash,
             ).apply(**args)
+        reservation = next(
+            item for item in fake.comments
+            if item["id"] == preview["reservation_slot_id"]
+        )
+        self.assertNotEqual(
+            reservation["createdAt"], reservation["updatedAt"],
+        )
+        self.assertEqual(fake.updated_at, reservation["updatedAt"])
         with self.assertRaisesRegex(
             RootTransitionError, "reservation_pending_review_new_preview_required"
         ):

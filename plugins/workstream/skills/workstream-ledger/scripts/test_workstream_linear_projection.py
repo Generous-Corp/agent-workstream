@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import nullcontext
 from copy import deepcopy
 import hashlib
 import io
@@ -1344,6 +1345,36 @@ class ProjectionTests(unittest.TestCase):
         self.assertFalse(result["resume_authority_verified"])
         self.assertEqual(result["projection_revision"], 10)
         self.assertEqual(len(result["writes"]), 10)
+
+    def test_decoded_receipts_compute_predecessor_contract_without_writes(self):
+        client, current, _source, graph, _children, manifest, binding = (
+            self.mixed_head_plan_generation_fixture()
+        )
+        scope = next(
+            item["value"] for item in manifest["projection"]
+            if (item["kind"], item["key"]) == ("scope", "root")
+        )
+        contracts = {
+            item["key"]: item["value"] for item in manifest["projection"]
+            if item["kind"] == "evidence_contract"
+        }
+        writes_before = sum(
+            "mutation " in query for query, _variables in client.calls
+        )
+        decoded = current.state()
+        computed, _authorities = terminal_child_evidence_seed_predecessor_contract(
+            graph, decoded, deepcopy(client.comments), workstream_id="GEN-37",
+            predecessor_plan_revision="b" * 64, desired_scope=scope,
+            seeds=manifest["terminal_child_evidence_seeds"],
+            desired_contracts=contracts,
+        )
+        self.assertEqual(computed, binding)
+        self.assertTrue(all(
+            {"id", "body"} <= set(comment) for comment in client.comments
+        ))
+        self.assertEqual(sum(
+            "mutation " in query for query, _variables in client.calls
+        ), writes_before)
 
     def run_mixed_head_seed_reconcile(
         self, client, adapter, source, graph, manifest, binding,
@@ -3492,6 +3523,10 @@ class ProjectionTests(unittest.TestCase):
         client, adapter, source, graph, _children, manifest, new_head = (
             self.terminal_seed_head_transition_fixture()
         )
+        self.assertNotIn(
+            "created_at",
+            manifest["terminal_child_evidence_seed_head_transition"],
+        )
         prepared = prepare_terminal_child_evidence_seeds(
             manifest, graph, adapter.state(), remote_head=new_head,
         )
@@ -3935,19 +3970,20 @@ class ProjectionTests(unittest.TestCase):
         )
 
     def test_gen14_legacy_split_prefix_replays_exact_disposition_then_scope(self):
-        plan, frontier = "e" * 64, "f" * 64
+        class Gen14ProjectionClient(FakeProjectionClient):
+            def execute(self, query, variables):
+                response = super().execute(query, variables)
+                if "query WorkstreamDeltaComments" in query:
+                    response["issue"]["identifier"] = "GEN-14"
+                return response
+
+        plan = "e" * 64
+        stored_frontier, frontier = "d" * 64, "f" * 64
         old_disposition_head, old_scope_head, new_head = (
             "a" * 40, "b" * 40, "c" * 40,
         )
         prefix_time = "2030-01-01T00:00:00Z"
         predecessor_plan = "f" * 64
-        predecessor_events = [build_projection_event(
-            workstream_id="GEN-14", kind="provenance", key=f"pred-{index}",
-            value={"agent": "synthetic", "machine": "predecessor",
-                   "session_id": f"pred-{index}"},
-            plan_revision=predecessor_plan, expected_revision=index,
-            created_at="2029-12-31T23:00:00Z", authority=AUTHORITY,
-        ) for index in range(11)]
         old_scope = {
             "primary_repository": "github.com:id:R_synthetic",
             "repositories": [{"provider_repository_id": "R_synthetic",
@@ -3966,32 +4002,145 @@ class ProjectionTests(unittest.TestCase):
             "child_ownership": {
                 "GEN-1": "github.com:id:R_synthetic",
                 "GEN-2": "github.com:id:R_synthetic",
-            }, "linear": deepcopy(AUTHORITY),
+            }, "linear": deepcopy(scope()["linear"]),
             "namespace": "synthetic",
         }
-        predecessor = {
-            "schema_version": 1, "plan_revision": predecessor_plan,
-            "projection_revision": len(predecessor_events),
-            "projection_events_sha256": canonical_digest(predecessor_events),
-            "projection_frontier_event_id": predecessor_events[-1]["event_id"],
-            "projection_frontier_sha256": canonical_digest(
-                predecessor_events[-1]
-            ),
-            "projection_history_sha256": canonical_digest(predecessor_events),
-            "material_revision": 180, "material_events_sha256": "4" * 64,
-            "checkpoint_event_id": "wsc_checkpoint",
-            "checkpoint_events_sha256": "5" * 64,
-            "input_frontier_sha256": frontier,
-            "evidence_heads": [{
-                "child_identifier": child, "key": key,
-                "evidence_event_id": "wsp_" + str(index + 2) * 32,
-                "evidence_value_sha256": str(index + 6) * 64,
-                "closure_event_id": "wsp_" + str(index + 4) * 32,
-                "closure_value_sha256": str(index + 8) * 64,
-            } for index, (key, child) in enumerate(
-                (("one", "GEN-1"), ("two", "GEN-2"))
-            )],
+        children = [{
+            "identifier": child,
+            "id": f"00000000-0000-4000-8000-00000000000{index}",
+            "parent": {"id": ROOT_UUID},
+            "team": {
+                "id": AUTHORITY["team_id"],
+                "organization": {"id": AUTHORITY["workspace_id"]},
+            },
+            "project": {"id": AUTHORITY["project_id"]},
+            "assignee": None, "state_id": f"state-{index}",
+            "status": "Done", "status_type": "completed",
+        } for index, child in enumerate(("GEN-1", "GEN-2"), start=1)]
+        snapshot = {
+            "root": {"id": ROOT_UUID, "identifier": "GEN-14", "revision": 1},
+            "children": children,
         }
+        predecessor_client = Gen14ProjectionClient()
+        predecessor_adapter = LinearProjectionAdapter(
+            predecessor_client, issue_id="GEN-14", workstream_id="GEN-14",
+            plan_revision=predecessor_plan, **AUTHORITY,
+        )
+
+        def append_predecessor(kind, key, value):
+            predecessor_adapter.append(build_projection_event(
+                workstream_id="GEN-14", kind=kind, key=key, value=value,
+                plan_revision=predecessor_plan,
+                expected_revision=predecessor_adapter.state().revision,
+                created_at="2029-12-31T22:00:00Z", authority=AUTHORITY,
+            ))
+
+        append_predecessor("scope", "root", deepcopy(old_scope))
+        append_predecessor("source", "root", {
+            "identity": "https://example.test/predecessor",
+            "sha256": predecessor_plan,
+        })
+        append_predecessor("provenance", "synthetic", {
+            "agent": "synthetic", "machine": "predecessor",
+            "session_id": "predecessor",
+        })
+        append_predecessor("disposition", "root", {
+            "disposition": "create_successor", "remote_head": old_scope_head,
+            "recovered_from_checkpoint": None,
+        })
+        predecessor_contracts = {}
+        for key, child in zip(("one", "two"), children):
+            contract_value = evidence_contract()
+            contract_value.update({
+                "slice_id": key, "owning_child": child["identifier"],
+                "repository": "github.com/acme/synthetic",
+                "repository_key": old_scope["primary_repository"],
+                "plan_revision": predecessor_plan,
+                "exact_head": old_scope_head,
+            })
+            for layer in contract_value["layers"].values():
+                for receipt in layer.get("receipts", []):
+                    receipt["repository_key"] = contract_value["repository_key"]
+                    receipt["exact_head"] = contract_value["exact_head"]
+            append_predecessor("evidence_contract", key, contract_value)
+            evidence_event = predecessor_adapter.state().events[-1]
+            readback = terminal_child_readback(child)
+            append_predecessor("child_closure", child["identifier"], {
+                "schema_version": 2, **readback,
+                "plan_revision": predecessor_plan,
+                "repository_key": contract_value["repository_key"],
+                "exact_head": old_scope_head,
+                "evidence_heads": [{
+                    "key": key, "event_id": evidence_event["event_id"],
+                    "value_sha256": canonical_digest(evidence_event["value"]),
+                }],
+                "evidence_receipts_sha256": evidence_receipts_sha256([
+                    contract_value,
+                ]),
+                "child_readback_sha256": canonical_digest(readback),
+            })
+            predecessor_contracts[key] = contract_value
+        predecessor_events = list(predecessor_adapter.state().events)
+        material = Delta(
+            "gen14-predecessor", "GEN-14", "requirement", "agent",
+            {"text": "Reconcile the captured successor."}, 0,
+            "2029-12-31T22:30:00Z",
+        )
+        checkpoint = build_checkpoint(
+            workstream_id="GEN-14", boundary_id="gen14-predecessor",
+            root_revision=1, plan_revision=predecessor_plan,
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "synthetic", "provider": "test",
+                "session_id": "predecessor", "machine": "test",
+                "worktree": {
+                    "state": "safe", "path": "/worktree",
+                    "branch": "predecessor", "head": old_scope_head,
+                },
+            },
+            exact_head=old_scope_head, evidence=[], blocker=None,
+            next_action="Reconcile the captured successor.",
+        )
+        supporting_comments = [{
+            "id": "material-gen14-predecessor",
+            "body": encode_event_comment(material),
+            "createdAt": "2029-12-31T22:31:00Z",
+            "updatedAt": "2029-12-31T22:31:00Z",
+        }, {
+            "id": "checkpoint-gen14-predecessor",
+            "body": encode_checkpoint_comment(checkpoint),
+            "createdAt": "2029-12-31T22:32:00Z",
+            "updatedAt": "2029-12-31T22:32:00Z",
+        }]
+        predecessor_client.comments.extend(deepcopy(supporting_comments))
+        target_before_prefix = LinearProjectionAdapter(
+            predecessor_client, issue_id="GEN-14", workstream_id="GEN-14",
+            plan_revision=plan, **AUTHORITY,
+        )
+        desired_scope = deepcopy(old_scope)
+        next(repository for repository in desired_scope["repositories"]
+             if repository_key(repository) == desired_scope["primary_repository"]
+             )["exact_head"] = new_head
+        seeds = [{
+            "child_identifier": child["identifier"],
+            "child_issue_id": child["id"],
+            "expected_child_readback_sha256": canonical_digest(
+                terminal_child_readback(child)
+            ),
+            "expected_assignee_id": None, "evidence_keys": [key],
+        } for key, child in zip(("one", "two"), children)]
+        desired_contracts = {}
+        for key, contract_value in predecessor_contracts.items():
+            desired_contracts[key] = deepcopy(contract_value)
+            desired_contracts[key]["plan_revision"] = plan
+        predecessor, _authorities = terminal_child_evidence_seed_predecessor_contract(
+            snapshot, target_before_prefix.state(), predecessor_client.comments,
+            workstream_id="GEN-14",
+            predecessor_plan_revision=predecessor_plan,
+            desired_scope=desired_scope, seeds=seeds,
+            desired_contracts=desired_contracts,
+        )
+        frontier = predecessor["input_frontier_sha256"]
         common_authority = {
             "schema_version": 1,
             "predecessor_plan_revision": predecessor["plan_revision"],
@@ -4020,16 +4169,11 @@ class ProjectionTests(unittest.TestCase):
         }
         evidence_values = []
         for head in predecessor["evidence_heads"]:
-            contract_value = evidence_contract()
+            contract_value = deepcopy(desired_contracts[head["key"]])
             contract_value.update({
-                "slice_id": head["key"],
-                "owning_child": head["child_identifier"],
-                "repository": "github.com/acme/synthetic",
-                "repository_key": "github.com:id:R_synthetic",
-                "plan_revision": plan,
-                "exact_head": old_scope_head,
                 "predecessor_closure_authority": {
                 **common_authority,
+                "input_frontier_sha256": stored_frontier,
                 "predecessor_evidence_event_id": head["evidence_event_id"],
                 "predecessor_evidence_value_sha256": head[
                     "evidence_value_sha256"
@@ -4046,7 +4190,7 @@ class ProjectionTests(unittest.TestCase):
                     receipt["exact_head"] = contract_value["exact_head"]
             evidence_values.append(contract_value)
         values = evidence_values + [
-            {"agent": "synthetic", "machine": "test", "session_id": "session"},
+            deepcopy(predecessor_events[2]["value"]),
             {"identity": "https://example.test/plan", "sha256": plan},
             {"disposition": "create_successor",
              "remote_head": old_disposition_head,
@@ -4070,6 +4214,28 @@ class ProjectionTests(unittest.TestCase):
         workstream_generation.GEN14_LEGACY_SPLIT_PREFIX_SHA256 = (
             canonical_digest(events)
         )
+        original_projection_stored = (
+            workstream_projection.GEN14_SPLIT_STORED_FRONTIER_SHA256
+        )
+        original_projection_recomputed = (
+            workstream_projection.GEN14_SPLIT_RECOMPUTED_FRONTIER_SHA256
+        )
+        original_generation_stored = (
+            workstream_generation.GEN14_LEGACY_SPLIT_STORED_FRONTIER_SHA256
+        )
+        original_generation_recomputed = (
+            workstream_generation.GEN14_LEGACY_SPLIT_RECOMPUTED_FRONTIER_SHA256
+        )
+        workstream_projection.GEN14_SPLIT_STORED_FRONTIER_SHA256 = (
+            stored_frontier
+        )
+        workstream_projection.GEN14_SPLIT_RECOMPUTED_FRONTIER_SHA256 = frontier
+        workstream_generation.GEN14_LEGACY_SPLIT_STORED_FRONTIER_SHA256 = (
+            stored_frontier
+        )
+        workstream_generation.GEN14_LEGACY_SPLIT_RECOMPUTED_FRONTIER_SHA256 = (
+            frontier
+        )
         self.addCleanup(
             setattr, workstream_projection, "GEN14_SPLIT_PREFIX_SHA256",
             original_digest,
@@ -4077,6 +4243,25 @@ class ProjectionTests(unittest.TestCase):
         self.addCleanup(
             setattr, workstream_generation,
             "GEN14_LEGACY_SPLIT_PREFIX_SHA256", original_generation_digest,
+        )
+        self.addCleanup(
+            setattr, workstream_projection,
+            "GEN14_SPLIT_STORED_FRONTIER_SHA256", original_projection_stored,
+        )
+        self.addCleanup(
+            setattr, workstream_projection,
+            "GEN14_SPLIT_RECOMPUTED_FRONTIER_SHA256",
+            original_projection_recomputed,
+        )
+        self.addCleanup(
+            setattr, workstream_generation,
+            "GEN14_LEGACY_SPLIT_STORED_FRONTIER_SHA256",
+            original_generation_stored,
+        )
+        self.addCleanup(
+            setattr, workstream_generation,
+            "GEN14_LEGACY_SPLIT_RECOMPUTED_FRONTIER_SHA256",
+            original_generation_recomputed,
         )
         state = SimpleNamespace(revision=6, events=events, snapshot={})
         contract = projection_review_contract(state)
@@ -4112,66 +4297,10 @@ class ProjectionTests(unittest.TestCase):
                 for event in events if event["kind"] != "disposition"
             ],
             "retirements": [],
-            "terminal_child_evidence_seeds": [{
-                "child_identifier": child,
-                "child_issue_id": f"00000000-0000-4000-8000-00000000000{index}",
-                "expected_child_readback_sha256": str(index + 7) * 64,
-                "expected_assignee_id": None, "evidence_keys": [key],
-            } for index, (key, child) in enumerate(
-                (("one", "GEN-1"), ("two", "GEN-2")), start=1
-            )],
+            "terminal_child_evidence_seeds": deepcopy(seeds),
             "terminal_child_evidence_seed_predecessor": predecessor,
             "terminal_child_evidence_seed_legacy_split_head_repair": transition,
         }
-        producer_values = [
-            deepcopy(old_scope),
-            {"identity": "https://example.test/predecessor",
-             "sha256": predecessor_plan},
-            deepcopy(values[2]),
-            {"disposition": "create_successor",
-             "remote_head": old_scope_head,
-             "recovered_from_checkpoint": None},
-            *[{**deepcopy(value), "plan_revision": predecessor_plan}
-              for value in evidence_values],
-            *[{
-                "child_identifier": child,
-                "plan_revision": predecessor_plan,
-                "repository_key": old_scope["primary_repository"],
-                "exact_head": old_scope_head,
-            } for child in ("GEN-1", "GEN-2")],
-        ]
-        for value in producer_values[4:6]:
-            value.pop("predecessor_closure_authority", None)
-        producer_identities = [
-            ("scope", "root"), ("source", "root"),
-            ("provenance", "synthetic"), ("disposition", "root"),
-            ("evidence_contract", "one"), ("evidence_contract", "two"),
-            ("child_closure", "GEN-1"), ("child_closure", "GEN-2"),
-        ]
-        producer_predecessor_events = [build_projection_event(
-            workstream_id="GEN-14", kind=kind, key=key, value=value,
-            plan_revision=predecessor_plan, expected_revision=index,
-            created_at="2029-12-31T22:00:00Z", authority=AUTHORITY,
-        ) for index, ((kind, key), value) in enumerate(zip(
-            producer_identities[:6], producer_values[:6],
-        ))]
-        producer_predecessor_events.extend({
-            "schema_version": 2, "workstream_id": "GEN-14",
-            "kind": kind, "key": key, "value": value,
-            "plan_revision": predecessor_plan,
-            "expected_revision": index,
-            "created_at": "2029-12-31T22:00:00Z",
-            "authority": deepcopy(AUTHORITY),
-            "supersedes_event_id": None,
-            "event_id": "wsp_" + str(index) * 32,
-        } for index, ((kind, key), value) in enumerate(zip(
-            producer_identities[6:], producer_values[6:],
-        ), start=6))
-        producer_predecessor_state = SimpleNamespace(
-            revision=len(producer_predecessor_events),
-            events=producer_predecessor_events,
-            snapshot={"projection_history": predecessor_events},
-        )
         workstream_projection._reviewed_manifest(manifest)
         workstream_projection._validate_gen14_legacy_split_repair_prefix(
             manifest, state, desired_scope,
@@ -4184,7 +4313,7 @@ class ProjectionTests(unittest.TestCase):
             supersedes_event_id=events[4]["event_id"],
             authority=AUTHORITY,
         )
-        scope = build_projection_event(
+        repair_scope_event = build_projection_event(
             workstream_id="GEN-14", kind="scope", key="root",
             value=desired_scope,
             plan_revision=plan,
@@ -4192,7 +4321,7 @@ class ProjectionTests(unittest.TestCase):
             supersedes_event_id=events[5]["event_id"],
             authority=AUTHORITY,
         )
-        for tail in ([disposition], [disposition, scope]):
+        for tail in ([disposition], [disposition, repair_scope_event]):
             replay = SimpleNamespace(
                 revision=6 + len(tail), events=[*events, *tail], snapshot={},
             )
@@ -4205,114 +4334,82 @@ class ProjectionTests(unittest.TestCase):
                 regenerated, replay, desired_scope,
             )
         self.assertEqual(disposition["supersedes_event_id"], events[4]["event_id"])
-        self.assertEqual(scope["supersedes_event_id"], events[5]["event_id"])
+        self.assertEqual(
+            repair_scope_event["supersedes_event_id"], events[5]["event_id"],
+        )
 
-        snapshot = {
-            "root": {"identifier": "GEN-14"},
-            "children": [{
-                "identifier": seed["child_identifier"],
-                "id": seed["child_issue_id"],
-                "parent": {"id": ROOT_UUID},
-                "team": {
-                    "id": AUTHORITY["team_id"],
-                    "organization": {"id": AUTHORITY["workspace_id"]},
-                },
-                "project": {"id": AUTHORITY["project_id"]},
-                "assignee": None,
-                "state_id": f"state-{index}",
-                "status": "Done",
-                "status_type": "completed",
-            } for index, seed in enumerate(
-                manifest["terminal_child_evidence_seeds"], start=1
-            )],
-        }
-        for seed, child in zip(
-            manifest["terminal_child_evidence_seeds"], snapshot["children"],
-        ):
-            seed["expected_child_readback_sha256"] = canonical_digest(
-                terminal_child_readback(child)
-            )
         source = {"identity": values[3]["identity"], "sha256": plan}
         readbacks = {
             seed["child_identifier"]: seed["expected_child_readback_sha256"]
             for seed in manifest["terminal_child_evidence_seeds"]
         }
-        authorities = {
-            head["key"]: {
-                "evidence_event_id": head["evidence_event_id"],
-                "evidence_value_sha256": head["evidence_value_sha256"],
-                "closure_event_id": head["closure_event_id"],
-                "closure_value_sha256": head["closure_value_sha256"],
-            } for head in predecessor["evidence_heads"]
-        }
-
-        class Gen14ProjectionClient(FakeProjectionClient):
-            def execute(self, query, variables):
-                response = super().execute(query, variables)
-                if "query WorkstreamDeltaComments" in query:
-                    response["issue"]["identifier"] = "GEN-14"
-                return response
-
-        def adapter_with_tail(tail):
+        def adapter_with_tail(tail, *, prefix_events=events, extra_comments=()):
             client = Gen14ProjectionClient()
             client.comments = [
-                projection_comment(event)
-                for event in [*predecessor_events, *events, *tail]
-            ]
+                {
+                    **projection_comment(event),
+                    "createdAt": f"2030-01-01T00:00:{index:02d}Z",
+                    "updatedAt": f"2030-01-01T00:00:{index:02d}Z",
+                }
+                for index, event in enumerate(
+                    [*predecessor_events, *prefix_events, *tail]
+                )
+            ] + deepcopy(supporting_comments) + deepcopy(list(extra_comments))
             return client, LinearProjectionAdapter(
                 client, issue_id="GEN-14", workstream_id="GEN-14",
                 plan_revision=plan, **AUTHORITY,
             )
 
         def prepared_operator_contract(adapter, requested_head, requested_at):
-            target_state = adapter.state()
-            with mock.patch.object(
-                workstream_generation, "reduce_projection_comments",
-                side_effect=lambda _comments, **kwargs: (
-                    producer_predecessor_state
-                    if kwargs["expected_plan_revision"] == predecessor_plan
-                    else target_state
-                ),
-            ), mock.patch.object(
-                workstream_projection,
-                "terminal_child_evidence_seed_predecessor_contract",
-                return_value=(predecessor, authorities),
-            ):
-                return prepare_generation_operator_contract(
-                    comments=deepcopy(adapter.client.comments),
-                    graph=deepcopy(snapshot), workstream_id="GEN-14",
-                    authority=AUTHORITY,
-                    description_plan_revision=predecessor_plan,
-                    target_source=source, created_at=requested_at,
-                    remote_head=requested_head,
-                    started_state={
-                        "id": "state-started", "name": "In Progress",
-                        "type": "started", "team_id": AUTHORITY["team_id"],
-                    },
-                )
+            return prepare_generation_operator_contract(
+                comments=deepcopy(adapter.client.comments),
+                graph=deepcopy(snapshot), workstream_id="GEN-14",
+                authority=AUTHORITY,
+                description_plan_revision=predecessor_plan,
+                target_source=source, created_at=requested_at,
+                remote_head=requested_head,
+                started_state={
+                    "id": "state-started", "name": "In Progress",
+                    "type": "started", "team_id": AUTHORITY["team_id"],
+                },
+            )
 
         def apply_operator_contract(adapter, operator):
             preview = operator["projection_preview"]
-            with mock.patch.object(
-                workstream_projection,
-                "terminal_child_evidence_seed_predecessor_contract",
-                return_value=(predecessor, authorities),
-            ):
-                return reconcile_required_projection(
-                    adapter, snapshot, preview["manifest"],
-                    **preview["invocation"], authenticated_source=source,
-                    terminal_child_fence=lambda child_ids: {
-                        child_id: readbacks[child_id] for child_id in child_ids
-                    },
-                    projection_input_fence=lambda: frontier,
-                    checkpoint_fence=lambda: None,
-                    projection_comments=adapter.client.comments,
-                    projection_input_snapshot=snapshot,
-                )
+            return reconcile_required_projection(
+                adapter, snapshot, preview["manifest"],
+                **preview["invocation"], authenticated_source=source,
+                terminal_child_fence=lambda child_ids: {
+                    child_id: readbacks[child_id] for child_id in child_ids
+                },
+                projection_input_fence=lambda: frontier,
+                checkpoint_fence=lambda: None,
+                projection_comments=adapter.client.comments,
+                projection_input_snapshot=snapshot,
+            )
 
         _fresh_client, fresh_adapter = adapter_with_tail([])
+        self.assertTrue(all(
+            {"id", "body", "createdAt", "updatedAt"} <= set(comment)
+            for comment in _fresh_client.comments
+        ))
+        decoded_prefix = list(fresh_adapter.state().events[:6])
+        self.assertEqual(decoded_prefix, events)
+        self.assertEqual(canonical_digest(decoded_prefix), canonical_digest(events))
         fresh_operator = prepared_operator_contract(
             fresh_adapter, new_head, transition["created_at"],
+        )
+        self.assertEqual(
+            fresh_operator["projection_preview"]["manifest"][
+                "terminal_child_evidence_seed_predecessor"
+            ],
+            predecessor,
+        )
+        self.assertEqual(
+            fresh_operator["projection_preview"]["manifest"][
+                "terminal_child_evidence_seed_legacy_split_head_repair"
+            ]["input_frontier_sha256"],
+            frontier,
         )
         fresh_before = fresh_adapter.state().revision
         fresh_result = apply_operator_contract(fresh_adapter, fresh_operator)
@@ -4322,6 +4419,165 @@ class ProjectionTests(unittest.TestCase):
             [("disposition", "root"), ("scope", "root")],
         )
         self.assertEqual(len(fresh_result["writes"]), 2)
+
+        def rebuilt_prefix(*, value_updates=None, plan_updates=None,
+                           authority_updates=None):
+            value_updates = value_updates or {}
+            plan_updates = plan_updates or {}
+            authority_updates = authority_updates or {}
+            return [build_projection_event(
+                workstream_id="GEN-14", kind=event["kind"], key=event["key"],
+                value=deepcopy(value_updates.get(index, event["value"])),
+                plan_revision=plan_updates.get(index, event["plan_revision"]),
+                expected_revision=index, created_at=event["created_at"],
+                authority=deepcopy(authority_updates.get(
+                    index, event["authority"],
+                )),
+            ) for index, event in enumerate(events)]
+
+        def assert_decoded_refusal(prefix_events, operator, error,
+                                   *, prefix_digest=None):
+            bad_client, bad_adapter = adapter_with_tail(
+                [], prefix_events=prefix_events,
+            )
+            writes_before = sum(
+                "mutation " in query for query, _variables in bad_client.calls
+            )
+            patcher = (
+                mock.patch.object(
+                    workstream_projection, "GEN14_SPLIT_PREFIX_SHA256",
+                    prefix_digest,
+                ) if prefix_digest is not None else nullcontext()
+            )
+            with patcher, self.assertRaisesRegex(
+                (LinearProjectionError, ValueError), error,
+            ):
+                apply_operator_contract(bad_adapter, operator)
+            self.assertEqual(sum(
+                "mutation " in query for query, _variables in bad_client.calls
+            ), writes_before)
+
+        def assert_decoded_producer_refusal(
+            prefix_events, requested_head, error, *, prefix_digest=None,
+            extra_comments=(),
+        ):
+            bad_client, bad_adapter = adapter_with_tail(
+                [], prefix_events=prefix_events, extra_comments=extra_comments,
+            )
+            writes_before = sum(
+                "mutation " in query for query, _variables in bad_client.calls
+            )
+            patcher = (
+                mock.patch.object(
+                    workstream_generation,
+                    "GEN14_LEGACY_SPLIT_PREFIX_SHA256", prefix_digest,
+                ) if prefix_digest is not None else nullcontext()
+            )
+            with patcher, self.assertRaisesRegex(
+                (
+                    LinearProjectionError,
+                    workstream_generation.WorkstreamGenerationError,
+                    ValueError,
+                ),
+                error,
+            ):
+                prepared_operator_contract(
+                    bad_adapter, requested_head, transition["created_at"],
+                )
+            self.assertEqual(sum(
+                "mutation " in query for query, _variables in bad_client.calls
+            ), writes_before)
+
+        wrong_prefix_value = deepcopy(events[2]["value"])
+        wrong_prefix_value["machine"] = "different-machine"
+        wrong_prefix_events = rebuilt_prefix(value_updates={2: wrong_prefix_value})
+        assert_decoded_producer_refusal(
+            wrong_prefix_events, new_head,
+            "prefix|unrelated|replacement|target_disposition",
+        )
+        assert_decoded_refusal(
+            wrong_prefix_events, fresh_operator,
+            "legacy_split_head_repair_prefix_mismatch",
+        )
+
+        wrong_stored_value_one = deepcopy(events[0]["value"])
+        wrong_stored_value_two = deepcopy(events[1]["value"])
+        for value in (wrong_stored_value_one, wrong_stored_value_two):
+            value["predecessor_closure_authority"][
+                "input_frontier_sha256"
+            ] = "7" * 64
+        wrong_stored_prefix = rebuilt_prefix(value_updates={
+            0: wrong_stored_value_one, 1: wrong_stored_value_two,
+        })
+        assert_decoded_producer_refusal(
+            wrong_stored_prefix, new_head,
+            "generation_prepare_legacy_split_head_stored_frontier_changed",
+            prefix_digest=canonical_digest(wrong_stored_prefix),
+        )
+        assert_decoded_refusal(
+            wrong_stored_prefix, fresh_operator,
+            "legacy_split_head_repair_stored_frontier_mismatch",
+            prefix_digest=canonical_digest(wrong_stored_prefix),
+        )
+
+        wrong_recomputed_operator = deepcopy(fresh_operator)
+        wrong_recomputed_operator["projection_preview"]["manifest"][
+            "terminal_child_evidence_seed_legacy_split_head_repair"
+        ]["input_frontier_sha256"] = "8" * 64
+        wrong_recomputed_operator["projection_preview"]["manifest"][
+            "terminal_child_evidence_seed_predecessor"
+        ]["input_frontier_sha256"] = "8" * 64
+        assert_decoded_refusal(
+            events, wrong_recomputed_operator,
+            "legacy_split_head_repair_recomputed_frontier_mismatch",
+        )
+
+        wrong_plan_prefix = rebuilt_prefix(plan_updates={0: "f" * 64})
+        assert_decoded_producer_refusal(
+            wrong_plan_prefix, new_head, "plan|revision|activation|prefix",
+        )
+        assert_decoded_refusal(
+            wrong_plan_prefix, fresh_operator, "plan|revision|activation|prefix",
+        )
+        wrong_route = {**AUTHORITY, "project_id": "different-project"}
+        wrong_route_prefix = rebuilt_prefix(authority_updates={0: wrong_route})
+        assert_decoded_producer_refusal(
+            wrong_route_prefix, new_head, "route|authority|prefix",
+        )
+        assert_decoded_refusal(
+            wrong_route_prefix, fresh_operator, "route|authority|prefix",
+        )
+
+        reused_head_operator = deepcopy(fresh_operator)
+        reused_head_operator["projection_preview"]["manifest"][
+            "terminal_child_evidence_seed_legacy_split_head_repair"
+        ]["to_exact_head"] = old_scope_head
+        reused_head_operator["projection_preview"]["manifest"][
+            "terminal_child_evidence_seed_legacy_split_head_repair"
+        ]["disposition"]["remote_head"] = old_scope_head
+        assert_decoded_refusal(
+            events, reused_head_operator,
+            "invalid_terminal_child_evidence_seed_legacy_split_head_repair",
+        )
+        assert_decoded_producer_refusal(
+            events, old_scope_head, "head|transition|replacement|changed",
+        )
+
+        frontier_drift = Delta(
+            "gen14-frontier-drift", "GEN-14", "requirement", "agent",
+            {"text": "Concurrent material drift."}, 1,
+            "2030-01-01T00:30:00Z",
+        )
+        assert_decoded_producer_refusal(
+            events, new_head,
+            "generation_prepare_legacy_split_head_recomputed_frontier_changed",
+            extra_comments=[{
+                "id": "material-gen14-frontier-drift",
+                "body": encode_event_comment(frontier_drift),
+                "createdAt": "2030-01-01T00:30:00Z",
+                "updatedAt": "2030-01-01T00:30:00Z",
+            }],
+        )
 
         interrupted_client, interrupted_adapter = adapter_with_tail([disposition])
         newer_requested_head = "d" * 40
@@ -4370,6 +4626,12 @@ class ProjectionTests(unittest.TestCase):
             "terminal_child_evidence_seed_head_transition",
             later_preview["manifest"],
         )
+        self.assertEqual(
+            later_preview["manifest"][
+                "terminal_child_evidence_seed_head_transition"
+            ]["created_at"],
+            later_created_at,
+        )
         self.assertNotIn(
             "terminal_child_evidence_seed_legacy_split_head_repair",
             later_preview["manifest"],
@@ -4381,28 +4643,68 @@ class ProjectionTests(unittest.TestCase):
         later_tail = interrupted_adapter.state().events[later_before:]
         self.assertEqual(
             [(event["kind"], event["key"]) for event in later_tail],
-            [("disposition", "root"), ("scope", "root")],
+            [
+                ("evidence_contract", "one"),
+                ("evidence_contract", "two"),
+                ("disposition", "root"), ("scope", "root"),
+            ],
         )
-        self.assertEqual(len(later_result["writes"]), 2)
-
-        _crash_client, crash_adapter = adapter_with_tail([
-            disposition, scope, later_tail[0],
-        ])
-        crash_operator = prepared_operator_contract(
-            crash_adapter, newer_requested_head, later_created_at,
+        self.assertEqual(len(later_result["writes"]), 4)
+        self.assertTrue(all(
+            event["value"]["predecessor_closure_authority"][
+                "input_frontier_sha256"
+            ] == frontier
+            for event in later_tail[:2]
+        ))
+        comments_before_ordinary_replay = len(interrupted_client.comments)
+        ordinary_replay = apply_operator_contract(
+            interrupted_adapter, later_operator,
         )
-        self.assertIn(
-            "terminal_child_evidence_seed_head_transition",
-            crash_operator["projection_preview"]["manifest"],
-        )
-        crash_before = crash_adapter.state().revision
-        crash_result = apply_operator_contract(crash_adapter, crash_operator)
+        self.assertEqual(ordinary_replay["writes"], [])
         self.assertEqual(
-            [(event["kind"], event["key"])
-             for event in crash_adapter.state().events[crash_before:]],
-            [("scope", "root")],
+            len(interrupted_client.comments), comments_before_ordinary_replay,
         )
-        self.assertEqual(len(crash_result["writes"]), 1)
+
+        for prefix_count in range(1, len(later_tail)):
+            with self.subTest(ordinary_prefix_count=prefix_count):
+                partial_client, partial_adapter = adapter_with_tail([
+                    disposition, repair_scope_event, *later_tail[:prefix_count],
+                ])
+                partial_operator = prepared_operator_contract(
+                    partial_adapter, newer_requested_head, later_created_at,
+                )
+                partial_result = apply_operator_contract(
+                    partial_adapter, partial_operator,
+                )
+                self.assertEqual(
+                    partial_adapter.state().events[8:], later_tail,
+                )
+                self.assertEqual(
+                    len(partial_result["writes"]),
+                    len(later_tail) - prefix_count,
+                )
+
+        bad_normalization_value = deepcopy(later_tail[0]["value"])
+        bad_normalization_value["predecessor_closure_authority"][
+            "input_frontier_sha256"
+        ] = "9" * 64
+        bad_normalization = build_projection_event(
+            workstream_id="GEN-14", kind=later_tail[0]["kind"],
+            key=later_tail[0]["key"], value=bad_normalization_value,
+            plan_revision=plan, expected_revision=8,
+            created_at=later_created_at,
+            supersedes_event_id=events[0]["event_id"], authority=AUTHORITY,
+        )
+        bad_client, bad_adapter = adapter_with_tail([
+            disposition, repair_scope_event, bad_normalization,
+        ])
+        with self.assertRaises(LinearProjectionError):
+            prepared_operator_contract(
+                bad_adapter, newer_requested_head, later_created_at,
+            )
+        self.assertFalse(any(
+            "mutation " in query for query, _variables in bad_client.calls
+        ))
 
         with mock.patch.object(
             workstream_projection, "prepare_terminal_child_repairs",
@@ -4424,7 +4726,7 @@ class ProjectionTests(unittest.TestCase):
             "wrong_disposition": [*events, {**disposition, "value": {
                 **transition["disposition"], "disposition": "attach",
             }}],
-            "wrong_order": [*events, scope],
+            "wrong_order": [*events, repair_scope_event],
         }
         for name, bad_events in planted.items():
             with self.subTest(name=name), self.assertRaises(LinearProjectionError):
@@ -4441,6 +4743,49 @@ class ProjectionTests(unittest.TestCase):
             workstream_projection._validate_gen14_legacy_split_repair_prefix(
                 manifest, SimpleNamespace(revision=6, events=drifted, snapshot={}),
                 desired_scope,
+            )
+
+        wrong_recomputed = deepcopy(manifest)
+        wrong_recomputed[
+            "terminal_child_evidence_seed_legacy_split_head_repair"
+        ]["input_frontier_sha256"] = "8" * 64
+        with mock.patch.object(
+            workstream_projection, "GEN14_SPLIT_PREFIX_SHA256",
+            canonical_digest(state.events[:6]),
+        ), mock.patch.object(
+            workstream_projection, "GEN14_SPLIT_STORED_FRONTIER_SHA256",
+            stored_frontier,
+        ), mock.patch.object(
+            workstream_projection, "GEN14_SPLIT_RECOMPUTED_FRONTIER_SHA256",
+            frontier,
+        ), self.assertRaisesRegex(
+            LinearProjectionError, "recomputed_frontier_mismatch",
+        ):
+            workstream_projection._validate_gen14_legacy_split_repair_prefix(
+                wrong_recomputed, state, desired_scope,
+            )
+
+        wrong_stored_events = deepcopy(events)
+        for event in wrong_stored_events[:2]:
+            event["value"]["predecessor_closure_authority"][
+                "input_frontier_sha256"
+            ] = "7" * 64
+        with mock.patch.object(
+            workstream_projection, "GEN14_SPLIT_PREFIX_SHA256",
+            canonical_digest(wrong_stored_events),
+        ), mock.patch.object(
+            workstream_projection, "GEN14_SPLIT_STORED_FRONTIER_SHA256",
+            stored_frontier,
+        ), mock.patch.object(
+            workstream_projection, "GEN14_SPLIT_RECOMPUTED_FRONTIER_SHA256",
+            frontier,
+        ), self.assertRaisesRegex(
+            LinearProjectionError, "stored_frontier_mismatch",
+        ):
+            workstream_projection._validate_gen14_legacy_split_repair_prefix(
+                manifest, SimpleNamespace(
+                    revision=6, events=wrong_stored_events, snapshot={},
+                ), desired_scope,
             )
 
     def test_terminal_seed_head_transition_recovers_each_evidence_prefix(self):

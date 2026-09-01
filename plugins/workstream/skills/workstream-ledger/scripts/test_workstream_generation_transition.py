@@ -325,7 +325,8 @@ class ActivationCheckpointLoader(Loader):
 class GenerationTransitionTests(unittest.TestCase):
     def test_gen14_legacy_split_producer_accepts_only_captured_prefix(self):
         from types import SimpleNamespace
-        plan, frontier = "e" * 64, "f" * 64
+        plan = "e" * 64
+        stored_frontier, frontier = "d" * 64, "f" * 64
         old_disposition_head, old_scope_head = "a" * 40, "b" * 40
         prefix_time = "2030-01-01T00:00:00Z"
         scope_value = {
@@ -349,7 +350,7 @@ class GenerationTransitionTests(unittest.TestCase):
         values = [
             {"slice_id": key, "owning_child": child,
              "predecessor_closure_authority": {
-                "input_frontier_sha256": frontier,
+                "input_frontier_sha256": stored_frontier,
             }} for key, child in (("one", "GEN-1"), ("two", "GEN-2"))
         ] + [
             {"agent": "synthetic", "machine": "test", "session_id": "session"},
@@ -373,9 +374,31 @@ class GenerationTransitionTests(unittest.TestCase):
         workstream_generation.GEN14_LEGACY_SPLIT_PREFIX_SHA256 = (
             workstream_projection.canonical_digest(events)
         )
+        original_stored_frontier = (
+            workstream_generation.GEN14_LEGACY_SPLIT_STORED_FRONTIER_SHA256
+        )
+        original_recomputed_frontier = (
+            workstream_generation.GEN14_LEGACY_SPLIT_RECOMPUTED_FRONTIER_SHA256
+        )
+        workstream_generation.GEN14_LEGACY_SPLIT_STORED_FRONTIER_SHA256 = (
+            stored_frontier
+        )
+        workstream_generation.GEN14_LEGACY_SPLIT_RECOMPUTED_FRONTIER_SHA256 = (
+            frontier
+        )
         self.addCleanup(
             setattr, workstream_generation, "GEN14_LEGACY_SPLIT_PREFIX_SHA256",
             original_digest,
+        )
+        self.addCleanup(
+            setattr, workstream_generation,
+            "GEN14_LEGACY_SPLIT_STORED_FRONTIER_SHA256",
+            original_stored_frontier,
+        )
+        self.addCleanup(
+            setattr, workstream_generation,
+            "GEN14_LEGACY_SPLIT_RECOMPUTED_FRONTIER_SHA256",
+            original_recomputed_frontier,
         )
         state = SimpleNamespace(revision=6, events=events)
         fresh_head = "c" * 40
@@ -451,6 +474,10 @@ class GenerationTransitionTests(unittest.TestCase):
         )
         mutations = {
             "arbitrary_pair": (5, "event_id", "wsp_" + "f" * 32),
+            "plan": (3, "plan_revision", "9" * 64),
+            "route": (3, "authority", {
+                **AUTHORITY, "project_id": "other-project",
+            }),
             "wrong_order": (4, "expected_revision", 5),
             "superseded": (4, "supersedes_event_id", "wsp_" + "e" * 32),
             "noncanonical_disposition": (
@@ -484,6 +511,26 @@ class GenerationTransitionTests(unittest.TestCase):
                 input_frontier_sha256=candidate_frontier,
                 remote_head=fresh_head,
             ))
+        for colliding_head in (old_disposition_head, old_scope_head):
+            self.assertFalse(_gen14_legacy_split_head_prefix(
+                state, workstream_id="GEN-14", target_plan=plan,
+                input_frontier_sha256=frontier,
+                remote_head=colliding_head,
+            ))
+
+        changed_stored = deepcopy(events)
+        for event in changed_stored[:2]:
+            event["value"]["predecessor_closure_authority"][
+                "input_frontier_sha256"
+            ] = "7" * 64
+        workstream_generation.GEN14_LEGACY_SPLIT_PREFIX_SHA256 = (
+            workstream_projection.canonical_digest(changed_stored)
+        )
+        self.assertFalse(_gen14_legacy_split_head_prefix(
+            SimpleNamespace(revision=6, events=changed_stored),
+            workstream_id="GEN-14", target_plan=plan,
+            input_frontier_sha256=frontier, remote_head=fresh_head,
+        ))
 
     def setUp(self):
         self.client = FakeClient()

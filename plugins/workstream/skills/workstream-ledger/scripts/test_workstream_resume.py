@@ -2631,7 +2631,15 @@ class ResumeTests(unittest.TestCase):
                     return {"issueUpdate": {
                         "success": True, "issue": client.root_issue(),
                     }}
-                return original_execute(query, variables)
+                response = original_execute(query, variables)
+                if (
+                    "mutation WorkstreamDeltaCommentCreate" in query
+                    and "<!-- workstream-root-transition:v1:"
+                    in str(variables.get("input", {}).get("body", ""))
+                ):
+                    receipt = response["commentCreate"]["comment"]
+                    client.graph_nonce = receipt["updatedAt"]
+                return response
 
             client.execute = recording_execute
             client.description = (
