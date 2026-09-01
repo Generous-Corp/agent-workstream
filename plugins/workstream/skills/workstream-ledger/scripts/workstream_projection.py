@@ -182,6 +182,31 @@ def _latest_acknowledged_checkpoint_id(snapshot: dict[str, Any]) -> str | None:
     return checkpoint_id
 
 
+def projection_disposition_value(
+    snapshot: dict[str, Any], desired: list[dict[str, Any]], *,
+    remote_head: str, workstream_id: str | None = None,
+) -> dict[str, Any]:
+    """Derive the one disposition written with a reviewed projection."""
+    disposition_input = deepcopy(snapshot)
+    disposition_input.pop("disposition", None)
+    if workstream_id is not None:
+        root = deepcopy(disposition_input.get("root") or {})
+        root.setdefault("identifier", workstream_id)
+        disposition_input["root"] = root
+    # The reviewed provenance being persisted is part of this same durable
+    # operation, so disposition must be derived from it on first creation too.
+    disposition_input["provenance"] = [
+        deepcopy(item["value"])
+        for item in desired if item["kind"] == "provenance"
+    ]
+    decision = choose_disposition(disposition_input, remote_head=remote_head)
+    return {
+        "disposition": decision["disposition"],
+        "remote_head": remote_head,
+        "recovered_from_checkpoint": decision.get("recovered_from_checkpoint"),
+    }
+
+
 def latest_acknowledged_checkpoint_id_from_comments(
     comments: list[dict[str, Any]], *, workstream_id: str,
     plan_revision: str, authenticated_route: dict[str, str],
@@ -848,6 +873,8 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             or set(seed_head_transition) != {
                 "repository_key", "from_exact_head", "to_exact_head",
                 "from_scope_event_id", "from_scope_value_sha256",
+                "from_disposition_event_id",
+                "from_disposition_value_sha256",
                 "disposition", "input_frontier_sha256",
             }
             or not isinstance(seed_head_transition.get("repository_key"), str)
@@ -867,6 +894,16 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             or not re.fullmatch(
                 r"[0-9a-f]{64}",
                 str(seed_head_transition.get("from_scope_value_sha256", "")),
+            )
+            or not isinstance(
+                seed_head_transition.get("from_disposition_event_id"), str,
+            )
+            or not seed_head_transition["from_disposition_event_id"]
+            or not re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(seed_head_transition.get(
+                    "from_disposition_value_sha256", "",
+                )),
             )
             or not re.fullmatch(
                 r"[0-9a-f]{64}",
@@ -1678,6 +1715,30 @@ def prepare_terminal_child_evidence_seeds(
             ].get("repositories", [])
             if repository_key(repository) == transition["repository_key"]
         ), None)
+        reviewed_disposition_event = next((
+            event for event in state.events
+            if event.get("event_id")
+            == transition["from_disposition_event_id"]
+            and (event.get("kind"), event.get("key"))
+            == ("disposition", "root")
+        ), None)
+        reviewed_disposition = (
+            reviewed_disposition_event.get("value", {})
+            if reviewed_disposition_event is not None else {}
+        )
+        current_disposition_event = active.get(("disposition", "root"))
+        disposition_progress_valid = (
+            current_disposition_event is not None
+            and (
+                current_disposition_event["event_id"]
+                == transition["from_disposition_event_id"]
+                and current_disposition_event["value"] == reviewed_disposition
+                or current_disposition_event["value"]
+                == transition["disposition"]
+                and current_disposition_event.get("supersedes_event_id")
+                == transition["from_disposition_event_id"]
+            )
+        )
         if (
             reviewed_scope_event is None
             or canonical_digest(reviewed_scope_event["value"])
@@ -1685,6 +1746,17 @@ def prepare_terminal_child_evidence_seeds(
             or reviewed_primary is None
             or reviewed_primary.get("exact_head")
             != transition["from_exact_head"]
+            or reviewed_disposition_event is None
+            or canonical_digest(reviewed_disposition)
+            != transition["from_disposition_value_sha256"]
+            or set(reviewed_disposition) != {
+                "disposition", "remote_head", "recovered_from_checkpoint",
+            }
+            or reviewed_disposition.get("remote_head")
+            != transition["from_exact_head"]
+            or reviewed_disposition.get("disposition")
+            not in {"attach", "create_successor"}
+            or not disposition_progress_valid
         ):
             raise LinearProjectionError(
                 "terminal_child_evidence_seed_reviewed_predecessor_missing"
@@ -2822,19 +2894,10 @@ def reconcile_required_projection(
                 "terminal_child_repair_primary_head_mismatch"
             )
 
-    disposition_input = dict(snapshot)
-    disposition_input.pop("disposition", None)
-    # The reviewed provenance being persisted is part of this same durable
-    # operation, so disposition must be derived from it on first creation too.
-    disposition_input["provenance"] = [
-        item["value"] for item in desired if item["kind"] == "provenance"
-    ]
-    decision = choose_disposition(disposition_input, remote_head=remote_head)
-    disposition = {
-        "disposition": decision["disposition"],
-        "remote_head": remote_head,
-        "recovered_from_checkpoint": decision.get("recovered_from_checkpoint"),
-    }
+    disposition = projection_disposition_value(
+        snapshot, desired, remote_head=remote_head,
+        workstream_id=adapter.workstream_id,
+    )
     desired.append({"kind": "disposition", "key": "root", "value": disposition})
     desired_by_identity = {
         (item["kind"], item["key"]): item["value"] for item in desired

@@ -228,7 +228,7 @@ def prepare_generation_operator_contract(
         _value_digest, prepare_terminal_child_evidence_seeds,
         prepare_terminal_child_repairs, projection_review_contract,
         terminal_child_evidence_seed_predecessor_contract,
-        bind_projection_plan_generation,
+        bind_projection_plan_generation, projection_disposition_value,
     )
 
     if (
@@ -287,12 +287,10 @@ def prepare_generation_operator_contract(
         identity: event for identity, event in _active_heads(target).items()
         if identity[0] not in generation_control_kinds
     }
-    target_disposition = target_heads.get(("disposition", "root"), {}).get(
-        "value", {}
-    )
-    disposition_matches_remote_head = (
-        isinstance(target_disposition, dict)
-        and target_disposition.get("remote_head") == remote_head
+    target_disposition_event = target_heads.get(("disposition", "root"))
+    target_disposition = (
+        target_disposition_event.get("value", {})
+        if target_disposition_event is not None else {}
     )
     required = {("scope", "root"), ("source", "root")}
     missing = sorted(required - set(predecessor_heads))
@@ -398,6 +396,14 @@ def prepare_generation_operator_contract(
                                    "value": deepcopy(event["value"])})
             carried.append({**identity, "mode": "exact_value_copy"})
 
+    desired_projection_disposition = projection_disposition_value(
+        graph, complete_items, remote_head=remote_head,
+        workstream_id=workstream_id,
+    )
+    disposition_matches_remote_head = (
+        target_disposition == desired_projection_disposition
+    )
+
     terminal_stage: dict[str, Any] | None = None
     phase = "complete_projection"
     manifest: dict[str, Any]
@@ -431,6 +437,10 @@ def prepare_generation_operator_contract(
         scope = next(
             item["value"] for item in seed_items
             if (item["kind"], item["key"]) == ("scope", "root")
+        )
+        desired_seed_disposition = projection_disposition_value(
+            graph, seed_items, remote_head=remote_head,
+            workstream_id=workstream_id,
         )
         seeds: list[dict[str, Any]] = []
         for child_id in sorted(closure_heads):
@@ -528,14 +538,34 @@ def prepare_generation_operator_contract(
                 raise WorkstreamGenerationError(
                     "generation_prepare_target_scope_drift"
                 )
+            reviewed_disposition_event = target_disposition_event
+            if target_disposition == desired_seed_disposition:
+                supersedes = (
+                    reviewed_disposition_event or {}
+                ).get("supersedes_event_id")
+                reviewed_disposition_event = next((
+                    event for event in target.events
+                    if event.get("event_id") == supersedes
+                    and (event.get("kind"), event.get("key"))
+                    == ("disposition", "root")
+                ), None)
+            reviewed_disposition = (
+                reviewed_disposition_event.get("value", {})
+                if reviewed_disposition_event is not None else {}
+            )
             if (
-                not isinstance(target_disposition, dict)
-                or set(target_disposition) != {
+                not isinstance(reviewed_disposition, dict)
+                or set(reviewed_disposition) != {
                     "disposition", "remote_head", "recovered_from_checkpoint",
                 }
-                or target_disposition.get("remote_head") != remote_head
-                or target_disposition.get("disposition")
+                or reviewed_disposition.get("remote_head")
+                != current_primary[0]["exact_head"]
+                or reviewed_disposition.get("disposition")
                 not in {"attach", "create_successor"}
+                or not (
+                    target_disposition == reviewed_disposition
+                    or target_disposition == desired_seed_disposition
+                )
             ):
                 raise WorkstreamGenerationError(
                     "generation_prepare_target_disposition_missing_for_head_transition"
@@ -546,7 +576,11 @@ def prepare_generation_operator_contract(
                 "to_exact_head": remote_head,
                 "from_scope_event_id": current_seed_scope["event_id"],
                 "from_scope_value_sha256": canonical_digest(current_scope),
-                "disposition": deepcopy(target_disposition),
+                "from_disposition_event_id": reviewed_disposition_event["event_id"],
+                "from_disposition_value_sha256": canonical_digest(
+                    reviewed_disposition
+                ),
+                "disposition": deepcopy(desired_seed_disposition),
                 "input_frontier_sha256": binding["input_frontier_sha256"],
             }
         normalized_seed = prepare_terminal_child_evidence_seeds(

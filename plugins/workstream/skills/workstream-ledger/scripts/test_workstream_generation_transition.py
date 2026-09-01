@@ -773,7 +773,7 @@ class GenerationTransitionTests(unittest.TestCase):
              "event_id": "wsp_" + "d" * 32, "value": evidence_new},
             {"schema_version": 2, "kind": "disposition", "key": "root",
              "event_id": "wsp_" + "e" * 32,
-             "value": {"disposition": "attach", "remote_head": target_head,
+             "value": {"disposition": "attach", "remote_head": predecessor_head,
                        "recovered_from_checkpoint": None}},
         ]
         closure = {
@@ -850,6 +850,17 @@ class GenerationTransitionTests(unittest.TestCase):
                         current_scope_event["event_id"],
                     )
                     self.assertEqual(
+                        transition["from_disposition_event_id"],
+                        common[4]["event_id"],
+                    )
+                    self.assertEqual(
+                        transition["from_disposition_value_sha256"],
+                        workstream_projection.canonical_digest(common[4]["value"]),
+                    )
+                    self.assertEqual(
+                        transition["disposition"]["remote_head"], target_head,
+                    )
+                    self.assertEqual(
                         result["expected_projection_revision"],
                         target_contract["expected_projection_revision"],
                     )
@@ -905,6 +916,24 @@ class GenerationTransitionTests(unittest.TestCase):
                     started_state=STARTED_STATE,
                 )
 
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_prepare_target_disposition_missing_for_head_transition",
+        ):
+            run(target_events[:-1])
+        unbound_progress = [*target_events, {
+            **deepcopy(common[4]), "event_id": "wsp_" + "4" * 32,
+            "value": {
+                "disposition": "attach", "remote_head": target_head,
+                "recovered_from_checkpoint": None,
+            },
+        }]
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_prepare_target_disposition_missing_for_head_transition",
+        ):
+            run(unbound_progress)
+
         seed_repair = run(target_events)
         self.assertEqual(
             seed_repair["projection_preview"]["phase"], "terminal_evidence_seed",
@@ -915,7 +944,16 @@ class GenerationTransitionTests(unittest.TestCase):
             if (item["kind"], item["key"]) == ("scope", "root")
         )
         target_events.append({
-            **deepcopy(common[0]), "event_id": "wsp_" + "2" * 32,
+            **deepcopy(common[4]), "event_id": "wsp_" + "2" * 32,
+            "supersedes_event_id": common[4]["event_id"],
+            "value": deepcopy(
+                seed_manifest[
+                    "terminal_child_evidence_seed_head_transition"
+                ]["disposition"]
+            ),
+        })
+        target_events.append({
+            **deepcopy(common[0]), "event_id": "wsp_" + "3" * 32,
             "value": desired_scope,
         })
 
