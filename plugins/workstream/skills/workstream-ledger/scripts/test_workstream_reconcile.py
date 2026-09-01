@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -12,15 +13,18 @@ import unittest
 
 from test_workstream_closure import ClosureTests
 from test_workstream_linear_projection import (
-    AUTHORITY, FakeProjectionClient, legacy_comment, legacy_event, PLAN, ROOT_UUID, scope,
+    AUTHORITY, FakeProjectionClient, legacy_comment, legacy_event,
+    live_graph_with_empty_child_comments, PLAN, ROOT_UUID, scope,
 )
+from workstream_child_dependencies import LinearChildDependencyAdapter
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
     projection_slot_id,
 )
 from workstream_reconcile import (
-    _bounded_command, canonical_digest, github_token_from_command, GitHubTruthReader,
-    parse_repository_bindings, ReconcileError, reconcile_lifecycle,
+    _bounded_command, authenticated_reconcile_snapshot, canonical_digest,
+    github_token_from_command, GitHubTruthReader, parse_repository_bindings,
+    ReconcileError, reconcile_lifecycle,
     ShipyardTruthReader,
 )
 from workstream_relation_readback import read_relation_targets
@@ -504,12 +508,27 @@ class ReconcileTests(unittest.TestCase):
         graph["root"]["next_action"] = "await exact landing review"
         graph["children"][0]["title"] = "Owned acceptance slice"
         graph["children"][0]["status"] = "Canceled"
-        before_lifecycle = add_material_history(
-            graph, client.comments, "GEN-37", authenticated_route=AUTHORITY,
-            authenticated_source={
-                "sha256": PLAN, "identity": "https://example.test/plan",
-            },
+        authenticated_source = {
+            "sha256": PLAN, "identity": "https://example.test/plan",
+        }
+        dependency_adapter = LinearChildDependencyAdapter(
+            client, workspace_id=AUTHORITY["workspace_id"],
+            team_id=AUTHORITY["team_id"], project_id=AUTHORITY["project_id"],
+            root_issue_id=AUTHORITY["root_issue_id"], root_identifier="GEN-37",
+            plan_revision=PLAN,
         )
+
+        def reconciled_snapshot():
+            live = live_graph_with_empty_child_comments(graph)
+            comments = [dict(item) for item in client.comments]
+            return authenticated_reconcile_snapshot(
+                live, comments, "GEN-37", authenticated_route=AUTHORITY,
+                authenticated_source=authenticated_source,
+                dependency_adapter=dependency_adapter,
+                reread=lambda: (deepcopy(live), deepcopy(comments)),
+            )
+
+        before_lifecycle = reconciled_snapshot()
         adapter.append(build_projection_event(
             workstream_id="GEN-37", kind="lifecycle", key="root",
             value={
@@ -532,12 +551,7 @@ class ReconcileTests(unittest.TestCase):
         )
         client.comments.append(legacy_comment(blocker, "late-v1-blocker-comment"))
         graph["root"]["next_action"] = "review quarantined legacy blocker"
-        resumed = add_material_history(
-            graph, client.comments, "GEN-37", authenticated_route=AUTHORITY,
-            authenticated_source={
-                "sha256": PLAN, "identity": "https://example.test/plan",
-            },
-        )
+        resumed = reconciled_snapshot()
         status = compact_context(resumed, "GEN-37", require_projection_authority=True)
         self.assertEqual(
             status["lifecycle_recovery"]["state"], "blocked_unresolved_quarantine",
