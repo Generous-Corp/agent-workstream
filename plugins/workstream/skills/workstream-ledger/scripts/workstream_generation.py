@@ -2231,6 +2231,15 @@ OperatorSnapshotValidator = Callable[
 ]
 
 
+def _activation_native_root_snapshot(
+    transport: Any, workstream_id: str,
+) -> dict[str, Any]:
+    """Load every root field bound by durable native-transition custody."""
+    return transport.snapshot_for_root(
+        workstream_id, include_description=True, include_child_comments=True,
+    )
+
+
 def native_root_activation_proof(
     snapshot: dict[str, Any], *, workstream_id: str,
     issue_id: str, authority: dict[str, str],
@@ -2296,6 +2305,7 @@ class GenerationTransport:
         operator_validator: OperatorValidator | None = None,
         operator_snapshot_validator: OperatorSnapshotValidator | None = None,
         operator_contract_sha256: str | None = None,
+        operator_remote_head: str | None = None,
     ):
         self.client = client
         self.issue_id = issue_id
@@ -2312,7 +2322,28 @@ class GenerationTransport:
         ):
             raise WorkstreamGenerationError("generation_operator_contract_digest_invalid")
         self.operator_contract_sha256 = operator_contract_sha256
+        if operator_remote_head is not None and not re.fullmatch(
+            r"[0-9a-f]{40}(?:[0-9a-f]{24})?", operator_remote_head,
+        ):
+            raise WorkstreamGenerationError(
+                "generation_operator_remote_head_invalid"
+            )
+        self.operator_remote_head = operator_remote_head
         self._capability_checked = False
+
+    def _activation_protocol_remote_head(
+        self, activation_checkpoint: dict[str, Any] | None,
+        remote_head: str | None,
+    ) -> str | None:
+        if (
+            self.operator_remote_head is not None
+            and remote_head is not None
+            and remote_head != self.operator_remote_head
+        ):
+            raise WorkstreamGenerationError(
+                "generation_operator_remote_head_mismatch"
+            )
+        return remote_head if activation_checkpoint is not None else None
 
     def _checkpoint_custody(
         self, *, target_plan_revision: str, created_at: str,
@@ -3494,6 +3525,9 @@ class GenerationTransport:
         remote_head: str | None = None,
     ) -> dict[str, Any]:
         """Validate activation inputs without creating a remote artifact."""
+        protocol_remote_head = self._activation_protocol_remote_head(
+            activation_checkpoint, remote_head,
+        )
         native_root = self._native_root_proof(None, require_reviewed=False)
         comments = self._comments()
         replay_from = (
@@ -3508,7 +3542,7 @@ class GenerationTransport:
                 expected_created_at=created_at,
                 validate_activation_inputs=True,
                 expected_activation_checkpoint=activation_checkpoint,
-                expected_remote_head=remote_head,
+                expected_remote_head=protocol_remote_head,
             )
             if replay:
                 return replay
@@ -3629,6 +3663,9 @@ class GenerationTransport:
         remote_head: str | None = None,
         expected_native_root_sha256: str | None = None,
     ) -> dict[str, Any]:
+        protocol_remote_head = self._activation_protocol_remote_head(
+            activation_checkpoint, remote_head,
+        )
         comments = self._comments()
         # Before the first activation write, bind the complete reviewed native
         # observation including updatedAt. On a schema-v6 crash replay,
@@ -3697,7 +3734,7 @@ class GenerationTransport:
                 expected_retirement=retirement, expected_created_at=created_at,
                 validate_activation_inputs=True,
                 expected_activation_checkpoint=activation_checkpoint,
-                expected_remote_head=remote_head,
+                expected_remote_head=protocol_remote_head,
             )
             if replay:
                 finalized = finalized_generation_transition_ids(
@@ -3759,7 +3796,7 @@ class GenerationTransport:
                     or reservation.get("retirement") != retirement
                     or reservation.get("activation_checkpoint")
                     != activation_checkpoint
-                    or reservation.get("remote_head") != remote_head
+                    or reservation.get("remote_head") != protocol_remote_head
                     or reservation.get("native_root_sha256")
                     != expected_native_root_sha256
                 ):
@@ -3946,7 +3983,7 @@ class GenerationTransport:
                     native_root["sha256"] if native_root is not None else None
                 ),
                 activation_checkpoint=activation_checkpoint,
-                remote_head=remote_head,
+                remote_head=protocol_remote_head,
                 operator_contract_sha256=self.operator_contract_sha256,
                 root_transition_receipt=root_transition_receipt,
             )
@@ -3968,7 +4005,7 @@ class GenerationTransport:
             )
         if reservation.get("schema_version") in {4, 5, 6} and (
             reservation.get("activation_checkpoint") != activation_checkpoint
-            or reservation.get("remote_head") != remote_head
+            or reservation.get("remote_head") != protocol_remote_head
             or reservation.get("source") != target_source
             or reservation.get("retirement") != retirement
         ):
@@ -4708,12 +4745,16 @@ def main() -> int:
             with open(args.activation_checkpoint, encoding="utf-8") as handle:
                 activation_checkpoint = json.load(handle)
             validate_checkpoint(activation_checkpoint)
+        activation_protocol_remote_head = (
+            getattr(args, "remote_head", None)
+            if activation_checkpoint is not None else None
+        )
         loader = strict_candidate_loader(
             client, token=args.token.upper(), authority=authority,
             plan_source=args.plan_source, plan_identity=args.plan_identity,
             max_bytes=args.max_bytes, max_items=args.max_items,
             activation_checkpoint=activation_checkpoint,
-            activation_remote_head=getattr(args, "remote_head", None),
+            activation_remote_head=activation_protocol_remote_head,
             activation_created_at=args.created_at,
         )
         linear_transport = LinearGraphQLTransport(
@@ -4785,7 +4826,9 @@ def main() -> int:
             authority=authority, candidate_loader=loader,
             legacy_description_plan_revision=description_plan_revision,
             native_root_loader=(
-                (lambda: linear_transport.snapshot_for_root(args.token.upper()))
+                (lambda: _activation_native_root_snapshot(
+                    linear_transport, args.token.upper(),
+                ))
                 if args.command == "activate" else None
             ),
             source_loader=(
@@ -4798,6 +4841,10 @@ def main() -> int:
             operator_snapshot_validator=activation_operator_snapshot_validator,
             operator_contract_sha256=(
                 _digest(operator_contract)
+                if isinstance(operator_contract, dict) else None
+            ),
+            operator_remote_head=(
+                operator_contract.get("remote_head")
                 if isinstance(operator_contract, dict) else None
             ),
         )
