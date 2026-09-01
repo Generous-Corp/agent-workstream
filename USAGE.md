@@ -213,7 +213,29 @@ routing detail, and older history with counts/digests. Add `--include-history`
 for an audit or closure pass; explicit
 byte/item caps still fail loudly rather than truncating required current state.
 Full-authority output requires the append-only scope, source, provenance, and
-attach/successor disposition projection. Before replacing a plan, use
+attach/successor disposition projection. If a legacy root has no checkpoint,
+first preview a deterministic root boundary:
+
+```sh
+workstreamctl checkpoint GEN-123 --created-at <UTC> \
+  --agent codex --provider openai --session-id <id> --machine M5 \
+  --worktree-state safe --worktree-path <path> --worktree-branch <branch> \
+  --worktree-head <head> --exact-head <head> \
+  --before-status 'In Progress' --after-status 'In Progress' \
+  --next-action 'Prepare the reviewed generation.'
+```
+
+Review its material revision and digest, then repeat with `--apply
+--expected-material-revision <revision> --expected-preview-sha256 <digest>`.
+Apply also advances the active disposition to the exact checkpoint and accepts
+only the predecessor frontier or that exact candidate as a no-write replay.
+Because Linear cannot atomically append both comment surfaces, a transport or
+native-root failure after the checkpoint may mean it is durable; the command
+reports `*_unknown_replay_required` or `*_postwrite_*_reconcile_required`, never
+a zero-write refusal. It succeeds only after ordinary default-budget resume is
+full and executable with the exact remote checkpoint receipt.
+
+Before replacing a plan, use
 `workstreamctl generation prepare GEN-123 --plan-source ./PLAN.md
 --plan-identity <URL> --remote-head <head> --created-at <UTC>
 --started-state-id <started-state-uuid>

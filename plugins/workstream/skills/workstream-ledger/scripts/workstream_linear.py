@@ -103,6 +103,7 @@ RESUME_ROOT_QUERY = """
 query WorkstreamResumeRoot($issueId: String!, $after: String) {
   issue(id: $issueId) {
     id identifier title description url updatedAt archivedAt
+    parent { id identifier }
     project { id }
     team { id organization { id } }
     assignee { id }

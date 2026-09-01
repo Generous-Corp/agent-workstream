@@ -18,7 +18,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from workstream_checkpoint import (
     CheckpointError,
@@ -394,7 +394,10 @@ class LinearCheckpointAdapter:
         self._validate_material_history(checkpoints, material.revision)
         return deepcopy(observed)
 
-    def persist(self, checkpoint: dict[str, Any]) -> dict[str, Any]:
+    def persist(
+        self, checkpoint: dict[str, Any], *,
+        prewrite_validator: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         """Persist once and return only a read-after-write remote acknowledgement."""
         validate_checkpoint(checkpoint)
         if checkpoint["workstream_id"] != self.workstream_id:
@@ -479,6 +482,8 @@ class LinearCheckpointAdapter:
             self._observed_authority,
         )
         self._assert_comment_id_capability()
+        if prewrite_validator is not None:
+            prewrite_validator()
 
         try:
             response = self.client.execute(
