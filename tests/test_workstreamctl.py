@@ -119,6 +119,20 @@ class WorkstreamCtlTests(unittest.TestCase):
             [MODULE.sys.executable, str(script), "activate", "GEN-37", "--help"],
         )
 
+    def test_generation_dispatches_handle_only_continuation(self):
+        argv = [
+            "generation", "continue", "GEN-37",
+            "--reservation-id", "wsgr_" + "1" * 32,
+            "--reservation-sha256", "2" * 64, "--apply",
+        ]
+        with mock.patch.object(MODULE.os, "execv") as execute:
+            MODULE.main(argv)
+        script = MODULE.SCRIPTS / "workstream_generation.py"
+        execute.assert_called_once_with(
+            MODULE.sys.executable,
+            [MODULE.sys.executable, str(script), *argv[1:]],
+        )
+
     def test_root_transition_dispatches_supported_native_mutation_command(self):
         with mock.patch.object(MODULE.os, "execv") as execute:
             MODULE.main(["root-transition", "reopen", "GEN-14", "--help"])

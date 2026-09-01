@@ -235,24 +235,46 @@ def plan_generation_freshness(
                 "write each exact content value to its named path, verify its "
                 "sha256, then execute this exact argv"
             )
-            reservation_token = (
-                f"generation:{item['reservation_id']}:"
-                f"{item['reservation_sha256']}"
-            )
-            if reservation_token in prepared_tokens:
-                reservations[-1]["abort"] = {
-                    "available": False,
-                    "reason": (
-                        "authority preparation is durable; replay the exact "
-                        "reservation to finalize after restoring its reviewed state"
-                    ),
-                }
+        elif item.get("schema_version") == 6:
+            reservations[-1]["native_root_sha256"] = item[
+                "native_root_sha256"
+            ]
+            reservations[-1]["continue"] = {
+                "available": True,
+                "command": [
+                    str(Path(sys.executable).resolve()),
+                    str(Path(__file__).resolve().with_name(
+                        "workstream_generation.py"
+                    )),
+                    "continue", token,
+                    "--reservation-id", item["reservation_id"],
+                    "--reservation-sha256", item["reservation_sha256"],
+                    "--apply",
+                ],
+                "requirement": (
+                    "execute this exact handle-only command; all reviewed "
+                    "activation inputs are authenticated from the reservation"
+                ),
+            }
         else:
             reservations[-1]["continue"] = {
                 "available": False,
                 "reason": (
-                    "legacy v2/v3 reservation lacks complete replay inputs; "
+                    f"schema{item.get('schema_version')} reservation lacks a "
+                    "supported self-contained continuation contract; "
                     "abort it after writer-death review, then preview a new activation"
+                ),
+            }
+        reservation_token = (
+            f"generation:{item['reservation_id']}:"
+            f"{item['reservation_sha256']}"
+        )
+        if reservation_token in prepared_tokens:
+            reservations[-1]["abort"] = {
+                "available": False,
+                "reason": (
+                    "authority preparation is durable; replay the exact "
+                    "reservation to finalize it"
                 ),
             }
     return {

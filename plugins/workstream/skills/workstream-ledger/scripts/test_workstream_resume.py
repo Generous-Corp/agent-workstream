@@ -163,6 +163,63 @@ class ResumeTests(unittest.TestCase):
         self.assertIn("2026-08-31T12:00:00Z", pending["continue"]["command"])
         self.assertIn("--expected-native-root-sha256", pending["continue"]["command"])
 
+    def test_schema6_pending_generation_surfaces_handle_only_continuation(self):
+        canonical, immutable = self.generation_sources()
+        reservation = {
+            "schema_version": 6,
+            "reservation_id": "wsgr_" + "1" * 32,
+            "reservation_sha256": "2" * 64,
+            "from_plan_revision": "a" * 64,
+            "to_plan_revision": "b" * 64,
+            "created_at": "2026-09-01T12:00:00Z",
+            "native_root_sha256": "3" * 64,
+            "source": {"identity": immutable, "sha256": "b" * 64},
+            "retirement": {"reviewed": True},
+            "activation_checkpoint": None, "remote_head": None,
+        }
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root",
+        }
+
+        def surface(prepared):
+            token = (
+                f"generation:{reservation['reservation_id']}:"
+                f"{reservation['reservation_sha256']}"
+            )
+            with mock.patch.object(MODULE, "plan_payload", return_value={
+                "source": {"identity": canonical, "sha256": "b" * 64},
+            }), mock.patch(
+                "workstream_generation.pending_generation_reservations",
+                return_value=[reservation],
+            ), mock.patch(
+                "workstream_generation.generation_ledger_frontier_tokens",
+                return_value=[token] if prepared else [],
+            ):
+                return MODULE.plan_generation_freshness(
+                    token="GEN-37",
+                    description=f"Canonical plan: {canonical}",
+                    active_source={"identity": immutable, "sha256": "a" * 64},
+                    comments=[], authenticated_route=route,
+                )["pending_generation_reservations"][0]
+
+        pending = surface(False)
+        self.assertEqual(pending["continue"]["command"], [
+            str(Path(sys.executable).resolve()),
+            str(Path(MODULE.__file__).resolve().with_name(
+                "workstream_generation.py"
+            )),
+            "continue", "GEN-37",
+            "--reservation-id", reservation["reservation_id"],
+            "--reservation-sha256", reservation["reservation_sha256"],
+            "--apply",
+        ])
+        self.assertNotIn("materialize_files", pending["continue"])
+        self.assertIn("--abort-reservation-id", pending["abort"]["command"])
+        prepared = surface(True)
+        self.assertFalse(prepared["abort"]["available"])
+        self.assertIn("replay", prepared["abort"]["reason"])
+
     def test_non_null_generation_replay_is_exact_and_legacy_is_abort_only(self):
         canonical, immutable = self.generation_sources()
         checkpoint = build_checkpoint(

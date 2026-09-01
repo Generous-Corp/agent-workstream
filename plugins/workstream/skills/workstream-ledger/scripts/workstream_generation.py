@@ -2329,6 +2329,7 @@ class GenerationTransport:
                 "generation_operator_remote_head_invalid"
             )
         self.operator_remote_head = operator_remote_head
+        self._required_reservation: tuple[str, str] | None = None
         self._capability_checked = False
 
     def _activation_protocol_remote_head(
@@ -2793,6 +2794,24 @@ class GenerationTransport:
         )
         return adapter._comments()
 
+    def _assert_required_reservation_present(
+        self, comments: list[dict[str, Any]],
+    ) -> None:
+        if self._required_reservation is None:
+            return
+        reservation_id, reservation_sha256 = self._required_reservation
+        if not any(
+            item["reservation_id"] == reservation_id
+            and item["reservation_sha256"] == reservation_sha256
+            for item in reduce_generation_reservations(
+                comments, workstream_id=self.workstream_id,
+                authenticated_route=self.authority,
+            )
+        ):
+            raise WorkstreamGenerationError(
+                "generation_continue_reservation_lost"
+            )
+
     def _capability(self) -> None:
         if self._capability_checked:
             return
@@ -2959,6 +2978,10 @@ class GenerationTransport:
         operator_contract_sha256: str | None = None,
         root_transition_receipt: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if self._required_reservation is not None:
+            raise WorkstreamGenerationError(
+                "generation_continue_new_reservation_forbidden"
+            )
         checkpoints = reduce_generation_checkpoint_comments(
             comments, workstream_id=self.workstream_id,
             authenticated_route=self.authority,
@@ -3048,6 +3071,10 @@ class GenerationTransport:
             if {key: existing[key] for key in reservation} != reservation:
                 raise WorkstreamGenerationError("generation_reservation_replay_mismatch")
             return existing
+        if self._required_reservation is not None:
+            raise WorkstreamGenerationError(
+                "generation_continue_reservation_lost_before_append"
+            )
         slot = ledger_boundary_slot_id(
             self.workstream_id, reservation["material_revision"],
             reservation["ledger_frontier"], self.authority,
@@ -3157,11 +3184,12 @@ class GenerationTransport:
         retirement: dict[str, Any], created_at: str,
     ) -> dict[str, Any] | None:
         """Discover an exact crashed operation before applying pending guards."""
+        reservations = reduce_generation_reservations(
+            comments, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+        )
         matches = [
-            item for item in reduce_generation_reservations(
-                comments, workstream_id=self.workstream_id,
-                authenticated_route=self.authority,
-            )
+            item for item in reservations
             if item["mode"] == mode
             and item["from_plan_revision"] == from_plan
             and item["to_plan_revision"] == to_plan
@@ -3172,6 +3200,21 @@ class GenerationTransport:
         ]
         if len(matches) > 1:
             raise WorkstreamGenerationError("generation_operation_replay_ambiguous")
+        if self._required_reservation is not None:
+            required_id, required_sha256 = self._required_reservation
+            exact = [
+                item for item in reservations
+                if item["reservation_id"] == required_id
+                and item["reservation_sha256"] == required_sha256
+            ]
+            if len(exact) != 1:
+                raise WorkstreamGenerationError(
+                    "generation_continue_reservation_lost"
+                )
+            if len(matches) != 1 or matches[0] != exact[0]:
+                raise WorkstreamGenerationError(
+                    "generation_continue_reservation_inputs_mismatch"
+                )
         return matches[0] if matches else None
 
     def _assert_reservation_live(
@@ -3186,6 +3229,22 @@ class GenerationTransport:
             and item["reservation_sha256"] == reservation["reservation_sha256"]
             for item in live
         ):
+            if self._required_reservation is not None:
+                all_reservations = reduce_generation_reservations(
+                    comments, workstream_id=self.workstream_id,
+                    authenticated_route=self.authority,
+                )
+                token = (
+                    f"{reservation['reservation_id']}:"
+                    f"{reservation['reservation_sha256']}"
+                )
+                if token in _generation_abort_ids(comments, all_reservations):
+                    raise WorkstreamGenerationError(
+                        "generation_continue_reservation_aborted"
+                    )
+                raise WorkstreamGenerationError(
+                    "generation_continue_reservation_completed_during_execution_retry"
+                )
             raise WorkstreamGenerationError("generation_reservation_aborted_or_completed")
 
     def _historical_replay(
@@ -3205,6 +3264,17 @@ class GenerationTransport:
                              or event["value"]["retirement"] == expected_retirement)
                         and (expected_created_at is None
                              or event["created_at"] == expected_created_at)]
+            if self._required_reservation is not None and matching:
+                required_id, required_sha256 = self._required_reservation
+                if any(
+                    event["value"].get("reservation_id") != required_id
+                    or event["value"].get("reservation_sha256")
+                    != required_sha256
+                    for event in matching
+                ):
+                    raise WorkstreamGenerationError(
+                        "generation_continue_historical_reservation_mismatch"
+                    )
             if len(matching) > 1:
                 raise WorkstreamGenerationError("generation_historical_replay_ambiguous")
             if matching:
@@ -3283,6 +3353,118 @@ class GenerationTransport:
                            if event["value"].get("schema_version") == 4 else {})}
         return None
 
+    def continue_reservation(
+        self, *, reservation_id: str, reservation_sha256: str,
+    ) -> dict[str, Any]:
+        """Finish one exact durable schema-v6 activation without local files."""
+        if not RESERVATION_ID.fullmatch(str(reservation_id)):
+            raise WorkstreamGenerationError(
+                "generation_continue_reservation_id_invalid"
+            )
+        if not HEX64.fullmatch(str(reservation_sha256)):
+            raise WorkstreamGenerationError(
+                "generation_continue_reservation_sha256_invalid"
+            )
+        comments = self._comments()
+        reservations = reduce_generation_reservations(
+            comments, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+        )
+        by_id = [
+            item for item in reservations
+            if item["reservation_id"] == reservation_id
+        ]
+        if not by_id:
+            raise WorkstreamGenerationError(
+                "generation_continue_reservation_id_not_found"
+            )
+        exact = [
+            item for item in by_id
+            if hmac.compare_digest(
+                item["reservation_sha256"], reservation_sha256,
+            )
+        ]
+        if not exact:
+            raise WorkstreamGenerationError(
+                "generation_continue_reservation_sha256_mismatch"
+            )
+        if len(exact) != 1:
+            raise WorkstreamGenerationError(
+                "generation_continue_reservation_ambiguous"
+            )
+        reservation = exact[0]
+        schema_version = reservation.get("schema_version")
+        if schema_version != 6:
+            raise WorkstreamGenerationError(
+                "generation_continue_schema_unavailable:"
+                f"schema{schema_version}_requires_exact_reviewed_inputs;"
+                "only_schema6_is_self_contained"
+            )
+        if reservation.get("mode") != "activate":
+            raise WorkstreamGenerationError(
+                "generation_continue_schema6_activation_required"
+            )
+        self._assert_source_current(reservation["source"])
+        token = f"{reservation_id}:{reservation_sha256}"
+        if token in _generation_abort_ids(comments, reservations):
+            raise WorkstreamGenerationError(
+                "generation_continue_reservation_aborted"
+            )
+        pending = pending_generation_reservations(
+            comments, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+        )
+        finalized = reduce_generation_finalizations(
+            comments, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+        )
+        is_pending = any(
+            item["reservation_id"] == reservation_id
+            and item["reservation_sha256"] == reservation_sha256
+            for item in pending
+        )
+        is_finalized = any(
+            item["reservation_id"] == reservation_id
+            and item["reservation_sha256"] == reservation_sha256
+            for item in finalized
+        )
+        if not is_pending and not is_finalized:
+            raise WorkstreamGenerationError(
+                "generation_continue_reservation_not_pending_or_finalized"
+            )
+        self._required_reservation = (reservation_id, reservation_sha256)
+        try:
+            if is_finalized:
+                replay = self._historical_replay(
+                    comments,
+                    from_plan=reservation["from_plan_revision"],
+                    to_plan=reservation["to_plan_revision"],
+                    expected_retirement=reservation["retirement"],
+                    expected_created_at=reservation["created_at"],
+                    validate_activation_inputs=True,
+                    expected_activation_checkpoint=reservation[
+                        "activation_checkpoint"
+                    ],
+                    expected_remote_head=reservation["remote_head"],
+                )
+                if replay is None:
+                    raise WorkstreamGenerationError(
+                        "generation_continue_finalized_transition_missing"
+                    )
+                return replay
+            return self.activate(
+                target_plan_revision=reservation["to_plan_revision"],
+                created_at=reservation["created_at"],
+                retirement=deepcopy(reservation["retirement"]),
+                activation_checkpoint=deepcopy(
+                    reservation["activation_checkpoint"]
+                ),
+                remote_head=reservation["remote_head"],
+                expected_native_root_sha256=reservation["native_root_sha256"],
+            )
+        finally:
+            self._required_reservation = None
+
     def abort(
         self, *, reservation_id: str, reservation_sha256: str,
         reason: str, created_at: str,
@@ -3304,28 +3486,6 @@ class GenerationTransport:
         ):
             raise WorkstreamGenerationError("invalid_generation_abort")
         reservation = matching[0]
-        prepared_transition_ids = {
-            item["transition_event_id"]
-            for item in reduce_generation_finalizations(
-                comments, workstream_id=self.workstream_id,
-                authenticated_route=self.authority,
-            )
-        }
-        prepared_for_reservation = [
-            event for state in self._states(
-                comments, reservation["from_plan_revision"]
-            )
-            for event in state.events
-            if event["kind"] == "generation_transition"
-            and event["value"].get("schema_version") == 4
-            and event["value"].get("reservation_id") == reservation_id
-            and event["value"].get("reservation_sha256") == reservation_sha256
-            and event["event_id"] not in prepared_transition_ids
-        ]
-        if prepared_for_reservation:
-            raise WorkstreamGenerationError(
-                "generation_abort_after_preparation_replay_required"
-            )
         token = f"{reservation_id}:{reservation_sha256}"
         aborted = _generation_abort_ids(comments, reservations)
         if token in aborted:
@@ -3341,13 +3501,25 @@ class GenerationTransport:
                 "reservation_id": reservation_id,
                 "remote_id": state.remote_ids[event["event_id"]], "replay": True,
             }
-        if not any(item["reservation_id"] == reservation_id
-                   and item["reservation_sha256"] == reservation_sha256
-                   for item in pending_generation_reservations(
-                       comments, workstream_id=self.workstream_id,
-                       authenticated_route=self.authority,
-                   )):
+        pending = any(
+            item["reservation_id"] == reservation_id
+            and item["reservation_sha256"] == reservation_sha256
+            for item in pending_generation_reservations(
+                comments, workstream_id=self.workstream_id,
+                authenticated_route=self.authority,
+            )
+        )
+        if not pending:
             raise WorkstreamGenerationError("generation_abort_after_activation")
+        prepared_token = (
+            f"generation:{reservation_id}:{reservation_sha256}"
+        )
+        if prepared_token in generation_ledger_frontier_tokens(
+            comments, workstream_id=self.workstream_id,
+        ):
+            raise WorkstreamGenerationError(
+                "generation_abort_after_preparation_replay_required"
+            )
         self._capability()
         for _attempt in range(8):
             state = self._states(comments, reservation["from_plan_revision"])[0]
@@ -3667,6 +3839,7 @@ class GenerationTransport:
             activation_checkpoint, remote_head,
         )
         comments = self._comments()
+        self._assert_required_reservation_present(comments)
         # Before the first activation write, bind the complete reviewed native
         # observation including updatedAt. On a schema-v6 crash replay,
         # protocol-owned comments may have advanced only that clock; exact
@@ -4614,18 +4787,39 @@ def parser() -> argparse.ArgumentParser:
                     "required with activate --apply"
                 ),
             )
+    continuation = commands.add_parser("continue")
+    continuation.add_argument("token")
+    continuation.add_argument("--reservation-id", required=True)
+    continuation.add_argument("--reservation-sha256", required=True)
+    continuation.add_argument("--apply", action="store_true")
     return value
 
 
 def main() -> int:
     args = parser().parse_args()
     try:
+        if args.command == "continue" and not args.apply:
+            raise WorkstreamGenerationError(
+                "generation_continue_requires_apply"
+            )
+        if args.command == "continue" and not RESERVATION_ID.fullmatch(
+            str(args.reservation_id)
+        ):
+            raise WorkstreamGenerationError(
+                "generation_continue_reservation_id_invalid"
+            )
+        if args.command == "continue" and not HEX64.fullmatch(
+            str(args.reservation_sha256)
+        ):
+            raise WorkstreamGenerationError(
+                "generation_continue_reservation_sha256_invalid"
+            )
         if args.command == "activate" and args.retirement_proof:
             raise WorkstreamGenerationError(
                 "generation_legacy_retirement_proof_cannot_authorize_operator"
             )
         aborting = args.command == "activate" and args.abort_reservation_id
-        if not aborting and (
+        if args.command != "continue" and not aborting and (
             not args.plan_source
             or (args.command == "activate" and not args.operator_contract)
         ):
@@ -4640,6 +4834,134 @@ def main() -> int:
                 "generation_activate_apply_requires_reviewed_native_root_proof"
             )
         client, authority = _route_and_client(args)
+        if args.command == "continue":
+            token = args.token.upper()
+            comments = LinearProjectionAdapter(
+                client, issue_id=token, workstream_id=token,
+                plan_revision="0" * 64, **authority,
+            )._comments()
+            reservations = reduce_generation_reservations(
+                comments, workstream_id=token,
+                authenticated_route=authority,
+            )
+            by_id = [
+                item for item in reservations
+                if item["reservation_id"] == args.reservation_id
+            ]
+            if not by_id:
+                raise WorkstreamGenerationError(
+                    "generation_continue_reservation_id_not_found"
+                )
+            exact = [
+                item for item in by_id
+                if hmac.compare_digest(
+                    item["reservation_sha256"], args.reservation_sha256,
+                )
+            ]
+            if not exact:
+                raise WorkstreamGenerationError(
+                    "generation_continue_reservation_sha256_mismatch"
+                )
+            if len(exact) != 1:
+                raise WorkstreamGenerationError(
+                    "generation_continue_reservation_ambiguous"
+                )
+            reservation = exact[0]
+            if reservation.get("schema_version") != 6:
+                raise WorkstreamGenerationError(
+                    "generation_continue_schema_unavailable:"
+                    f"schema{reservation.get('schema_version')}_requires_exact_"
+                    "reviewed_inputs;only_schema6_is_self_contained"
+                )
+            payload_source = plan_payload(
+                reservation["source"]["identity"],
+                reservation["source"]["identity"],
+            )["source"]
+            source = {
+                "identity": payload_source.get("identity")
+                or payload_source.get("url"),
+                "sha256": payload_source.get("sha256"),
+            }
+            if source != reservation["source"]:
+                raise WorkstreamGenerationError(
+                    "generation_continue_authenticated_source_mismatch"
+                )
+            loader = strict_candidate_loader(
+                client, token=token, authority=authority,
+                plan_source=reservation["source"]["identity"],
+                plan_identity=reservation["source"]["identity"],
+                activation_checkpoint=reservation["activation_checkpoint"],
+                activation_remote_head=reservation["remote_head"],
+                activation_created_at=reservation["created_at"],
+            )
+            linear_transport = LinearGraphQLTransport(
+                client, team_id=authority["team_id"],
+                workspace_id=authority["workspace_id"],
+                project_id=authority["project_id"],
+            )
+            initial_root_snapshot = linear_transport.snapshot_for_root(
+                token, include_description=True, include_child_comments=True,
+            )
+            description_plan_revision = initial_root_snapshot["root"].get(
+                "plan_revision"
+            )
+            transport = GenerationTransport(
+                client, issue_id=token, workstream_id=token,
+                authority=authority, candidate_loader=loader,
+                legacy_description_plan_revision=description_plan_revision,
+                native_root_loader=lambda: _activation_native_root_snapshot(
+                    linear_transport, token,
+                ),
+                source_loader=lambda: plan_payload(
+                    reservation["source"]["identity"],
+                    reservation["source"]["identity"],
+                )["source"],
+                operator_contract_sha256=reservation[
+                    "operator_contract_sha256"
+                ],
+                operator_remote_head=reservation["remote_head"],
+            )
+            output = transport.continue_reservation(
+                reservation_id=args.reservation_id,
+                reservation_sha256=args.reservation_sha256,
+            )
+            selected, final_candidate = strict_active_generation_receipt(
+                client, token=token, authority=authority,
+                description_plan_revision=description_plan_revision,
+                requested_plan_revision=reservation["to_plan_revision"],
+                requested_loader=loader,
+                max_bytes=DEFAULT_RESUME_MAX_BYTES, max_items=100,
+            )
+            output.update({
+                "command": "continue", "apply": True,
+                "reservation_id": args.reservation_id,
+                "reservation_sha256": args.reservation_sha256,
+                "final_active_plan_revision": selected["plan_revision"],
+                "final_candidate": final_candidate,
+            })
+            if selected["plan_revision"] != output["activated_plan_revision"]:
+                output["post_read_status"] = (
+                    "historical_replay_active_generation_advanced"
+                )
+            elif (
+                final_candidate["graph_frontier_sha256"]
+                != output["bound_graph_frontier_sha256"]
+                or final_candidate["snapshot_sha256"]
+                != output["bound_candidate_resume_sha256"]
+            ):
+                raise WorkstreamGenerationError(
+                    "authority_changed_with_post_read_drift"
+                )
+            else:
+                output["post_read_status"] = (
+                    "authority_bound_two_phase_finalization_match"
+                )
+            json.dump(
+                output, sys.stdout, ensure_ascii=False,
+                sort_keys=True, indent=2,
+            )
+            sys.stdout.write("\n")
+            return 0
         if args.command == "activate" and args.abort_reservation_id:
             if (
                 not args.apply or not args.abort_reservation_sha256
