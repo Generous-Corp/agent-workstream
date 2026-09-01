@@ -1024,9 +1024,13 @@ def main() -> int:
                     authority=authority, comments=comments, graph=snapshot,
                 )
         else:
-            source = plan_payload(
+            payload_source = plan_payload(
                 args.plan_source, args.plan_identity or args.plan_source,
             )["source"]
+            source = {
+                "identity": payload_source["identity"],
+                "sha256": payload_source["sha256"],
+            }
             with Path(args.operator_contract).open(encoding="utf-8") as handle:
                 contract = json.load(handle)
             target_state_id = (

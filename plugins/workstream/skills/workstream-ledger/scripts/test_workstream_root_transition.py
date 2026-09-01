@@ -3,14 +3,16 @@ from __future__ import annotations
 
 from copy import deepcopy
 import io
+import json
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 from workstream_root_transition import (
     RootTransitionError, RootTransitionTransport, main as root_main,
-    validate_active_locator_authorization,
+    validate_active_locator_authorization, validate_operator_contract,
 )
 from workstream_linear import LinearTransportError
 
@@ -245,6 +247,115 @@ class RootTransitionTests(unittest.TestCase):
             operation="reconcile-plan-url", target=ACTIVE_PINNED,
         )
         self.assertTrue(client_type.called)
+
+    def test_reopen_cli_normalizes_authenticated_plan_payload_source(self):
+        source = {"identity": MAIN, "sha256": "f" * 64}
+        started_state = {
+            "id": STARTED_STATE, "name": "In Progress", "type": "started",
+            "team_id": AUTHORITY["team_id"],
+        }
+        contract = {
+            "schema_version": 1,
+            "workstream_id": TOKEN,
+            "created_at": "2030-01-01T00:00:00Z",
+            "authenticated_route": deepcopy(AUTHORITY),
+            "source": deepcopy(source),
+            "native_transition": {
+                "operation": "reopen", "target_state": started_state,
+            },
+            "remote_head": "a" * 40,
+            "generation": {
+                "from_plan_revision": "e" * 64,
+                "target_plan_revision": "f" * 64,
+                "activation_epoch": 1,
+                "previous_control_event_id": "wsp_" + "1" * 32,
+            },
+            "frontiers": {"projection": "2" * 64},
+            "retirement_proof": {"declaration_sha256": "3" * 64},
+            "projection_preview": {"phase": "activation_ready"},
+            "contract_sha256": "4" * 64,
+        }
+        transport = mock.Mock()
+        transport.preview.return_value = {"apply": False}
+        stdout = io.StringIO()
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", encoding="utf-8",
+        ) as handle:
+            json.dump(contract, handle)
+            handle.flush()
+            argv = [
+                "workstream_root_transition.py", "reopen", TOKEN,
+                "--state-id", STARTED_STATE,
+                "--operator-contract", handle.name,
+                "--plan-source", "PLAN.md", "--plan-identity", MAIN,
+            ]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                sys, "stdout", stdout,
+            ), mock.patch(
+                "workstream_root_transition.resolve_linear_route",
+                return_value=({
+                    key: AUTHORITY[key]
+                    for key in ("workspace_id", "team_id", "project_id")
+                }, {}),
+            ), mock.patch(
+                "workstream_root_transition.load_linear_api_key",
+                return_value="key",
+            ), mock.patch(
+                "workstream_root_transition.HttpGraphQLClient",
+            ), mock.patch(
+                "workstream_root_transition.bootstrap_linear_route",
+                return_value=AUTHORITY,
+            ), mock.patch(
+                "workstream_root_transition.plan_payload",
+                return_value={"source": {**source, "bytes": b"reviewed plan"}},
+            ), mock.patch(
+                "workstream_root_transition.authenticated_started_state",
+                return_value=started_state,
+            ), mock.patch(
+                "workstream_root_transition.RootTransitionTransport",
+                return_value=transport,
+            ) as transport_type, mock.patch(
+                "workstream_generation.prepare_generation_operator_contract",
+                return_value=contract,
+            ) as prepare:
+                self.assertEqual(root_main(), 0)
+                validator = transport_type.call_args.kwargs[
+                    "operator_validator"
+                ]
+                authorization = validator(
+                    {"root": {"plan_revision": "e" * 64}}, [],
+                )
+                self.assertEqual(authorization["source"], source)
+                self.assertEqual(
+                    authorization["contract_sha256"], "4" * 64,
+                )
+                prepare.assert_called_once_with(
+                    comments=[], graph={
+                        "root": {"plan_revision": "e" * 64},
+                    }, workstream_id=TOKEN, authority=AUTHORITY,
+                    description_plan_revision="e" * 64,
+                    target_source=source,
+                    created_at="2030-01-01T00:00:00Z",
+                    remote_head="a" * 40, started_state=started_state,
+                )
+                for mismatch in (
+                    {"identity": ACTIVE_PINNED, "sha256": "f" * 64},
+                    {"identity": MAIN, "sha256": "0" * 64},
+                ):
+                    with self.subTest(source=mismatch), self.assertRaisesRegex(
+                        RootTransitionError,
+                        "root_transition_operator_contract_invalid",
+                    ):
+                        validate_operator_contract(
+                            contract, source=mismatch, token=TOKEN,
+                            authority=AUTHORITY, comments=[], graph={},
+                            started_state=started_state,
+                            description_plan_revision="e" * 64,
+                        )
+                self.assertEqual(prepare.call_count, 1)
+        transport.preview.assert_called_once_with(
+            operation="reopen", target=STARTED_STATE,
+        )
 
     def test_locator_reconcile_apply_replay_and_fresh_noop(self):
         fake = FakeClient()
