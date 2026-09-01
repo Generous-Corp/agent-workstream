@@ -746,12 +746,16 @@ class ResumeTests(unittest.TestCase):
 
         self.assertEqual(context["project_name"], "Linear Integration")
 
-    def test_invalid_recovered_linear_project_name_fails_closed(self):
-        snapshot = self.snapshot()
-        snapshot["root"]["project"] = {"id": "project", "name": "   "}
+    def test_invalid_recovered_linear_project_name_does_not_downgrade_resume(self):
+        for name in ("   ", "x" * (MODULE.MAX_PROJECT_NAME_BYTES + 1), 7):
+            with self.subTest(name=name):
+                snapshot = self.snapshot()
+                snapshot["root"]["project"] = {"id": "project", "name": name}
 
-        with self.assertRaisesRegex(MODULE.ResumeError, "invalid_linear_project_name"):
-            MODULE.compact_context(snapshot, "GEN-37")
+                context = MODULE.compact_context(snapshot, "GEN-37")
+
+                self.assertEqual(context["resume_authority"], "full")
+                self.assertIsNone(context["project_name"])
 
     def test_missing_plan_revision_fails_closed(self):
         snapshot = self.snapshot(); del snapshot["root"]["plan_revision"]

@@ -535,6 +535,11 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.52 persists authenticated closure-receipt bodies while keeping
+ordinary resume bounded, and treats cmux/Herdr title binding as an optional
+adapter that uses only authenticated project-name and exact automatic-title
+provenance.
+
 Version 0.4.51 aligns generation and projection terminal-seed frontiers and
 authenticates legacy dependency grants whose immutable schema predates the
 material-frontier digest, without weakening current writers.

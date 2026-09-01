@@ -2527,7 +2527,10 @@ def compact_context(
         or not project_name.strip()
         or len(project_name.encode("utf-8")) > MAX_PROJECT_NAME_BYTES
     ):
-        raise ResumeError("invalid_linear_project_name")
+        # Human-readable project names are optional tab-adapter metadata, not
+        # execution authority.  Preserve full recovery and let the adapter
+        # decline a generated-title update when this display value is unusable.
+        project_name = None
 
     def history_summary(
         events: list[dict[str, Any]], *, include_latest: bool = True,
