@@ -437,6 +437,17 @@ reviewed replacement can reserve and activate from the revision advanced by
 that abort. The generation
 transport uses `commentCreate` only and never calls `issueUpdate`.
 
+If an older schema-v6 retry sealed its candidate and then refuses solely
+because Linear advanced the root `updatedAt` for those protocol comments, run
+`workstream_generation.py clock-custody HANDLE --reservation-id ID
+--reservation-sha256 SHA --historical-root-updated-at TIMESTAMP` first as a
+zero-write preview, then repeat with `--apply`. The command appends one
+deterministic receipt only when substituting that single historical clock
+through the strict production loader reproduces the reserved graph and native
+root digests. A subsequent ordinary `generation continue` consumes exactly
+one such receipt automatically. Semantic, child, source, frontier, ambiguous,
+or competing-generation drift still refuses.
+
 When a reviewed generation transition needs either of the two mutable native
 root changes that generation deliberately does not own, use the separate
 `workstreamctl root-transition` surface. `plan-url` changes exactly one labeled

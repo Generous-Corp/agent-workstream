@@ -76,6 +76,10 @@ CHECKPOINT_CUSTODY_PREFIX = "<!-- workstream-generation-checkpoint-custody:v1:"
 CHECKPOINT_CUSTODY_RE = re.compile(
     r"<!-- workstream-generation-checkpoint-custody:v1:([A-Za-z0-9_-]+) -->"
 )
+CLOCK_CUSTODY_PREFIX = "<!-- workstream-generation-graph-clock-custody:v1:"
+CLOCK_CUSTODY_RE = re.compile(
+    r"<!-- workstream-generation-graph-clock-custody:v1:([A-Za-z0-9_-]+) -->"
+)
 PREPARE_STARTED_STATE_QUERY = """
 query WorkstreamGenerationPrepareState($teamId: String!, $stateId: String!) {
   team(id: $teamId) { id organization { id } }
@@ -1604,6 +1608,96 @@ def _validate_reservation(value: dict[str, Any]) -> None:
 def encode_generation_reservation(value: dict[str, Any]) -> str:
     _validate_reservation(value)
     return _envelope(RESERVATION_PREFIX, "reservation", value)
+
+
+def _validate_graph_clock_custody(value: dict[str, Any]) -> None:
+    fields = {
+        "schema_version", "workstream_id", "authority", "reservation_id",
+        "reservation_sha256", "source", "candidate_seal_event_id",
+        "candidate_seal_sha256", "graph_frontier_sha256",
+        "native_root_sha256", "native_root_material_sha256",
+        "root_transition_receipt_ref", "root_transition_receipt_sha256",
+        "historical_root_updated_at", "observed_root_updated_at",
+        "observed_graph_frontier_sha256", "observed_native_root_sha256",
+    }
+    if (
+        not isinstance(value, dict) or set(value) != fields
+        or value.get("schema_version") != 1
+        or not re.fullmatch(
+            r"[A-Z][A-Z0-9]*-\d+", str(value.get("workstream_id", ""))
+        )
+        or not isinstance(value.get("authority"), dict)
+        or set(value["authority"]) != {
+            "workspace_id", "team_id", "project_id", "root_issue_id",
+        }
+        or not all(
+            isinstance(item, str) and item
+            for item in value["authority"].values()
+        )
+        or not RESERVATION_ID.fullmatch(str(value.get("reservation_id", "")))
+        or not EVENT_ID.fullmatch(str(value.get("candidate_seal_event_id", "")))
+        or not all(HEX64.fullmatch(str(value.get(field, ""))) for field in (
+            "reservation_sha256", "candidate_seal_sha256",
+            "graph_frontier_sha256", "native_root_sha256",
+            "native_root_material_sha256", "root_transition_receipt_sha256",
+            "observed_graph_frontier_sha256", "observed_native_root_sha256",
+        ))
+        or not isinstance(value.get("source"), dict)
+        or set(value["source"]) != {"identity", "sha256"}
+        or not isinstance(value["source"].get("identity"), str)
+        or not value["source"]["identity"]
+        or not HEX64.fullmatch(str(value["source"].get("sha256", "")))
+        or not re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+            r"[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            str(value.get("root_transition_receipt_ref", "")),
+        )
+        or not isinstance(value.get("historical_root_updated_at"), str)
+        or not value["historical_root_updated_at"]
+        or not isinstance(value.get("observed_root_updated_at"), str)
+        or not value["observed_root_updated_at"]
+    ):
+        raise WorkstreamGenerationError("invalid_generation_graph_clock_custody")
+
+
+def encode_generation_graph_clock_custody(value: dict[str, Any]) -> str:
+    _validate_graph_clock_custody(value)
+    return _envelope(CLOCK_CUSTODY_PREFIX, "graph_clock_custody", value)
+
+
+def graph_clock_custody_slot_id(value: dict[str, Any]) -> str:
+    _validate_graph_clock_custody(value)
+    return str(uuid.UUID(hex=_digest(value)[:32], version=4))
+
+
+def reduce_generation_graph_clock_custodies(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    authenticated_route: dict[str, str],
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    observed: set[str] = set()
+    for comment in comments:
+        body = str(comment.get("body") or "")
+        if CLOCK_CUSTODY_PREFIX not in body:
+            continue
+        value = _decode_envelope(
+            body, prefix=CLOCK_CUSTODY_PREFIX, pattern=CLOCK_CUSTODY_RE,
+            payload_name="graph_clock_custody",
+        )
+        _validate_graph_clock_custody(value)
+        slot = graph_clock_custody_slot_id(value)
+        if (
+            value["workstream_id"] != workstream_id
+            or value["authority"] != authenticated_route
+            or comment.get("id") != slot
+            or slot in observed
+        ):
+            raise WorkstreamGenerationError(
+                "generation_graph_clock_custody_mismatch"
+            )
+        observed.add(slot)
+        result.append({**value, "remote_id": slot})
+    return sorted(result, key=lambda item: item["remote_id"])
 
 
 def _validate_finalization(value: dict[str, Any]) -> None:
@@ -4410,6 +4504,7 @@ def strict_candidate_loader(
     activation_checkpoint: dict[str, Any] | None = None,
     activation_remote_head: str | None = None,
     activation_created_at: str | None = None,
+    root_updated_at_override: str | None = None,
 ) -> CandidateLoader:
     authenticated_source = plan_payload(
         plan_source, plan_identity or plan_source,
@@ -4422,9 +4517,21 @@ def strict_candidate_loader(
             client, team_id=authority["team_id"],
             workspace_id=authority["workspace_id"], project_id=authority["project_id"],
         )
-        graph = transport.snapshot_for_root(
-            token, include_description=True, include_child_comments=True,
-        )
+        if root_updated_at_override is not None:
+            if not isinstance(root_updated_at_override, str) or not root_updated_at_override:
+                raise WorkstreamGenerationError(
+                    "generation_graph_clock_historical_timestamp_invalid"
+                )
+
+        def snapshot_for_candidate() -> dict[str, Any]:
+            snapshot = transport.snapshot_for_root(
+                token, include_description=True, include_child_comments=True,
+            )
+            if root_updated_at_override is not None:
+                snapshot["root"]["updatedAt"] = root_updated_at_override
+            return snapshot
+
+        graph = snapshot_for_candidate()
         description_plan_revision = (
             graph["root"].get("plan_revision") or plan_revision
         )
@@ -4442,9 +4549,7 @@ def strict_candidate_loader(
             graph, comments,
             generation_selector_plan_revision=description_plan_revision,
             reread=lambda: (
-                transport.snapshot_for_root(
-                    token, include_description=True, include_child_comments=True,
-                ),
+                snapshot_for_candidate(),
                 LinearProjectionAdapter(
                     client, issue_id=token, workstream_id=token,
                     plan_revision=plan_revision, **authority,
@@ -4673,6 +4778,385 @@ def strict_candidate_loader(
     return load
 
 
+def generation_graph_clock_custody(
+    client: Any, *, token: str, authority: dict[str, str],
+    reservation_id: str, reservation_sha256: str,
+    historical_root_updated_at: str, apply: bool,
+) -> dict[str, Any]:
+    """Bind the one protocol-owned root-clock advance on a sealed schema-v6 retry.
+
+    The supplied historical timestamp is never trusted by itself. It is usable
+    only when substituting that single field through the production strict
+    candidate loader reproduces both reservation digests exactly.
+    """
+    token = token.upper()
+    if (
+        not RESERVATION_ID.fullmatch(str(reservation_id))
+        or not HEX64.fullmatch(str(reservation_sha256))
+        or not isinstance(historical_root_updated_at, str)
+        or not historical_root_updated_at
+    ):
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_arguments_invalid"
+        )
+    adapter = LinearProjectionAdapter(
+        client, issue_id=token, workstream_id=token,
+        plan_revision="0" * 64, **authority,
+    )
+    comments = adapter._comments()
+    reservations = reduce_generation_reservations(
+        comments, workstream_id=token, authenticated_route=authority,
+    )
+    exact = [item for item in reservations if (
+        item["reservation_id"] == reservation_id
+        and hmac.compare_digest(item["reservation_sha256"], reservation_sha256)
+    )]
+    if len(exact) != 1:
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_reservation_mismatch"
+        )
+    reservation = exact[0]
+    if reservation.get("schema_version") != 6 or reservation.get("mode") != "activate":
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_schema6_activation_required"
+        )
+    pending = pending_generation_reservations(
+        comments, workstream_id=token, authenticated_route=authority,
+    )
+    if len(pending) != 1 or any(
+        item["reservation_id"] != reservation_id
+        or item["reservation_sha256"] != reservation_sha256
+        for item in pending
+    ):
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_pending_reservation_ambiguous"
+        )
+    if f"{reservation_id}:{reservation_sha256}" in _generation_abort_ids(
+        comments, reservations,
+    ):
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_reservation_aborted"
+        )
+    if any(
+        event["kind"] == "generation_transition"
+        and event.get("value", {}).get("reservation_id") == reservation_id
+        for event in generation_controls(comments)
+    ) or any(
+        item["reservation_id"] == reservation_id
+        for item in reduce_generation_finalizations(
+            comments, workstream_id=token, authenticated_route=authority,
+        )
+    ):
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_generation_already_advanced"
+        )
+    selected = select_plan_generation(
+        comments, workstream_id=token,
+        description_plan_revision=reservation["from_plan_revision"],
+        authenticated_route=authority,
+    )
+    if (
+        selected["plan_revision"] != reservation["from_plan_revision"]
+        or selected["transition_tip_event_id"]
+        != reservation["previous_control_event_id"]
+    ):
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_predecessor_changed"
+        )
+    from_state = reduce_projection_comments(
+        comments, workstream_id=token,
+        expected_plan_revision=reservation["from_plan_revision"],
+        authenticated_route=authority,
+    )
+    target_state = reduce_projection_comments(
+        comments, workstream_id=token,
+        expected_plan_revision=reservation["to_plan_revision"],
+        authenticated_route=authority,
+    )
+    seals = [event for event in target_state.events if (
+        event["kind"] == "generation_candidate_seal"
+        and event["key"] == reservation_id
+    )]
+    if len(seals) != 1:
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_candidate_seal_ambiguous"
+        )
+    seal = seals[0]
+    seal_value = seal.get("value") or {}
+    if (
+        seal_value.get("reservation_sha256") != reservation_sha256
+        or seal_value.get("graph_frontier_sha256")
+        != reservation["graph_frontier_sha256"]
+        or seal_value.get("source") != reservation["source"]
+        or seal_value.get("retirement") != reservation["retirement"]
+        or seal_value.get("previous_control_event_id")
+        != reservation["previous_control_event_id"]
+        or from_state.revision != reservation["from_projection_revision"]
+        or target_state.revision != reservation["to_projection_revision"] + 1
+    ):
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_candidate_seal_mismatch"
+        )
+    existing = [item for item in reduce_generation_graph_clock_custodies(
+        comments, workstream_id=token, authenticated_route=authority,
+    ) if item["reservation_id"] == reservation_id]
+    if len(existing) > 1:
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_ambiguous"
+        )
+    if existing and (
+        existing[0]["reservation_sha256"] != reservation_sha256
+        or existing[0]["historical_root_updated_at"]
+        != historical_root_updated_at
+    ):
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_replay_mismatch"
+        )
+
+    source_identity = reservation["source"]["identity"]
+    current_loader = strict_candidate_loader(
+        client, token=token, authority=authority,
+        plan_source=source_identity, plan_identity=source_identity,
+        activation_checkpoint=reservation["activation_checkpoint"],
+        activation_remote_head=reservation["remote_head"],
+        activation_created_at=reservation["created_at"],
+    )
+    historical_loader = strict_candidate_loader(
+        client, token=token, authority=authority,
+        plan_source=source_identity, plan_identity=source_identity,
+        activation_checkpoint=reservation["activation_checkpoint"],
+        activation_remote_head=reservation["remote_head"],
+        activation_created_at=reservation["created_at"],
+        root_updated_at_override=historical_root_updated_at,
+    )
+    current_candidate = current_loader(reservation["to_plan_revision"])
+    historical_candidate = historical_loader(reservation["to_plan_revision"])
+    expected_checkpoint_ids = reservation["checkpoint_event_ids"]
+    if (
+        current_candidate["source"] != reservation["source"]
+        or current_candidate["material_revision"] != reservation["material_revision"]
+        or current_candidate["checkpoint_event_ids"] != expected_checkpoint_ids
+        or historical_candidate["graph_frontier_sha256"]
+        != reservation["graph_frontier_sha256"]
+        or any(
+            historical_candidate[field] != current_candidate[field]
+            for field in (
+                "source", "material_revision", "checkpoint_event_ids",
+                "projection_revision", "snapshot_sha256",
+            )
+        )
+    ):
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_strict_candidate_mismatch"
+        )
+    linear = LinearGraphQLTransport(
+        client, team_id=authority["team_id"],
+        workspace_id=authority["workspace_id"],
+        project_id=authority["project_id"],
+    )
+    native_snapshot = _activation_native_root_snapshot(linear, token)
+    root = native_snapshot.get("root") or {}
+    observed_updated_at = root.get("updatedAt")
+    if not isinstance(observed_updated_at, str) or not observed_updated_at:
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_current_timestamp_missing"
+        )
+    current_native = native_root_activation_proof(
+        native_snapshot, workstream_id=token, issue_id=token,
+        authority=authority,
+    )
+    historical_snapshot = deepcopy(native_snapshot)
+    historical_snapshot["root"]["updatedAt"] = historical_root_updated_at
+    historical_native = native_root_activation_proof(
+        historical_snapshot, workstream_id=token, issue_id=token,
+        authority=authority,
+    )
+    if (
+        current_native["material_sha256"]
+        != reservation["native_root_material_sha256"]
+        or historical_native["sha256"] != reservation["native_root_sha256"]
+    ):
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_native_root_mismatch"
+        )
+    root_receipts = [
+        item for item in comments
+        if item.get("id") == reservation["root_transition_receipt_ref"]
+    ]
+    if len(root_receipts) != 1:
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_root_receipt_missing"
+        )
+    from workstream_root_transition import (
+        _decode as decode_root_transition, reopen_transition_witness_context,
+    )
+    root_receipt = decode_root_transition(
+        str(root_receipts[0].get("body") or "")
+    )
+    target_state_id = (root_receipt.get("after") or {}).get("state")
+    contract_sha = (root_receipt.get("operator_authorization") or {}).get(
+        "contract_sha256"
+    )
+    root_context = reopen_transition_witness_context(
+        comments=comments, graph=native_snapshot, token=token,
+        authority=authority, contract_sha256=str(contract_sha or ""),
+        target_state=target_state_id,
+        expected_slot=reservation["root_transition_receipt_ref"],
+        require_original_frontier=False,
+        operator_contract_sha256=reservation["operator_contract_sha256"],
+    )
+    if (
+        root_context is None
+        or root_context["receipt"]["sha256"]
+        != reservation["root_transition_receipt_sha256"]
+    ):
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_root_receipt_mismatch"
+        )
+    value = {
+        "schema_version": 1, "workstream_id": token,
+        "authority": deepcopy(authority),
+        "reservation_id": reservation_id,
+        "reservation_sha256": reservation_sha256,
+        "source": deepcopy(reservation["source"]),
+        "candidate_seal_event_id": seal["event_id"],
+        "candidate_seal_sha256": _digest(seal),
+        "graph_frontier_sha256": reservation["graph_frontier_sha256"],
+        "native_root_sha256": reservation["native_root_sha256"],
+        "native_root_material_sha256": reservation[
+            "native_root_material_sha256"
+        ],
+        "root_transition_receipt_ref": reservation[
+            "root_transition_receipt_ref"
+        ],
+        "root_transition_receipt_sha256": reservation[
+            "root_transition_receipt_sha256"
+        ],
+        "historical_root_updated_at": historical_root_updated_at,
+        "observed_root_updated_at": observed_updated_at,
+        "observed_graph_frontier_sha256": current_candidate[
+            "graph_frontier_sha256"
+        ],
+        "observed_native_root_sha256": current_native["sha256"],
+    }
+    if existing:
+        stored = {key: existing[0][key] for key in value}
+        if stored != value:
+            # Reconstruct the pre-append observation recorded by the receipt;
+            # only the root clock may have advanced since it was appended.
+            observed_loader = strict_candidate_loader(
+                client, token=token, authority=authority,
+                plan_source=source_identity, plan_identity=source_identity,
+                activation_checkpoint=reservation["activation_checkpoint"],
+                activation_remote_head=reservation["remote_head"],
+                activation_created_at=reservation["created_at"],
+                root_updated_at_override=existing[0]["observed_root_updated_at"],
+            )
+            observed_candidate = observed_loader(reservation["to_plan_revision"])
+            observed_snapshot = deepcopy(native_snapshot)
+            observed_snapshot["root"]["updatedAt"] = existing[0][
+                "observed_root_updated_at"
+            ]
+            observed_native = native_root_activation_proof(
+                observed_snapshot, workstream_id=token, issue_id=token,
+                authority=authority,
+            )
+            stable = {
+                **value,
+                "observed_root_updated_at": existing[0]["observed_root_updated_at"],
+                "observed_graph_frontier_sha256": observed_candidate[
+                    "graph_frontier_sha256"
+                ],
+                "observed_native_root_sha256": observed_native["sha256"],
+            }
+            if stored != stable:
+                raise WorkstreamGenerationError(
+                    "generation_graph_clock_custody_replay_mismatch"
+                )
+        return {**existing[0], "apply": apply, "replay": True}
+    result = {**value, "apply": apply, "replay": False}
+    if not apply:
+        return result
+
+    # Final zero-write race fence. The append itself is the first mutation.
+    if adapter._comments() != comments:
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_comments_changed_before_append"
+        )
+    if _activation_native_root_snapshot(linear, token) != native_snapshot:
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_root_changed_before_append"
+        )
+    if current_loader(reservation["to_plan_revision"]) != current_candidate:
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_candidate_changed_before_append"
+        )
+    slot = graph_clock_custody_slot_id(value)
+    body = encode_generation_graph_clock_custody(value)
+    try:
+        client.execute(COMMENT_CREATE_MUTATION, {"input": {
+            "id": slot, "issueId": token, "body": body,
+        }})
+    except (LinearTransportError, OSError, TimeoutError):
+        after = reduce_generation_graph_clock_custodies(
+            adapter._comments(), workstream_id=token,
+            authenticated_route=authority,
+        )
+        if not any(
+            item["remote_id"] == slot
+            and {key: item[key] for key in value} == value
+            for item in after
+        ):
+            raise WorkstreamGenerationError(
+                "generation_graph_clock_custody_slot_lost_reload_required"
+            )
+    after = reduce_generation_graph_clock_custodies(
+        adapter._comments(), workstream_id=token,
+        authenticated_route=authority,
+    )
+    matches = [item for item in after if item["remote_id"] == slot]
+    if len(matches) != 1 or {key: matches[0][key] for key in value} != value:
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_not_observed"
+        )
+    after_comments = adapter._comments()
+    after_selected = select_plan_generation(
+        after_comments, workstream_id=token,
+        description_plan_revision=reservation["from_plan_revision"],
+        authenticated_route=authority,
+    )
+    after_from = reduce_projection_comments(
+        after_comments, workstream_id=token,
+        expected_plan_revision=reservation["from_plan_revision"],
+        authenticated_route=authority,
+    )
+    after_target = reduce_projection_comments(
+        after_comments, workstream_id=token,
+        expected_plan_revision=reservation["to_plan_revision"],
+        authenticated_route=authority,
+    )
+    after_native = native_root_activation_proof(
+        _activation_native_root_snapshot(linear, token),
+        workstream_id=token, issue_id=token, authority=authority,
+    )
+    if (
+        after_selected != selected
+        or after_from.revision != from_state.revision
+        or after_target.revision != target_state.revision
+        or reduce_event_comments(
+            after_comments, workstream_id=token,
+        ).revision != reservation["material_revision"]
+        or historical_loader(reservation["to_plan_revision"])
+        != historical_candidate
+        or after_native["material_sha256"]
+        != reservation["native_root_material_sha256"]
+    ):
+        raise WorkstreamGenerationError(
+            "generation_graph_clock_custody_authority_changed_after_append"
+        )
+    return {**matches[0], "apply": True, "replay": False}
+
+
 def strict_active_generation_receipt(
     client: Any, *, token: str, authority: dict[str, str],
     description_plan_revision: str | None, requested_plan_revision: str,
@@ -4792,6 +5276,12 @@ def parser() -> argparse.ArgumentParser:
     continuation.add_argument("--reservation-id", required=True)
     continuation.add_argument("--reservation-sha256", required=True)
     continuation.add_argument("--apply", action="store_true")
+    custody = commands.add_parser("clock-custody")
+    custody.add_argument("token")
+    custody.add_argument("--reservation-id", required=True)
+    custody.add_argument("--reservation-sha256", required=True)
+    custody.add_argument("--historical-root-updated-at", required=True)
+    custody.add_argument("--apply", action="store_true")
     return value
 
 
@@ -4819,7 +5309,7 @@ def main() -> int:
                 "generation_legacy_retirement_proof_cannot_authorize_operator"
             )
         aborting = args.command == "activate" and args.abort_reservation_id
-        if args.command != "continue" and not aborting and (
+        if args.command not in {"continue", "clock-custody"} and not aborting and (
             not args.plan_source
             or (args.command == "activate" and not args.operator_contract)
         ):
@@ -4834,6 +5324,21 @@ def main() -> int:
                 "generation_activate_apply_requires_reviewed_native_root_proof"
             )
         client, authority = _route_and_client(args)
+        if args.command == "clock-custody":
+            output = generation_graph_clock_custody(
+                client, token=args.token, authority=authority,
+                reservation_id=args.reservation_id,
+                reservation_sha256=args.reservation_sha256,
+                historical_root_updated_at=args.historical_root_updated_at,
+                apply=args.apply,
+            )
+            output["command"] = "clock-custody"
+            json.dump(
+                output, sys.stdout, ensure_ascii=False,
+                sort_keys=True, indent=2,
+            )
+            sys.stdout.write("\n")
+            return 0
         if args.command == "continue":
             token = args.token.upper()
             comments = LinearProjectionAdapter(
@@ -4886,6 +5391,47 @@ def main() -> int:
                 raise WorkstreamGenerationError(
                     "generation_continue_authenticated_source_mismatch"
                 )
+            clock_custodies = [
+                item for item in reduce_generation_graph_clock_custodies(
+                    comments, workstream_id=token,
+                    authenticated_route=authority,
+                )
+                if item["reservation_id"] == args.reservation_id
+                and item["reservation_sha256"] == args.reservation_sha256
+            ]
+            if len(clock_custodies) > 1:
+                raise WorkstreamGenerationError(
+                    "generation_graph_clock_custody_ambiguous"
+                )
+            root_updated_at_override = None
+            if clock_custodies:
+                pending_tokens = {
+                    (item["reservation_id"], item["reservation_sha256"])
+                    for item in pending_generation_reservations(
+                        comments, workstream_id=token,
+                        authenticated_route=authority,
+                    )
+                }
+                if (args.reservation_id, args.reservation_sha256) in pending_tokens:
+                    verified_custody = generation_graph_clock_custody(
+                        client, token=token, authority=authority,
+                        reservation_id=args.reservation_id,
+                        reservation_sha256=args.reservation_sha256,
+                        historical_root_updated_at=clock_custodies[0][
+                            "historical_root_updated_at"
+                        ],
+                        apply=False,
+                    )
+                else:
+                    # Finalized replay is independently fenced by the exact
+                    # transition/finalization reducers below. The deterministic
+                    # custody envelope remains the historical clock authority;
+                    # rerunning its pre-transition proof would incorrectly
+                    # require the predecessor to still be active.
+                    verified_custody = clock_custodies[0]
+                root_updated_at_override = verified_custody[
+                    "historical_root_updated_at"
+                ]
             loader = strict_candidate_loader(
                 client, token=token, authority=authority,
                 plan_source=reservation["source"]["identity"],
@@ -4893,6 +5439,7 @@ def main() -> int:
                 activation_checkpoint=reservation["activation_checkpoint"],
                 activation_remote_head=reservation["remote_head"],
                 activation_created_at=reservation["created_at"],
+                root_updated_at_override=root_updated_at_override,
             )
             linear_transport = LinearGraphQLTransport(
                 client, team_id=authority["team_id"],
