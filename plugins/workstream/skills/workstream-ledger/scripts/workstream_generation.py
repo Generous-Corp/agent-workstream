@@ -1320,8 +1320,15 @@ def _validate_candidate_receipt(
         "graph_frontier_sha256", "snapshot_sha256",
         "quarantined_legacy_writes",
     }
+    schema7_fields = {
+        "graph_digest_schema", "graph_observation_sha256",
+        "graph_material_sha256", "dependency_graph_sha256",
+    }
+    fields = set(receipt) if isinstance(receipt, dict) else set()
+    extended = fields == required | schema7_fields
     if (
-        not isinstance(receipt, dict) or set(receipt) != required
+        not isinstance(receipt, dict)
+        or fields not in (required, required | schema7_fields)
         or receipt["resume_authority"] != "full"
         or receipt["plan_revision"] != plan_revision
         or receipt["authenticated_route"] != authority
@@ -1330,6 +1337,14 @@ def _validate_candidate_receipt(
         or receipt["checkpoint_event_ids"] != checkpoint_event_ids
         or receipt["projection_revision"] != projection_revision
         or not HEX64.fullmatch(str(receipt["graph_frontier_sha256"]))
+        or extended and (
+            receipt["graph_digest_schema"] != 2
+            or not HEX64.fullmatch(str(receipt["graph_observation_sha256"]))
+            or receipt["graph_observation_sha256"]
+            != receipt["graph_frontier_sha256"]
+            or not HEX64.fullmatch(str(receipt["graph_material_sha256"]))
+            or not HEX64.fullmatch(str(receipt["dependency_graph_sha256"]))
+        )
         or not HEX64.fullmatch(str(receipt["snapshot_sha256"]))
         or not isinstance(receipt["quarantined_legacy_writes"], dict)
         or set(receipt["quarantined_legacy_writes"]) != {"count", "sha256"}
@@ -1341,6 +1356,107 @@ def _validate_candidate_receipt(
         raise WorkstreamGenerationError(
             "generation_candidate_not_strict_full_authority"
         )
+
+
+def _graph_receipt_digests(surface: dict[str, Any]) -> dict[str, Any]:
+    """Bind the full observation and schema-2 material graph separately."""
+    material = deepcopy(surface)
+    root = material.get("root")
+    if not isinstance(root, dict):
+        raise WorkstreamGenerationError("generation_graph_root_missing")
+    root.pop("updatedAt", None)
+    return {
+        "graph_digest_schema": 2,
+        "graph_frontier_sha256": _digest(surface),
+        "graph_observation_sha256": _digest(surface),
+        "graph_material_sha256": _digest(material),
+    }
+
+
+def _dependency_material_sha256(surface: dict[str, Any]) -> str:
+    """Digest validated semantic dependency authority, not readback clocks.
+
+    The strict loader still validates the complete dependency surface before
+    calling this helper.  Schema 7 binds the durable relations, grants, route,
+    and owned identities while excluding provider/protocol observations that
+    necessarily advance when generation comments are appended.
+    """
+    proof = surface.get("validation_authority")
+    return _digest({
+        "schema_version": surface.get("schema_version"),
+        "authority": surface.get("authority"),
+        "plan_revision": surface.get("plan_revision"),
+        "route": deepcopy(surface.get("route")),
+        "revision": surface.get("revision"),
+        "sha256": surface.get("sha256"),
+        "authorization_batches": deepcopy(surface.get(
+            "authorization_batches",
+        )),
+        "relations": deepcopy(surface.get("relations")),
+        "native_readback": surface.get("native_readback"),
+        "ignored_non_dependency_count": surface.get(
+            "ignored_non_dependency_count",
+        ),
+        "owned_children": deepcopy(
+            proof.get("owned_children") if isinstance(proof, dict) else None
+        ),
+    })
+
+
+def _reservation_graph_sha256(reservation: dict[str, Any]) -> str:
+    return (
+        reservation["graph_material_sha256"]
+        if reservation.get("schema_version") == 7
+        else reservation["graph_frontier_sha256"]
+    )
+
+
+def _candidate_graph_sha256(
+    receipt: dict[str, Any], reservation: dict[str, Any],
+) -> str:
+    return (
+        receipt["graph_material_sha256"]
+        if reservation.get("schema_version") == 7
+        else receipt["graph_frontier_sha256"]
+    )
+
+
+def _candidate_graph_matches(
+    receipt: dict[str, Any], reservation: dict[str, Any],
+) -> bool:
+    return (
+        _candidate_graph_sha256(receipt, reservation)
+        == _reservation_graph_sha256(reservation)
+        and (
+            reservation.get("schema_version") != 7
+            or receipt["dependency_graph_sha256"]
+            == reservation["dependency_graph_sha256"]
+        )
+    )
+
+
+def _bound_candidate_graph_sha256(
+    receipt: dict[str, Any], activation: dict[str, Any],
+) -> str:
+    return (
+        receipt["graph_material_sha256"]
+        if activation.get("bound_graph_digest_schema") == 2
+        else receipt["graph_frontier_sha256"]
+    )
+
+
+def _bound_candidate_graph_matches(
+    receipt: dict[str, Any], activation: dict[str, Any],
+) -> bool:
+    return (
+        _bound_candidate_graph_sha256(receipt, activation)
+        == activation["bound_graph_frontier_sha256"]
+        and (
+            activation.get("bound_graph_digest_schema") != 2
+            or receipt["dependency_graph_sha256"]
+            == activation["bound_dependency_graph_sha256"]
+        )
+    )
 
 
 def _prospective_activation_checkpoint(
@@ -1496,20 +1612,25 @@ def _validate_reservation(value: dict[str, Any]) -> None:
         "candidate_resume_sha256", "retirement", "created_at",
     }
     schema_version = value.get("schema_version")
-    if schema_version in {3, 4, 5, 6}:
+    if schema_version in {3, 4, 5, 6, 7}:
         fields.add("native_root_sha256")
-    if schema_version in {4, 5, 6}:
+    if schema_version in {4, 5, 6, 7}:
         fields.update({"activation_checkpoint", "remote_head"})
-    if schema_version in {5, 6}:
+    if schema_version in {5, 6, 7}:
         fields.add("operator_contract_sha256")
-    if schema_version == 6:
+    if schema_version in {6, 7}:
         fields.update({
             "native_root_material_sha256", "root_transition_receipt_ref",
             "root_transition_receipt_sha256",
         })
+    if schema_version == 7:
+        fields.update({
+            "graph_digest_schema", "graph_observation_sha256",
+            "graph_material_sha256", "dependency_graph_sha256",
+        })
     if (
         set(value) != fields
-        or schema_version not in {2, 3, 4, 5, 6}
+        or schema_version not in {2, 3, 4, 5, 6, 7}
         or not RESERVATION_ID.fullmatch(str(value.get("reservation_id", "")))
         or value.get("mode") not in {"bootstrap", "activate"}
         or not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", str(value.get("workstream_id", "")))
@@ -1541,11 +1662,11 @@ def _validate_reservation(value: dict[str, Any]) -> None:
         )
         or not isinstance(value.get("created_at"), str) or not value["created_at"]
         or (
-            schema_version in {3, 4, 5, 6}
+            schema_version in {3, 4, 5, 6, 7}
             and not HEX64.fullmatch(str(value.get("native_root_sha256", "")))
         )
         or (
-            schema_version in {4, 5, 6}
+            schema_version in {4, 5, 6, 7}
             and (
                 (value.get("activation_checkpoint") is not None
                  and not isinstance(value.get("activation_checkpoint"), dict))
@@ -1559,11 +1680,11 @@ def _validate_reservation(value: dict[str, Any]) -> None:
             )
         )
         or (
-            schema_version in {5, 6}
+            schema_version in {5, 6, 7}
             and not HEX64.fullmatch(str(value.get("operator_contract_sha256", "")))
         )
         or (
-            schema_version == 6
+            schema_version in {6, 7}
             and (
                 not HEX64.fullmatch(str(value.get(
                     "native_root_material_sha256", "",
@@ -1578,6 +1699,23 @@ def _validate_reservation(value: dict[str, Any]) -> None:
                 )))
             )
         )
+        or (
+            schema_version == 7
+            and (
+                value.get("graph_digest_schema") != 2
+                or not HEX64.fullmatch(str(value.get(
+                    "graph_observation_sha256", "",
+                )))
+                or value.get("graph_observation_sha256")
+                != value.get("graph_frontier_sha256")
+                or not HEX64.fullmatch(str(value.get(
+                    "graph_material_sha256", "",
+                )))
+                or not HEX64.fullmatch(str(value.get(
+                    "dependency_graph_sha256", "",
+                )))
+            )
+        )
     ):
         raise WorkstreamGenerationError("invalid_generation_reservation")
     previous = value["previous_control_event_id"]
@@ -1586,7 +1724,7 @@ def _validate_reservation(value: dict[str, Any]) -> None:
     _validate_retirement(
         value["retirement"], value["from_plan_revision"], value["activation_epoch"],
     )
-    if schema_version in {4, 5, 6} and value["activation_checkpoint"] is not None:
+    if schema_version in {4, 5, 6, 7} and value["activation_checkpoint"] is not None:
         try:
             validate_checkpoint(value["activation_checkpoint"])
         except (TypeError, ValueError) as error:
@@ -2117,7 +2255,7 @@ def pending_generation_reservations(
                 ), None)
                 if (
                     reservation is not None
-                    and (reservation.get("schema_version") not in {4, 5, 6}
+                    and (reservation.get("schema_version") not in {4, 5, 6, 7}
                          or reservation.get("mode") == "bootstrap"
                          or token in finalized_tokens)
                 ):
@@ -2252,7 +2390,10 @@ def _validate_prepared_generation_transition(
         "from": expected_from,
         "to": expected_to_before,
         "source": deepcopy(reservation["source"]),
-        "graph_frontier_sha256": reservation["graph_frontier_sha256"],
+        # Schema 7 seals the material graph digest so a provider-owned root
+        # clock tick cannot strand an otherwise identical prepared transition.
+        # Legacy schemas remain byte-for-byte bound to their observation hash.
+        "graph_frontier_sha256": _reservation_graph_sha256(reservation),
         "candidate_resume_sha256": reservation["candidate_resume_sha256"],
         "retirement": deepcopy(reservation["retirement"]),
         "previous_control_event_id": reservation[
@@ -2938,14 +3079,14 @@ class GenerationTransport:
         if reservation is None:
             return False
         if (
-            reservation.get("schema_version") not in {5, 6}
+            reservation.get("schema_version") not in {5, 6, 7}
             or reservation.get("operator_contract_sha256")
             != self.operator_contract_sha256
         ):
             raise WorkstreamGenerationError(
                 "generation_pending_operator_contract_mismatch"
             )
-        if reservation.get("schema_version") == 6:
+        if reservation.get("schema_version") in {6, 7}:
             from workstream_root_transition import (
                 _decode as decode_root_transition,
                 reopen_transition_witness_context,
@@ -3002,7 +3143,7 @@ class GenerationTransport:
             and event["key"] == reservation["reservation_id"]
         ]
         if not seals:
-            if reservation.get("schema_version") == 6:
+            if reservation.get("schema_version") in {6, 7}:
                 # The exact reservation already carries the recovered native
                 # transition receipt and material-root proof.  That durable
                 # custody is sufficient before the candidate seal exists;
@@ -3089,7 +3230,7 @@ class GenerationTransport:
     def _post_protocol_native_root_proof(
         self, reservation: dict[str, Any], expected_sha256: str | None,
     ) -> dict[str, Any] | None:
-        if reservation.get("schema_version") == 6:
+        if reservation.get("schema_version") in {6, 7}:
             return self._native_root_proof(
                 None, require_reviewed=False,
                 expected_material_sha256=reservation[
@@ -3345,7 +3486,7 @@ class GenerationTransport:
         )
         unsigned = {
             "schema_version": (
-                6 if root_transition_receipt is not None
+                7 if root_transition_receipt is not None
                 else (5 if operator_contract_sha256 is not None
                 else (4 if native_root_sha256 is not None else 2)
                 )
@@ -3380,6 +3521,14 @@ class GenerationTransport:
                 raise WorkstreamGenerationError(
                     "generation_root_transition_receipt_native_root_required"
                 )
+            schema7_fields = {
+                "graph_digest_schema", "graph_observation_sha256",
+                "graph_material_sha256", "dependency_graph_sha256",
+            }
+            if not schema7_fields.issubset(candidate["receipt"]):
+                raise WorkstreamGenerationError(
+                    "generation_schema7_candidate_material_missing"
+                )
             unsigned.update({
                 "native_root_material_sha256": root_transition_receipt[
                     "native_root_material_sha256"
@@ -3389,6 +3538,18 @@ class GenerationTransport:
                 ],
                 "root_transition_receipt_sha256": root_transition_receipt[
                     "sha256"
+                ],
+                "graph_digest_schema": candidate["receipt"][
+                    "graph_digest_schema"
+                ],
+                "graph_observation_sha256": candidate["receipt"][
+                    "graph_observation_sha256"
+                ],
+                "graph_material_sha256": candidate["receipt"][
+                    "graph_material_sha256"
+                ],
+                "dependency_graph_sha256": candidate["receipt"][
+                    "dependency_graph_sha256"
                 ],
             })
         value = {**unsigned, "reservation_id": "wsgr_" + _digest(unsigned)[:32]}
@@ -3453,7 +3614,7 @@ class GenerationTransport:
             "transition_sha256": _digest(transition),
             "native_root_sha256": (
                 reservation["native_root_sha256"]
-                if reservation.get("schema_version") == 6
+                if reservation.get("schema_version") in {6, 7}
                 else native_root["sha256"]
             ),
             "source": deepcopy(reservation["source"]),
@@ -3633,7 +3794,7 @@ class GenerationTransport:
                         "generation_historical_reservation_ambiguous"
                     )
                 if reservation_matches and (
-                    reservation_matches[0].get("schema_version") in {5, 6}
+                    reservation_matches[0].get("schema_version") in {5, 6, 7}
                     and reservation_matches[0].get("operator_contract_sha256")
                     != self.operator_contract_sha256
                 ):
@@ -3681,6 +3842,15 @@ class GenerationTransport:
                         "revision": event["expected_revision"] + 1,
                         "activated_plan_revision": event["value"]["to"]["plan_revision"],
                         "bound_graph_frontier_sha256": event["value"]["graph_frontier_sha256"],
+                        **({"bound_graph_digest_schema": 2}
+                           if reservation_matches
+                           and reservation_matches[0].get("schema_version") == 7
+                           else {}),
+                        **({"bound_dependency_graph_sha256":
+                            reservation_matches[0]["dependency_graph_sha256"]}
+                           if reservation_matches
+                           and reservation_matches[0].get("schema_version") == 7
+                           else {}),
                         "bound_candidate_resume_sha256": event["value"]["candidate_resume_sha256"],
                         "replay": True,
                         **({"prepared_schema_version": 4}
@@ -3690,7 +3860,7 @@ class GenerationTransport:
     def continue_reservation(
         self, *, reservation_id: str, reservation_sha256: str,
     ) -> dict[str, Any]:
-        """Finish one exact durable schema-v6 activation without local files."""
+        """Finish one exact durable schema-v6/v7 activation without local files."""
         if not RESERVATION_ID.fullmatch(str(reservation_id)):
             raise WorkstreamGenerationError(
                 "generation_continue_reservation_id_invalid"
@@ -3728,15 +3898,15 @@ class GenerationTransport:
             )
         reservation = exact[0]
         schema_version = reservation.get("schema_version")
-        if schema_version != 6:
+        if schema_version not in {6, 7}:
             raise WorkstreamGenerationError(
                 "generation_continue_schema_unavailable:"
                 f"schema{schema_version}_requires_exact_reviewed_inputs;"
-                "only_schema6_is_self_contained"
+                "only_schema6_or_schema7_is_self_contained"
             )
         if reservation.get("mode") != "activate":
             raise WorkstreamGenerationError(
-                "generation_continue_schema6_activation_required"
+                "generation_continue_schema6_or_schema7_activation_required"
             )
         self._assert_source_current(reservation["source"])
         token = f"{reservation_id}:{reservation_sha256}"
@@ -4175,7 +4345,7 @@ class GenerationTransport:
         comments = self._comments()
         self._assert_required_reservation_present(comments)
         # Before the first activation write, bind the complete reviewed native
-        # observation including updatedAt. On a schema-v6 crash replay,
+        # observation including updatedAt. On a schema-v6/v7 crash replay,
         # protocol-owned comments may have advanced only that clock; exact
         # custody instead revalidates the witness and stored material digest.
         selected_for_native = select_plan_generation(
@@ -4183,12 +4353,13 @@ class GenerationTransport:
             description_plan_revision=self.legacy_description_plan_revision,
             authenticated_route=self.authority,
         )
+        all_native_reservations = reduce_generation_reservations(
+            comments, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+        )
         native_matches = [
-            item for item in reduce_generation_reservations(
-                comments, workstream_id=self.workstream_id,
-                authenticated_route=self.authority,
-            )
-            if item.get("schema_version") == 6
+            item for item in all_native_reservations
+            if item.get("schema_version") in {6, 7}
             and item.get("mode") == "activate"
             and item.get("to_plan_revision") == target_plan_revision
             and item.get("retirement") == retirement
@@ -4198,7 +4369,7 @@ class GenerationTransport:
         ]
         if len(native_matches) > 1:
             raise WorkstreamGenerationError(
-                "generation_native_root_schema6_custody_ambiguous"
+                "generation_native_root_custody_ambiguous"
             )
         native_reservation = native_matches[0] if native_matches else None
         checkpoint_replay = None
@@ -4212,7 +4383,7 @@ class GenerationTransport:
             )
         if (
             native_reservation is not None
-            and native_reservation.get("schema_version") == 6
+            and native_reservation.get("schema_version") in {6, 7}
         ):
             if selected_for_native["plan_revision"] != target_plan_revision:
                 self._pending_operator_replay(
@@ -4320,8 +4491,11 @@ class GenerationTransport:
                     ),
                 )
                 if (
-                    prepared_post["receipt"]["graph_frontier_sha256"]
-                    != transition["value"]["graph_frontier_sha256"]
+                    not _candidate_graph_matches(
+                        prepared_post["receipt"], reservation,
+                    )
+                    or transition["value"]["graph_frontier_sha256"]
+                    != _reservation_graph_sha256(reservation)
                     or prepared_post["receipt"]["snapshot_sha256"]
                     != transition["value"]["candidate_resume_sha256"]
                 ):
@@ -4516,14 +4690,14 @@ class GenerationTransport:
             and (
                 reservation.get("native_root_material_sha256")
                 != native_root["material_sha256"]
-                if reservation.get("schema_version") == 6 else
+                if reservation.get("schema_version") in {6, 7} else
                 reservation.get("native_root_sha256") != native_root["sha256"]
             )
         ):
             raise WorkstreamGenerationError(
                 "generation_reservation_native_root_proof_mismatch"
             )
-        if reservation.get("schema_version") in {4, 5, 6} and (
+        if reservation.get("schema_version") in {4, 5, 6, 7} and (
             reservation.get("activation_checkpoint") != activation_checkpoint
             or reservation.get("remote_head") != protocol_remote_head
             or reservation.get("source") != target_source
@@ -4539,6 +4713,16 @@ class GenerationTransport:
             retirement=retirement, created_at=created_at,
         ):
             self._validate_operator(retirement)
+        candidate = self._candidate(
+            target_plan_revision, comments,
+            activation_checkpoint=activation_checkpoint,
+        )
+        if (
+            not _candidate_graph_matches(candidate["receipt"], reservation)
+        ):
+            raise WorkstreamGenerationError(
+                "generation_candidate_changed_after_reservation"
+            )
         from_state, to_state = self._states(comments, from_plan, target_plan_revision)
         selected_before_seal = select_plan_generation(
             comments, workstream_id=self.workstream_id,
@@ -4576,7 +4760,7 @@ class GenerationTransport:
             "reservation_sha256": stored["reservation_sha256"],
             "from": from_frontier, "to": to_frontier_before,
             "source": candidate["source"],
-            "graph_frontier_sha256": reservation["graph_frontier_sha256"],
+            "graph_frontier_sha256": _reservation_graph_sha256(reservation),
             "candidate_resume_sha256": reservation["candidate_resume_sha256"],
             "retirement": retirement,
             "previous_control_event_id": previous_control,
@@ -4600,7 +4784,7 @@ class GenerationTransport:
             target_plan_revision, comments,
             activation_checkpoint=activation_checkpoint,
         )
-        if post["receipt"]["graph_frontier_sha256"] != reservation["graph_frontier_sha256"]:
+        if not _candidate_graph_matches(post["receipt"], reservation):
             raise WorkstreamGenerationError("generation_graph_changed_after_reservation")
         from_state, to_state = self._states(comments, from_plan, target_plan_revision)
         if from_state.revision != reservation["from_projection_revision"]:
@@ -4641,7 +4825,7 @@ class GenerationTransport:
                 ),
                 "native_root_sha256": (
                     reservation["native_root_sha256"]
-                    if reservation.get("schema_version") == 6
+                    if reservation.get("schema_version") in {6, 7}
                     else native_root["sha256"]
                 ),
             })
@@ -4663,8 +4847,7 @@ class GenerationTransport:
             final_comments, from_plan, target_plan_revision,
         )
         if (
-            final_post["receipt"]["graph_frontier_sha256"]
-            != reservation["graph_frontier_sha256"]
+            not _candidate_graph_matches(final_post["receipt"], reservation)
             or final_post["material"].revision != reservation["material_revision"]
             or final_from.revision != reservation["from_projection_revision"]
             or final_to.revision != reservation["to_projection_revision"] + 1
@@ -4683,7 +4866,7 @@ class GenerationTransport:
                  allowed_generation_reservation_id=reservation["reservation_id"],
                  allow_retired_generation_control=True)
         after = self._comments()
-        if reservation.get("schema_version") in {4, 5, 6}:
+        if reservation.get("schema_version") in {4, 5, 6, 7}:
             self._assert_reservation_live(after, reservation)
             prepared = select_plan_generation(
                 after, workstream_id=self.workstream_id,
@@ -4707,8 +4890,9 @@ class GenerationTransport:
                 ),
             )
             if (
-                prepared_post["receipt"]["graph_frontier_sha256"]
-                != reservation["graph_frontier_sha256"]
+                not _candidate_graph_matches(
+                    prepared_post["receipt"], reservation,
+                )
                 or prepared_post["receipt"]["snapshot_sha256"]
                 != value["candidate_resume_sha256"]
             ):
@@ -4750,6 +4934,11 @@ class GenerationTransport:
             **receipt,
             "activated_plan_revision": target_plan_revision,
             "bound_graph_frontier_sha256": value["graph_frontier_sha256"],
+            **({"bound_graph_digest_schema": 2}
+               if reservation.get("schema_version") == 7 else {}),
+            **({"bound_dependency_graph_sha256":
+                reservation["dependency_graph_sha256"]}
+               if reservation.get("schema_version") == 7 else {}),
             "bound_candidate_resume_sha256": value["candidate_resume_sha256"],
             "quarantined_legacy_writes": final_post["receipt"][
                 "quarantined_legacy_writes"
@@ -5012,6 +5201,7 @@ def strict_candidate_loader(
             "root": graph_root, "children": graph.get("children", []),
             "decisions": graph.get("decisions", []),
         }
+        graph_digests = _graph_receipt_digests(graph_surface)
         quarantined_legacy_writes = joined["root"].get(
             "quarantined_legacy_writes", {
                 "count": 0,
@@ -5048,7 +5238,10 @@ def strict_candidate_loader(
                 if item["plan_revision"] == plan_revision
             ),
             "projection_revision": projection.revision,
-            "graph_frontier_sha256": _digest(graph_surface),
+            **graph_digests,
+            "dependency_graph_sha256": _dependency_material_sha256(
+                joined["dependency_graph"],
+            ),
             "snapshot_sha256": _digest(candidate_resume_surface),
             "quarantined_legacy_writes": quarantined_legacy_writes,
         }
@@ -5653,11 +5846,11 @@ def main() -> int:
                     "generation_continue_reservation_ambiguous"
                 )
             reservation = exact[0]
-            if reservation.get("schema_version") != 6:
+            if reservation.get("schema_version") not in {6, 7}:
                 raise WorkstreamGenerationError(
                     "generation_continue_schema_unavailable:"
                     f"schema{reservation.get('schema_version')}_requires_exact_"
-                    "reviewed_inputs;only_schema6_is_self_contained"
+                    "reviewed_inputs;only_schema6_or_schema7_is_self_contained"
                 )
             payload_source = plan_payload(
                 reservation["source"]["identity"],
@@ -5806,8 +5999,7 @@ def main() -> int:
                     "historical_replay_active_generation_advanced"
                 )
             elif (
-                final_candidate["graph_frontier_sha256"]
-                != output["bound_graph_frontier_sha256"]
+                not _bound_candidate_graph_matches(final_candidate, output)
                 or final_candidate["snapshot_sha256"]
                 != output["bound_candidate_resume_sha256"]
             ):
@@ -6100,8 +6292,7 @@ def main() -> int:
                         "historical_replay_active_generation_advanced"
                     )
                 elif (
-                    final_candidate["graph_frontier_sha256"]
-                    != output["bound_graph_frontier_sha256"]
+                    not _bound_candidate_graph_matches(final_candidate, output)
                     or final_candidate["snapshot_sha256"]
                     != output["bound_candidate_resume_sha256"]
                 ):
@@ -6133,8 +6324,7 @@ def main() -> int:
                         "historical_replay_active_generation_advanced"
                     )
                 elif (
-                    final_candidate["graph_frontier_sha256"]
-                    != output["bound_graph_frontier_sha256"]
+                    not _bound_candidate_graph_matches(final_candidate, output)
                     or final_candidate["snapshot_sha256"]
                     != output["bound_candidate_resume_sha256"]
                 ):

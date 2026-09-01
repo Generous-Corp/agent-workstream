@@ -567,6 +567,14 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.69 writes schema-v7 activation reservations with both the full
+observed graph digest and a schema-v2 material digest that excludes only the
+provider-owned root `updatedAt` field. Reservation, seal, finalization, and
+handle-only recovery therefore tolerate their own comment clock updates while
+still refusing every other graph, source, projection, checkpoint, authority,
+or custody change. Existing schema-v6 reservations retain their strict
+full-observation continuation semantics.
+
 Version 0.4.57 keeps root-transition reservations from invalidating their own
 prewrite fence when Linear advances the root `updatedAt`, while still comparing
 every material root field and the non-reservation comment frontier. It also
