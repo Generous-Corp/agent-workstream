@@ -390,6 +390,126 @@ def validate_operator_contract(
     }
 
 
+def reopen_transition_witness_context(
+    *, comments: list[dict[str, Any]], graph: dict[str, Any], token: str,
+    authority: dict[str, str], contract_sha256: str,
+    target_state: dict[str, Any], expected_slot: str | None = None,
+    require_original_frontier: bool = True,
+    operator_contract_sha256: str | None = None,
+) -> dict[str, Any] | None:
+    """Validate one durable reopen witness and reconstruct its pre-state graph."""
+    candidates = []
+    for comment in comments:
+        body = str(comment.get("body") or "")
+        if PREFIX not in body:
+            continue
+        reservation = _decode(body)
+        authorization = reservation.get("operator_authorization") or {}
+        if (
+            reservation.get("operation") == "reopen"
+            and reservation.get("workstream_id") == token
+            and reservation.get("authority") == authority
+            and authorization.get("contract_sha256") == contract_sha256
+            and reservation.get("after") == {"state": target_state}
+        ):
+            candidates.append((comment, reservation))
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise RootTransitionError("root_transition_reopen_witness_ambiguous")
+    comment, reservation = candidates[0]
+    if not isinstance(operator_contract_sha256, str) or not HEX64.fullmatch(
+        operator_contract_sha256
+    ):
+        raise RootTransitionError("root_transition_reopen_witness_mismatch")
+    required = {
+        "schema_version", "operation", "workstream_id", "authority",
+        "expected_snapshot_sha256", "expected_frontier_sha256", "before",
+        "after", "update", "preserved_root", "operator_authorization",
+        "intent_sha256",
+    }
+    before = reservation.get("before") or {}
+    before_state = before.get("state") if isinstance(before, dict) else None
+    snapshot_sha = reservation.get("expected_snapshot_sha256")
+    frontier_sha = reservation.get("expected_frontier_sha256")
+    slot = (
+        _slot_id(authority, snapshot_sha, frontier_sha)
+        if isinstance(snapshot_sha, str) and HEX64.fullmatch(snapshot_sha)
+        and isinstance(frontier_sha, str) and HEX64.fullmatch(frontier_sha)
+        else None
+    )
+    root = graph.get("root") or {}
+    live_state = root.get("state") or {}
+    normalized_live = {
+        "state_id": root.get("state_id"), "status": root.get("status"),
+        "status_type": root.get("status_type"),
+    }
+    unsigned = {
+        key: deepcopy(value) for key, value in reservation.items()
+        if key != "intent_sha256"
+    }
+    body = str(comment.get("body") or "")
+    if (
+        set(reservation) != required or reservation.get("schema_version") != 1
+        or reservation.get("update") != {"stateId": target_state.get("id")}
+        or not isinstance(before_state, dict)
+        or str(before_state.get("type", "")).lower() not in TERMINAL_TYPES
+        or live_state != {
+            key: target_state[key] for key in ("id", "name", "type")
+        }
+        or normalized_live != {
+            "state_id": target_state.get("id"),
+            "status": target_state.get("name"),
+            "status_type": target_state.get("type"),
+        }
+        or slot is None or comment.get("id") != slot
+        or expected_slot is not None and slot != expected_slot
+        or body != _encode(reservation)
+        or not all(
+            isinstance(comment.get(field), str) and comment[field]
+            for field in ("id", "body", "createdAt", "updatedAt")
+        )
+        or reservation.get("intent_sha256") != _digest(unsigned)
+        or _preserved_root(graph, "reopen")
+        != reservation.get("preserved_root")
+        or (
+            require_original_frontier
+            and comment_frontier_sha256(comments, exclude_id=slot)
+            != frontier_sha
+        )
+    ):
+        raise RootTransitionError("root_transition_reopen_witness_mismatch")
+    reconstructed = deepcopy(graph)
+    reconstructed_root = reconstructed["root"]
+    reconstructed_root["state"] = deepcopy(before_state)
+    reconstructed_root["state_id"] = before_state.get("id")
+    reconstructed_root["status"] = (
+        before_state.get("name") or before_state.get("type")
+    )
+    reconstructed_root["status_type"] = before_state.get("type")
+    material_root = _root_without_updated_at(graph)
+    receipt_core = {
+        "schema_version": 1, "operation": "reopen",
+        "workstream_id": token, "authority": deepcopy(authority),
+        "reservation_slot_id": slot,
+        "reservation_body_sha256": hashlib.sha256(body.encode()).hexdigest(),
+        "intent_sha256": reservation["intent_sha256"],
+        "contract_sha256": contract_sha256,
+        "operator_contract_sha256": operator_contract_sha256,
+        "operator_authorization_sha256": _digest(
+            reservation["operator_authorization"]
+        ),
+        "before_state_sha256": _digest(before_state),
+        "after_state_sha256": _digest(target_state),
+        "preserved_root_sha256": _digest(reservation["preserved_root"]),
+        "material_root_sha256": _digest(material_root),
+    }
+    return {
+        "graph": reconstructed, "reservation": deepcopy(reservation),
+        "receipt": {**receipt_core, "sha256": _digest(receipt_core)},
+    }
+
+
 def authenticated_started_state(
     client: Any, *, authority: dict[str, str], state_id: str,
 ) -> dict[str, str]:
@@ -424,6 +544,7 @@ class RootTransitionTransport:
         operator_validator: Callable[
             [dict[str, Any], list[dict[str, Any]]], dict[str, Any]
         ] | None = None,
+        operator_contract_sha256: str | None = None,
         after_reservation_created: Callable[[], None] | None = None,
     ):
         self.client = client
@@ -446,6 +567,13 @@ class RootTransitionTransport:
             if operator_authorization is not None else None
         )
         self.operator_validator = operator_validator
+        if operator_contract_sha256 is not None and not HEX64.fullmatch(
+            operator_contract_sha256
+        ):
+            raise RootTransitionError(
+                "root_transition_operator_contract_digest_invalid"
+            )
+        self.operator_contract_sha256 = operator_contract_sha256
         self.after_reservation_created = after_reservation_created
         self.graph = LinearGraphQLTransport(
             client, team_id=authority["team_id"],
@@ -556,6 +684,33 @@ class RootTransitionTransport:
             else self.operator_authorization
         )
         return self._validated_authorization(authorization)
+
+    def _reopen_witness_authorization(
+        self, snapshot: dict[str, Any], comments: list[dict[str, Any]], *,
+        target_state: dict[str, Any], slot: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        matches = [item for item in comments if item.get("id") == slot]
+        if len(matches) != 1:
+            raise RootTransitionError("root_transition_reopen_witness_ambiguous")
+        reservation = _decode(str(matches[0].get("body") or ""))
+        authorization = reservation.get("operator_authorization") or {}
+        contract_sha256 = authorization.get("contract_sha256")
+        if not isinstance(contract_sha256, str):
+            raise RootTransitionError("root_transition_reopen_witness_mismatch")
+        context = reopen_transition_witness_context(
+            comments=comments, graph=snapshot, token=self.token,
+            authority=self.authority, contract_sha256=contract_sha256,
+            target_state=target_state, expected_slot=slot,
+            operator_contract_sha256=self.operator_contract_sha256,
+        )
+        if context is None:
+            raise RootTransitionError("root_transition_reopen_witness_mismatch")
+        recovered = self._authorize(context["graph"], comments)
+        if recovered != context["reservation"]["operator_authorization"]:
+            raise RootTransitionError(
+                "root_transition_reopen_witness_authorization_mismatch"
+            )
+        return recovered, context["receipt"]
 
     def _started_state(self, state_id: str) -> dict[str, Any]:
         return authenticated_started_state(
@@ -727,12 +882,24 @@ class RootTransitionTransport:
         ):
             raise RootTransitionError("root_transition_expected_fence_invalid")
         snapshot, comments = self._read()
-        current_authorization = self._authorize(snapshot, comments)
         reviewed_state = self._started_state(target) if operation == "reopen" else None
         slot = _slot_id(self.authority, expected_snapshot_sha256, expected_frontier_sha256)
         reserved = [item for item in comments if item.get("id") == slot]
         # Rebuild the original reviewed intent only while the original snapshot is present.
         replayed = snapshot_sha256(snapshot) != expected_snapshot_sha256
+        target_applied = (
+            operation == "reopen"
+            and (snapshot.get("root", {}).get("state") or {}).get("id") == target
+        )
+        recovery_receipt = None
+        if replayed and len(reserved) == 1 and target_applied:
+            current_authorization, recovery_receipt = (
+                self._reopen_witness_authorization(
+                    snapshot, comments, target_state=reviewed_state, slot=slot,
+                )
+            )
+        else:
+            current_authorization = self._authorize(snapshot, comments)
         if replayed and len(reserved) == 1:
             reservation_body = str(reserved[0].get("body") or "")
             pending = _decode(reservation_body)
@@ -904,7 +1071,27 @@ class RootTransitionTransport:
             ):
                 raise RootTransitionError("root_transition_replay_intent_mismatch")
         final, final_comments = self._read()
-        final_authorization = self._authorize(final, final_comments)
+        final_target_applied = (
+            operation == "reopen"
+            and (final.get("root", {}).get("state") or {}).get("id") == target
+        )
+        if final_target_applied:
+            final_authorization, final_recovery_receipt = (
+                self._reopen_witness_authorization(
+                    final, final_comments, target_state=reviewed_state,
+                    slot=slot,
+                )
+            )
+            if (
+                recovery_receipt is not None
+                and recovery_receipt != final_recovery_receipt
+            ):
+                raise RootTransitionError(
+                    "root_transition_reopen_witness_changed"
+                )
+            recovery_receipt = final_recovery_receipt
+        else:
+            final_authorization = self._authorize(final, final_comments)
         reservation_body = _encode(reservation)
         self._reservation_receipt(
             final_comments, slot=slot, body=reservation_body,
@@ -932,7 +1119,7 @@ class RootTransitionTransport:
         observed_frontier = comment_frontier_sha256(final_comments, exclude_id=slot)
         if not replayed and observed_frontier != expected_frontier_sha256:
             raise RootTransitionError("root_transition_postwrite_frontier_drift")
-        return {
+        result = {
             "apply": True, "result": "applied_or_exact_replay",
             "conditional_update_available": False,
             "reservation_slot_id": slot,
@@ -947,6 +1134,9 @@ class RootTransitionTransport:
             "authenticated_route": self.authority,
             "final_root": _root_view(final),
         }
+        if recovery_receipt is not None:
+            result["root_transition_recovery_receipt"] = recovery_receipt
+        return result
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1060,6 +1250,10 @@ def main() -> int:
         transport = RootTransitionTransport(
             client, token=args.token.upper(), authority=authority,
             operator_validator=operator_validator,
+            operator_contract_sha256=(
+                _digest(contract) if args.command != "reconcile-plan-url"
+                else None
+            ),
         )
         operation = args.command
         target = (

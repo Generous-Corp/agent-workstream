@@ -24,7 +24,9 @@ from workstream_generation import (
     encode_generation_finalization, generation_finalization_slot_id,
     native_root_activation_proof,
     pending_generation_reservations, reduce_generation_checkpoint_comments,
-    reduce_generation_finalizations, selected_activation_checkpoints,
+    reduce_generation_checkpoint_custodies,
+    reduce_generation_finalizations, reduce_generation_reservations,
+    selected_activation_checkpoints,
     selected_generation_execution_status,
     strict_candidate_loader,
 )
@@ -45,7 +47,9 @@ from workstream_linear_projection import (
 )
 from workstream_projection import bind_projection_plan_generation
 from workstream_resume import compact_context as real_compact_context
-from workstream_root_transition import RootTransitionError
+from workstream_root_transition import (
+    RootTransitionError, RootTransitionTransport, validate_operator_contract,
+)
 
 
 WORKSTREAM = "GEN-37"
@@ -73,16 +77,22 @@ class FakeClient:
         self.before_each_create = None
         self.description = f"Plan revision: {OLD}"
         self.graph_nonce = "initial"
+        self.graph_title = "Generation test"
         self.graph_status = "In Progress"
         self.graph_status_type = "started"
         self.graph_state_id = "state"
         self.children: list[dict] = []
         self.before_issue_create = None
+        self.allow_issue_update = False
+        self.lose_issue_update_response_once = False
+        self.issue_update_count = 0
+        self.comment_updates_root = False
+        self.comment_clock = 0
 
     def root_issue(self):
         return {
             "id": AUTHORITY["root_issue_id"], "identifier": WORKSTREAM,
-            "title": "Generation test", "description": self.description,
+            "title": self.graph_title, "description": self.description,
             "url": "https://linear.test/GEN-37", "updatedAt": self.graph_nonce,
             "parent": None,
             "project": {"id": "project"},
@@ -109,6 +119,28 @@ class FakeClient:
                     "hasNextPage": False, "endCursor": None,
                 }},
             }}
+        if "WorkstreamRootTransitionState" in query:
+            return {
+                "team": {"id": "team", "organization": {"id": "workspace"}},
+                "workflowState": {
+                    "id": variables["stateId"], "name": "In Progress",
+                    "type": "started", "team": {"id": "team"},
+                },
+            }
+        if "WorkstreamRootTransition" in query:
+            if not self.allow_issue_update:
+                raise AssertionError("generation protocol must never issueUpdate")
+            update = variables["input"]
+            self.issue_update_count += 1
+            if "stateId" in update:
+                self.graph_state_id = update["stateId"]
+                self.graph_status = "In Progress"
+                self.graph_status_type = "started"
+            self.graph_nonce = f"issue-update-{self.issue_update_count}"
+            if self.lose_issue_update_response_once:
+                self.lose_issue_update_response_once = False
+                raise LinearTransportError("response lost after accepted issue update")
+            return {"issueUpdate": {"success": True, "issue": self.root_issue()}}
         if "issueUpdate" in query:
             raise AssertionError("generation protocol must never issueUpdate")
         if "CommentCreateCapability" in query:
@@ -165,12 +197,17 @@ class FakeClient:
             if any(comment["id"] == item["id"] for comment in self.comments):
                 raise LinearTransportError("duplicate comment id")
             self.mutations.append(item)
+            timestamp = "2026-08-29T00:00:00Z"
+            if self.comment_updates_root:
+                self.comment_clock += 1
+                timestamp = f"comment-{self.comment_clock}"
             comment = {
                 "id": item["id"], "body": item["body"],
-                "createdAt": "2026-08-29T00:00:00Z",
-                "updatedAt": "2026-08-29T00:00:00Z",
+                "createdAt": timestamp, "updatedAt": timestamp,
             }
             self.comments.append(comment)
+            if self.comment_updates_root:
+                self.graph_nonce = timestamp
             if len(self.mutations) in self.commit_then_fail_at:
                 raise LinearTransportError("lost response after commit")
             return {"commentCreate": {"success": True, "comment": deepcopy(comment)}}
@@ -1380,6 +1417,450 @@ class GenerationTransitionTests(unittest.TestCase):
             native_root_loader=lambda: linear.snapshot_for_root(WORKSTREAM),
             source_loader=lambda: deepcopy(source_state),
         )
+
+    def test_terminal_reopen_response_loss_drives_schema6_activation_replays(self):
+        with patch(__name__ + ".WORKSTREAM", "GEN-37"):
+            client = FakeClient()
+            client.allow_issue_update = True
+            client.comment_updates_root = True
+            client.graph_state_id = "done-state"
+            client.graph_status = "Done"
+            client.graph_status_type = "completed"
+            project_full(client, OLD)
+            source = {
+                "identity": f"https://example.test/{NEW}", "sha256": NEW,
+            }
+            created_at = "2026-09-01T12:00:00Z"
+
+            def graph_for(current):
+                return LinearGraphQLTransport(
+                    current, workspace_id="workspace", team_id="team",
+                    project_id="project",
+                ).snapshot_for_root(
+                    WORKSTREAM, include_description=True,
+                    include_child_comments=True,
+                )
+
+            def prepare():
+                return prepare_generation_operator_contract(
+                    comments=deepcopy(client.comments), graph=graph_for(client),
+                    workstream_id=WORKSTREAM, authority=AUTHORITY,
+                    description_plan_revision=OLD, target_source=source,
+                    created_at=created_at, remote_head="e" * 40,
+                    started_state=STARTED_STATE,
+                )
+
+            contract = prepare()
+            target = adapter(client, NEW)
+            for phase in range(4):
+                if contract["projection_preview"]["phase"] == "activation_ready":
+                    break
+                state = target.state()
+                active = {
+                    (event["kind"], event["key"]): event
+                    for event in state.events
+                }
+                for index, item in enumerate(
+                    contract["projection_preview"]["manifest"]["projection"]
+                ):
+                    prior = active.get((item["kind"], item["key"]))
+                    if prior is not None and prior["value"] == item["value"]:
+                        continue
+                    target.append(build_projection_event(
+                        workstream_id=WORKSTREAM, kind=item["kind"],
+                        key=item["key"], value=deepcopy(item["value"]),
+                        plan_revision=NEW,
+                        expected_revision=target.state().revision,
+                        created_at=f"target-{phase}-{index}",
+                        supersedes_event_id=(
+                            prior["event_id"] if prior is not None else None
+                        ), authority=AUTHORITY,
+                    ))
+                if contract["projection_preview"]["phase"] == "complete_projection":
+                    state = target.state()
+                    prior = next((
+                        event for event in reversed(state.events)
+                        if (event["kind"], event["key"])
+                        == ("disposition", "root")
+                    ), None)
+                    disposition = {
+                        "disposition": "attach", "remote_head": "e" * 40,
+                        "recovered_from_checkpoint": None,
+                    }
+                    if prior is None or prior["value"] != disposition:
+                        target.append(build_projection_event(
+                            workstream_id=WORKSTREAM, kind="disposition",
+                            key="root", value=disposition,
+                            plan_revision=NEW,
+                            expected_revision=target.state().revision,
+                            created_at=f"target-{phase}-disposition",
+                            supersedes_event_id=(
+                                prior["event_id"] if prior is not None else None
+                            ), authority=AUTHORITY,
+                        ))
+                contract = prepare()
+            self.assertEqual(
+                contract["projection_preview"]["phase"], "activation_ready",
+            )
+
+            def root_operator(graph, comments):
+                return validate_operator_contract(
+                    contract, source=source, token=WORKSTREAM,
+                    authority=AUTHORITY, comments=comments, graph=graph,
+                    started_state=STARTED_STATE,
+                    description_plan_revision=OLD,
+                )
+
+            root_transport = RootTransitionTransport(
+                client, token=WORKSTREAM, authority=AUTHORITY,
+                operator_validator=root_operator,
+                operator_contract_sha256=_digest(contract),
+            )
+            root_preview = root_transport.preview(
+                operation="reopen", target=STARTED_STATE["id"],
+            )
+            root_args = {
+                "operation": "reopen", "target": STARTED_STATE["id"],
+                "expected_snapshot_sha256": root_preview[
+                    "expected_snapshot_sha256"
+                ],
+                "expected_frontier_sha256": root_preview[
+                    "expected_frontier_sha256"
+                ],
+                "expected_intent_sha256": root_preview["intent_sha256"],
+            }
+            client.lose_issue_update_response_once = True
+            with self.assertRaisesRegex(LinearTransportError, "response lost"):
+                root_transport.apply(**root_args)
+            root_replay = root_transport.apply(**root_args)
+            self.assertEqual(client.issue_update_count, 1)
+            root_receipt = root_replay["root_transition_recovery_receipt"]
+
+            def operator_validation(current):
+                return validate_activation_operator_contract(
+                    contract, source=source, workstream_id=WORKSTREAM,
+                    authority=AUTHORITY, comments=deepcopy(current.comments),
+                    graph=graph_for(current),
+                    description_plan_revision=OLD,
+                    created_at=created_at, remote_head="e" * 40,
+                )
+
+            def operator_snapshot_validation(comments, graph):
+                return validate_activation_operator_contract(
+                    contract, source=source, workstream_id=WORKSTREAM,
+                    authority=AUTHORITY, comments=deepcopy(comments),
+                    graph=deepcopy(graph),
+                    description_plan_revision=OLD,
+                    created_at=created_at, remote_head="e" * 40,
+                )
+
+            validated = operator_validation(client)
+            self.assertEqual(
+                validated["root_transition_recovery_receipt"], root_receipt,
+            )
+            base = deepcopy(client)
+            retirement = contract["retirement_proof"]
+
+            def activation_transport(current, candidate_loader=None):
+                return GenerationTransport(
+                    current, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
+                    authority=AUTHORITY,
+                    candidate_loader=candidate_loader or Loader(current),
+                    legacy_description_plan_revision=OLD,
+                    native_root_loader=lambda: graph_for(current),
+                    source_loader=lambda: deepcopy(source),
+                    operator_validator=lambda: operator_validation(current),
+                    operator_snapshot_validator=operator_snapshot_validation,
+                    operator_contract_sha256=_digest(contract),
+                )
+
+            def reviewed_sha(current):
+                return native_root_activation_proof(
+                    graph_for(current), workstream_id=WORKSTREAM,
+                    issue_id=WORKSTREAM, authority=AUTHORITY,
+                )["sha256"]
+
+            def retry_and_assert(current, expected_sha):
+                recovered = activation_transport(current).activate(
+                    target_plan_revision=NEW, created_at=created_at,
+                    retirement=retirement,
+                    expected_native_root_sha256=expected_sha,
+                )
+                replay_writes = len(current.mutations)
+                replayed = activation_transport(current).activate(
+                    target_plan_revision=NEW, created_at=created_at,
+                    retirement=retirement,
+                    expected_native_root_sha256=expected_sha,
+                )
+                self.assertEqual(replayed["event_id"], recovered["event_id"])
+                self.assertEqual(len(current.mutations), replay_writes)
+                self.assertEqual(current.issue_update_count, 1)
+                ids = [item["id"] for item in current.comments]
+                self.assertEqual(len(ids), len(set(ids)))
+                reservations = reduce_generation_reservations(
+                    current.comments, workstream_id=WORKSTREAM,
+                    authenticated_route=AUTHORITY,
+                )
+                self.assertEqual(len(reservations), 1)
+                self.assertEqual(reservations[0]["schema_version"], 6)
+                self.assertEqual(
+                    reservations[0]["root_transition_receipt_sha256"],
+                    root_receipt["sha256"],
+                )
+                return recovered
+
+            checkpoint = self.activation_checkpoint()
+            custody_only = deepcopy(base)
+            custody_loader = ActivationCheckpointLoader(
+                custody_only, checkpoint,
+            )
+            custody_transport = activation_transport(
+                custody_only, custody_loader,
+            )
+            custody_sha = reviewed_sha(custody_only)
+            append_custody = custody_transport._append_checkpoint_custody
+
+            def crash_after_custody(value):
+                append_custody(value)
+                raise WorkstreamGenerationError(
+                    "crash_after_checkpoint_custody"
+                )
+
+            custody_transport._append_checkpoint_custody = crash_after_custody
+            with self.assertRaisesRegex(
+                WorkstreamGenerationError, "crash_after_checkpoint_custody",
+            ):
+                custody_transport.activate(
+                    target_plan_revision=NEW, created_at=created_at,
+                    retirement=retirement,
+                    activation_checkpoint=checkpoint,
+                    remote_head="e" * 40,
+                    expected_native_root_sha256=custody_sha,
+                )
+            custodies = reduce_generation_checkpoint_custodies(
+                custody_only.comments, workstream_id=WORKSTREAM,
+                authenticated_route=AUTHORITY,
+            )
+            self.assertEqual(len(custodies), 1)
+            self.assertFalse(reduce_generation_reservations(
+                custody_only.comments, workstream_id=WORKSTREAM,
+                authenticated_route=AUTHORITY,
+            ))
+            self.assertFalse(any(
+                event["kind"] == "disposition"
+                and event["value"].get("recovered_from_checkpoint")
+                == checkpoint["event_id"]
+                for event in adapter(custody_only, NEW).state().events
+            ))
+            changed_custody = deepcopy(custody_only)
+            changed_writes = len(changed_custody.mutations)
+            with self.assertRaisesRegex(
+                WorkstreamGenerationError,
+                "generation_checkpoint_custody_native_root_mismatch",
+            ):
+                activation_transport(
+                    changed_custody,
+                    ActivationCheckpointLoader(changed_custody, checkpoint),
+                ).activate(
+                    target_plan_revision=NEW, created_at=created_at,
+                    retirement=retirement, activation_checkpoint=checkpoint,
+                    remote_head="e" * 40,
+                    expected_native_root_sha256="9" * 64,
+                )
+            self.assertEqual(len(changed_custody.mutations), changed_writes)
+            custody_result = activation_transport(
+                custody_only,
+                ActivationCheckpointLoader(custody_only, checkpoint),
+            ).activate(
+                target_plan_revision=NEW, created_at=created_at,
+                retirement=retirement, activation_checkpoint=checkpoint,
+                remote_head="e" * 40,
+                expected_native_root_sha256=custody_sha,
+            )
+            self.assertEqual(custody_result["activated_plan_revision"], NEW)
+            self.assertEqual(len(reduce_generation_checkpoint_custodies(
+                custody_only.comments, workstream_id=WORKSTREAM,
+                authenticated_route=AUTHORITY,
+            )), 1)
+            self.assertEqual(len(reduce_generation_reservations(
+                custody_only.comments, workstream_id=WORKSTREAM,
+                authenticated_route=AUTHORITY,
+            )), 1)
+            self.assertEqual(sum(
+                event["kind"] == "disposition"
+                and event["value"].get("recovered_from_checkpoint")
+                == checkpoint["event_id"]
+                for event in adapter(custody_only, NEW).state().events
+            ), 1)
+            self.assertEqual(custody_only.issue_update_count, 1)
+            custody_ids = [item["id"] for item in custody_only.comments]
+            self.assertEqual(len(custody_ids), len(set(custody_ids)))
+
+            checkpoint_client = deepcopy(base)
+            checkpoint_loader = ActivationCheckpointLoader(
+                checkpoint_client, checkpoint,
+            )
+            checkpoint_transport = activation_transport(
+                checkpoint_client, checkpoint_loader,
+            )
+            checkpoint_sha = reviewed_sha(checkpoint_client)
+            checkpoint_transport._append_reservation = (
+                lambda _value: (_ for _ in ()).throw(
+                    WorkstreamGenerationError(
+                        "crash_after_prospective_checkpoint_append"
+                    )
+                )
+            )
+            with self.assertRaisesRegex(
+                WorkstreamGenerationError,
+                "crash_after_prospective_checkpoint_append",
+            ):
+                checkpoint_transport.activate(
+                    target_plan_revision=NEW, created_at=created_at,
+                    retirement=retirement,
+                    activation_checkpoint=checkpoint,
+                    remote_head="e" * 40,
+                    expected_native_root_sha256=checkpoint_sha,
+                )
+            self.assertFalse(reduce_generation_reservations(
+                checkpoint_client.comments, workstream_id=WORKSTREAM,
+                authenticated_route=AUTHORITY,
+            ))
+            self.assertEqual(sum(
+                event["kind"] == "disposition"
+                and event["value"].get("recovered_from_checkpoint")
+                == checkpoint["event_id"]
+                for event in adapter(checkpoint_client, NEW).state().events
+            ), 1)
+            substituted = deepcopy(checkpoint_client)
+            substituted_writes = len(substituted.mutations)
+            with self.assertRaisesRegex(
+                WorkstreamGenerationError,
+                "generation_checkpoint_custody_native_root_mismatch",
+            ):
+                activation_transport(
+                    substituted,
+                    ActivationCheckpointLoader(substituted, checkpoint),
+                ).activate(
+                    target_plan_revision=NEW, created_at=created_at,
+                    retirement=retirement, activation_checkpoint=checkpoint,
+                    remote_head="e" * 40,
+                    expected_native_root_sha256="9" * 64,
+                )
+            self.assertEqual(len(substituted.mutations), substituted_writes)
+            checkpoint_result = activation_transport(
+                checkpoint_client,
+                ActivationCheckpointLoader(checkpoint_client, checkpoint),
+            ).activate(
+                target_plan_revision=NEW, created_at=created_at,
+                retirement=retirement, activation_checkpoint=checkpoint,
+                remote_head="e" * 40,
+                expected_native_root_sha256=checkpoint_sha,
+            )
+            self.assertEqual(checkpoint_result["activated_plan_revision"], NEW)
+            self.assertEqual(checkpoint_client.issue_update_count, 1)
+            checkpoint_reservations = reduce_generation_reservations(
+                checkpoint_client.comments, workstream_id=WORKSTREAM,
+                authenticated_route=AUTHORITY,
+            )
+            self.assertEqual(len(checkpoint_reservations), 1)
+            self.assertEqual(
+                checkpoint_reservations[0]["native_root_sha256"],
+                checkpoint_sha,
+            )
+            self.assertEqual(sum(
+                event["kind"] == "disposition"
+                and event["value"].get("recovered_from_checkpoint")
+                == checkpoint["event_id"]
+                for event in adapter(checkpoint_client, NEW).state().events
+            ), 1)
+
+            # Response loss immediately after the reservation must reuse its
+            # authenticated custody without a fresh terminal-state prepare.
+            after_reservation = deepcopy(base)
+            reservation_transport = activation_transport(after_reservation)
+            reservation_sha = reviewed_sha(after_reservation)
+            append_reservation = reservation_transport._append_reservation
+
+            def crash_after_reservation(value):
+                append_reservation(value)
+                raise WorkstreamGenerationError("crash_after_v6_reservation")
+
+            reservation_transport._append_reservation = crash_after_reservation
+            with self.assertRaisesRegex(
+                WorkstreamGenerationError, "crash_after_v6_reservation",
+            ):
+                reservation_transport.activate(
+                    target_plan_revision=NEW, created_at=created_at,
+                    retirement=retirement,
+                    expected_native_root_sha256=reservation_sha,
+                )
+            for field, value in (
+                ("graph_title", "unrelated root drift"),
+                ("graph_status", "Blocked"),
+            ):
+                drifted = deepcopy(after_reservation)
+                setattr(drifted, field, value)
+                writes = len(drifted.mutations)
+                with self.subTest(material_drift=field), self.assertRaisesRegex(
+                    (WorkstreamGenerationError, RootTransitionError),
+                    "generation_pending_native_root_material_mismatch|"
+                    "generation_activation_requires_reviewed_in_progress_root|"
+                    "root_transition_reopen_witness_mismatch",
+                ):
+                    activation_transport(drifted).activate(
+                        target_plan_revision=NEW, created_at=created_at,
+                        retirement=retirement,
+                        expected_native_root_sha256=reservation_sha,
+                    )
+                self.assertEqual(len(drifted.mutations), writes)
+                self.assertEqual(drifted.issue_update_count, 1)
+            retry_and_assert(after_reservation, reservation_sha)
+
+            for crash_call, error in (
+                (2, "crash_after_v6_candidate_seal"),
+                (4, "crash_after_v6_prepared_transition"),
+            ):
+                current = deepcopy(base)
+                stable = Loader(current)
+                calls = {"count": 0}
+
+                def crashing_loader(plan, *, _at=crash_call, _error=error):
+                    calls["count"] += 1
+                    receipt = stable(plan)
+                    if calls["count"] == _at:
+                        raise WorkstreamGenerationError(_error)
+                    return receipt
+
+                transport = activation_transport(current, crashing_loader)
+                expected_sha = reviewed_sha(current)
+                with self.assertRaisesRegex(WorkstreamGenerationError, error):
+                    transport.activate(
+                        target_plan_revision=NEW, created_at=created_at,
+                        retirement=retirement,
+                        expected_native_root_sha256=expected_sha,
+                    )
+                retry_and_assert(current, expected_sha)
+
+            after_finalization = deepcopy(base)
+            final_transport = activation_transport(after_finalization)
+            final_sha = reviewed_sha(after_finalization)
+            append_finalization = final_transport._append_finalization
+
+            def crash_after_finalization(**kwargs):
+                append_finalization(**kwargs)
+                raise WorkstreamGenerationError("crash_after_v6_finalization")
+
+            final_transport._append_finalization = crash_after_finalization
+            with self.assertRaisesRegex(
+                WorkstreamGenerationError, "crash_after_v6_finalization",
+            ):
+                final_transport.activate(
+                    target_plan_revision=NEW, created_at=created_at,
+                    retirement=retirement,
+                    expected_native_root_sha256=final_sha,
+                )
+            retry_and_assert(after_finalization, final_sha)
 
     def test_activation_accepts_exact_prepared_v2_retirement_and_refuses_tamper(self):
         target = adapter(self.client, NEW)
