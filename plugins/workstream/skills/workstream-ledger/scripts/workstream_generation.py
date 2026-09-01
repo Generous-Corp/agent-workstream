@@ -68,6 +68,12 @@ FINALIZATION_RE = re.compile(
     r"<!-- workstream-generation-finalization:v1:([A-Za-z0-9_-]+) -->"
 )
 FINALIZATION_ID = re.compile(r"wsgf_[0-9a-f]{32}")
+PREPARE_STARTED_STATE_QUERY = """
+query WorkstreamGenerationPrepareState($teamId: String!, $stateId: String!) {
+  team(id: $teamId) { id organization { id } }
+  workflowState(id: $stateId) { id name type team { id } }
+}
+"""
 
 
 class WorkstreamGenerationError(LinearTransportError):
@@ -116,6 +122,9 @@ def _validate_retirement(value: dict[str, Any], predecessor: str, epoch: int) ->
         "predecessor_plan_revision", "retired_at", "retired_writer_epoch",
         "provenance_event_ids", "checkpoint_event_ids", "declaration_sha256",
     }
+    schema_version = value.get("schema_version") if isinstance(value, dict) else None
+    if schema_version == 2:
+        fields.update({"schema_version", "authenticated_quiescence"})
     if not isinstance(value, dict) or set(value) != fields:
         raise WorkstreamGenerationError("invalid_generation_retirement_proof")
     unsigned = {key: deepcopy(item) for key, item in value.items()
@@ -131,6 +140,14 @@ def _validate_retirement(value: dict[str, Any], predecessor: str, epoch: int) ->
             for field in ("provenance_event_ids", "checkpoint_event_ids")
         )
         or value["declaration_sha256"] != _digest(unsigned)
+        or (
+            schema_version == 2
+            and (
+                not isinstance(value.get("authenticated_quiescence"), dict)
+                or value["retired_at"]
+                != value["authenticated_quiescence"].get("observed_at")
+            )
+        )
     ):
         raise WorkstreamGenerationError("invalid_generation_retirement_proof")
 
@@ -149,11 +166,51 @@ def build_retirement_proof(
     return {**proof, "declaration_sha256": _digest(proof)}
 
 
+def build_authenticated_retirement_proof(
+    *, predecessor_plan_revision: str, observed_at: str,
+    retired_writer_epoch: int, provenance_event_ids: list[str],
+    checkpoint_event_ids: list[str], authority: dict[str, str],
+    selected_generation: dict[str, Any], material: Any,
+    predecessor_projection_contract: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind retirement to authenticated frontiers later serialized by activation."""
+    quiescence = {
+        "schema_version": 1,
+        "observed_at": observed_at,
+        "authenticated_route": deepcopy(authority),
+        "selected_generation": {
+            "plan_revision": selected_generation["plan_revision"],
+            "activation_epoch": selected_generation["activation_epoch"],
+            "transition_tip_event_id": selected_generation[
+                "transition_tip_event_id"
+            ],
+        },
+        "material_revision": material.revision,
+        "material_event_ids": sorted(event.event_id for event in material.events),
+        "checkpoint_event_ids": sorted(checkpoint_event_ids),
+        "predecessor_projection": deepcopy(predecessor_projection_contract),
+        "ordering": (
+            "activation_reservation_must_follow_exact_frontiers_and_blocks_"
+            "upgraded_predecessor_writers"
+        ),
+    }
+    proof = {
+        "schema_version": 2,
+        "predecessor_plan_revision": predecessor_plan_revision,
+        "retired_at": observed_at,
+        "retired_writer_epoch": retired_writer_epoch,
+        "provenance_event_ids": sorted(set(provenance_event_ids)),
+        "checkpoint_event_ids": sorted(set(checkpoint_event_ids)),
+        "authenticated_quiescence": quiescence,
+    }
+    return {**proof, "declaration_sha256": _digest(proof)}
+
+
 def prepare_generation_operator_contract(
     *, comments: list[dict[str, Any]], graph: dict[str, Any],
     workstream_id: str, authority: dict[str, str],
     description_plan_revision: str | None, target_source: dict[str, str],
-    created_at: str, retired_at: str, remote_head: str,
+    created_at: str, remote_head: str, started_state: dict[str, str],
 ) -> dict[str, Any]:
     """Build the complete zero-write review contract for a new generation.
 
@@ -171,12 +228,16 @@ def prepare_generation_operator_contract(
 
     if (
         not isinstance(created_at, str) or not created_at
-        or not isinstance(retired_at, str) or not retired_at
         or set(target_source) != {"identity", "sha256"}
         or not isinstance(target_source["identity"], str)
         or not target_source["identity"]
         or not HEX64.fullmatch(str(target_source["sha256"]))
         or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", remote_head)
+        or set(started_state) != {"id", "name", "type", "team_id"}
+        or not isinstance(started_state["id"], str) or not started_state["id"]
+        or not isinstance(started_state["name"], str) or not started_state["name"]
+        or str(started_state["type"]).lower() != "started"
+        or started_state["team_id"] != authority.get("team_id")
     ):
         raise WorkstreamGenerationError(
             "generation_prepare_exact_source_and_timestamps_required"
@@ -226,11 +287,14 @@ def prepare_generation_operator_contract(
         item["event_id"] for item in checkpoints.checkpoints
         if item["plan_revision"] == predecessor_plan
     )
-    retirement = build_retirement_proof(
+    material = reduce_event_comments(comments, workstream_id=workstream_id)
+    retirement = build_authenticated_retirement_proof(
         predecessor_plan_revision=predecessor_plan,
-        retired_at=retired_at, retired_writer_epoch=epoch,
+        observed_at=created_at, retired_writer_epoch=epoch,
         provenance_event_ids=provenance_ids,
         checkpoint_event_ids=checkpoint_ids,
+        authority=authority, selected_generation=selected, material=material,
+        predecessor_projection_contract=projection_review_contract(predecessor),
     )
 
     closure_heads = {
@@ -515,13 +579,16 @@ def prepare_generation_operator_contract(
             "generation_prepare_active_key_classification_incomplete:"
             f"omitted={omitted}:extra={extra}"
         )
-    material = reduce_event_comments(comments, workstream_id=workstream_id)
     contract = {
         "schema_version": 1,
         "workstream_id": workstream_id,
         "created_at": created_at,
         "authenticated_route": deepcopy(authority),
         "source": deepcopy(target_source),
+        "native_transition": {
+            "operation": "reopen",
+            "target_state": deepcopy(started_state),
+        },
         "remote_head": remote_head,
         "generation": {
             "from_plan_revision": predecessor_plan,
@@ -1565,6 +1632,44 @@ class GenerationTransport:
             raise WorkstreamGenerationError(
                 "generation_retirement_frontier_mismatch"
             )
+        if retirement.get("schema_version") == 2:
+            from workstream_projection import projection_review_contract
+
+            quiescence = retirement.get("authenticated_quiescence") or {}
+            selected = select_plan_generation(
+                comments, workstream_id=self.workstream_id,
+                description_plan_revision=self.legacy_description_plan_revision,
+                authenticated_route=self.authority,
+            )
+            material = reduce_event_comments(
+                comments, workstream_id=self.workstream_id,
+            )
+            expected_quiescence = {
+                "schema_version": 1,
+                "observed_at": retirement["retired_at"],
+                "authenticated_route": self.authority,
+                "selected_generation": {
+                    "plan_revision": selected["plan_revision"],
+                    "activation_epoch": selected["activation_epoch"],
+                    "transition_tip_event_id": selected[
+                        "transition_tip_event_id"
+                    ],
+                },
+                "material_revision": material.revision,
+                "material_event_ids": sorted(
+                    event.event_id for event in material.events
+                ),
+                "checkpoint_event_ids": expected_predecessor_checkpoints,
+                "predecessor_projection": projection_review_contract(from_state),
+                "ordering": (
+                    "activation_reservation_must_follow_exact_frontiers_and_blocks_"
+                    "upgraded_predecessor_writers"
+                ),
+            }
+            if quiescence != expected_quiescence:
+                raise WorkstreamGenerationError(
+                    "generation_retirement_quiescence_frontier_mismatch"
+                )
         return {
             "provenance_event_ids": expected_provenance_ids,
             "checkpoint_event_ids": expected_predecessor_checkpoints,
@@ -3034,12 +3139,12 @@ def parser() -> argparse.ArgumentParser:
             command.add_argument("--apply", action="store_true")
         else:
             command.add_argument(
-                "--retired-at", required=True,
-                help="reviewed predecessor writer-retirement timestamp",
-            )
-            command.add_argument(
                 "--remote-head", required=True,
                 help="authenticated exact repository head for target disposition",
+            )
+            command.add_argument(
+                "--started-state-id", required=True,
+                help="reviewed Linear started-state UUID for native root reopen",
             )
         if name == "activate":
             command.add_argument("--retirement-proof",
@@ -3091,6 +3196,27 @@ def main() -> int:
             raise WorkstreamGenerationError("generation_candidate_cli_arguments_incomplete")
         source = plan_payload(args.plan_source, args.plan_identity or args.plan_source)["source"]
         if args.command == "prepare":
+            state_result = client.execute(PREPARE_STARTED_STATE_QUERY, {
+                "teamId": authority["team_id"], "stateId": args.started_state_id,
+            })
+            state = state_result.get("workflowState") or {}
+            team = state_result.get("team") or {}
+            if (
+                team.get("id") != authority["team_id"]
+                or (team.get("organization") or {}).get("id")
+                != authority["workspace_id"]
+                or state.get("id") != args.started_state_id
+                or (state.get("team") or {}).get("id") != authority["team_id"]
+                or str(state.get("type", "")).lower() != "started"
+                or not isinstance(state.get("name"), str) or not state["name"]
+            ):
+                raise WorkstreamGenerationError(
+                    "generation_prepare_started_state_readback_mismatch"
+                )
+            started_state = {
+                "id": state["id"], "name": state["name"],
+                "type": state["type"], "team_id": authority["team_id"],
+            }
             linear_transport = LinearGraphQLTransport(
                 client, team_id=authority["team_id"],
                 workspace_id=authority["workspace_id"],
@@ -3112,8 +3238,9 @@ def main() -> int:
                 target_source={
                     "identity": source["identity"], "sha256": source["sha256"],
                 },
-                created_at=args.created_at, retired_at=args.retired_at,
+                created_at=args.created_at,
                 remote_head=args.remote_head,
+                started_state=started_state,
             )
             json.dump(output, sys.stdout, ensure_ascii=False, sort_keys=True, indent=2)
             sys.stdout.write("\n")

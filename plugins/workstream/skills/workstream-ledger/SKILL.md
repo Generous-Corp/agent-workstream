@@ -262,12 +262,17 @@ and the exact target plan:
 workstreamctl generation prepare GEN-123 --plan-source ./PLAN.md \
   --plan-identity <canonical-immutable-plan-url> \
   --remote-head <authenticated-exact-head> \
-  --created-at <reviewed-utc-time> --retired-at <reviewed-utc-time> \
+  --created-at <reviewed-utc-time> \
+  --started-state-id <authenticated-linear-started-state-uuid> \
   > generation-review.json
 ```
 
 `prepare` has no apply mode. It accounts for every active projection key and
-emits the retirement proof plus the first target manifest. For terminal
+emits an authenticated predecessor-quiescence proof, the exact reviewed native
+reopen state, and the first target manifest. The proof binds the current route,
+selected generation, material/checkpoint frontiers, and predecessor projection;
+generation reservation revalidates those frontiers before it can retire the
+predecessor. For terminal
 children it uses predecessor-authorized evidence seeding and explicitly stages
 closure repair and later keys; it never copies a closure as authority. After
 each manifest is applied, rerun the same `prepare` command. It recognizes only
@@ -289,8 +294,9 @@ workstreamctl projection GEN-123 target-projection.json \
   --apply --expected-preview-sha256 <preview-sha256>
 ```
 
-The flagless projection invocation remains compatibility apply behavior and
-reports `legacy_implicit_apply`; new automation must use the digest-gated path.
+There is no implicit apply mode. A flagless invocation refuses before live
+access, and `--apply` refuses unless both the reviewed timestamp and preview
+digest are supplied.
 After the target projection is complete, use the generated structured
 retirement proof for the current active epoch:
 
@@ -412,9 +418,11 @@ root changes that generation deliberately does not own, use the separate
 `workstreamctl root-transition` surface. `plan-url` changes exactly one labeled
 same-document pinned GitHub blob URL to its reviewed `blob/main` locator while
 preserving every other description byte. `reopen` changes the same exact
-terminal root to one authenticated Linear `started` state. Both commands are
-zero-write previews unless `--apply` is supplied, and apply requires the
-previewed root-snapshot and complete comment-frontier digests. See
+terminal root to the authenticated Linear `started` state embedded in the exact
+prepared `activation_ready` generation contract. Both commands require that
+contract and its authenticated plan source, and are zero-write previews unless
+`--apply` is supplied. Apply requires the previewed root-snapshot, complete
+comment-frontier, and intent digests. See
 [`references/root-transition.md`](references/root-transition.md).
 
 These mutations do not change append-only generation authority. Linear has no

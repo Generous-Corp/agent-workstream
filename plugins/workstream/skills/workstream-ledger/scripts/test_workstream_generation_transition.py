@@ -49,6 +49,10 @@ AUTHORITY = {
     "workspace_id": "workspace", "team_id": "team", "project_id": "project",
     "root_issue_id": "33333333-3333-4333-8333-333333333333",
 }
+STARTED_STATE = {
+    "id": "44444444-4444-4444-8444-444444444444",
+    "name": "In Progress", "type": "started", "team_id": "team",
+}
 CHILD_CONTENT = {
     "schema_version": 1,
     "title": "New child",
@@ -355,8 +359,8 @@ class GenerationTransitionTests(unittest.TestCase):
                 "identity": f"https://example.test/{NEW}", "sha256": NEW,
             },
             created_at="2026-08-31T23:00:00Z",
-            retired_at="2026-08-31T22:59:59Z",
             remote_head="e" * 40,
+            started_state=STARTED_STATE,
         )
 
     def test_prepare_emits_complete_zero_write_operator_contract(self):
@@ -376,6 +380,17 @@ class GenerationTransitionTests(unittest.TestCase):
                 if event["kind"] == "provenance"
             )],
         )
+        self.assertEqual(first["retirement_proof"]["schema_version"], 2)
+        quiescence = first["retirement_proof"]["authenticated_quiescence"]
+        self.assertEqual(quiescence["authenticated_route"], AUTHORITY)
+        self.assertEqual(quiescence["material_revision"], 0)
+        self.assertEqual(
+            quiescence["predecessor_projection"],
+            first["frontiers"]["predecessor_projection"],
+        )
+        self.assertEqual(first["native_transition"], {
+            "operation": "reopen", "target_state": STARTED_STATE,
+        })
         accounting = first["projection_preview"]["active_key_accounting"]
         classified = {
             (item["kind"], item["key"])
@@ -422,16 +437,17 @@ class GenerationTransitionTests(unittest.TestCase):
                 workstream_id=WORKSTREAM, authority=AUTHORITY,
                 description_plan_revision=OLD,
                 target_source={"identity": "target", "sha256": "not-a-digest"},
-                created_at="", retired_at="now",
+                created_at="",
                 remote_head="e" * 40,
+                started_state=STARTED_STATE,
             )
 
     def test_prepare_cli_is_zero_write_and_has_no_apply_flag(self):
         args = parser().parse_args([
             "prepare", WORKSTREAM, "--plan-source", "PLAN.md",
             "--created-at", "2026-08-31T23:00:00Z",
-            "--retired-at", "2026-08-31T22:59:59Z",
             "--remote-head", "e" * 40,
+            "--started-state-id", STARTED_STATE["id"],
         ])
         self.assertEqual(args.command, "prepare")
         self.assertFalse(hasattr(args, "apply"))
@@ -439,8 +455,8 @@ class GenerationTransitionTests(unittest.TestCase):
             parser().parse_args([
                 "prepare", WORKSTREAM, "--plan-source", "PLAN.md",
                 "--created-at", "2026-08-31T23:00:00Z",
-                "--retired-at", "2026-08-31T22:59:59Z",
                 "--remote-head", "e" * 40, "--apply",
+                "--started-state-id", STARTED_STATE["id"],
             ])
 
     def test_prepare_stages_terminal_evidence_and_closure_without_copying_closure(self):
@@ -526,8 +542,8 @@ class GenerationTransitionTests(unittest.TestCase):
                     "identity": f"https://example.test/{NEW}", "sha256": NEW,
                 },
                 created_at="2026-08-31T23:00:00Z",
-                retired_at="2026-08-31T22:59:59Z",
                 remote_head="e" * 40,
+                started_state=STARTED_STATE,
             )
         preview = prepared["projection_preview"]
         self.assertEqual(preview["terminal_child_stage"], {
@@ -691,8 +707,8 @@ class GenerationTransitionTests(unittest.TestCase):
                         "identity": f"https://example.test/{NEW}", "sha256": NEW,
                     },
                     created_at="2026-08-31T23:00:00Z",
-                    retired_at="2026-08-31T22:59:59Z",
                     remote_head="e" * 40,
+                    started_state=STARTED_STATE,
                 )
 
         repair = run(target_events)

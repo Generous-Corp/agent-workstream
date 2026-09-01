@@ -413,6 +413,31 @@ def evidence_contract() -> dict:
 
 
 class ProjectionTests(unittest.TestCase):
+    def setUp(self):
+        # CLI integration cases below exercise the apply/readback path. Keep
+        # their reviewed preview receipt deterministic while the dedicated
+        # preview tests exercise the real digest function.
+        patcher = mock.patch.object(
+            workstream_projection, "projection_preview_sha256",
+            return_value="a" * 64,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_projection_cli_refuses_implicit_apply_before_any_live_access(self):
+        argv = [
+            "workstream_projection.py", "GEN-37", "manifest.json",
+            "--remote-head", HEAD, "--plan-source", "PLAN.md",
+        ]
+        with mock.patch.object(workstream_projection.sys, "argv", argv), \
+             mock.patch.object(
+                 workstream_projection, "load_linear_api_key",
+             ) as load_key, \
+             self.assertRaises(SystemExit) as refused:
+            workstream_projection.main()
+        self.assertEqual(refused.exception.code, 2)
+        load_key.assert_not_called()
+
     def test_preview_adapter_is_deterministic_and_cannot_write_linear(self):
         client = FakeProjectionClient()
         live = self.authorization_adapter(client)
@@ -8000,6 +8025,8 @@ class ProjectionTests(unittest.TestCase):
                 "--remote-head", HEAD, "--plan-source", "ignored",
                 "--plan-identity", exact,
                 "--max-bytes", "65536", "--max-items", "500",
+                "--apply", "--created-at", "2026-08-31T23:00:00Z",
+                "--expected-preview-sha256", "a" * 64,
             ]
             with mock.patch.object(workstream_projection.sys, "argv", argv), \
                  mock.patch.object(workstream_projection.sys, "stdout", output), \
@@ -8327,6 +8354,8 @@ class ProjectionTests(unittest.TestCase):
                     "workstream_projection.py", "GEN-37", str(manifest_path),
                     "--remote-head", HEAD, "--plan-source", str(plan_path),
                     "--plan-identity", identity,
+                    "--apply", "--created-at", "2026-08-31T23:00:00Z",
+                    "--expected-preview-sha256", "a" * 64,
                 ]
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with mock.patch.object(workstream_projection.sys, "argv", argv), \
@@ -8714,6 +8743,8 @@ class ProjectionTests(unittest.TestCase):
                 "--remote-head", HEAD, "--plan-source", str(plan_path),
                 "--plan-identity", identity,
                 "--max-bytes", "65536", "--max-items", "500",
+                "--apply", "--created-at", "2026-08-31T23:00:00Z",
+                "--expected-preview-sha256", "a" * 64,
             ]
             compact = workstream_projection.compact_context
             for expected_writes in (5, 5):
@@ -8872,6 +8903,8 @@ class ProjectionTests(unittest.TestCase):
                     "--remote-head", HEAD, "--plan-source", str(plan_path),
                     "--plan-identity", identity,
                     "--max-bytes", str(12 * 1024), "--max-items", "500",
+                    "--apply", "--created-at", "2026-08-31T23:00:00Z",
+                    "--expected-preview-sha256", "a" * 64,
                 ]
                 stdout, stderr = io.StringIO(), io.StringIO()
                 with mock.patch.object(workstream_projection.sys, "argv", argv), \
@@ -8952,6 +8985,8 @@ class ProjectionTests(unittest.TestCase):
                 "--remote-head", HEAD, "--plan-source", "ignored",
                 "--plan-identity", source["identity"],
                 "--max-bytes", "65536", "--max-items", "500",
+                "--apply", "--created-at", "2026-08-31T23:00:00Z",
+                "--expected-preview-sha256", "a" * 64,
             ]
             for _ in range(2):
                 manifest_path.write_text(json.dumps(manifest))
@@ -9042,6 +9077,8 @@ class ProjectionTests(unittest.TestCase):
                 "--remote-head", HEAD, "--plan-source", "ignored",
                 "--plan-identity", source["identity"],
                 "--max-bytes", "65536", "--max-items", "500",
+                "--apply", "--created-at", "2026-08-31T23:00:00Z",
+                "--expected-preview-sha256", "a" * 64,
             ]
 
             def invoke(reviewed=manifest):
@@ -9232,6 +9269,8 @@ class ProjectionTests(unittest.TestCase):
                 "--remote-head", HEAD, "--plan-source", "ignored",
                 "--plan-identity", source["identity"],
                 "--max-bytes", "65536", "--max-items", "500",
+                "--apply", "--created-at", "2026-08-31T23:00:00Z",
+                "--expected-preview-sha256", "a" * 64,
             ]
 
             def invoke(reviewed):

@@ -19,6 +19,22 @@ AUTHORITY = {
 PINNED = "https://github.com/example/private-plans/blob/" + "a" * 40 + "/plan.md"
 MAIN = "https://github.com/example/private-plans/blob/main/plan.md"
 STARTED_STATE = "44444444-4444-4444-8444-444444444444"
+OPERATOR_AUTHORIZATION = {
+    "schema_version": 1, "contract_sha256": "1" * 64,
+    "source": {"identity": MAIN, "sha256": "f" * 64},
+    "generation": {
+        "from_plan_revision": "e" * 64, "target_plan_revision": "f" * 64,
+        "activation_epoch": 1, "previous_control_event_id": None,
+    },
+    "native_transition": {
+        "operation": "reopen",
+        "target_state": {
+            "id": STARTED_STATE, "name": "In Progress", "type": "started",
+            "team_id": "team",
+        },
+    },
+    "retirement_sha256": "2" * 64, "frontiers_sha256": "3" * 64,
+}
 
 
 class FakeClient:
@@ -105,7 +121,10 @@ class FakeClient:
 
 class RootTransitionTests(unittest.TestCase):
     def transport(self, fake):
-        return RootTransitionTransport(fake, token=TOKEN, authority=AUTHORITY)
+        return RootTransitionTransport(
+            fake, token=TOKEN, authority=AUTHORITY,
+            operator_authorization=OPERATOR_AUTHORIZATION,
+        )
 
     def test_plan_url_preview_is_zero_write_and_apply_preserves_other_text(self):
         fake = FakeClient()
@@ -161,7 +180,9 @@ class RootTransitionTests(unittest.TestCase):
                 self.transport(fake).preview(operation="plan-url", target=MAIN)
         fake = FakeClient()
         other = "https://github.com/example/private-plans/blob/main/other.md"
-        with self.assertRaisesRegex(RootTransitionError, "different_document"):
+        with self.assertRaisesRegex(
+            RootTransitionError, "different_document|not_authorized_by_candidate"
+        ):
             self.transport(fake).preview(operation="plan-url", target=other)
 
     def test_apply_refuses_snapshot_or_comment_frontier_drift_without_write(self):
@@ -189,6 +210,14 @@ class RootTransitionTests(unittest.TestCase):
     def test_reopen_requires_terminal_root_and_reviewed_started_state(self):
         fake = FakeClient()
         transport = self.transport(fake)
+        unreviewed_started_state = "55555555-5555-4555-8555-555555555555"
+        with self.assertRaisesRegex(
+            RootTransitionError, "reopen_state_not_authorized_by_candidate"
+        ):
+            transport.preview(operation="reopen", target=unreviewed_started_state)
+        self.assertFalse(any(
+            "WorkstreamRootTransitionState" in query for query, _ in fake.calls
+        ))
         preview = transport.preview(operation="reopen", target=STARTED_STATE)
         result = transport.apply(
             operation="reopen", target=STARTED_STATE,
@@ -239,7 +268,7 @@ class RootTransitionTests(unittest.TestCase):
             ("plan-url", "https://github.com/EXAMPLE/private-plans/blob/main/plan.md"),
         ):
             with self.subTest(operation=operation), self.assertRaisesRegex(
-                RootTransitionError, "intent_mismatch"
+                RootTransitionError, "intent_mismatch|not_authorized_by_candidate"
             ):
                 transport.apply(
                     operation=operation, target=target,
@@ -266,6 +295,7 @@ class RootTransitionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "process died"):
             RootTransitionTransport(
                 fake, token=TOKEN, authority=AUTHORITY,
+                operator_authorization=OPERATOR_AUTHORIZATION,
                 after_reservation_created=crash,
             ).apply(**args)
         with self.assertRaisesRegex(
@@ -315,6 +345,7 @@ class RootTransitionTests(unittest.TestCase):
 
             transport = RootTransitionTransport(
                 fake, token=TOKEN, authority=AUTHORITY,
+                operator_authorization=OPERATOR_AUTHORIZATION,
                 after_reservation_created=corrupt,
             )
             with self.subTest(mode=mode), self.assertRaisesRegex(

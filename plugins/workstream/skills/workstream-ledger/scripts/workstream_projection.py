@@ -3579,7 +3579,7 @@ def main() -> int:
     )
     parser.add_argument("--config")
     parser.add_argument("--linear-endpoint", default="https://api.linear.app/graphql")
-    mode = parser.add_mutually_exclusive_group()
+    mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument(
         "--preview", action="store_true",
         help="validate and simulate the exact batch without any Linear write",
@@ -3598,6 +3598,10 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
+        if args.apply and (not args.created_at or not args.expected_preview_sha256):
+            raise LinearProjectionError(
+                "projection_apply_requires_matching_reviewed_preview"
+            )
         token = extract_token(args.token)
         manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
         authenticated_source = plan_payload(args.plan_source, args.plan_identity)["source"]
@@ -3838,12 +3842,11 @@ def main() -> int:
             json.dump(preview, sys.stdout, ensure_ascii=False, sort_keys=True, indent=2)
             sys.stdout.write("\n")
             return 0
-        if args.apply:
-            require_matching_projection_preview(
-                created_at=args.created_at,
-                expected_sha256=args.expected_preview_sha256,
-                observed_sha256=preview_digest,
-            )
+        require_matching_projection_preview(
+            created_at=args.created_at,
+            expected_sha256=args.expected_preview_sha256,
+            observed_sha256=preview_digest,
+        )
 
         description_before_write = transport.snapshot_for_root(
             token, include_description=True,
@@ -3868,7 +3871,6 @@ def main() -> int:
         )
         result["canonical_description_fence"] = description_fence
         result["reviewed_preview_sha256"] = preview_digest
-        result["legacy_implicit_apply"] = not args.apply
         # Double-collect graph and comments so a concurrent root/child/checkpoint
         # mutation cannot be certified from a mixed pre/post-write snapshot.
         final_comments = LinearCommentEventAdapter(

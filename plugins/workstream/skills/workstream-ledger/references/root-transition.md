@@ -10,14 +10,26 @@ Preview a same-document pinned-commit locator migration:
 
 ```sh
 workstreamctl root-transition plan-url GEN-123 \
-  --to https://github.com/owner/plans/blob/main/PLAN.md
+  --to https://github.com/owner/plans/blob/main/PLAN.md \
+  --operator-contract generation-review.json \
+  --plan-source ./PLAN.md \
+  --plan-identity https://github.com/owner/plans/blob/main/PLAN.md
 ```
 
 Preview reopening the exact terminal root to a reviewed Linear `started` state:
 
 ```sh
-workstreamctl root-transition reopen GEN-123 --state-id <linear-state-uuid>
+workstreamctl root-transition reopen GEN-123 \
+  --state-id <linear-state-uuid> \
+  --operator-contract generation-review.json \
+  --plan-source ./PLAN.md \
+  --plan-identity https://github.com/owner/plans/blob/main/PLAN.md
 ```
+
+The contract must be the exact `activation_ready` output from `workstreamctl
+generation prepare`. It binds the target generation bytes/source, reviewed
+started-state readback, authenticated route, and predecessor quiescence
+frontiers. A caller-selected state UUID or unrelated plan source is refused.
 
 Review `intent`, `authenticated_route`, `expected_snapshot_sha256`,
 `expected_frontier_sha256`, and `intent_sha256`, then repeat the identical

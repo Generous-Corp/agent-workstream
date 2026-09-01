@@ -18,6 +18,7 @@ import re
 import sys
 import uuid
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, Callable
 
 from workstream_config import load_linear_api_key, resolve_linear_route
@@ -30,6 +31,7 @@ from workstream_linear_events import (
     LinearCommentEventAdapter,
 )
 from workstream_plan import CANONICAL_PLAN_LINE, HTTPS_URL, canonical_plan_url, same_plan_document
+from workstream_plan import plan_payload
 
 
 PREFIX = "<!-- workstream-root-transition:v1:"
@@ -195,14 +197,142 @@ def _validate_authority(
         raise RootTransitionError("root_transition_requires_active_root_issue")
 
 
+def validate_operator_contract(
+    contract: dict[str, Any], *, source: dict[str, str], token: str,
+    authority: dict[str, str], comments: list[dict[str, Any]],
+    description_plan_revision: str | None,
+) -> dict[str, Any]:
+    """Authenticate the prepared candidate and predecessor quiescence contract."""
+    from workstream_generation import (
+        _validate_retirement, GenerationTransport,
+        reduce_generation_checkpoint_comments,
+    )
+    from workstream_linear_events import reduce_event_comments
+    from workstream_linear_projection import (
+        reduce_projection_comments, select_plan_generation,
+    )
+    from workstream_projection import projection_review_contract
+
+    if not isinstance(contract, dict):
+        raise RootTransitionError("root_transition_operator_contract_invalid")
+    unsigned = {key: deepcopy(value) for key, value in contract.items()
+                if key != "contract_sha256"}
+    if (
+        contract.get("schema_version") != 1
+        or contract.get("contract_sha256") != _digest(unsigned)
+        or contract.get("workstream_id") != token
+        or contract.get("authenticated_route") != authority
+        or contract.get("source") != source
+        or (contract.get("projection_preview") or {}).get("phase")
+        != "activation_ready"
+    ):
+        raise RootTransitionError("root_transition_operator_contract_invalid")
+    generation = contract.get("generation") or {}
+    selected = select_plan_generation(
+        comments, workstream_id=token,
+        description_plan_revision=description_plan_revision,
+        authenticated_route=authority,
+    )
+    expected_generation = {
+        "from_plan_revision": selected["plan_revision"],
+        "target_plan_revision": source["sha256"],
+        "activation_epoch": (
+            selected["activation_epoch"]
+            if selected["activation_epoch"] is not None else -1
+        ) + 1,
+        "previous_control_event_id": selected["transition_tip_event_id"],
+    }
+    if generation != expected_generation:
+        raise RootTransitionError("root_transition_operator_generation_mismatch")
+    native_transition = contract.get("native_transition") or {}
+    target_state = native_transition.get("target_state") or {}
+    if (
+        native_transition.get("operation") != "reopen"
+        or set(target_state) != {"id", "name", "type", "team_id"}
+        or str(target_state.get("type", "")).lower() != "started"
+        or target_state.get("team_id") != authority["team_id"]
+    ):
+        raise RootTransitionError("root_transition_operator_native_state_invalid")
+    predecessor = reduce_projection_comments(
+        comments, workstream_id=token,
+        expected_plan_revision=generation["from_plan_revision"],
+        authenticated_route=authority,
+    )
+    target = reduce_projection_comments(
+        comments, workstream_id=token,
+        expected_plan_revision=generation["target_plan_revision"],
+        authenticated_route=authority,
+    )
+    material = reduce_event_comments(comments, workstream_id=token)
+    checkpoint_ids = sorted(
+        item["event_id"] for item in reduce_generation_checkpoint_comments(
+            comments, workstream_id=token, authenticated_route=authority,
+        ).checkpoints
+        if item["plan_revision"] == generation["from_plan_revision"]
+    )
+    frontiers = contract.get("frontiers") or {}
+    if frontiers != {
+        "material_revision": material.revision,
+        "predecessor_projection": projection_review_contract(predecessor),
+        "target_projection": projection_review_contract(target),
+        "predecessor_checkpoint_event_ids": checkpoint_ids,
+    }:
+        raise RootTransitionError("root_transition_operator_frontier_mismatch")
+    retirement = contract.get("retirement_proof") or {}
+    if retirement.get("schema_version") != 2:
+        raise RootTransitionError(
+            "root_transition_authenticated_retirement_required"
+        )
+    try:
+        _validate_retirement(
+            retirement, generation["from_plan_revision"],
+            generation["activation_epoch"],
+        )
+        validator = GenerationTransport(
+            object(), issue_id=token, workstream_id=token,
+            authority=authority, candidate_loader=lambda _plan: {},
+            legacy_description_plan_revision=description_plan_revision,
+        )
+        validator._validate_retirement_frontier(
+            comments, from_plan=generation["from_plan_revision"],
+            retirement=retirement, from_state=predecessor,
+        )
+    except LinearTransportError as error:
+        raise RootTransitionError(str(error)) from error
+    return {
+        "schema_version": 1,
+        "contract_sha256": contract["contract_sha256"],
+        "source": deepcopy(source),
+        "generation": deepcopy(generation),
+        "native_transition": deepcopy(native_transition),
+        "retirement_sha256": retirement["declaration_sha256"],
+        "frontiers_sha256": _digest(frontiers),
+    }
+
+
 class RootTransitionTransport:
     def __init__(
         self, client: Any, *, token: str, authority: dict[str, str],
+        operator_authorization: dict[str, Any],
         after_reservation_created: Callable[[], None] | None = None,
     ):
         self.client = client
         self.token = token.upper()
         self.authority = deepcopy(authority)
+        required_operator = {
+            "schema_version", "contract_sha256", "source", "generation",
+            "native_transition", "retirement_sha256", "frontiers_sha256",
+        }
+        if (
+            not isinstance(operator_authorization, dict)
+            or set(operator_authorization) != required_operator
+            or operator_authorization.get("schema_version") != 1
+            or not all(HEX64.fullmatch(str(operator_authorization.get(field, "")))
+                       for field in ("contract_sha256", "retirement_sha256",
+                                     "frontiers_sha256"))
+        ):
+            raise RootTransitionError("root_transition_operator_authorization_required")
+        self.operator_authorization = deepcopy(operator_authorization)
         self.after_reservation_created = after_reservation_created
         self.graph = LinearGraphQLTransport(
             client, team_id=authority["team_id"],
@@ -292,6 +422,10 @@ class RootTransitionTransport:
         snapshot, comments = self._read()
         root = snapshot["root"]
         if operation == "plan-url":
+            if target != (self.operator_authorization.get("source") or {}).get("identity"):
+                raise RootTransitionError(
+                    "root_transition_plan_url_not_authorized_by_candidate"
+                )
             desired_description, current = replace_canonical_plan_url(
                 root.get("description") or "", target,
             )
@@ -299,7 +433,19 @@ class RootTransitionTransport:
             before = {"canonical_plan_url": current}
             after = {"canonical_plan_url": target}
         elif operation == "reopen":
+            authorized_state = (
+                (self.operator_authorization.get("native_transition") or {})
+                .get("target_state") or {}
+            )
+            if target != authorized_state.get("id"):
+                raise RootTransitionError(
+                    "root_transition_reopen_state_not_authorized_by_candidate"
+                )
             state = self._started_state(target)
+            if state != authorized_state:
+                raise RootTransitionError(
+                    "root_transition_reopen_state_readback_changed"
+                )
             native = root.get("state") or {}
             if str(native.get("type", "")).lower() not in TERMINAL_TYPES:
                 raise RootTransitionError("root_reopen_requires_terminal_root")
@@ -317,6 +463,7 @@ class RootTransitionTransport:
             "expected_frontier_sha256": frontier,
             "before": before, "after": after, "update": update,
             "preserved_root": _preserved_root(snapshot, operation),
+            "operator_authorization": deepcopy(self.operator_authorization),
         }
         return {
             "apply": False, "conditional_update_available": False,
@@ -488,6 +635,9 @@ def parser() -> argparse.ArgumentParser:
     reopen.add_argument("token")
     reopen.add_argument("--state-id", required=True)
     for command in (plan, reopen):
+        command.add_argument("--operator-contract", required=True)
+        command.add_argument("--plan-source", required=True)
+        command.add_argument("--plan-identity")
         command.add_argument("--expected-snapshot-sha256")
         command.add_argument("--expected-frontier-sha256")
         command.add_argument("--expected-intent-sha256")
@@ -511,11 +661,37 @@ def main() -> int:
             "workspace_id", "team_id", "project_id",
         )):
             raise RootTransitionError("root_transition_configured_route_mismatch")
+        source = plan_payload(
+            args.plan_source, args.plan_identity or args.plan_source,
+        )["source"]
+        with Path(args.operator_contract).open(encoding="utf-8") as handle:
+            contract = json.load(handle)
+        linear = LinearGraphQLTransport(
+            client, team_id=authority["team_id"],
+            workspace_id=authority["workspace_id"],
+            project_id=authority["project_id"],
+        )
+        root_snapshot = linear.snapshot_for_root(
+            args.token.upper(), include_description=True,
+        )
+        comments = LinearCommentEventAdapter(
+            client, issue_id=args.token.upper(), **authority,
+        ).comments()
+        operator_authorization = validate_operator_contract(
+            contract, source=source, token=args.token.upper(),
+            authority=authority, comments=comments,
+            description_plan_revision=root_snapshot["root"].get("plan_revision"),
+        )
         transport = RootTransitionTransport(
             client, token=args.token.upper(), authority=authority,
+            operator_authorization=operator_authorization,
         )
         operation = args.command
         target = args.to if operation == "plan-url" else args.state_id
+        if operation == "plan-url" and target != source["identity"]:
+            raise RootTransitionError(
+                "root_transition_plan_url_must_equal_authenticated_target_source"
+            )
         if args.apply:
             if (
                 not args.expected_snapshot_sha256
