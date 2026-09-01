@@ -39,6 +39,9 @@ from workstream_resume import (
 )
 from workstream_relation_readback import add_relation_target_readback
 from workstream_scope import repository_key
+from workstream_child_dependencies import (
+    ChildDependencyError, LinearChildDependencyAdapter,
+)
 
 
 OID = re.compile(r"[0-9a-f]{40}")
@@ -53,6 +56,30 @@ SAFE_COMMAND_ENV = {
 
 class ReconcileError(RuntimeError):
     """Live truth or closure input was incomplete, stale, or contradictory."""
+
+
+def authenticated_reconcile_snapshot(
+    graph: dict[str, Any], comments: list[dict[str, Any]], token: str, *,
+    authenticated_route: dict[str, str],
+    authenticated_source: dict[str, str],
+    dependency_adapter: LinearChildDependencyAdapter,
+    reread: Callable[[], tuple[dict[str, Any], list[dict[str, Any]]]],
+) -> dict[str, Any]:
+    """Attach live dependency authority before lifecycle snapshot validation."""
+    candidate = deepcopy(graph)
+    candidate["dependency_graph"] = (
+        dependency_adapter.read_authorized_graph_for_snapshot(
+            graph, comments,
+            generation_selector_plan_revision=graph["root"].get("plan_revision"),
+            reread=reread,
+        )
+    )
+    return add_material_history(
+        candidate, comments, token,
+        authenticated_route=authenticated_route,
+        authenticated_source=authenticated_source,
+        permit_stale_lifecycle_for_reconcile=True,
+    )
 
 
 def canonical_digest(value: Any) -> str:
@@ -753,7 +780,6 @@ def main() -> int:
             client, team_id=route["team_id"], workspace_id=route["workspace_id"],
             project_id=route["project_id"],
         )
-        graph = transport.snapshot_for_root(token)
         comments_adapter = LinearCommentEventAdapter(
             client, issue_id=token, workspace_id=route["workspace_id"],
             team_id=route["team_id"], project_id=route["project_id"],
@@ -764,10 +790,23 @@ def main() -> int:
             workspace_id=route["workspace_id"], team_id=route["team_id"],
             project_id=route["project_id"], root_issue_id=route["root_issue_id"],
         )
-        snapshot = add_material_history(
-            graph, comments_adapter.comments(), token,
-            authenticated_route=route, authenticated_source=authenticated_source,
-            permit_stale_lifecycle_for_reconcile=True,
+        dependency_adapter = LinearChildDependencyAdapter(
+            client, workspace_id=route["workspace_id"], team_id=route["team_id"],
+            project_id=route["project_id"], root_issue_id=route["root_issue_id"],
+            root_identifier=token, plan_revision=authenticated_source["sha256"],
+        )
+        graph, comments = stable_live_readback(
+            transport, comments_adapter, token, include_description=True,
+            include_child_comments=True,
+        )
+        snapshot = authenticated_reconcile_snapshot(
+            graph, comments, token, authenticated_route=route,
+            authenticated_source=authenticated_source,
+            dependency_adapter=dependency_adapter,
+            reread=lambda: stable_live_readback(
+                transport, comments_adapter, token, include_description=True,
+                include_child_comments=True,
+            ),
         )
         snapshot = add_relation_target_readback(snapshot, client)
         if snapshot["root"].get("plan_revision") != authenticated_source["sha256"]:
@@ -775,12 +814,17 @@ def main() -> int:
 
         def snapshot_fence() -> dict[str, Any]:
             graph_fence, comments_fence = stable_live_readback(
-                transport, comments_adapter, token,
+                transport, comments_adapter, token, include_description=True,
+                include_child_comments=True,
             )
-            fenced = add_material_history(
-                graph_fence, comments_fence, token,
-                authenticated_route=route, authenticated_source=authenticated_source,
-                permit_stale_lifecycle_for_reconcile=True,
+            fenced = authenticated_reconcile_snapshot(
+                graph_fence, comments_fence, token, authenticated_route=route,
+                authenticated_source=authenticated_source,
+                dependency_adapter=dependency_adapter,
+                reread=lambda: stable_live_readback(
+                    transport, comments_adapter, token, include_description=True,
+                    include_child_comments=True,
+                ),
             )
             return add_relation_target_readback(fenced, client)
         github_reader = GitHubTruthReader(github_token)
@@ -812,12 +856,18 @@ def main() -> int:
         activation_receipt = adapter.activate_v2(created_at=created_at)
         if activation_receipt is not None:
             graph_after_activation, comments_after_activation = stable_live_readback(
-                transport, comments_adapter, token,
+                transport, comments_adapter, token, include_description=True,
+                include_child_comments=True,
             )
-            snapshot = add_material_history(
+            snapshot = authenticated_reconcile_snapshot(
                 graph_after_activation, comments_after_activation, token,
-                authenticated_route=route, authenticated_source=authenticated_source,
-                permit_stale_lifecycle_for_reconcile=True,
+                authenticated_route=route,
+                authenticated_source=authenticated_source,
+                dependency_adapter=dependency_adapter,
+                reread=lambda: stable_live_readback(
+                    transport, comments_adapter, token, include_description=True,
+                    include_child_comments=True,
+                ),
             )
             snapshot = add_relation_target_readback(snapshot, client)
         result = reconcile_lifecycle(
@@ -834,7 +884,7 @@ def main() -> int:
         return 0
     except (
         OSError, json.JSONDecodeError, LinearProjectionError, LinearTransportError,
-        ResumeError, ReconcileError, ValueError,
+        ChildDependencyError, ResumeError, ReconcileError, ValueError,
     ) as error:
         print(f"workstream reconcile refused: {error}", file=sys.stderr)
         return 2

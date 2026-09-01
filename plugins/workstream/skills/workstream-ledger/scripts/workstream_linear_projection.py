@@ -128,6 +128,49 @@ def _projection_receipt(comment: dict[str, Any]) -> dict[str, Any]:
     return {key: comment.get(key) for key in ("id", "createdAt", "updatedAt", "body")}
 
 
+def dependency_material_frontier_sha256(
+    events: Any, remote_ids: Mapping[str, str], comments: list[dict[str, Any]],
+    *, revision: int,
+) -> str:
+    """Bind a material prefix to its canonical event IDs and remote bodies."""
+    if (
+        not isinstance(revision, int) or isinstance(revision, bool) or revision < 0
+        or not isinstance(remote_ids, Mapping) or not isinstance(comments, list)
+    ):
+        raise LinearProjectionError("invalid_child_dependency_material_frontier")
+    ordered = list(events)
+    if revision > len(ordered):
+        raise LinearProjectionError("invalid_child_dependency_material_frontier")
+    comments_by_id: dict[str, dict[str, Any]] = {}
+    for comment in comments:
+        remote_id = comment.get("id") if isinstance(comment, dict) else None
+        if not isinstance(remote_id, str) or not remote_id:
+            continue
+        if remote_id in comments_by_id:
+            raise LinearProjectionError("ambiguous_child_dependency_material_receipt")
+        comments_by_id[remote_id] = comment
+    receipts = []
+    for delta in ordered[:revision]:
+        event_id = getattr(delta, "event_id", None)
+        remote_id = remote_ids.get(event_id)
+        comment = comments_by_id.get(remote_id)
+        body = comment.get("body") if isinstance(comment, dict) else None
+        if (
+            not isinstance(event_id, str) or not event_id
+            or not isinstance(remote_id, str) or not remote_id
+            or not isinstance(body, str)
+        ):
+            raise LinearProjectionError("child_dependency_material_receipt_missing")
+        receipts.append({
+            "event_id": event_id,
+            "remote_comment_id": remote_id,
+            "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        })
+    return hashlib.sha256(_canonical([
+        "child-dependency-material-frontier-v1", revision, receipts,
+    ])).hexdigest()
+
+
 def projection_prefix_sha256(
     events: list[dict[str, Any]], comments_by_event_id: Mapping[str, dict[str, Any]],
     through_event_id: str,
@@ -1412,6 +1455,7 @@ def validate_projection_event(event: dict[str, Any]) -> None:
         required_authorization = {
             "root_issue_id", "route", "plan_revision", "batch_id",
             "relation_ids", "relations_sha256", "expected_material_revision",
+            "expected_material_frontier_sha256",
             "expected_projection_revision", "expected_graph_revision",
             "expected_graph_sha256",
             "initial_state",
@@ -1436,6 +1480,10 @@ def validate_projection_event(event: dict[str, Any]) -> None:
                 r"[89ab][0-9a-f]{3}-[0-9a-f]{12}", str(item), re.IGNORECASE,
             ) for item in relation_ids)
             or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("relations_sha256", "")))
+            or not re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(value.get("expected_material_frontier_sha256", "")),
+            )
             or not re.fullmatch(
                 r"[0-9a-f]{64}", str(value.get("expected_graph_sha256", "")),
             )
@@ -4479,6 +4527,10 @@ class LinearProjectionAdapter:
             expected_plan_revision=self.plan_revision,
             authenticated_route=self.authority,
         )
+        material_frontier_sha256 = dependency_material_frontier_sha256(
+            material.events, material.remote_ids, before_comments,
+            revision=expected_material_revision,
+        )
         value = {
             "root_issue_id": self.root_issue_id,
             "route": self.authority,
@@ -4487,6 +4539,7 @@ class LinearProjectionAdapter:
             "relation_ids": sorted(relation_ids),
             "relations_sha256": relations_sha256,
             "expected_material_revision": expected_material_revision,
+            "expected_material_frontier_sha256": material_frontier_sha256,
             "expected_projection_revision": expected_projection_revision,
             "expected_graph_revision": expected_graph_revision,
             "expected_graph_sha256": expected_graph_sha256,

@@ -326,6 +326,16 @@ class ResumeTests(unittest.TestCase):
                 "decisions": [{"id": "D1", "status": "accepted"}], "provenance": [{"machine": "M3"}]}
 
     def live_snapshot(self, snapshot, route):
+        snapshot["root"].update({
+            "id": route["root_issue_id"], "title": snapshot["root"].get("title", "Root"),
+            "description": snapshot["root"].get("description", "Plan revision: sha"),
+            "url": snapshot["root"].get("url", "https://linear/GEN-37"),
+            "updatedAt": snapshot["root"].get("updatedAt", "now"), "parent": None,
+            "team": {"id": route["team_id"],
+                     "organization": {"id": route["workspace_id"]}},
+            "project": {"id": route["project_id"]}, "assignee": None,
+            "state": {"id": "started", "name": "In Progress", "type": "started"},
+        })
         for index, child in enumerate(snapshot["children"]):
             child.update({
                 "id": f"child-{index}",
@@ -349,6 +359,12 @@ class ResumeTests(unittest.TestCase):
         }
         plan_revision = "a" * 64
         snapshot["root"]["plan_revision"] = plan_revision
+        snapshot["root"].update({
+            "id": route["root_issue_id"],
+            "description": snapshot["root"].get(
+                "description", f"Plan revision: {plan_revision}"
+            ),
+        })
         snapshot["root"]["issue_revision"] = snapshot["root"]["revision"]
         repository_key = "github.com:id:R_agent_workstream"
         scope = {
@@ -433,6 +449,28 @@ class ResumeTests(unittest.TestCase):
             "latest_checkpoint": None,
             "checkpoint_recovery": {"state": "not_found", "stale_plan_count": 0},
         })
+        empty_graph_sha256 = hashlib.sha256(b"[]").hexdigest()
+        snapshot["dependency_graph"] = {
+            "schema_version": 1,
+            "authority": "child_dependency_authorization",
+            "plan_revision": plan_revision,
+            "route": route,
+            "revision": 0,
+            "sha256": empty_graph_sha256,
+            "authorization_batches": [],
+            "relations": [],
+            "native_readback": "relations_and_inverseRelations",
+            "ignored_non_dependency_count": 0,
+            "observed_frontier": {
+                "material_revision": snapshot.get("material_event_revision", 0),
+                "projection_revision": len(projection_events),
+                "graph_revision": 0,
+                "graph_sha256": empty_graph_sha256,
+            },
+            "root_readback_sha256": MODULE.dependency_root_readback_sha256(
+                snapshot["root"]
+            ),
+        }
         return snapshot
 
     def test_repair_graph_frontier_binds_native_status_and_state_identity(self):
@@ -1652,6 +1690,10 @@ class ResumeTests(unittest.TestCase):
             bounded["context_schema"]["envelope"], "bounded_authority_v1",
         )
         self.assertEqual(
+            bounded["execution_frontier"]["child_dependency_graph"]["sha256"],
+            hashlib.sha256(b"[]").hexdigest(),
+        )
+        self.assertEqual(
             bounded["deferred_audit_detail"]["state"],
             "bounded_authority_envelope",
         )
@@ -1805,6 +1847,20 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(
             context["execution_frontier"]["dependencies"],
             [["blocked_by", "OPS-900"]],
+        )
+        self.assertEqual(
+            context["execution_frontier"]["child_dependency_graph"]["relations"],
+            [],
+        )
+        self.assertEqual(
+            context["execution_frontier"]["child_dependency_graph"]
+            ["authority"]["sha256"],
+            hashlib.sha256(b"[]").hexdigest(),
+        )
+        self.assertEqual(
+            context["deferred_audit_detail"]["hydration_selectors"]
+            ["child_dependency_graph"],
+            ".dependency_graph",
         )
 
     def test_mature_resume_contradiction_refuses_before_compaction(self):
@@ -2033,6 +2089,39 @@ class ResumeTests(unittest.TestCase):
         snapshot["evidence_contracts"] = []
         snapshot["material_events"] = []
         snapshot["material_event_revision"] = 0
+        snapshot["authenticated_route"] = {
+            "workspace_id": "ws", "team_id": "team", "project_id": "project",
+            "root_issue_id": "33333333-3333-4333-8333-333333333333",
+        }
+        snapshot["dependency_graph"] = {
+            "schema_version": 1,
+            "authority": "child_dependency_authorization",
+            "plan_revision": "sha",
+            "route": snapshot["authenticated_route"],
+            "revision": 0,
+            "sha256": hashlib.sha256(b"[]").hexdigest(),
+            "authorization_batches": [],
+            "relations": [],
+            "native_readback": "relations_and_inverseRelations",
+            "ignored_non_dependency_count": 0,
+            "observed_frontier": {
+                "material_revision": 0, "projection_revision": 0,
+                "graph_revision": 0,
+                "graph_sha256": hashlib.sha256(b"[]").hexdigest(),
+            },
+            "root_readback_sha256": "0" * 64,
+        }
+        snapshot["root"].update({
+            "id": snapshot["authenticated_route"]["root_issue_id"],
+            "title": "Root", "description": "Plan revision: sha",
+            "url": "https://linear/GEN-37", "updatedAt": "now", "parent": None,
+            "team": {"id": "team", "organization": {"id": "ws"}},
+            "project": {"id": "project"}, "assignee": None,
+            "state": {"id": "started", "name": "In Progress", "type": "started"},
+        })
+        snapshot["dependency_graph"]["root_readback_sha256"] = (
+            MODULE.dependency_root_readback_sha256(snapshot["root"])
+        )
         snapshot["root"]["issue_revision"] = snapshot["root"]["revision"]
         snapshot["root"]["revision"] = 0
         snapshot["latest_checkpoint"] = None
@@ -2044,7 +2133,33 @@ class ResumeTests(unittest.TestCase):
         self.assertNotIn("route_verification", context["scope"]["linear"])
         self.assertRegex(context["scope"]["validated_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(context["relations"][0]["target"]["identifier"], "GEN-50")
+        self.assertEqual(context["dependency_graph"]["relations"], [])
         self.assertTrue(all(value == "available" for value in context["surface_availability"].values()))
+
+        mutated = copy.deepcopy(snapshot)
+        mutated["dependency_graph"]["observed_frontier"]["material_revision"] = 999
+        with self.assertRaisesRegex(
+            MODULE.ResumeError, "dependency_resume_frontier_mismatch",
+        ):
+            MODULE.compact_context(mutated, "GEN-37")
+        mutated = copy.deepcopy(snapshot)
+        mutated["dependency_graph"]["root_readback_sha256"] = "f" * 64
+        with self.assertRaisesRegex(
+            MODULE.ResumeError, "dependency_resume_root_mismatch",
+        ):
+            MODULE.compact_context(mutated, "GEN-37")
+
+    def test_full_authority_requires_explicit_authenticated_dependency_graph(self):
+        for mutation in ("missing", "null"):
+            snapshot = self.snapshot()
+            if mutation == "null":
+                snapshot["dependency_graph"] = None
+            with self.assertRaisesRegex(
+                MODULE.ResumeError, "authenticated_dependency_graph_missing",
+            ):
+                MODULE.validate_snapshot(
+                    snapshot, "GEN-37", require_projection_authority=True,
+                )
 
     def test_legacy_live_snapshot_exposes_untransported_factory_surfaces(self):
         context = MODULE.compact_context(self.snapshot(), "GEN-37")
@@ -2070,7 +2185,7 @@ class ResumeTests(unittest.TestCase):
              mock.patch.object(MODULE.sys, "stdout"):
             self.assertEqual(MODULE.main(), 0)
         transport.snapshot_for_root.assert_called_once_with(
-            "GEN-37", include_description=True, include_child_comments=True,
+            "GEN-37", include_child_comments=True, include_description=True,
         )
         comments.comments.assert_called_once_with()
 
@@ -2101,7 +2216,7 @@ class ResumeTests(unittest.TestCase):
             client, team_id="team", workspace_id="workspace", project_id="project"
         )
         transport.snapshot_for_root.assert_called_once_with(
-            "GEN-37", include_description=True, include_child_comments=True,
+            "GEN-37", include_child_comments=True, include_description=True,
         )
         comments.comments.assert_called_once_with()
 
@@ -2144,6 +2259,9 @@ class ResumeTests(unittest.TestCase):
             "identity": "https://example.test/immutable-plan",
             "sha256": "a" * 64, "bytes": 123,
         }
+        graph["root"]["description"] = (
+            "Canonical plan: " + authenticated_source["identity"]
+        )
         before = MODULE.add_material_history(
             graph, [], "GEN-37", authenticated_route=route,
             authenticated_source=authenticated_source,
@@ -2204,6 +2322,29 @@ class ResumeTests(unittest.TestCase):
         })
         comments = mock.Mock()
         comments.comments.return_value = comments_payload
+        dependency_graph = {
+            "schema_version": 1,
+            "authority": "child_dependency_authorization",
+            "plan_revision": "a" * 64,
+            "route": route,
+            "revision": 0,
+            "sha256": hashlib.sha256(b"[]").hexdigest(),
+            "authorization_batches": [],
+            "relations": [],
+            "native_readback": "relations_and_inverseRelations",
+            "ignored_non_dependency_count": 0,
+            "observed_frontier": {
+                "material_revision": 0, "projection_revision": 1,
+                "graph_revision": 0,
+                "graph_sha256": hashlib.sha256(b"[]").hexdigest(),
+            },
+            "root_readback_sha256": MODULE.dependency_root_readback_sha256(
+                before["root"],
+            ),
+        }
+        dependency_adapter = mock.Mock()
+        dependency_adapter.read_authorized_graph.return_value = dependency_graph
+        dependency_constructor = mock.Mock(return_value=dependency_adapter)
         stdout = io.StringIO()
 
         def verified_context(snapshot, *_args, **_kwargs):
@@ -2212,6 +2353,7 @@ class ResumeTests(unittest.TestCase):
                 "Landed — acceptance review required",
             )
             self.assertNotIn("lifecycle_recovery", snapshot)
+            self.assertEqual(snapshot["dependency_graph"], dependency_graph)
             return {"status": snapshot["root"]["status"]}
 
         with mock.patch.object(MODULE, "resolve_linear_route", return_value=(None, None)), \
@@ -2219,6 +2361,9 @@ class ResumeTests(unittest.TestCase):
              mock.patch.object(MODULE, "HttpGraphQLClient", return_value=mock.Mock()), \
              mock.patch.object(MODULE, "LinearGraphQLTransport", return_value=transport), \
              mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
+             mock.patch.object(
+                 MODULE, "LinearChildDependencyAdapter", dependency_constructor,
+             ), \
              mock.patch.object(MODULE, "load_linear_api_key", return_value="secret"), \
              mock.patch.object(
                  MODULE, "plan_payload", return_value={"source": authenticated_source},
@@ -2241,6 +2386,12 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(first["status"], "Landed — acceptance review required")
         self.assertEqual(transport.snapshot_for_root.call_count, 2)
         self.assertEqual(comments.comments.call_count, 2)
+        self.assertEqual(dependency_constructor.call_count, 2)
+        dependency_constructor.assert_called_with(
+            mock.ANY, workspace_id="workspace", team_id="team",
+            project_id="project", root_issue_id=route["root_issue_id"],
+            root_identifier="GEN-37", plan_revision="a" * 64,
+        )
         graph["root"]["next_action"] = "new material state after reconciliation"
         with self.assertRaisesRegex(
             MODULE.ResumeError, "lifecycle_snapshot_stale_reconcile_required",

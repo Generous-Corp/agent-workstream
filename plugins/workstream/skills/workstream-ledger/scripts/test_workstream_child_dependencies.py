@@ -9,14 +9,17 @@ from unittest import mock
 
 import workstream_child_dependencies as dependency_module
 from workstream_child_dependencies import (
-    ChildDependencyError, LinearChildDependencyAdapter,
-    dependency_relation_id, reduce_dependency_readback,
+    authorized_dependency_graph, ChildDependencyError, DependencyGraph,
+    LinearChildDependencyAdapter, dependency_relation_id,
+    reduce_dependency_readback, validate_authorized_dependency_graph_surface,
+    validate_dependency_graph_summary,
 )
 from workstream_delta import Delta, event_id_for
 from workstream_linear import LinearTransportError
 from workstream_linear_events import encode_event_comment
 from workstream_linear_projection import (
-    build_projection_event, encode_projection_comment, projection_slot_id,
+    build_projection_event, dependency_material_frontier_sha256,
+    encode_projection_comment, projection_slot_id,
 )
 
 
@@ -282,6 +285,246 @@ class ChildDependencyTests(unittest.TestCase):
         })
         self.assertFalse(any("issueCreate" in query or "projectCreate" in query
                              for query, _ in mutations))
+
+    def test_resume_graph_binds_native_readback_to_active_authorization(self):
+        fake = FakeLinear()
+        self.apply(fake)
+        adapter = self.adapter(fake)
+
+        surface = adapter.read_authorized_graph()
+
+        self.assertEqual(surface["authority"], "child_dependency_authorization")
+        self.assertEqual(surface["revision"], 1)
+        self.assertEqual(surface["relations"][0]["blocker"], A)
+        self.assertEqual(surface["relations"][0]["blocked"], B)
+        self.assertEqual(len(surface["authorization_batches"]), 1)
+        projection = adapter.authorization.state()
+        self.assertEqual(
+            validate_authorized_dependency_graph_surface(
+                surface, projection.events, authority=AUTHORITY,
+                plan_revision=PLAN,
+            ),
+            surface,
+        )
+
+        unauthorized = fake.native_relation(A, C)
+        graph = DependencyGraph(
+            relations=tuple([*surface["relations"], {
+                "id": unauthorized["id"], "type": "blocks",
+                "blocker": A, "blocked": C, "inverse_type": "blocked_by",
+            }]),
+            ignored_non_dependency_count=0,
+        )
+        with self.assertRaisesRegex(
+            ChildDependencyError, "unauthorized_native_dependency",
+        ):
+            authorized_dependency_graph(
+                graph, projection.events, authority=AUTHORITY,
+                plan_revision=PLAN,
+                observed_frontier=surface["observed_frontier"],
+                root_readback_sha256=surface["root_readback_sha256"],
+            )
+
+        stale = deepcopy(projection.events)
+        authorization = next(
+            event for event in stale
+            if event["kind"] == "child_dependency_authorization"
+        )
+        authorization["value"]["expected_graph_revision"] = 1
+        with self.assertRaisesRegex(
+            ChildDependencyError, "stale_dependency_authorization_frontier",
+        ):
+            authorized_dependency_graph(
+                DependencyGraph(tuple(surface["relations"]), 0), stale,
+                authority=AUTHORITY, plan_revision=PLAN,
+                observed_frontier=surface["observed_frontier"],
+                root_readback_sha256=surface["root_readback_sha256"],
+            )
+
+        cross_generation = deepcopy(projection.events)
+        authorization = next(
+            event for event in cross_generation
+            if event["kind"] == "child_dependency_authorization"
+        )
+        authorization["plan_revision"] = "b" * 64
+        with self.assertRaisesRegex(
+            ChildDependencyError, "cross_generation_dependency_authorization",
+        ):
+            authorized_dependency_graph(
+                DependencyGraph(tuple(surface["relations"]), 0),
+                cross_generation, authority=AUTHORITY, plan_revision=PLAN,
+                observed_frontier=surface["observed_frontier"],
+                root_readback_sha256=surface["root_readback_sha256"],
+            )
+
+    def test_legacy_no_edge_root_authenticates_canonical_empty_graph(self):
+        fake = FakeLinear()
+        fake.children = []
+
+        surface = self.adapter(fake).read_authorized_graph()
+
+        self.assertEqual(surface["relations"], [])
+        self.assertEqual(surface["authorization_batches"], [])
+        self.assertEqual(surface["revision"], 0)
+        self.assertEqual(surface["sha256"], graph_sha256([]))
+        self.assertEqual(
+            validate_dependency_graph_summary(
+                surface, authority=AUTHORITY, plan_revision=PLAN,
+                expected_frontier=FRONTIER,
+            ),
+            surface,
+        )
+
+    def test_summary_rejects_semantic_forgery_with_recomputed_graph_digests(self):
+        fake = FakeLinear()
+        self.apply(fake)
+        surface = self.adapter(fake).read_authorized_graph()
+
+        forged_endpoint = deepcopy(surface)
+        relation = forged_endpoint["relations"][0]
+        relation["blocked"] = C
+        relation["id"] = dependency_relation_id(
+            authority=AUTHORITY, blocker=relation["blocker"], blocked=C,
+        )
+        forged_endpoint["revision"] = 1
+        forged_endpoint["sha256"] = graph_sha256(forged_endpoint["relations"])
+        forged_endpoint["observed_frontier"].update({
+            "graph_revision": 1,
+            "graph_sha256": forged_endpoint["sha256"],
+        })
+        batch = forged_endpoint["authorization_batches"][0]
+        batch["relation_ids"] = [relation["id"]]
+        batch["relations_sha256"] = graph_sha256([relation])
+
+        mutations = {
+            "endpoint": forged_endpoint,
+            "uncovered": {
+                **deepcopy(surface), "authorization_batches": [],
+            },
+            "malformed_batch": deepcopy(surface),
+            "stale_frontier": deepcopy(surface),
+            "batch_digest": deepcopy(surface),
+        }
+        mutations["malformed_batch"]["authorization_batches"][0]["arbitrary"] = True
+        mutations["stale_frontier"]["authorization_batches"][0][
+            "expected_graph_revision"
+        ] = 1
+        mutations["batch_digest"]["authorization_batches"][0][
+            "relations_sha256"
+        ] = "f" * 64
+        for label, forged in mutations.items():
+            with self.subTest(label=label), self.assertRaises(ChildDependencyError):
+                validate_dependency_graph_summary(
+                    forged, authority=AUTHORITY, plan_revision=PLAN,
+                    expected_frontier=forged["observed_frontier"],
+                )
+
+    def test_resume_graph_rejects_stale_material_frontier_and_pregrant_event(self):
+        fake = FakeLinear()
+        native = fake.native_relation(A, B)
+        fake.relations.append(native)
+        relation = {
+            "id": native["id"], "type": "blocks", "blocker": A,
+            "blocked": B, "inverse_type": "blocked_by",
+        }
+        route = {key: AUTHORITY[key] for key in (
+            "workspace_id", "team_id", "project_id", "root_issue_id",
+        )}
+        batch_id = "wsdb_" + "9" * 32
+        stale_grant = build_projection_event(
+            workstream_id="GEN-37", kind="child_dependency_authorization",
+            key=batch_id, value={
+                "root_issue_id": ROOT_ID, "route": route,
+                "plan_revision": PLAN, "batch_id": batch_id,
+                "relation_ids": [relation["id"]],
+                "relations_sha256": graph_sha256([relation]),
+                "expected_material_revision": 999,
+                "expected_material_frontier_sha256": (
+                    dependency_material_frontier_sha256([], {}, [], revision=0)
+                ),
+                "expected_projection_revision": 0,
+                "expected_graph_revision": 0,
+                "expected_graph_sha256": graph_sha256([]),
+                "initial_state": "owned_children_validated",
+            }, plan_revision=PLAN, expected_revision=0,
+            created_at="2026-08-29T00:00:00Z", authority=route,
+        )
+        fake.comments["GEN-37"].append({
+            "id": projection_slot_id("GEN-37", PLAN, 0, route),
+            "body": encode_projection_comment(stale_grant),
+            "createdAt": "2026-08-29T00:00:00Z",
+            "updatedAt": "2026-08-29T00:00:00Z",
+        })
+        adapter = self.adapter(fake)
+        with self.assertRaisesRegex(
+            ChildDependencyError, "stale_dependency_material_frontier",
+        ):
+            adapter.read_authorized_graph()
+
+        fake = FakeLinear()
+        self.apply(fake)
+        adapter = self.adapter(fake)
+        fake.add_material()
+        fake.comments["GEN-37"][-1]["createdAt"] = "2026-08-28T23:59:59Z"
+        fake.comments["GEN-37"][-1]["updatedAt"] = "2026-08-28T23:59:59Z"
+        with self.assertRaisesRegex(
+            ChildDependencyError,
+            "dependency_material_event_not_ordered_after_authorization",
+        ):
+            adapter.read_authorized_graph()
+
+    def test_resume_graph_binds_material_comment_ids_and_bodies(self):
+        for mutation in ("body", "remote_id"):
+            with self.subTest(mutation=mutation):
+                fake = FakeLinear()
+                fake.add_material()
+                frontier = {**FRONTIER, "material_revision": 1}
+                self.apply(fake, frontier=frontier)
+                material = next(
+                    item for item in fake.comments["GEN-37"]
+                    if "workstream-delta:v1" in item["body"]
+                )
+                if mutation == "body":
+                    material["body"] += "\nreviewed prose edited in place"
+                else:
+                    material["id"] = str(uuid.uuid4())
+                with self.assertRaisesRegex(
+                    ChildDependencyError,
+                    "dependency_material_(frontier_mismatch|receipt_missing)",
+                ):
+                    self.adapter(fake).read_authorized_graph()
+
+    def test_resume_graph_rejects_duplicate_relation_authorization(self):
+        fake = FakeLinear()
+        self.apply(fake)
+        adapter = self.adapter(fake)
+        projection = adapter.authorization.state()
+        first = next(
+            event for event in projection.events
+            if event["kind"] == "child_dependency_authorization"
+        )
+        second_batch = "wsdb_" + "1" * 32
+        value = deepcopy(first["value"])
+        value["batch_id"] = second_batch
+        value["expected_projection_revision"] = 1
+        second = build_projection_event(
+            workstream_id="GEN-37", kind="child_dependency_authorization",
+            key=second_batch, value=value, plan_revision=PLAN,
+            expected_revision=1, created_at="2026-08-29T00:00:01Z",
+            authority={key: AUTHORITY[key] for key in (
+                "workspace_id", "team_id", "project_id", "root_issue_id",
+            )},
+        )
+        fake.comments["GEN-37"].append({
+            "id": projection_slot_id("GEN-37", PLAN, 1, second["authority"]),
+            "body": encode_projection_comment(second),
+            "createdAt": "2026-08-29T00:00:01Z",
+            "updatedAt": "2026-08-29T00:00:01Z",
+        })
+        with self.assertRaisesRegex(
+            ChildDependencyError, "duplicate_dependency_authorization",
+        ):
+            adapter.read_authorized_graph()
 
     def test_blocked_by_input_preserves_exact_direction(self):
         result = self.apply(FakeLinear(), [self.relation(B, "blocked_by", A)])

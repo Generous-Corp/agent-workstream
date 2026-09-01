@@ -128,6 +128,23 @@ class FakeClient:
                     "hasNextPage": False, "endCursor": None,
                 }},
             }}
+        if (
+            "query WorkstreamChildRelations" in query
+            or "query WorkstreamChildInverseRelations" in query
+        ):
+            child = next(
+                item for item in self.children
+                if item["identifier"] == variables["issueId"]
+            )
+            field = (
+                "inverseRelations"
+                if "InverseRelations" in query else "relations"
+            )
+            return {"issue": {**deepcopy(child), field: {
+                "nodes": [], "pageInfo": {
+                    "hasNextPage": False, "endCursor": None,
+                },
+            }}}
         if "commentCreate" in query:
             item = deepcopy(variables["input"])
             if self.before_each_create is not None:
@@ -1220,9 +1237,14 @@ class GenerationTransitionTests(unittest.TestCase):
         graph = {
             "root": {
                 "id": AUTHORITY["root_issue_id"], "identifier": WORKSTREAM,
+                "description": f"Plan revision: {OLD}",
                 "url": "https://linear.test/GEN-37", "plan_revision": OLD,
                 "revision": 0, "status": "In Progress",
                 "next_action": "Activate the reviewed generation.",
+                "team": {"id": AUTHORITY["team_id"], "organization": {
+                    "id": AUTHORITY["workspace_id"],
+                }},
+                "project": {"id": AUTHORITY["project_id"]},
             },
             "children": [{
                 "id": "44444444-4444-4444-8444-444444444444",
@@ -2604,7 +2626,14 @@ class GenerationTransitionTests(unittest.TestCase):
         ).revision, 0)
 
     def test_strict_loader_uses_standard_budgets_and_main_revalidates(self):
-        graph = {"root": {"identifier": WORKSTREAM}, "children": [],
+        graph = {"root": {
+                    "id": AUTHORITY["root_issue_id"], "identifier": WORKSTREAM,
+                    "description": f"Plan revision: {OLD}",
+                    "team": {"id": AUTHORITY["team_id"], "organization": {
+                        "id": AUTHORITY["workspace_id"],
+                    }},
+                    "project": {"id": AUTHORITY["project_id"]},
+                }, "children": [],
                  "decisions": [], "child_comments": {}}
         compact = MagicMock(return_value={
             "resume_authority": "full", "material_event_revision": 0,
@@ -2739,9 +2768,14 @@ class GenerationTransitionTests(unittest.TestCase):
         graph = {
             "root": {
                 "id": AUTHORITY["root_issue_id"], "identifier": WORKSTREAM,
+                "description": f"Plan revision: {OLD}",
                 "url": "https://linear.test/GEN-37", "plan_revision": OLD,
                 "revision": 0, "status": "In Progress",
                 "next_action": "Activate the reviewed generation.",
+                "team": {"id": AUTHORITY["team_id"], "organization": {
+                    "id": AUTHORITY["workspace_id"],
+                }},
+                "project": {"id": AUTHORITY["project_id"]},
             },
             "children": [{
                 "id": "44444444-4444-4444-8444-444444444444",

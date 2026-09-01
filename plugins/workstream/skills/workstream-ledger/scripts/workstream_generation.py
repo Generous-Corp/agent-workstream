@@ -49,6 +49,9 @@ from workstream_checkpoint import (
     acknowledge_checkpoint, recover_latest, validate_checkpoint,
 )
 from workstream_successor import choose_disposition
+from workstream_child_dependencies import (
+    LinearChildDependencyAdapter, rebind_authenticated_dependency_graph,
+)
 
 
 RESERVATION_PREFIX = "<!-- workstream-generation-reservation:v2:"
@@ -2306,6 +2309,25 @@ def strict_candidate_loader(
             client, issue_id=token, workstream_id=token,
             plan_revision=plan_revision, **authority,
         )._comments()
+        dependency_adapter = LinearChildDependencyAdapter(
+            client, workspace_id=authority["workspace_id"],
+            team_id=authority["team_id"], project_id=authority["project_id"],
+            root_issue_id=authority["root_issue_id"], root_identifier=token,
+            plan_revision=plan_revision,
+        )
+        base_dependency_graph = dependency_adapter.read_authorized_graph_for_snapshot(
+            graph, comments,
+            generation_selector_plan_revision=description_plan_revision,
+            reread=lambda: (
+                transport.snapshot_for_root(
+                    token, include_description=True, include_child_comments=True,
+                ),
+                LinearProjectionAdapter(
+                    client, issue_id=token, workstream_id=token,
+                    plan_revision=plan_revision, **authority,
+                )._comments(),
+            ),
+        )
         selected = select_plan_generation(
             comments, workstream_id=token,
             description_plan_revision=description_plan_revision,
@@ -2454,9 +2476,15 @@ def strict_candidate_loader(
             authenticated_source=authenticated_source,
             relation_target_resolver=lambda relations: read_relation_targets(client, relations),
         )
+        joined["dependency_graph"] = rebind_authenticated_dependency_graph(
+            joined, comments, base_dependency_graph,
+            authority={**authority, "root_identifier": token},
+            plan_revision=plan_revision,
+        )
         context = compact_context(
             joined, token, max_bytes=max_bytes, max_items=max_items,
-            require_projection_authority=True, include_history=False,
+            require_projection_authority=True, require_dependency_graph=True,
+            include_history=False,
         )
         if context.get("resume_authority") != "full":
             raise WorkstreamGenerationError("generation_candidate_not_strict_full_authority")

@@ -51,6 +51,11 @@ from workstream_child_closure import (
     canonical_digest, evidence_receipts_sha256, terminal_child_readback,
     ChildClosureError,
 )
+from workstream_child_dependencies import (
+    ChildDependencyError, LinearChildDependencyAdapter,
+    dependency_root_readback_sha256,
+    validate_authorized_dependency_graph_surface,
+)
 from workstream_scope import (
     repository_key, ScopeError, validate_relations, validate_scope,
 )
@@ -1301,8 +1306,11 @@ def extract_token(value: str) -> str:
 def validate_snapshot(
     snapshot: dict[str, Any], token: str | None = None, *,
     require_projection_authority: bool = False,
+    require_dependency_graph: bool | None = None,
     expected_missing_terminal_closures: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
+    if require_dependency_graph is None:
+        require_dependency_graph = require_projection_authority
     if expected_missing_terminal_closures and not require_projection_authority:
         raise ResumeError(
             "expected_missing_terminal_closures_requires_projection_authority"
@@ -1702,6 +1710,40 @@ def validate_snapshot(
                 raise ResumeError(
                     "disposition_checkpoint_stale_reconcile_required"
                 )
+    dependency_graph = snapshot.get("dependency_graph")
+    if require_dependency_graph and dependency_graph is None:
+        raise ResumeError("authenticated_dependency_graph_missing")
+    if dependency_graph is not None:
+        if not isinstance(authenticated_route, dict):
+            raise ResumeError("dependency_graph_authenticated_route_missing")
+        try:
+            dependency_graph = validate_authorized_dependency_graph_surface(
+                dependency_graph, projection_events,
+                authority={
+                    **authenticated_route,
+                    "root_identifier": identifier.upper(),
+                },
+                plan_revision=root["plan_revision"],
+                expected_frontier={
+                    "material_revision": (
+                        material_revision
+                        if isinstance(material_revision, int)
+                        else len(material_events)
+                    ),
+                    "projection_revision": (
+                        projection_revision
+                        if isinstance(projection_revision, int)
+                        else len(projection_events)
+                    ),
+                    "graph_revision": dependency_graph.get("revision"),
+                    "graph_sha256": dependency_graph.get("sha256"),
+                },
+                expected_root_readback_sha256=(
+                    dependency_root_readback_sha256(root)
+                ),
+            )
+        except ChildDependencyError as error:
+            raise ResumeError(str(error)) from error
     try:
         choice_view = reduce_choices(choice_events)
         scope = snapshot.get("scope")
@@ -1898,14 +1940,14 @@ def validate_snapshot(
             else "transport_unimplemented"
             for field in (
                 "scope", "relations", "choice_events", "evidence_contracts",
-                "material_events",
+                "material_events", "dependency_graph",
             )
         }
         availability["child_closures"] = "available"
         availability["latest_checkpoint"] = (
             "available" if "latest_checkpoint" in snapshot else "transport_unimplemented"
         )
-    except (ChoiceError, ScopeError) as error:
+    except (ChildDependencyError, ChoiceError, ScopeError) as error:
         raise ResumeError(str(error)) from error
     if require_projection_authority:
         if not projection_events:
@@ -1939,6 +1981,7 @@ def validate_snapshot(
             "projection_recovery": projection_recovery,
             "lifecycle_recovery": lifecycle_recovery,
             "authenticated_route": authenticated_route,
+            "dependency_graph": dependency_graph,
             "authenticated_source": snapshot.get("authenticated_source")}
 
 
@@ -2138,6 +2181,11 @@ def _bounded_authority_envelope(
         "dependencies": _bounded_semantic(
             context.get("relations", []), text_limit=text_limit,
         ),
+        # Native child ordering is distinct from cross-workstream relations.
+        # Keep its already-validated semantic surface in every executable
+        # representation; consumers must hydrate before mutation, but should
+        # never mistake an omitted graph for an empty graph.
+        "child_dependency_graph": deepcopy(context.get("dependency_graph")),
         "checkpoint": _bounded_semantic(
             context.get("latest_checkpoint"), text_limit=text_limit,
         ),
@@ -2272,6 +2320,24 @@ def _fixed_frontier_authority_envelope(
         brief(field(item, "type", "kind")),
         brief(field(field(item, "target"), "identifier", "issue_id", "id")),
     ] for item in context.get("relations", [])]
+    dependency_graph = context.get("dependency_graph") or {}
+    child_dependencies = [[
+        field(item, "id"),
+        field(field(item, "blocker"), "identifier", "issue_id"),
+        field(field(item, "blocked"), "identifier", "issue_id"),
+    ] for item in dependency_graph.get("relations", [])]
+    child_dependency_authority = {
+        key: dependency_graph.get(key) for key in (
+            "authority", "plan_revision", "route", "revision", "sha256",
+            "observed_frontier", "root_readback_sha256",
+        )
+    }
+    child_dependency_authority["authorization_batches_sha256"] = hashlib.sha256(
+        json.dumps(
+            dependency_graph.get("authorization_batches", []),
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
     all_fields = [
         _canonical_field_record("/" + name, value)
         for name, value in sorted(context.items())
@@ -2310,7 +2376,7 @@ def _fixed_frontier_authority_envelope(
             "execution_frontier": "complete_digest_bound_excerpts",
             "item_count": (
                 1 + len(children) + len(obligations) + len(decisions)
-                + len(choices) + len(dependencies)
+                + len(choices) + len(dependencies) + len(child_dependencies)
             ),
             "omitted_items_claimed_executable": False,
             "truncated_cell_count": truncated_cell_count,
@@ -2321,12 +2387,17 @@ def _fixed_frontier_authority_envelope(
             "root": root, "children": children, "obligations": obligations,
             "decisions": decisions, "choices": choices,
             "dependencies": dependencies,
+            "child_dependency_graph": {
+                "authority": child_dependency_authority,
+                "relations": child_dependencies,
+            },
             "columns": {
                 "children": ["id", "status", "owner", "repository", "next", "blocker"],
                 "obligations": ["source", "child", "id", "kind", "action"],
                 "decisions": ["id", "status", "action"],
                 "choices": ["id", "status", "action"],
                 "dependencies": ["type", "target"],
+                "child_dependency_graph.relations": ["id", "blocker", "blocked"],
             },
             "checkpoint": checkpoint_brief,
             "disposition": disposition_brief,
@@ -2352,6 +2423,7 @@ def _fixed_frontier_authority_envelope(
                 "decisions": ".decisions[<row>]",
                 "choices": ".choice_events[<row>]",
                 "dependencies": ".relations[<row>]",
+                "child_dependency_graph": ".dependency_graph",
                 "checkpoint": ".latest_checkpoint",
                 "disposition": ".disposition",
             },
@@ -2375,12 +2447,14 @@ def compact_context(
     snapshot: dict[str, Any], token: str, max_bytes: int = DEFAULT_RESUME_MAX_BYTES,
     max_items: int = 100, *, require_projection_authority: bool = False,
     include_history: bool = False,
+    require_dependency_graph: bool | None = None,
     expected_missing_terminal_closures: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     normalized_token = extract_token(token)
     clean = validate_snapshot(
         snapshot, normalized_token,
         require_projection_authority=require_projection_authority,
+        require_dependency_graph=require_dependency_graph,
         expected_missing_terminal_closures=expected_missing_terminal_closures,
     )
     root = clean["root"]
@@ -2524,6 +2598,26 @@ def compact_context(
         "choice_events": clean["choice_events"],
         "scope": clean["scope"] if include_history else _compact_scope(clean["scope"]),
         "relations": clean["relations"],
+        "dependency_graph": clean["dependency_graph"],
+        "dependency_authority": ({
+            "owned_children": sorted([
+                {"issue_id": child["id"], "identifier": child["identifier"]}
+                for child in clean["children"]
+            ], key=lambda item: (item["identifier"], item["issue_id"])),
+            "authorization_events": [
+                deepcopy(event) for event in clean["projection_events"]
+                if event.get("kind") == "child_dependency_authorization"
+            ],
+            "material_event_ids": [
+                event["event_id"] for event in clean["material_events"]
+            ],
+        } if (
+            clean["dependency_graph"] is not None
+            and (
+                clean["dependency_graph"].get("relations")
+                or clean["dependency_graph"].get("authorization_batches")
+            )
+        ) else None),
         "evidence_contracts": (
             clean["evidence_contracts"] if include_history
             else _compact_evidence_contracts(
@@ -2604,7 +2698,10 @@ def compact_context(
             context.get("projection_quarantined", []),
             context.get("projection_unresolved_quarantine", []),
         )
-    ) + len(clean["provenance"])
+    ) + len(clean["provenance"]) + (
+        len((clean["dependency_graph"] or {}).get("relations", []))
+        + len((clean["dependency_graph"] or {}).get("authorization_batches", []))
+    )
     if max_items < 0 or item_count > max_items:
         raise ResumeError(f"resume_context_over_item_budget:{item_count}>{max_items}")
     encoded = _default_output_bytes(context)
@@ -2757,9 +2854,12 @@ def main() -> int:
                 project_id=route.get("project_id"),
             )
             live_graph_snapshot = transport.snapshot_for_root(
-                token, include_description=True, include_child_comments=True,
+                token, include_child_comments=True, include_description=True,
             )
-            root_description = live_graph_snapshot["root"].pop("description", "")
+            # The canonical-plan label is also part of the authenticated native
+            # root readback used by dependency and lifecycle fences. Read it
+            # without removing it from the shared snapshot.
+            root_description = live_graph_snapshot["root"].get("description", "")
             complete_route = route if all(
                 route.get(field) for field in ("workspace_id", "team_id", "project_id")
             ) else {}
@@ -2905,11 +3005,27 @@ def main() -> int:
                     )
                     sys.stdout.write(_default_output_text(freshness))
                     return 0
+                snapshot["dependency_graph"] = LinearChildDependencyAdapter(
+                    client,
+                    workspace_id=route["workspace_id"],
+                    team_id=route["team_id"],
+                    project_id=route["project_id"],
+                    root_issue_id=route["root_issue_id"],
+                    root_identifier=token,
+                    plan_revision=generation["plan_revision"],
+                ).read_authorized_graph(
+                    expected_material_revision=snapshot["material_event_revision"],
+                    expected_projection_revision=snapshot["projection_revision"],
+                    expected_root_readback_sha256=(
+                        dependency_root_readback_sha256(snapshot["root"])
+                    ),
+                )
             else:
                 snapshot["authenticated_source"] = authenticated_source
         output = compact_context(
             snapshot, token, args.max_bytes, args.max_items,
             require_projection_authority=not args.inspection_only,
+            require_dependency_graph=not args.inspection_only,
             include_history=args.include_history,
         )
     except (
