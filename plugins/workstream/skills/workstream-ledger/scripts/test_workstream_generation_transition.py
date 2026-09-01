@@ -23,9 +23,11 @@ from workstream_generation import (
     validate_activation_operator_contract,
     encode_generation_reservation,
     encode_generation_finalization, generation_finalization_slot_id,
+    generation_graph_clock_custody,
     native_root_activation_proof,
     pending_generation_reservations, reduce_generation_checkpoint_comments,
     reduce_generation_checkpoint_custodies,
+    reduce_generation_graph_clock_custodies,
     reduce_generation_finalizations, reduce_generation_reservations,
     selected_activation_checkpoints,
     selected_generation_execution_status,
@@ -2178,6 +2180,159 @@ class GenerationTransitionTests(unittest.TestCase):
                             reason="writer stopped", created_at="abort-race",
                         )
                 retry_and_assert(current, expected_sha)
+
+            # A candidate seal is itself a protocol comment and therefore can
+            # advance Linear's root updatedAt without changing any semantic
+            # authority. Bind that one clock advance append-only, then prove a
+            # fresh handle-only continuation completes and replays zero-write.
+            clock_client = deepcopy(base)
+            historical_clock = clock_client.graph_nonce
+
+            class ClockLoader(Loader):
+                def __init__(self, current, override=None):
+                    super().__init__(current)
+                    self.override = override
+
+                def __call__(self, plan):
+                    receipt = super().__call__(plan)
+                    receipt["graph_frontier_sha256"] = _digest({
+                        "root_updated_at": (
+                            self.override
+                            if self.override is not None
+                            else self.client.graph_nonce
+                        ),
+                        "root_title": self.client.graph_title,
+                        "children": self.client.children,
+                    })
+                    return receipt
+
+            stable_clock = ClockLoader(clock_client)
+            clock_calls = {"count": 0}
+
+            def crash_after_clock_seal(plan):
+                clock_calls["count"] += 1
+                receipt = stable_clock(plan)
+                if clock_calls["count"] == 2:
+                    raise WorkstreamGenerationError(
+                        "crash_after_clock_candidate_seal"
+                    )
+                return receipt
+
+            with self.assertRaisesRegex(
+                WorkstreamGenerationError, "crash_after_clock_candidate_seal",
+            ):
+                activation_transport(
+                    clock_client, crash_after_clock_seal,
+                ).activate(
+                    target_plan_revision=NEW, created_at=created_at,
+                    retirement=retirement, remote_head="e" * 40,
+                    expected_native_root_sha256=reviewed_sha(clock_client),
+                )
+            clock_reservation = reduce_generation_reservations(
+                clock_client.comments, workstream_id=WORKSTREAM,
+                authenticated_route=AUTHORITY,
+            )[0]
+            self.assertEqual(sum(
+                event["kind"] == "generation_candidate_seal"
+                for event in adapter(clock_client, NEW).state().events
+            ), 1)
+
+            def strict_clock_factory(*_args, **kwargs):
+                return ClockLoader(
+                    clock_client, kwargs.get("root_updated_at_override"),
+                )
+
+            custody_args = {
+                "client": clock_client, "token": WORKSTREAM,
+                "authority": AUTHORITY,
+                "reservation_id": clock_reservation["reservation_id"],
+                "reservation_sha256": clock_reservation[
+                    "reservation_sha256"
+                ],
+                "historical_root_updated_at": historical_clock,
+            }
+            with patch(
+                "workstream_generation.plan_payload",
+                return_value={"source": {**source, "bytes": b"plan"}},
+            ), patch(
+                "workstream_generation.strict_candidate_loader",
+                side_effect=strict_clock_factory,
+            ):
+                writes = len(clock_client.mutations)
+                preview = generation_graph_clock_custody(
+                    **custody_args, apply=False,
+                )
+                self.assertFalse(preview["apply"])
+                self.assertEqual(len(clock_client.mutations), writes)
+                with self.assertRaisesRegex(
+                    WorkstreamGenerationError,
+                    "generation_graph_clock_custody_(strict_candidate|native_root)_mismatch",
+                ):
+                    generation_graph_clock_custody(
+                        **{**custody_args,
+                           "historical_root_updated_at": "wrong-clock"},
+                        apply=False,
+                    )
+                self.assertEqual(len(clock_client.mutations), writes)
+
+                clock_client.commit_then_fail_at.add(writes + 1)
+                applied = generation_graph_clock_custody(
+                    **custody_args, apply=True,
+                )
+                self.assertFalse(applied["replay"])
+                self.assertEqual(len(reduce_generation_graph_clock_custodies(
+                    clock_client.comments, workstream_id=WORKSTREAM,
+                    authenticated_route=AUTHORITY,
+                )), 1)
+                writes = len(clock_client.mutations)
+                replay = generation_graph_clock_custody(
+                    **custody_args, apply=True,
+                )
+                self.assertTrue(replay["replay"])
+                self.assertEqual(len(clock_client.mutations), writes)
+
+                cli_stdout = io.StringIO()
+                cli_argv = [
+                    "workstream_generation.py", "continue", WORKSTREAM,
+                    "--reservation-id", clock_reservation["reservation_id"],
+                    "--reservation-sha256",
+                    clock_reservation["reservation_sha256"], "--apply",
+                ]
+                with patch.object(sys, "argv", cli_argv), patch(
+                    "workstream_generation._route_and_client",
+                    return_value=(clock_client, AUTHORITY),
+                ), patch.object(sys, "stdout", cli_stdout):
+                    self.assertEqual(main(), 0)
+                continued = json.loads(cli_stdout.getvalue())
+                self.assertEqual(continued["activated_plan_revision"], NEW)
+                continued_writes = len(clock_client.mutations)
+                replay_stdout = io.StringIO()
+                with patch.object(sys, "argv", cli_argv), patch(
+                    "workstream_generation._route_and_client",
+                    return_value=(clock_client, AUTHORITY),
+                ), patch.object(sys, "stdout", replay_stdout):
+                    self.assertEqual(main(), 0)
+                repeated = json.loads(replay_stdout.getvalue())
+                self.assertEqual(repeated["event_id"], continued["event_id"])
+                self.assertEqual(len(clock_client.mutations), continued_writes)
+
+            semantic_drift = deepcopy(clock_client)
+            semantic_drift.graph_title = "semantic drift"
+            with patch(
+                "workstream_generation.plan_payload",
+                return_value={"source": {**source, "bytes": b"plan"}},
+            ), patch(
+                "workstream_generation.strict_candidate_loader",
+                side_effect=lambda *_args, **kwargs: ClockLoader(
+                    semantic_drift, kwargs.get("root_updated_at_override"),
+                ),
+            ), self.assertRaisesRegex(
+                WorkstreamGenerationError,
+                "generation_graph_clock_custody_",
+            ):
+                generation_graph_clock_custody(
+                    **{**custody_args, "client": semantic_drift}, apply=False,
+                )
 
             after_finalization = deepcopy(base)
             final_transport = activation_transport(after_finalization)
