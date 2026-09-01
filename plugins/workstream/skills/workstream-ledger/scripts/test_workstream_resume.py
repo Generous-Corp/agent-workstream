@@ -2454,8 +2454,55 @@ class ResumeTests(unittest.TestCase):
             generation_fixture.project_full(
                 client, old_digest, identity=old_identity,
             )
-            generation_fixture.project_full(
-                client, new_digest, identity=new_identity,
+            linear = generation_fixture.LinearGraphQLTransport(
+                client, workspace_id="workspace", team_id="team",
+                project_id="project",
+            )
+
+            def prepare_operator_contract():
+                graph = linear.snapshot_for_root(
+                    token, include_description=True,
+                    include_child_comments=True,
+                )
+                return generation_cli_module.prepare_generation_operator_contract(
+                    comments=copy.deepcopy(client.comments), graph=graph,
+                    workstream_id=token, authority=route,
+                    description_plan_revision=old_digest,
+                    target_source={
+                        "identity": new_identity, "sha256": new_digest,
+                    },
+                    created_at="2026-08-31T12:00:00Z",
+                    remote_head="e" * 40,
+                    started_state=generation_fixture.STARTED_STATE,
+                )
+
+            operator_contract = prepare_operator_contract()
+            target = generation_fixture.adapter(client, new_digest)
+            target_revision = target.state().revision
+            for index, item in enumerate(
+                operator_contract["projection_preview"]["manifest"]["projection"]
+            ):
+                target.append(generation_fixture.build_projection_event(
+                    workstream_id=token, kind=item["kind"], key=item["key"],
+                    value=copy.deepcopy(item["value"]),
+                    plan_revision=new_digest,
+                    expected_revision=target_revision,
+                    created_at=f"target-{index}", authority=route,
+                ))
+                target_revision += 1
+            target.append(generation_fixture.build_projection_event(
+                workstream_id=token, kind="disposition", key="root",
+                value={
+                    "disposition": "attach", "remote_head": "e" * 40,
+                    "recovered_from_checkpoint": None,
+                },
+                plan_revision=new_digest, expected_revision=target_revision,
+                created_at="target-disposition", authority=route,
+            ))
+            operator_contract = prepare_operator_contract()
+            self.assertEqual(
+                operator_contract["projection_preview"]["phase"],
+                "activation_ready",
             )
             initial_comment_count = len(client.comments)
 
@@ -2511,14 +2558,6 @@ class ResumeTests(unittest.TestCase):
                     generation_cli_module, "_route_and_client",
                     return_value=(client, route),
                 ), mock.patch.object(
-                    generation_cli_module,
-                    "validate_activation_operator_contract",
-                    side_effect=lambda contract, **_kwargs: {
-                        "authorization": {},
-                        "retirement_proof": contract["retirement_proof"],
-                        "remote_head": contract["remote_head"],
-                    },
-                ), mock.patch.object(
                     generation_cli_module.sys, "argv",
                     ["workstream_generation.py", *arguments],
                 ), mock.patch.object(
@@ -2546,22 +2585,7 @@ class ResumeTests(unittest.TestCase):
 
             client.graph_status = "In Progress"
             client.graph_status_type = "started"
-            old_state = LinearProjectionAdapter(
-                client, issue_id=token, workstream_id=token,
-                plan_revision=old_digest, **route,
-            ).state()
-            retirement = build_retirement_proof(
-                predecessor_plan_revision=old_digest,
-                retired_at="2026-08-31T12:00:00Z", retired_writer_epoch=0,
-                provenance_event_ids=[
-                    event["event_id"] for event in old_state.events
-                    if event["kind"] == "provenance"
-                ],
-                checkpoint_event_ids=[],
-            )
-            operator_contract = {
-                "retirement_proof": retirement, "remote_head": None,
-            }
+            client.graph_state_id = generation_fixture.STARTED_STATE["id"]
             operator_file = tempfile.NamedTemporaryFile("w+", suffix=".json")
             self.addCleanup(operator_file.close)
             json.dump(operator_contract, operator_file)

@@ -530,6 +530,10 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.49 adds the authenticated root material-boundary checkpoint
+operator, exact crash replay, true-root and deterministic-slot proof, and
+postwrite ordinary-resume and native-graph verification.
+
 Version 0.4.48 adds phase-aware generation preparation, explicit reviewed
 projection and native-root transitions, exact crash replay, and warm-session
 continuation that keeps authorized delivery moving while tracking is
@@ -1071,8 +1075,19 @@ the material-event history is not guessed or silently repaired: new event and
 checkpoint mutation fails with `checkpoint_material_history_incomplete` until
 a reviewed quarantine/remediation operation accounts for the missing history.
 Exact replay of the existing checkpoint remains a no-write acknowledgement.
-This is
-logical transport proof. Its `from_env` constructor consumes the same validated
+For a root boundary, use `workstreamctl checkpoint` without `--apply` first,
+then apply the unchanged preview with its exact material revision and preview
+digest. The operator derives `material-<revision>`, the active generation and
+checkpoint predecessor, full material/checkpoint/serialization frontiers, the
+deterministic shared slot, true unarchived-root proof, graph digest, and exact
+disposition candidate. Only predecessor state or that exact candidate replay
+is accepted. It invokes ordinary default-budget resume and requires full,
+executable authority plus the exact remote receipt before reporting success.
+Linear cannot atomically append the checkpoint and its disposition projection;
+therefore a failure after either append is `replay_required`, `unknown`, or
+postcondition drift—not evidence that no write occurred.
+
+This is logical transport proof. Its `from_env` constructor consumes the same validated
 repository-root route and refuses a root outside it. Do not call the
 deterministic fake-client tests a live Linear, second-machine, process-death, or
 deletion-resistance canary.

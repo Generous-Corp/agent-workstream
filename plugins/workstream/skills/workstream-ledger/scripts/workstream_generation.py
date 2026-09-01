@@ -268,8 +268,23 @@ def prepare_generation_operator_contract(
         expected_plan_revision=target_plan,
         authenticated_route=authority,
     )
-    predecessor_heads = _active_heads(predecessor)
-    target_heads = _active_heads(target)
+    # Generation controls belong to the authority chain, not the portable
+    # workstream projection.  Their exact history is already bound by the
+    # selected generation and projection frontier; copying a predecessor seal
+    # into a new plan would both forge its embedded plan binding and make a
+    # second reviewed migration impossible.
+    generation_control_kinds = {
+        "generation_genesis", "generation_candidate_seal",
+        "generation_transition", "generation_abort",
+    }
+    predecessor_heads = {
+        identity: event for identity, event in _active_heads(predecessor).items()
+        if identity[0] not in generation_control_kinds
+    }
+    target_heads = {
+        identity: event for identity, event in _active_heads(target).items()
+        if identity[0] not in generation_control_kinds
+    }
     target_disposition = target_heads.get(("disposition", "root"), {}).get(
         "value", {}
     )
@@ -1586,7 +1601,15 @@ class GenerationTransport:
         self, comments: list[dict[str, Any]], *, target_plan_revision: str,
         retirement: dict[str, Any], created_at: str,
     ) -> bool:
-        """Recognize only a seal reserved by this exact reviewed contract."""
+        """Recognize custody reserved by this exact reviewed contract.
+
+        The first operator validation happens before any activation-side write.
+        Once its schema-v5 reservation is durably read back with the exact
+        contract digest, replay must use that fenced custody: a prospective
+        activation checkpoint may already have advanced the inert target
+        projection, so recomputing the pre-write prepare contract would be both
+        stale and impossible by construction.
+        """
         if self.operator_contract_sha256 is None:
             return False
         selected = select_plan_generation(
@@ -1624,7 +1647,12 @@ class GenerationTransport:
             and event["key"] == reservation["reservation_id"]
         ]
         if not seals:
-            return False
+            # Only checkpoint-bound activation intentionally advances the
+            # inert target between the first review and the seal. Ordinary
+            # activation can and must still recompute the live operator
+            # contract here so an injected target drift is diagnosed before
+            # the seal attempt.
+            return reservation.get("activation_checkpoint") is not None
         if len(seals) != 1:
             raise WorkstreamGenerationError("generation_pending_candidate_seal_ambiguous")
         value = seals[0]["value"]

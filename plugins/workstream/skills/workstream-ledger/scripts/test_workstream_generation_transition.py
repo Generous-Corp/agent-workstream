@@ -546,6 +546,23 @@ class GenerationTransitionTests(unittest.TestCase):
                 started_state=STARTED_STATE,
             )
 
+    def test_transport_invokes_operator_gate_before_activation_preview(self):
+        project_full(self.client, NEW)
+
+        def planted_gate():
+            raise WorkstreamGenerationError("planted_operator_gate")
+
+        self.transport.operator_validator = planted_gate
+        writes = len(self.client.mutations)
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError, "planted_operator_gate",
+        ):
+            self.transport.preview_activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=self.retirement(),
+            )
+        self.assertEqual(len(self.client.mutations), writes)
+
     def test_prepare_cli_is_zero_write_and_has_no_apply_flag(self):
         with tempfile.TemporaryDirectory() as directory:
             manifest_path = f"{directory}/target-projection.json"
@@ -3814,28 +3831,82 @@ class GenerationTransitionTests(unittest.TestCase):
 
         def invoke(client, argv):
             stdout, stderr = io.StringIO(), io.StringIO()
-            def authorize(contract, **kwargs):
-                return {
-                    "authorization": {},
-                    "retirement_proof": contract["retirement_proof"],
-                    "remote_head": kwargs.get("remote_head") or "e" * 40,
-                }
             with patch.object(sys, "argv", ["workstream_generation.py", *argv]), \
                     patch("workstream_generation._route_and_client",
                           return_value=(client, AUTHORITY)), patch(
-                    "workstream_generation.validate_activation_operator_contract",
-                    side_effect=authorize), patch(
                     "workstream_generation.compact_context",
                     wraps=real_compact_context) as compact, patch.object(
                     sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
                 code = main()
             return code, stdout.getvalue(), stderr.getvalue(), compact
 
-        def reviewed_operator_contract(retirement):
-            # Live contract validation is patched at this CLI composition
-            # boundary, but the production command still consumes the v2
-            # envelope and extracts its nested retirement proof.
-            return {"retirement_proof": retirement}
+        def ready_operator_contract(client, digest, identity, created_at):
+            client.graph_state_id = STARTED_STATE["id"]
+            linear = LinearGraphQLTransport(
+                client, workspace_id="workspace", team_id="team",
+                project_id="project",
+            )
+            graph = linear.snapshot_for_root(
+                WORKSTREAM, include_description=True,
+                include_child_comments=True,
+            )
+
+            def prepare():
+                return prepare_generation_operator_contract(
+                    comments=deepcopy(client.comments), graph=graph,
+                    workstream_id=WORKSTREAM, authority=AUTHORITY,
+                    description_plan_revision=graph["root"].get(
+                        "plan_revision"
+                    ),
+                    target_source={"identity": identity, "sha256": digest},
+                    created_at=created_at, remote_head="e" * 40,
+                    started_state=STARTED_STATE,
+                )
+
+            contract = prepare()
+            target = adapter(client, digest)
+            revision = target.state().revision
+            for index, item in enumerate(
+                contract["projection_preview"]["manifest"]["projection"]
+            ):
+                target.append(build_projection_event(
+                    workstream_id=WORKSTREAM, kind=item["kind"],
+                    key=item["key"], value=deepcopy(item["value"]),
+                    plan_revision=digest, expected_revision=revision,
+                    created_at=f"{created_at}-projection-{index}",
+                    authority=AUTHORITY,
+                ))
+                revision += 1
+            target.append(build_projection_event(
+                workstream_id=WORKSTREAM, kind="disposition", key="root",
+                value={
+                    "disposition": "attach", "remote_head": "e" * 40,
+                    "recovered_from_checkpoint": None,
+                },
+                plan_revision=digest, expected_revision=revision,
+                created_at=f"{created_at}-disposition", authority=AUTHORITY,
+            ))
+            contract = prepare()
+            self.assertEqual(
+                contract["projection_preview"]["phase"], "activation_ready",
+            )
+            authorization = validate_activation_operator_contract(
+                contract,
+                source={"identity": identity, "sha256": digest},
+                workstream_id=WORKSTREAM, authority=AUTHORITY,
+                comments=deepcopy(client.comments),
+                graph=linear.snapshot_for_root(
+                    WORKSTREAM, include_description=True,
+                    include_child_comments=True,
+                ),
+                description_plan_revision=graph["root"].get("plan_revision"),
+                created_at=created_at, remote_head="e" * 40,
+            )
+            self.assertEqual(
+                authorization["authorization"]["contract_sha256"],
+                contract["contract_sha256"],
+            )
+            return contract
 
         bootstrap_plan, bootstrap_digest = plan_file("# Bootstrap plan\n")
         self.addCleanup(bootstrap_plan.close)
@@ -3871,17 +3942,11 @@ class GenerationTransitionTests(unittest.TestCase):
             f"Plan revision: {old_digest}\nNext action: Continue."
         )
         project_full(activate_client, old_digest, identity=old_plan.name)
-        project_full(activate_client, new_digest, identity=new_plan.name)
-        old_state = adapter(activate_client, old_digest).state()
-        retirement = build_retirement_proof(
-            predecessor_plan_revision=old_digest, retired_at="now",
-            retired_writer_epoch=0,
-            provenance_event_ids=[event["event_id"] for event in old_state.events
-                                  if event["kind"] == "provenance"],
-            checkpoint_event_ids=[],
+        operator_contract = ready_operator_contract(
+            activate_client, new_digest, new_plan.name, "now",
         )
         with tempfile.NamedTemporaryFile("w", suffix=".json") as proof:
-            json.dump(reviewed_operator_contract(retirement), proof)
+            json.dump(operator_contract, proof)
             proof.flush()
             code, raw, error, compact = invoke(activate_client, [
                 "activate", WORKSTREAM, "--plan-source", new_plan.name,
@@ -3905,16 +3970,8 @@ class GenerationTransitionTests(unittest.TestCase):
             f"Plan revision: {old_digest}\nNext action: Continue."
         )
         project_full(checkpoint_client, old_digest, identity=old_plan.name)
-        project_full(checkpoint_client, new_digest, identity=new_plan.name)
-        checkpoint_old = adapter(checkpoint_client, old_digest).state()
-        checkpoint_retirement = build_retirement_proof(
-            predecessor_plan_revision=old_digest, retired_at="checkpoint",
-            retired_writer_epoch=0,
-            provenance_event_ids=[
-                event["event_id"] for event in checkpoint_old.events
-                if event["kind"] == "provenance"
-            ],
-            checkpoint_event_ids=[],
+        checkpoint_contract = ready_operator_contract(
+            checkpoint_client, new_digest, new_plan.name, "checkpoint",
         )
         activation_checkpoint = build_checkpoint(
             workstream_id=WORKSTREAM, boundary_id="production-main-activation",
@@ -3933,7 +3990,7 @@ class GenerationTransitionTests(unittest.TestCase):
         )
         with tempfile.NamedTemporaryFile("w", suffix=".json") as proof, \
                 tempfile.NamedTemporaryFile("w", suffix=".json") as checkpoint_file:
-            json.dump(reviewed_operator_contract(checkpoint_retirement), proof)
+            json.dump(checkpoint_contract, proof)
             proof.flush()
             json.dump(activation_checkpoint, checkpoint_file)
             checkpoint_file.flush()
@@ -3974,17 +4031,11 @@ class GenerationTransitionTests(unittest.TestCase):
 
         later_plan, later_digest = plan_file("# Later plan\n")
         self.addCleanup(later_plan.close)
-        project_full(activate_client, later_digest, identity=later_plan.name)
-        new_state = adapter(activate_client, new_digest).state()
-        later_retirement = build_retirement_proof(
-            predecessor_plan_revision=new_digest, retired_at="later",
-            retired_writer_epoch=1,
-            provenance_event_ids=[event["event_id"] for event in new_state.events
-                                  if event["kind"] == "provenance"],
-            checkpoint_event_ids=[],
+        later_contract = ready_operator_contract(
+            activate_client, later_digest, later_plan.name, "later",
         )
         with tempfile.NamedTemporaryFile("w", suffix=".json") as proof:
-            json.dump(reviewed_operator_contract(later_retirement), proof)
+            json.dump(later_contract, proof)
             proof.flush()
             code, _raw, error, _compact = invoke(activate_client, [
                 "activate", WORKSTREAM, "--plan-source", later_plan.name,
@@ -3996,7 +4047,7 @@ class GenerationTransitionTests(unittest.TestCase):
             ])
         self.assertEqual((code, error), (0, ""))
         with tempfile.NamedTemporaryFile("w", suffix=".json") as proof:
-            json.dump(reviewed_operator_contract(retirement), proof)
+            json.dump(operator_contract, proof)
             proof.flush()
             code, raw, error, _compact = invoke(activate_client, [
                 "activate", WORKSTREAM, "--plan-source", new_plan.name,
@@ -4017,7 +4068,9 @@ class GenerationTransitionTests(unittest.TestCase):
             f"Plan revision: {old_digest}\nNext action: Continue."
         )
         project_full(drift_client, old_digest, identity=old_plan.name)
-        project_full(drift_client, new_digest, identity=new_plan.name)
+        drift_contract = ready_operator_contract(
+            drift_client, new_digest, new_plan.name, "now",
+        )
 
         def drift_at_authority_create(item, client):
             if PROJECTION_PREFIX not in item["body"]:
@@ -4027,16 +4080,8 @@ class GenerationTransitionTests(unittest.TestCase):
                 client.graph_status = "Drifted after bind"
 
         drift_client.before_each_create = drift_at_authority_create
-        drift_state = adapter(drift_client, old_digest).state()
-        drift_retirement = build_retirement_proof(
-            predecessor_plan_revision=old_digest, retired_at="now",
-            retired_writer_epoch=0,
-            provenance_event_ids=[event["event_id"] for event in drift_state.events
-                                  if event["kind"] == "provenance"],
-            checkpoint_event_ids=[],
-        )
         with tempfile.NamedTemporaryFile("w", suffix=".json") as proof:
-            json.dump(reviewed_operator_contract(drift_retirement), proof)
+            json.dump(drift_contract, proof)
             proof.flush()
             code, _raw, error, _compact = invoke(drift_client, [
                 "activate", WORKSTREAM, "--plan-source", new_plan.name,
