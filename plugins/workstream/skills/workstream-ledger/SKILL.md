@@ -89,10 +89,12 @@ root material/projection frontier plus the child dependency graph, reserves a
 deterministic append-only `child_dependency_authorization` projection slot,
 then projects that immutable authority into a native `blocks` cache relation
 with one deterministic client-supplied UUIDv4. The authorization is ordered
-after the exact pre-grant material/projection/graph state; the graph frontier
-includes a canonical SHA-256 so a same-count edge replacement cannot pass as
-unchanged. Root comments observed beyond the reviewed material frontier must
-have a strictly later server creation time than the grant. Projection CAS
+after the exact pre-grant material/projection/graph state. Its material
+frontier digest binds every ordered event ID, remote comment ID, and exact
+comment body, while the graph frontier includes a canonical SHA-256 so a
+same-count edit or edge replacement cannot pass as unchanged. Root comments
+observed beyond the reviewed material frontier must have a strictly later
+server creation time than the grant. Projection CAS
 orders later projection events after it. Events ordered after the grant do not
 retroactively invalidate it: contradictions or scope changes require an
 append-only superseding event and reconciliation of the derived native cache.

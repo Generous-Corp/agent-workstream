@@ -30,7 +30,8 @@ from workstream_linear import (
 from workstream_config import load_linear_api_key
 from workstream_linear_events import LinearCommentEventAdapter, reduce_event_comments
 from workstream_linear_projection import (
-    LinearProjectionAdapter, reduce_projection_comments, select_plan_generation,
+    dependency_material_frontier_sha256, LinearProjectionAdapter,
+    LinearProjectionError, reduce_projection_comments, select_plan_generation,
 )
 from workstream_scope import ScopeError, validate_scope
 
@@ -308,6 +309,18 @@ def authorized_dependency_graph(
                 or comments is None
             ):
                 raise ChildDependencyError("dependency_authorization_receipt_missing")
+            try:
+                material_frontier_sha256 = dependency_material_frontier_sha256(
+                    material_events, material_remote_ids, comments,
+                    revision=expected_material_revision,
+                )
+            except LinearProjectionError as error:
+                raise ChildDependencyError(str(error)) from error
+            if (
+                value.get("expected_material_frontier_sha256")
+                != material_frontier_sha256
+            ):
+                raise ChildDependencyError("dependency_material_frontier_mismatch")
             grant_remote_id = projection_remote_ids.get(event.get("event_id"))
             grant_comment = comment_by_id.get(grant_remote_id)
             grant_time = _remote_comment_time(grant_comment)
@@ -354,6 +367,9 @@ def authorized_dependency_graph(
             "relation_ids": list(authorized_ids),
             "relations_sha256": value.get("relations_sha256"),
             "expected_material_revision": value.get("expected_material_revision"),
+            "expected_material_frontier_sha256": value.get(
+                "expected_material_frontier_sha256"
+            ),
             "expected_projection_revision": value.get("expected_projection_revision"),
             "expected_graph_revision": value.get("expected_graph_revision"),
             "expected_graph_sha256": value.get("expected_graph_sha256"),

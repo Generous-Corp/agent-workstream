@@ -63,6 +63,12 @@ class ResumeTests(unittest.TestCase):
         }
         plan_revision = "a" * 64
         snapshot["root"]["plan_revision"] = plan_revision
+        snapshot["root"].update({
+            "id": route["root_issue_id"],
+            "description": snapshot["root"].get(
+                "description", f"Plan revision: {plan_revision}"
+            ),
+        })
         snapshot["root"]["issue_revision"] = snapshot["root"]["revision"]
         repository_key = "github.com:id:R_agent_workstream"
         scope = {
@@ -147,6 +153,28 @@ class ResumeTests(unittest.TestCase):
             "latest_checkpoint": None,
             "checkpoint_recovery": {"state": "not_found", "stale_plan_count": 0},
         })
+        empty_graph_sha256 = hashlib.sha256(b"[]").hexdigest()
+        snapshot["dependency_graph"] = {
+            "schema_version": 1,
+            "authority": "child_dependency_authorization",
+            "plan_revision": plan_revision,
+            "route": route,
+            "revision": 0,
+            "sha256": empty_graph_sha256,
+            "authorization_batches": [],
+            "relations": [],
+            "native_readback": "relations_and_inverseRelations",
+            "ignored_non_dependency_count": 0,
+            "observed_frontier": {
+                "material_revision": snapshot.get("material_event_revision", 0),
+                "projection_revision": len(projection_events),
+                "graph_revision": 0,
+                "graph_sha256": empty_graph_sha256,
+            },
+            "root_readback_sha256": MODULE.dependency_root_readback_sha256(
+                snapshot["root"]
+            ),
+        }
         return snapshot
 
     def test_repair_graph_frontier_binds_native_status_and_state_identity(self):
@@ -1366,6 +1394,10 @@ class ResumeTests(unittest.TestCase):
             bounded["context_schema"]["envelope"], "bounded_authority_v1",
         )
         self.assertEqual(
+            bounded["execution_frontier"]["child_dependency_graph"]["sha256"],
+            hashlib.sha256(b"[]").hexdigest(),
+        )
+        self.assertEqual(
             bounded["deferred_audit_detail"]["state"],
             "bounded_authority_envelope",
         )
@@ -1519,6 +1551,20 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(
             context["execution_frontier"]["dependencies"],
             [["blocked_by", "OPS-900"]],
+        )
+        self.assertEqual(
+            context["execution_frontier"]["child_dependency_graph"]["relations"],
+            [],
+        )
+        self.assertEqual(
+            context["execution_frontier"]["child_dependency_graph"]
+            ["authority"]["sha256"],
+            hashlib.sha256(b"[]").hexdigest(),
+        )
+        self.assertEqual(
+            context["deferred_audit_detail"]["hydration_selectors"]
+            ["child_dependency_graph"],
+            ".dependency_graph",
         )
 
     def test_mature_resume_contradiction_refuses_before_compaction(self):
@@ -1843,7 +1889,7 @@ class ResumeTests(unittest.TestCase):
              mock.patch.object(MODULE.sys, "stdout"):
             self.assertEqual(MODULE.main(), 0)
         transport.snapshot_for_root.assert_called_once_with(
-            "GEN-37", include_child_comments=True,
+            "GEN-37", include_child_comments=True, include_description=True,
         )
         comments.comments.assert_called_once_with()
 
@@ -1874,7 +1920,7 @@ class ResumeTests(unittest.TestCase):
             client, team_id="team", workspace_id="workspace", project_id="project"
         )
         transport.snapshot_for_root.assert_called_once_with(
-            "GEN-37", include_child_comments=True,
+            "GEN-37", include_child_comments=True, include_description=True,
         )
         comments.comments.assert_called_once_with()
 

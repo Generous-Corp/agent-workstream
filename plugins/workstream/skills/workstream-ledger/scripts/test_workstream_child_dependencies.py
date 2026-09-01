@@ -17,7 +17,8 @@ from workstream_delta import Delta, event_id_for
 from workstream_linear import LinearTransportError
 from workstream_linear_events import encode_event_comment
 from workstream_linear_projection import (
-    build_projection_event, encode_projection_comment, projection_slot_id,
+    build_projection_event, dependency_material_frontier_sha256,
+    encode_projection_comment, projection_slot_id,
 )
 
 
@@ -375,6 +376,9 @@ class ChildDependencyTests(unittest.TestCase):
                 "relation_ids": [relation["id"]],
                 "relations_sha256": graph_sha256([relation]),
                 "expected_material_revision": 999,
+                "expected_material_frontier_sha256": (
+                    dependency_material_frontier_sha256([], {}, [], revision=0)
+                ),
                 "expected_projection_revision": 0,
                 "expected_graph_revision": 0,
                 "expected_graph_sha256": graph_sha256([]),
@@ -405,6 +409,27 @@ class ChildDependencyTests(unittest.TestCase):
             "dependency_material_event_not_ordered_after_authorization",
         ):
             adapter.read_authorized_graph()
+
+    def test_resume_graph_binds_material_comment_ids_and_bodies(self):
+        for mutation in ("body", "remote_id"):
+            with self.subTest(mutation=mutation):
+                fake = FakeLinear()
+                fake.add_material()
+                frontier = {**FRONTIER, "material_revision": 1}
+                self.apply(fake, frontier=frontier)
+                material = next(
+                    item for item in fake.comments["GEN-37"]
+                    if "workstream-delta:v1" in item["body"]
+                )
+                if mutation == "body":
+                    material["body"] += "\nreviewed prose edited in place"
+                else:
+                    material["id"] = str(uuid.uuid4())
+                with self.assertRaisesRegex(
+                    ChildDependencyError,
+                    "dependency_material_(frontier_mismatch|receipt_missing)",
+                ):
+                    self.adapter(fake).read_authorized_graph()
 
     def test_resume_graph_rejects_duplicate_relation_authorization(self):
         fake = FakeLinear()

@@ -1939,6 +1939,11 @@ def _bounded_authority_envelope(
         "dependencies": _bounded_semantic(
             context.get("relations", []), text_limit=text_limit,
         ),
+        # Native child ordering is distinct from cross-workstream relations.
+        # Keep its already-validated semantic surface in every executable
+        # representation; consumers must hydrate before mutation, but should
+        # never mistake an omitted graph for an empty graph.
+        "child_dependency_graph": deepcopy(context.get("dependency_graph")),
         "checkpoint": _bounded_semantic(
             context.get("latest_checkpoint"), text_limit=text_limit,
         ),
@@ -2073,6 +2078,24 @@ def _fixed_frontier_authority_envelope(
         brief(field(item, "type", "kind")),
         brief(field(field(item, "target"), "identifier", "issue_id", "id")),
     ] for item in context.get("relations", [])]
+    dependency_graph = context.get("dependency_graph") or {}
+    child_dependencies = [[
+        field(item, "id"),
+        field(field(item, "blocker"), "identifier", "issue_id"),
+        field(field(item, "blocked"), "identifier", "issue_id"),
+    ] for item in dependency_graph.get("relations", [])]
+    child_dependency_authority = {
+        key: dependency_graph.get(key) for key in (
+            "authority", "plan_revision", "route", "revision", "sha256",
+            "observed_frontier", "root_readback_sha256",
+        )
+    }
+    child_dependency_authority["authorization_batches_sha256"] = hashlib.sha256(
+        json.dumps(
+            dependency_graph.get("authorization_batches", []),
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
     all_fields = [
         _canonical_field_record("/" + name, value)
         for name, value in sorted(context.items())
@@ -2111,7 +2134,7 @@ def _fixed_frontier_authority_envelope(
             "execution_frontier": "complete_digest_bound_excerpts",
             "item_count": (
                 1 + len(children) + len(obligations) + len(decisions)
-                + len(choices) + len(dependencies)
+                + len(choices) + len(dependencies) + len(child_dependencies)
             ),
             "omitted_items_claimed_executable": False,
             "truncated_cell_count": truncated_cell_count,
@@ -2122,12 +2145,17 @@ def _fixed_frontier_authority_envelope(
             "root": root, "children": children, "obligations": obligations,
             "decisions": decisions, "choices": choices,
             "dependencies": dependencies,
+            "child_dependency_graph": {
+                "authority": child_dependency_authority,
+                "relations": child_dependencies,
+            },
             "columns": {
                 "children": ["id", "status", "owner", "repository", "next", "blocker"],
                 "obligations": ["source", "child", "id", "kind", "action"],
                 "decisions": ["id", "status", "action"],
                 "choices": ["id", "status", "action"],
                 "dependencies": ["type", "target"],
+                "child_dependency_graph.relations": ["id", "blocker", "blocked"],
             },
             "checkpoint": checkpoint_brief,
             "disposition": disposition_brief,
@@ -2153,6 +2181,7 @@ def _fixed_frontier_authority_envelope(
                 "decisions": ".decisions[<row>]",
                 "choices": ".choice_events[<row>]",
                 "dependencies": ".relations[<row>]",
+                "child_dependency_graph": ".dependency_graph",
                 "checkpoint": ".latest_checkpoint",
                 "disposition": ".disposition",
             },
@@ -2559,7 +2588,7 @@ def main() -> int:
                 project_id=route.get("project_id"),
             )
             live_graph_snapshot = transport.snapshot_for_root(
-                token, include_child_comments=True,
+                token, include_child_comments=True, include_description=True,
             )
             complete_route = route if all(
                 route.get(field) for field in ("workspace_id", "team_id", "project_id")

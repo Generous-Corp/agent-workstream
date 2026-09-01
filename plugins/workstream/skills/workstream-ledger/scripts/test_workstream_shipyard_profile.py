@@ -101,6 +101,30 @@ class ShipyardProfileTests(unittest.TestCase):
                 }],
             },
             "relations": [],
+            "dependency_graph": {
+                "schema_version": 1,
+                "authority": "child_dependency_authorization",
+                "plan_revision": PLAN,
+                "route": {
+                    "workspace_id": "workspace",
+                    "team_id": "team",
+                    "project_id": "project",
+                    "root_issue_id": "33333333-3333-4333-8333-333333333333",
+                },
+                "revision": 0,
+                "sha256": hashlib.sha256(b"[]").hexdigest(),
+                "authorization_batches": [],
+                "relations": [],
+                "native_readback": "relations_and_inverseRelations",
+                "ignored_non_dependency_count": 0,
+                "observed_frontier": {
+                    "material_revision": 3,
+                    "projection_revision": 4,
+                    "graph_revision": 0,
+                    "graph_sha256": hashlib.sha256(b"[]").hexdigest(),
+                },
+                "root_readback_sha256": "6" * 64,
+            },
             "evidence_contracts": [],
             "surface_availability": {
                 "scope": "available",
@@ -108,6 +132,7 @@ class ShipyardProfileTests(unittest.TestCase):
                 "choice_events": "available",
                 "evidence_contracts": "available",
                 "material_events": "available",
+                "dependency_graph": "available",
                 "latest_checkpoint": "available",
             },
             "provenance": [{"kind": "plan", "sha256": PLAN}],
@@ -171,6 +196,14 @@ class ShipyardProfileTests(unittest.TestCase):
         ])
         self.assertEqual(profile["checkpoint"]["generation"], 2)
         self.assertEqual(
+            profile["continuation_bootstrap"]["dependency_graph_sha256"],
+            hashlib.sha256(b"[]").hexdigest(),
+        )
+        self.assertRegex(
+            profile["continuation_bootstrap"]["dependency_graph_digest"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertEqual(
             profile["continuation_bootstrap"]["expected_resume_context_digest"],
             MODULE._resume_context_digest(context),
         )
@@ -204,6 +237,27 @@ class ShipyardProfileTests(unittest.TestCase):
                 model="gpt-5.6-sol", reasoning_effort="medium",
             )
             self.assertEqual(first, second)
+
+    def test_launch_profile_rejects_missing_null_or_tampered_dependency_graph(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for mutation in ("missing", "null", "body"):
+                with self.subTest(mutation=mutation):
+                    context = self.context(root)
+                    if mutation == "missing":
+                        context.pop("dependency_graph")
+                    elif mutation == "null":
+                        context["dependency_graph"] = None
+                    else:
+                        context["dependency_graph"]["sha256"] = "f" * 64
+                    with self.assertRaisesRegex(
+                        MODULE.ShipyardProfileError,
+                        "resume_dependency_graph_(missing|invalid)",
+                    ):
+                        MODULE.build_launch_profile(
+                            context, "GEN-37", self.git(root),
+                            model="gpt-5.6-sol", reasoning_effort="medium",
+                        )
 
     def test_digest_bound_resume_envelope_requires_exact_hydration(self):
         with tempfile.TemporaryDirectory() as directory:
