@@ -3552,6 +3552,35 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(replay_result["writes"], [])
         self.assertEqual(len(client.comments), comments_before)
 
+    def test_terminal_repair_consumer_refuses_primary_head_mismatch(self):
+        client, adapter, source, graph, _children, manifest = (
+            self.multi_terminal_repair_fixture(evidence_active=True)
+        )
+        prepared = prepare_terminal_child_repairs(
+            manifest, graph, adapter.state(),
+        )
+        scope = next(
+            item["value"] for item in prepared["projection"]
+            if (item["kind"], item["key"]) == ("scope", "root")
+        )
+        primary = next(
+            repository for repository in scope["repositories"]
+            if repository_key(repository) == scope["primary_repository"]
+        )
+        primary["exact_head"] = "b" * 40
+        comments_before = len(client.comments)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_repair_primary_head_mismatch",
+        ):
+            reconcile_required_projection(
+                adapter, graph, prepared, remote_head=HEAD,
+                created_at="2026-09-01T09:31:00Z",
+                authenticated_source=source,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        self.assertEqual(len(client.comments), comments_before)
+
     def test_terminal_seed_head_transition_recovers_before_scope_commit(self):
         client, adapter, source, graph, _children, manifest, new_head = (
             self.terminal_seed_head_transition_fixture()
