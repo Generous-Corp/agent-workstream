@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import re
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 import uuid
@@ -42,6 +43,7 @@ from workstream_resume import (
 )
 from workstream_relation_readback import RelationReadbackError
 import workstream_projection
+import workstream_generation
 import workstream_linear_projection as projection_module
 import workstream_resume as resume_module
 import workstream_shipyard_profile as shipyard_profile
@@ -3931,6 +3933,515 @@ class ProjectionTests(unittest.TestCase):
              for event in adapter.state().events[before_revision:]],
             [("scope", "root")],
         )
+
+    def test_gen14_legacy_split_prefix_replays_exact_disposition_then_scope(self):
+        plan, frontier = "e" * 64, "f" * 64
+        old_disposition_head, old_scope_head, new_head = (
+            "a" * 40, "b" * 40, "c" * 40,
+        )
+        prefix_time = "2030-01-01T00:00:00Z"
+        predecessor_plan = "f" * 64
+        predecessor_events = [build_projection_event(
+            workstream_id="GEN-14", kind="provenance", key=f"pred-{index}",
+            value={"agent": "synthetic", "machine": "predecessor",
+                   "session_id": f"pred-{index}"},
+            plan_revision=predecessor_plan, expected_revision=index,
+            created_at="2029-12-31T23:00:00Z", authority=AUTHORITY,
+        ) for index in range(11)]
+        old_scope = {
+            "primary_repository": "github.com:id:R_synthetic",
+            "repositories": [{"provider_repository_id": "R_synthetic",
+                              "slug": "github.com/acme/synthetic",
+                              "exact_head": old_scope_head, "aliases": [],
+                              "evidence": [], "identity_updates": [],
+                              "identity_resolution": {
+                                  "provider_repository_id": "R_synthetic",
+                                  "resolved_slug": "github.com/acme/synthetic",
+                                  "observed_at": prefix_time,
+                                  "evidence": [{"authenticated": True,
+                                      "kind": "authenticated_provider_readback",
+                                      "provider_repository_id": "R_synthetic",
+                                      "resolved_slug": "github.com/acme/synthetic"}],
+                              }}],
+            "child_ownership": {
+                "GEN-1": "github.com:id:R_synthetic",
+                "GEN-2": "github.com:id:R_synthetic",
+            }, "linear": deepcopy(AUTHORITY),
+            "namespace": "synthetic",
+        }
+        predecessor = {
+            "schema_version": 1, "plan_revision": predecessor_plan,
+            "projection_revision": len(predecessor_events),
+            "projection_events_sha256": canonical_digest(predecessor_events),
+            "projection_frontier_event_id": predecessor_events[-1]["event_id"],
+            "projection_frontier_sha256": canonical_digest(
+                predecessor_events[-1]
+            ),
+            "projection_history_sha256": canonical_digest(predecessor_events),
+            "material_revision": 180, "material_events_sha256": "4" * 64,
+            "checkpoint_event_id": "wsc_checkpoint",
+            "checkpoint_events_sha256": "5" * 64,
+            "input_frontier_sha256": frontier,
+            "evidence_heads": [{
+                "child_identifier": child, "key": key,
+                "evidence_event_id": "wsp_" + str(index + 2) * 32,
+                "evidence_value_sha256": str(index + 6) * 64,
+                "closure_event_id": "wsp_" + str(index + 4) * 32,
+                "closure_value_sha256": str(index + 8) * 64,
+            } for index, (key, child) in enumerate(
+                (("one", "GEN-1"), ("two", "GEN-2"))
+            )],
+        }
+        common_authority = {
+            "schema_version": 1,
+            "predecessor_plan_revision": predecessor["plan_revision"],
+            "predecessor_projection_revision": predecessor[
+                "projection_revision"
+            ],
+            "predecessor_projection_events_sha256": predecessor[
+                "projection_events_sha256"
+            ],
+            "predecessor_projection_frontier_event_id": predecessor[
+                "projection_frontier_event_id"
+            ],
+            "predecessor_projection_frontier_sha256": predecessor[
+                "projection_frontier_sha256"
+            ],
+            "projection_history_sha256": predecessor[
+                "projection_history_sha256"
+            ],
+            "material_revision": predecessor["material_revision"],
+            "material_events_sha256": predecessor["material_events_sha256"],
+            "checkpoint_event_id": predecessor["checkpoint_event_id"],
+            "checkpoint_events_sha256": predecessor[
+                "checkpoint_events_sha256"
+            ],
+            "input_frontier_sha256": predecessor["input_frontier_sha256"],
+        }
+        evidence_values = []
+        for head in predecessor["evidence_heads"]:
+            contract_value = evidence_contract()
+            contract_value.update({
+                "slice_id": head["key"],
+                "owning_child": head["child_identifier"],
+                "repository": "github.com/acme/synthetic",
+                "repository_key": "github.com:id:R_synthetic",
+                "plan_revision": plan,
+                "exact_head": old_scope_head,
+                "predecessor_closure_authority": {
+                **common_authority,
+                "predecessor_evidence_event_id": head["evidence_event_id"],
+                "predecessor_evidence_value_sha256": head[
+                    "evidence_value_sha256"
+                ],
+                "predecessor_closure_event_id": head["closure_event_id"],
+                "predecessor_closure_value_sha256": head[
+                    "closure_value_sha256"
+                ],
+            },
+            })
+            for layer in contract_value["layers"].values():
+                for receipt in layer.get("receipts", []):
+                    receipt["repository_key"] = contract_value["repository_key"]
+                    receipt["exact_head"] = contract_value["exact_head"]
+            evidence_values.append(contract_value)
+        values = evidence_values + [
+            {"agent": "synthetic", "machine": "test", "session_id": "session"},
+            {"identity": "https://example.test/plan", "sha256": plan},
+            {"disposition": "create_successor",
+             "remote_head": old_disposition_head,
+             "recovered_from_checkpoint": None}, old_scope,
+        ]
+        identities = [
+            ("evidence_contract", "one"), ("evidence_contract", "two"),
+            ("provenance", "synthetic"), ("source", "root"),
+            ("disposition", "root"), ("scope", "root"),
+        ]
+        events = [build_projection_event(
+            workstream_id="GEN-14", kind=kind, key=key, value=value,
+            plan_revision=plan, expected_revision=index,
+            created_at=prefix_time, authority=AUTHORITY,
+        ) for index, ((kind, key), value) in enumerate(zip(identities, values))]
+        original_digest = workstream_projection.GEN14_SPLIT_PREFIX_SHA256
+        workstream_projection.GEN14_SPLIT_PREFIX_SHA256 = canonical_digest(events)
+        original_generation_digest = (
+            workstream_generation.GEN14_LEGACY_SPLIT_PREFIX_SHA256
+        )
+        workstream_generation.GEN14_LEGACY_SPLIT_PREFIX_SHA256 = (
+            canonical_digest(events)
+        )
+        self.addCleanup(
+            setattr, workstream_projection, "GEN14_SPLIT_PREFIX_SHA256",
+            original_digest,
+        )
+        self.addCleanup(
+            setattr, workstream_generation,
+            "GEN14_LEGACY_SPLIT_PREFIX_SHA256", original_generation_digest,
+        )
+        state = SimpleNamespace(revision=6, events=events, snapshot={})
+        contract = projection_review_contract(state)
+        desired_scope = deepcopy(old_scope)
+        primary = next(
+            item for item in desired_scope["repositories"]
+            if repository_key(item) == desired_scope["primary_repository"]
+        )
+        primary["exact_head"] = new_head
+        transition = {
+            "repository_key": desired_scope["primary_repository"],
+            "from_exact_head": old_scope_head,
+            "from_disposition_exact_head": old_disposition_head,
+            "to_exact_head": new_head,
+            "from_scope_event_id": events[5]["event_id"],
+            "from_scope_value_sha256": canonical_digest(events[5]["value"]),
+            "from_disposition_event_id": events[4]["event_id"],
+            "from_disposition_value_sha256": canonical_digest(events[4]["value"]),
+            "disposition": {
+                "disposition": "create_successor",
+                "remote_head": new_head,
+                "recovered_from_checkpoint": None,
+            },
+            "input_frontier_sha256": predecessor["input_frontier_sha256"],
+            "created_at": "2026-09-01T10:00:00Z",
+        }
+        manifest = {
+            **contract,
+            "projection": [
+                {"kind": event["kind"], "key": event["key"],
+                 "value": desired_scope if event["kind"] == "scope"
+                 else deepcopy(event["value"])}
+                for event in events if event["kind"] != "disposition"
+            ],
+            "retirements": [],
+            "terminal_child_evidence_seeds": [{
+                "child_identifier": child,
+                "child_issue_id": f"00000000-0000-4000-8000-00000000000{index}",
+                "expected_child_readback_sha256": str(index + 7) * 64,
+                "expected_assignee_id": None, "evidence_keys": [key],
+            } for index, (key, child) in enumerate(
+                (("one", "GEN-1"), ("two", "GEN-2")), start=1
+            )],
+            "terminal_child_evidence_seed_predecessor": predecessor,
+            "terminal_child_evidence_seed_legacy_split_head_repair": transition,
+        }
+        producer_values = [
+            deepcopy(old_scope),
+            {"identity": "https://example.test/predecessor",
+             "sha256": predecessor_plan},
+            deepcopy(values[2]),
+            {"disposition": "create_successor",
+             "remote_head": old_scope_head,
+             "recovered_from_checkpoint": None},
+            *[{**deepcopy(value), "plan_revision": predecessor_plan}
+              for value in evidence_values],
+            *[{
+                "child_identifier": child,
+                "plan_revision": predecessor_plan,
+                "repository_key": old_scope["primary_repository"],
+                "exact_head": old_scope_head,
+            } for child in ("GEN-1", "GEN-2")],
+        ]
+        for value in producer_values[4:6]:
+            value.pop("predecessor_closure_authority", None)
+        producer_identities = [
+            ("scope", "root"), ("source", "root"),
+            ("provenance", "synthetic"), ("disposition", "root"),
+            ("evidence_contract", "one"), ("evidence_contract", "two"),
+            ("child_closure", "GEN-1"), ("child_closure", "GEN-2"),
+        ]
+        producer_predecessor_events = [build_projection_event(
+            workstream_id="GEN-14", kind=kind, key=key, value=value,
+            plan_revision=predecessor_plan, expected_revision=index,
+            created_at="2029-12-31T22:00:00Z", authority=AUTHORITY,
+        ) for index, ((kind, key), value) in enumerate(zip(
+            producer_identities[:6], producer_values[:6],
+        ))]
+        producer_predecessor_events.extend({
+            "schema_version": 2, "workstream_id": "GEN-14",
+            "kind": kind, "key": key, "value": value,
+            "plan_revision": predecessor_plan,
+            "expected_revision": index,
+            "created_at": "2029-12-31T22:00:00Z",
+            "authority": deepcopy(AUTHORITY),
+            "supersedes_event_id": None,
+            "event_id": "wsp_" + str(index) * 32,
+        } for index, ((kind, key), value) in enumerate(zip(
+            producer_identities[6:], producer_values[6:],
+        ), start=6))
+        producer_predecessor_state = SimpleNamespace(
+            revision=len(producer_predecessor_events),
+            events=producer_predecessor_events,
+            snapshot={"projection_history": predecessor_events},
+        )
+        workstream_projection._reviewed_manifest(manifest)
+        workstream_projection._validate_gen14_legacy_split_repair_prefix(
+            manifest, state, desired_scope,
+        )
+        disposition = build_projection_event(
+            workstream_id="GEN-14", kind="disposition", key="root",
+            value=transition["disposition"],
+            plan_revision=plan,
+            expected_revision=6, created_at=transition["created_at"],
+            supersedes_event_id=events[4]["event_id"],
+            authority=AUTHORITY,
+        )
+        scope = build_projection_event(
+            workstream_id="GEN-14", kind="scope", key="root",
+            value=desired_scope,
+            plan_revision=plan,
+            expected_revision=7, created_at=transition["created_at"],
+            supersedes_event_id=events[5]["event_id"],
+            authority=AUTHORITY,
+        )
+        for tail in ([disposition], [disposition, scope]):
+            replay = SimpleNamespace(
+                revision=6 + len(tail), events=[*events, *tail], snapshot={},
+            )
+            workstream_projection._validate_gen14_legacy_split_repair_prefix(
+                manifest, replay, desired_scope,
+            )
+            regenerated = deepcopy(manifest)
+            regenerated.update(projection_review_contract(replay))
+            workstream_projection._validate_gen14_legacy_split_repair_prefix(
+                regenerated, replay, desired_scope,
+            )
+        self.assertEqual(disposition["supersedes_event_id"], events[4]["event_id"])
+        self.assertEqual(scope["supersedes_event_id"], events[5]["event_id"])
+
+        snapshot = {
+            "root": {"identifier": "GEN-14"},
+            "children": [{
+                "identifier": seed["child_identifier"],
+                "id": seed["child_issue_id"],
+                "parent": {"id": ROOT_UUID},
+                "team": {
+                    "id": AUTHORITY["team_id"],
+                    "organization": {"id": AUTHORITY["workspace_id"]},
+                },
+                "project": {"id": AUTHORITY["project_id"]},
+                "assignee": None,
+                "state_id": f"state-{index}",
+                "status": "Done",
+                "status_type": "completed",
+            } for index, seed in enumerate(
+                manifest["terminal_child_evidence_seeds"], start=1
+            )],
+        }
+        for seed, child in zip(
+            manifest["terminal_child_evidence_seeds"], snapshot["children"],
+        ):
+            seed["expected_child_readback_sha256"] = canonical_digest(
+                terminal_child_readback(child)
+            )
+        source = {"identity": values[3]["identity"], "sha256": plan}
+        readbacks = {
+            seed["child_identifier"]: seed["expected_child_readback_sha256"]
+            for seed in manifest["terminal_child_evidence_seeds"]
+        }
+        authorities = {
+            head["key"]: {
+                "evidence_event_id": head["evidence_event_id"],
+                "evidence_value_sha256": head["evidence_value_sha256"],
+                "closure_event_id": head["closure_event_id"],
+                "closure_value_sha256": head["closure_value_sha256"],
+            } for head in predecessor["evidence_heads"]
+        }
+
+        class Gen14ProjectionClient(FakeProjectionClient):
+            def execute(self, query, variables):
+                response = super().execute(query, variables)
+                if "query WorkstreamDeltaComments" in query:
+                    response["issue"]["identifier"] = "GEN-14"
+                return response
+
+        def adapter_with_tail(tail):
+            client = Gen14ProjectionClient()
+            client.comments = [
+                projection_comment(event)
+                for event in [*predecessor_events, *events, *tail]
+            ]
+            return client, LinearProjectionAdapter(
+                client, issue_id="GEN-14", workstream_id="GEN-14",
+                plan_revision=plan, **AUTHORITY,
+            )
+
+        def prepared_operator_contract(adapter, requested_head, requested_at):
+            target_state = adapter.state()
+            with mock.patch.object(
+                workstream_generation, "reduce_projection_comments",
+                side_effect=lambda _comments, **kwargs: (
+                    producer_predecessor_state
+                    if kwargs["expected_plan_revision"] == predecessor_plan
+                    else target_state
+                ),
+            ), mock.patch.object(
+                workstream_projection,
+                "terminal_child_evidence_seed_predecessor_contract",
+                return_value=(predecessor, authorities),
+            ):
+                return prepare_generation_operator_contract(
+                    comments=deepcopy(adapter.client.comments),
+                    graph=deepcopy(snapshot), workstream_id="GEN-14",
+                    authority=AUTHORITY,
+                    description_plan_revision=predecessor_plan,
+                    target_source=source, created_at=requested_at,
+                    remote_head=requested_head,
+                    started_state={
+                        "id": "state-started", "name": "In Progress",
+                        "type": "started", "team_id": AUTHORITY["team_id"],
+                    },
+                )
+
+        def apply_operator_contract(adapter, operator):
+            preview = operator["projection_preview"]
+            with mock.patch.object(
+                workstream_projection,
+                "terminal_child_evidence_seed_predecessor_contract",
+                return_value=(predecessor, authorities),
+            ):
+                return reconcile_required_projection(
+                    adapter, snapshot, preview["manifest"],
+                    **preview["invocation"], authenticated_source=source,
+                    terminal_child_fence=lambda child_ids: {
+                        child_id: readbacks[child_id] for child_id in child_ids
+                    },
+                    projection_input_fence=lambda: frontier,
+                    checkpoint_fence=lambda: None,
+                    projection_comments=adapter.client.comments,
+                    projection_input_snapshot=snapshot,
+                )
+
+        _fresh_client, fresh_adapter = adapter_with_tail([])
+        fresh_operator = prepared_operator_contract(
+            fresh_adapter, new_head, transition["created_at"],
+        )
+        fresh_before = fresh_adapter.state().revision
+        fresh_result = apply_operator_contract(fresh_adapter, fresh_operator)
+        self.assertEqual(
+            [(event["kind"], event["key"])
+             for event in fresh_adapter.state().events[fresh_before:]],
+            [("disposition", "root"), ("scope", "root")],
+        )
+        self.assertEqual(len(fresh_result["writes"]), 2)
+
+        interrupted_client, interrupted_adapter = adapter_with_tail([disposition])
+        newer_requested_head = "d" * 40
+        interrupted_operator = prepared_operator_contract(
+            interrupted_adapter, newer_requested_head,
+            "2030-01-01T03:00:00Z",
+        )
+        self.assertEqual(interrupted_operator["remote_head"], newer_requested_head)
+        self.assertEqual(
+            interrupted_operator["projection_preview"]["invocation"], {
+                "remote_head": new_head,
+                "created_at": transition["created_at"],
+            },
+        )
+        interrupted_before = interrupted_adapter.state().revision
+        interrupted_result = apply_operator_contract(
+            interrupted_adapter, interrupted_operator,
+        )
+        self.assertEqual(
+            [(event["kind"], event["key"])
+             for event in interrupted_adapter.state().events[
+                 interrupted_before:
+             ]],
+            [("scope", "root")],
+        )
+        self.assertEqual(len(interrupted_result["writes"]), 1)
+
+        replay_operator = deepcopy(interrupted_operator)
+        comments_before_replay = len(interrupted_client.comments)
+        replay_result = apply_operator_contract(
+            interrupted_adapter, replay_operator,
+        )
+        self.assertEqual(replay_result["writes"], [])
+        self.assertEqual(len(interrupted_client.comments), comments_before_replay)
+
+        later_created_at = "2030-01-01T05:00:00Z"
+        later_operator = prepared_operator_contract(
+            interrupted_adapter, newer_requested_head, later_created_at,
+        )
+        later_preview = later_operator["projection_preview"]
+        self.assertEqual(later_preview["invocation"], {
+            "remote_head": newer_requested_head,
+            "created_at": later_created_at,
+        })
+        self.assertIn(
+            "terminal_child_evidence_seed_head_transition",
+            later_preview["manifest"],
+        )
+        self.assertNotIn(
+            "terminal_child_evidence_seed_legacy_split_head_repair",
+            later_preview["manifest"],
+        )
+        later_before = interrupted_adapter.state().revision
+        later_result = apply_operator_contract(
+            interrupted_adapter, later_operator,
+        )
+        later_tail = interrupted_adapter.state().events[later_before:]
+        self.assertEqual(
+            [(event["kind"], event["key"]) for event in later_tail],
+            [("disposition", "root"), ("scope", "root")],
+        )
+        self.assertEqual(len(later_result["writes"]), 2)
+
+        _crash_client, crash_adapter = adapter_with_tail([
+            disposition, scope, later_tail[0],
+        ])
+        crash_operator = prepared_operator_contract(
+            crash_adapter, newer_requested_head, later_created_at,
+        )
+        self.assertIn(
+            "terminal_child_evidence_seed_head_transition",
+            crash_operator["projection_preview"]["manifest"],
+        )
+        crash_before = crash_adapter.state().revision
+        crash_result = apply_operator_contract(crash_adapter, crash_operator)
+        self.assertEqual(
+            [(event["kind"], event["key"])
+             for event in crash_adapter.state().events[crash_before:]],
+            [("scope", "root")],
+        )
+        self.assertEqual(len(crash_result["writes"]), 1)
+
+        with mock.patch.object(
+            workstream_projection, "prepare_terminal_child_repairs",
+            side_effect=lambda repair_manifest, _snapshot, _state: (
+                repair_manifest
+            ),
+        ):
+            continued = prepared_operator_contract(
+                interrupted_adapter, newer_requested_head,
+                "2030-01-01T06:00:00Z",
+            )
+        self.assertNotIn(
+            "terminal_child_evidence_seed_legacy_split_head_repair",
+            continued["projection_preview"]["manifest"],
+        )
+
+        planted = {
+            "extra_event": [*events, {**disposition, "kind": "choice"}],
+            "wrong_disposition": [*events, {**disposition, "value": {
+                **transition["disposition"], "disposition": "attach",
+            }}],
+            "wrong_order": [*events, scope],
+        }
+        for name, bad_events in planted.items():
+            with self.subTest(name=name), self.assertRaises(LinearProjectionError):
+                workstream_projection._validate_gen14_legacy_split_repair_prefix(
+                    manifest, SimpleNamespace(
+                        revision=len(bad_events), events=bad_events, snapshot={},
+                    ), desired_scope,
+                )
+        drifted = deepcopy(events)
+        drifted[5]["value"]["namespace"] = "arbitrary-split"
+        with self.assertRaisesRegex(
+            LinearProjectionError, "legacy_split_head_repair_prefix_mismatch",
+        ):
+            workstream_projection._validate_gen14_legacy_split_repair_prefix(
+                manifest, SimpleNamespace(revision=6, events=drifted, snapshot={}),
+                desired_scope,
+            )
 
     def test_terminal_seed_head_transition_recovers_each_evidence_prefix(self):
         for prefix_count, expected_kinds in (

@@ -287,6 +287,13 @@ nonempty inactive candidate refuses rather than being merged or guessed.
 Projection has an explicit safe preview/apply path. Reuse the preview's exact
 timestamp and digest:
 
+Use `projection_preview.invocation.remote_head` and
+`projection_preview.invocation.created_at` from the latest generation prepare
+result. These normally equal the requested prepare inputs. During the one
+content-addressed GEN-14 split-prefix repair they instead finish a durable
+disposition-only crash prefix at its recorded head and timestamp before any
+later ordinary head transition.
+
 ```sh
 workstreamctl projection GEN-123 target-projection.json \
   --remote-head <authenticated-exact-head> --plan-source ./PLAN.md \
@@ -541,6 +548,14 @@ scope, or resistance to an authorized person editing/deleting comments. No
 live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
+
+Version 0.4.56 contains one content-addressed recovery for GEN-14's captured
+0.4.51 split-head inactive seed prefix. It binds both malformed predecessor
+heads and every frontier, writes the authenticated new disposition before the
+scope, and admits only the exact deterministic crash prefix on replay.
+If main advances after the disposition append, fresh prepare derives the
+recorded repair head from that exact Linear event, completes the paired scope,
+and leaves any later head movement to the ordinary matched transition.
 
 Version 0.4.55 treats one standard Markdown link on the canonical-plan line as
 one logical locator and atomically rewrites both its label and destination,

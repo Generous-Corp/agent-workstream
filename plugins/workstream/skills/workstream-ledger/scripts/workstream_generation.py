@@ -79,6 +79,14 @@ query WorkstreamGenerationPrepareState($teamId: String!, $stateId: String!) {
 }
 """
 
+# Agent Workstream 0.4.51 wrote this one inactive GEN-14 candidate with the
+# disposition and scope taken from different authenticated Shipyard heads.
+# Keep the escape hatch content-addressed to that exact six-event prefix; this
+# is a migration receipt, not permission to reconcile arbitrary split heads.
+GEN14_LEGACY_SPLIT_PREFIX_SHA256 = (
+    "180e178d1732b914edce564ba1d6411e229ceaaecd48cbcb5422de2736d56c28"
+)
+
 
 class WorkstreamGenerationError(LinearTransportError):
     """Generation authority cannot be changed without guessing."""
@@ -86,6 +94,127 @@ class WorkstreamGenerationError(LinearTransportError):
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _gen14_split_prefix_context(
+    target: Any, *, workstream_id: str, target_plan: str,
+    input_frontier_sha256: str,
+) -> dict[str, Any] | None:
+    """Authenticate the one private prefix through one public opaque digest."""
+    if workstream_id != "GEN-14" or target.revision < 6:
+        return None
+    prefix = list(target.events[:6])
+    if len(prefix) != 6 or not hmac.compare_digest(
+        canonical_digest(prefix), GEN14_LEGACY_SPLIT_PREFIX_SHA256,
+    ):
+        return None
+    plan = prefix[0].get("plan_revision")
+    authority = prefix[0].get("authority")
+    created_at = prefix[0].get("created_at")
+    identities = [(event.get("kind"), event.get("key")) for event in prefix]
+    frontiers = {
+        event.get("value", {}).get("predecessor_closure_authority", {}).get(
+            "input_frontier_sha256"
+        )
+        for event in prefix[:2]
+    }
+    scope = prefix[5].get("value", {})
+    primary_key = scope.get("primary_repository")
+    primary = [
+        repository for repository in scope.get("repositories", [])
+        if repository_key(repository) == primary_key
+    ]
+    disposition = prefix[4].get("value", {})
+    if (
+        target_plan != plan
+        or identities[:4] != [
+            ("evidence_contract", identities[0][1]),
+            ("evidence_contract", identities[1][1]),
+            ("provenance", identities[2][1]), ("source", "root"),
+        ]
+        or identities[4:] != [("disposition", "root"), ("scope", "root")]
+        or not isinstance(created_at, str) or not created_at
+        or len(primary) != 1 or len(frontiers) != 1
+        or input_frontier_sha256 not in frontiers
+        or disposition != {
+            "disposition": "create_successor",
+            "remote_head": disposition.get("remote_head"),
+            "recovered_from_checkpoint": None,
+        }
+        or primary[0].get("exact_head") == disposition.get("remote_head")
+        or not all(
+            event.get("schema_version") == 2
+            and event.get("expected_revision") == index
+            and event.get("workstream_id") == workstream_id
+            and event.get("plan_revision") == plan
+            and event.get("authority") == authority
+            and event.get("created_at") == created_at
+            and event.get("supersedes_event_id") is None
+            for index, event in enumerate(prefix)
+        )
+    ):
+        return None
+    return {
+        "prefix": prefix, "plan_revision": plan, "authority": authority,
+        "scope_head": primary[0]["exact_head"],
+        "disposition_head": disposition["remote_head"],
+    }
+
+
+def _gen14_legacy_split_head_prefix(
+    target: Any, *, workstream_id: str, target_plan: str,
+    input_frontier_sha256: str, remote_head: str,
+) -> bool:
+    context = _gen14_split_prefix_context(
+        target, workstream_id=workstream_id, target_plan=target_plan,
+        input_frontier_sha256=input_frontier_sha256,
+    )
+    if context is None or remote_head in {
+        context["scope_head"], context["disposition_head"],
+    }:
+        return False
+    if target.revision == 6:
+        return True
+    prefix = context["prefix"]
+    repair_created_at = target.events[6].get("created_at")
+    desired_scope = deepcopy(prefix[5]["value"])
+    next(repository for repository in desired_scope["repositories"]
+         if repository_key(repository) == desired_scope["primary_repository"]
+         )["exact_head"] = remote_head
+    expected_tail = [
+        build_projection_event(
+            workstream_id=workstream_id, kind="disposition", key="root",
+            value={"disposition": "create_successor", "remote_head": remote_head,
+                   "recovered_from_checkpoint": None},
+            plan_revision=target_plan, expected_revision=6,
+            created_at=repair_created_at, supersedes_event_id=prefix[4]["event_id"],
+            authority=context["authority"],
+        ),
+        build_projection_event(
+            workstream_id=workstream_id, kind="scope", key="root",
+            value=desired_scope, plan_revision=target_plan, expected_revision=7,
+            created_at=repair_created_at, supersedes_event_id=prefix[5]["event_id"],
+            authority=context["authority"],
+        ),
+    ]
+    required_tail = min(target.revision - 6, 2)
+    return list(target.events[6:6 + required_tail]) == expected_tail[:required_tail]
+
+
+def _gen14_recorded_repair_head(
+    target: Any, requested_head: str, *, workstream_id: str,
+    target_plan: str, input_frontier_sha256: str,
+) -> str:
+    """Finish exact D6 at recorded C before considering a newer main."""
+    if target.revision not in {7, 8}:
+        return requested_head
+    recorded = target.events[6].get("value", {}).get("remote_head")
+    if not isinstance(recorded, str) or not _gen14_legacy_split_head_prefix(
+        target, workstream_id=workstream_id, target_plan=target_plan,
+        input_frontier_sha256=input_frontier_sha256, remote_head=recorded,
+    ):
+        return requested_head
+    return recorded
 
 
 def _envelope(prefix: str, payload_name: str, payload: dict[str, Any]) -> str:
@@ -413,6 +542,7 @@ def prepare_generation_operator_contract(
 
     terminal_stage: dict[str, Any] | None = None
     phase = "complete_projection"
+    effective_remote_head = remote_head
     manifest: dict[str, Any]
     if closure_heads:
         # Generation prepare and projection preview must bind terminal carry to
@@ -475,6 +605,25 @@ def prepare_generation_operator_contract(
             desired_scope=scope, seeds=seeds,
             desired_contracts=desired_contracts,
         )
+        recorded_repair_head = _gen14_recorded_repair_head(
+            target, remote_head, workstream_id=workstream_id,
+            target_plan=target_plan,
+            input_frontier_sha256=binding["input_frontier_sha256"],
+        )
+        if recorded_repair_head == remote_head:
+            recorded_repair_head = None
+        seed_remote_head = (
+            recorded_repair_head
+            if target.revision == 7 and isinstance(recorded_repair_head, str)
+            else remote_head
+        )
+        if seed_remote_head != remote_head:
+            effective_remote_head = seed_remote_head
+            seed_primary = next(
+                repository for repository in scope["repositories"]
+                if repository_key(repository) == scope["primary_repository"]
+            )
+            seed_primary["exact_head"] = seed_remote_head
         empty_contract = _contract_from_heads(
             0, {}, legacy_event_ids=[], legacy_events_sha256=None,
             quarantine_count=0, quarantine_sha256=_value_digest([]),
@@ -501,12 +650,48 @@ def prepare_generation_operator_contract(
             "terminal_child_evidence_seeds": seeds,
             "terminal_child_evidence_seed_predecessor": binding,
         }
+        legacy_candidate = (
+            workstream_id == "GEN-14" and target.revision >= 6
+            and hmac.compare_digest(
+                canonical_digest(list(target.events[:6])),
+                GEN14_LEGACY_SPLIT_PREFIX_SHA256,
+            )
+        )
+        durable_repair_head = (
+            target.events[6].get("value", {}).get("remote_head")
+            if target.revision >= 7 else remote_head
+        )
+        legacy_prefix = _gen14_legacy_split_head_prefix(
+            target, workstream_id=workstream_id, target_plan=target_plan,
+            input_frontier_sha256=binding["input_frontier_sha256"],
+            remote_head=durable_repair_head,
+        )
+        if legacy_prefix:
+            # The one content-addressed legacy prefix already contains the
+            # reviewed predecessor authority on its evidence contracts.  Keep
+            # those exact active values; the ordinary seed path starts from
+            # the predecessor and injects equivalent authority later, which
+            # would make this replay look like an evidence replacement.
+            for item in seed_items:
+                identity = (item["kind"], item["key"])
+                if item["kind"] != "evidence_contract":
+                    continue
+                current = target_heads.get(identity)
+                if current is None:
+                    raise WorkstreamGenerationError(
+                        "generation_prepare_legacy_split_head_evidence_missing"
+                    )
+                item["value"] = deepcopy(current["value"])
+        if legacy_candidate and not legacy_prefix:
+            raise WorkstreamGenerationError(
+                "generation_prepare_legacy_split_head_prefix_changed"
+            )
         if (
             current_seed_scope is not None
             and current_seed_scope["value"] != scope
         ):
             desired_seed_disposition = projection_disposition_value(
-                graph, seed_items, remote_head=remote_head,
+                graph, seed_items, remote_head=seed_remote_head,
                 workstream_id=workstream_id,
             )
             current_scope = current_seed_scope["value"]
@@ -531,7 +716,7 @@ def prepare_generation_operator_contract(
                 or len(desired_primary) != 1
                 or len(expected_primary) != 1
                 or current_scope.get("primary_repository") != primary_key
-                or desired_primary[0].get("exact_head") != remote_head
+                or desired_primary[0].get("exact_head") != seed_remote_head
                 or not re.fullmatch(
                     r"[0-9a-f]{40}(?:[0-9a-f]{24})?",
                     str(current_primary[0].get("exact_head", "")),
@@ -540,7 +725,7 @@ def prepare_generation_operator_contract(
                 raise WorkstreamGenerationError(
                     "generation_prepare_target_primary_head_transition_invalid"
                 )
-            expected_primary[0]["exact_head"] = remote_head
+            expected_primary[0]["exact_head"] = seed_remote_head
             if expected_scope != scope:
                 raise WorkstreamGenerationError(
                     "generation_prepare_target_scope_drift"
@@ -560,27 +745,52 @@ def prepare_generation_operator_contract(
                 reviewed_disposition_event.get("value", {})
                 if reviewed_disposition_event is not None else {}
             )
-            if (
-                not isinstance(reviewed_disposition, dict)
-                or set(reviewed_disposition) != {
+            ordinary_transition = (
+                isinstance(reviewed_disposition, dict)
+                and set(reviewed_disposition) == {
                     "disposition", "remote_head", "recovered_from_checkpoint",
                 }
-                or reviewed_disposition.get("remote_head")
-                != current_primary[0]["exact_head"]
-                or reviewed_disposition.get("disposition")
-                not in {"attach", "create_successor"}
-                or not (
+                and reviewed_disposition.get("remote_head")
+                == current_primary[0]["exact_head"]
+                and reviewed_disposition.get("disposition")
+                in {"attach", "create_successor"}
+                and (
                     target_disposition == reviewed_disposition
                     or target_disposition == desired_seed_disposition
                 )
-            ):
+            )
+            legacy_split = (
+                not ordinary_transition
+                and reviewed_disposition_event is not None
+                and legacy_prefix
+                and reviewed_disposition.get("remote_head")
+                == target.events[4]["value"]["remote_head"]
+                and target_disposition in (
+                    reviewed_disposition, desired_seed_disposition,
+                )
+                and seed_remote_head not in {
+                    current_primary[0]["exact_head"],
+                    reviewed_disposition.get("remote_head"),
+                }
+                and desired_seed_disposition == {
+                    "disposition": "create_successor",
+                    "remote_head": seed_remote_head,
+                    "recovered_from_checkpoint": None,
+                }
+            )
+            if not ordinary_transition and not legacy_split:
                 raise WorkstreamGenerationError(
                     "generation_prepare_target_disposition_missing_for_head_transition"
                 )
-            seed_manifest["terminal_child_evidence_seed_head_transition"] = {
+            transition_name = (
+                "terminal_child_evidence_seed_legacy_split_head_repair"
+                if legacy_split
+                else "terminal_child_evidence_seed_head_transition"
+            )
+            transition = {
                 "repository_key": primary_key,
                 "from_exact_head": current_primary[0]["exact_head"],
-                "to_exact_head": remote_head,
+                "to_exact_head": seed_remote_head,
                 "from_scope_event_id": current_seed_scope["event_id"],
                 "from_scope_value_sha256": canonical_digest(current_scope),
                 "from_disposition_event_id": reviewed_disposition_event["event_id"],
@@ -590,8 +800,17 @@ def prepare_generation_operator_contract(
                 "disposition": deepcopy(desired_seed_disposition),
                 "input_frontier_sha256": binding["input_frontier_sha256"],
             }
+            if legacy_split:
+                transition["from_disposition_exact_head"] = (
+                    reviewed_disposition["remote_head"]
+                )
+                transition["created_at"] = (
+                    target.events[6]["created_at"]
+                    if target.revision >= 7 else created_at
+                )
+            seed_manifest[transition_name] = transition
         normalized_seed = prepare_terminal_child_evidence_seeds(
-            seed_manifest, graph, seed_target, remote_head=remote_head,
+            seed_manifest, graph, seed_target, remote_head=seed_remote_head,
             comments=comments,
         )
         seed_values = {
@@ -780,6 +999,15 @@ def prepare_generation_operator_contract(
         "projection_preview": {
             "apply": False,
             "writes_performed": 0,
+            "invocation": {
+                "remote_head": effective_remote_head,
+                "created_at": (
+                    manifest.get(
+                        "terminal_child_evidence_seed_legacy_split_head_repair",
+                        {},
+                    ).get("created_at", created_at)
+                ),
+            },
             "manifest": manifest,
             "active_key_accounting": {
                 "carried": carried, "staged": staged, "computed": computed,
