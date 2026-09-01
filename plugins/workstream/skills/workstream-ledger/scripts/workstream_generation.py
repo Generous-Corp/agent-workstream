@@ -227,6 +227,7 @@ def prepare_generation_operator_contract(
         _value_digest, prepare_terminal_child_evidence_seeds,
         prepare_terminal_child_repairs, projection_review_contract,
         terminal_child_evidence_seed_predecessor_contract,
+        bind_projection_plan_generation,
     )
 
     if (
@@ -378,6 +379,24 @@ def prepare_generation_operator_contract(
     phase = "complete_projection"
     manifest: dict[str, Any]
     if closure_heads:
+        # Generation prepare and projection preview must bind terminal carry to
+        # the same canonical candidate graph.  The transport snapshot still
+        # names the description-selected predecessor and contains raw child
+        # comment collections; projection preview first binds the requested
+        # generation and reduces those child logs.  Computing the predecessor
+        # binding from the raw snapshot therefore made a deterministic prepare
+        # output impossible for its consumer to accept.
+        if "child_comments" in graph:
+            graph = bind_projection_plan_generation(
+                graph, comments, workstream_id=workstream_id,
+                requested_plan_revision=target_plan,
+                authenticated_route=authority,
+            )
+            graph = add_child_material_history(
+                graph, graph["child_comments"],
+                authenticated_route=authority, root_comments=comments,
+                proposal_plan_revision=predecessor_plan,
+            )
         seed_items = [
             deepcopy(item) for item in complete_items
             if item["kind"] in {"scope", "source", "provenance"}
