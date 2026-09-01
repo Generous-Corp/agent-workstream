@@ -21,6 +21,13 @@ concurrent creators converge on one exact root/child graph or fail closed.
 An optional repository-root `.workstream.json` is the fail-closed routing
 authority for its Linear workspace, team, and project; explicit overrides must
 match it.
+Ordinary authenticated resume remains bounded to 24 KiB after validating the
+complete immutable history. If verbose current state would exceed that bound,
+the response keeps a digest-bound execution frontier and exposes exact JSON
+Pointers plus a full-history audit command in `deferred_audit_detail`; byte
+growth alone does not strand a valid workstream. A checkpoint can fence an
+acknowledged material-event prefix, but cannot by itself bound open-child
+state, current decisions, dependencies, proposals, or projection authority.
 The small [workstream-resume skill](plugins/workstream/skills/workstream-resume/SKILL.md)
 recovers an existing handle before loading broader lifecycle guidance. The
 [workstream-ledger skill](plugins/workstream/skills/workstream-ledger/SKILL.md)

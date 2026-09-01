@@ -1847,10 +1847,16 @@ def strict_candidate_loader(
             "root": graph_root, "children": graph.get("children", []),
             "decisions": graph.get("decisions", []),
         }
+        quarantined_legacy_writes = joined["root"].get(
+            "quarantined_legacy_writes", {
+                "count": 0,
+                "sha256": hashlib.sha256(b"[]").hexdigest(),
+            },
+        )
         candidate_resume_surface = {
             "resume_authority": context["resume_authority"],
             "plan_revision": plan_revision,
-            "material_revision": context["material_event_revision"],
+            "material_revision": material.revision,
             "material_event_ids": [
                 event.event_id for event in material.events
             ],
@@ -1864,16 +1870,14 @@ def strict_candidate_loader(
                     "generation_genesis", "generation_transition",
                 }
             ],
-            "quarantined_legacy_writes": context[
-                "quarantined_legacy_writes"
-            ],
+            "quarantined_legacy_writes": quarantined_legacy_writes,
         }
         return {
             "resume_authority": "full", "plan_revision": plan_revision,
             "authenticated_route": authority,
             "source": {"identity": authenticated_source["identity"],
                        "sha256": authenticated_source["sha256"]},
-            "material_revision": context["material_event_revision"],
+            "material_revision": material.revision,
             "checkpoint_event_ids": sorted(
                 item["event_id"] for item in checkpoints.checkpoints
                 if item["plan_revision"] == plan_revision
@@ -1881,9 +1885,7 @@ def strict_candidate_loader(
             "projection_revision": projection.revision,
             "graph_frontier_sha256": _digest(graph_surface),
             "snapshot_sha256": _digest(candidate_resume_surface),
-            "quarantined_legacy_writes": context[
-                "quarantined_legacy_writes"
-            ],
+            "quarantined_legacy_writes": quarantined_legacy_writes,
         }
     return load
 
