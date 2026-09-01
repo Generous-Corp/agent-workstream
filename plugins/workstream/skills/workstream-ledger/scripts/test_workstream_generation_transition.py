@@ -21,6 +21,7 @@ from workstream_generation import (
     build_retirement_proof, generation_quarantine_metadata, main, parser,
     prepare_generation_operator_contract,
     validate_activation_operator_contract,
+    encode_generation_reservation,
     encode_generation_finalization, generation_finalization_slot_id,
     native_root_activation_proof,
     pending_generation_reservations, reduce_generation_checkpoint_comments,
@@ -1854,7 +1855,287 @@ class GenerationTransitionTests(unittest.TestCase):
                     )
                 self.assertEqual(len(drifted.mutations), writes)
                 self.assertEqual(drifted.issue_update_count, 1)
-            retry_and_assert(after_reservation, reservation_sha)
+            reservation = reduce_generation_reservations(
+                after_reservation.comments, workstream_id=WORKSTREAM,
+                authenticated_route=AUTHORITY,
+            )[0]
+            pending_snapshot = deepcopy(after_reservation)
+
+            def continuation_transport(
+                current, *, observed_source=source,
+            ):
+                native_transport = LinearGraphQLTransport(
+                    current, workspace_id="workspace", team_id="team",
+                    project_id="project",
+                )
+                return GenerationTransport(
+                    current, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
+                    authority=AUTHORITY, candidate_loader=Loader(current),
+                    legacy_description_plan_revision=OLD,
+                    native_root_loader=lambda: (
+                        workstream_generation._activation_native_root_snapshot(
+                            native_transport, WORKSTREAM,
+                        )
+                    ),
+                    source_loader=lambda: deepcopy(observed_source),
+                    operator_contract_sha256=reservation[
+                        "operator_contract_sha256"
+                    ],
+                    operator_remote_head=reservation["remote_head"],
+                )
+
+            # A fresh agent needs only the durable handle pair. In particular,
+            # it has no access to the deleted local operator-contract JSON.
+            continued = continuation_transport(
+                after_reservation,
+            ).continue_reservation(
+                reservation_id=reservation["reservation_id"],
+                reservation_sha256=reservation["reservation_sha256"],
+            )
+            writes = len(after_reservation.mutations)
+            repeated = continuation_transport(
+                after_reservation,
+            ).continue_reservation(
+                reservation_id=reservation["reservation_id"],
+                reservation_sha256=reservation["reservation_sha256"],
+            )
+            self.assertEqual(repeated["event_id"], continued["event_id"])
+            self.assertEqual(len(after_reservation.mutations), writes)
+
+            # A later active successor does not invalidate exact historical
+            # replay of this finalized handle.
+            project_full(after_reservation, OTHER)
+            new_state = adapter(after_reservation, NEW).state()
+            successor_retirement = build_retirement_proof(
+                predecessor_plan_revision=NEW,
+                retired_at="later-successor", retired_writer_epoch=1,
+                provenance_event_ids=[
+                    event["event_id"] for event in new_state.events
+                    if event["kind"] == "provenance"
+                ],
+                checkpoint_event_ids=[],
+            )
+            GenerationTransport(
+                after_reservation, issue_id=WORKSTREAM,
+                workstream_id=WORKSTREAM, authority=AUTHORITY,
+                candidate_loader=Loader(after_reservation),
+                legacy_description_plan_revision=OLD,
+            ).activate(
+                target_plan_revision=OTHER,
+                created_at="later-successor",
+                retirement=successor_retirement,
+            )
+            successor_writes = len(after_reservation.mutations)
+            historical = continuation_transport(
+                after_reservation,
+            ).continue_reservation(
+                reservation_id=reservation["reservation_id"],
+                reservation_sha256=reservation["reservation_sha256"],
+            )
+            self.assertEqual(historical["event_id"], continued["event_id"])
+            self.assertEqual(len(after_reservation.mutations), successor_writes)
+            self.assertEqual(select_plan_generation(
+                after_reservation.comments, workstream_id=WORKSTREAM,
+                description_plan_revision=OLD,
+                authenticated_route=AUTHORITY,
+            )["plan_revision"], OTHER)
+
+            # The selected handle may not fall through to a historical event
+            # belonging to a different reservation with otherwise identical
+            # operation inputs.
+            nonexact = continuation_transport(after_reservation)
+            nonexact._required_reservation = (
+                "wsgr_" + "0" * 32, "0" * 64,
+            )
+            with self.assertRaisesRegex(
+                WorkstreamGenerationError,
+                "generation_continue_historical_reservation_mismatch",
+            ):
+                nonexact._historical_replay(
+                    nonexact._comments(), from_plan=OLD, to_plan=NEW,
+                    expected_retirement=retirement,
+                    expected_created_at=created_at,
+                    validate_activation_inputs=True,
+                    expected_activation_checkpoint=None,
+                    expected_remote_head=None,
+                )
+
+            for bad_id, bad_sha, reason in (
+                ("wsgr_" + "0" * 32, reservation["reservation_sha256"],
+                 "generation_continue_reservation_id_not_found"),
+                (reservation["reservation_id"], "0" * 64,
+                 "generation_continue_reservation_sha256_mismatch"),
+            ):
+                with self.subTest(continue_refusal=reason), self.assertRaisesRegex(
+                    WorkstreamGenerationError, reason,
+                ):
+                    continuation_transport(after_reservation).continue_reservation(
+                        reservation_id=bad_id, reservation_sha256=bad_sha,
+                    )
+
+            # Use independent pending snapshots for each negative case.
+            wrong_source = deepcopy(pending_snapshot)
+            before = len(wrong_source.mutations)
+            with self.assertRaisesRegex(
+                WorkstreamGenerationError,
+                "generation_canonical_source_changed_during_activation",
+            ):
+                continuation_transport(
+                    wrong_source,
+                    observed_source={
+                        "identity": source["identity"], "sha256": OTHER,
+                    },
+                ).continue_reservation(
+                    reservation_id=reservation["reservation_id"],
+                    reservation_sha256=reservation["reservation_sha256"],
+                )
+            self.assertEqual(len(wrong_source.mutations), before)
+
+            wrong_root = deepcopy(pending_snapshot)
+            wrong_root.graph_title = "changed after reservation"
+            before = len(wrong_root.mutations)
+            with self.assertRaisesRegex(
+                (WorkstreamGenerationError, RootTransitionError),
+                "generation_pending_native_root_material_mismatch|"
+                "root_transition_reopen_witness_mismatch",
+            ):
+                continuation_transport(wrong_root).continue_reservation(
+                    reservation_id=reservation["reservation_id"],
+                    reservation_sha256=reservation["reservation_sha256"],
+                )
+            self.assertEqual(len(wrong_root.mutations), before)
+
+            missing_receipt = deepcopy(pending_snapshot)
+            missing_receipt.comments = [
+                item for item in missing_receipt.comments
+                if item.get("id") != reservation["root_transition_receipt_ref"]
+            ]
+            before = len(missing_receipt.mutations)
+            with self.assertRaisesRegex(
+                WorkstreamGenerationError,
+                "generation_pending_root_transition_witness_missing",
+            ):
+                continuation_transport(missing_receipt).continue_reservation(
+                    reservation_id=reservation["reservation_id"],
+                    reservation_sha256=reservation["reservation_sha256"],
+                )
+            self.assertEqual(len(missing_receipt.mutations), before)
+
+            aborted = deepcopy(pending_snapshot)
+            continuation_transport(aborted).abort(
+                reservation_id=reservation["reservation_id"],
+                reservation_sha256=reservation["reservation_sha256"],
+                reason="original writer stopped", created_at="abort-race",
+            )
+            before = len(aborted.mutations)
+            with self.assertRaisesRegex(
+                WorkstreamGenerationError,
+                "generation_continue_reservation_aborted",
+            ):
+                continuation_transport(aborted).continue_reservation(
+                    reservation_id=reservation["reservation_id"],
+                    reservation_sha256=reservation["reservation_sha256"],
+                )
+            self.assertEqual(len(aborted.mutations), before)
+
+            disappearing = deepcopy(pending_snapshot)
+            disappearing_transport = continuation_transport(disappearing)
+            original_comments = disappearing_transport._comments
+            read_count = {"value": 0}
+
+            def comments_then_delete_reservation():
+                result = original_comments()
+                read_count["value"] += 1
+                if read_count["value"] == 1:
+                    disappearing.comments = [
+                        item for item in disappearing.comments
+                        if item.get("id") != reservation["remote_id"]
+                    ]
+                return result
+
+            disappearing_transport._comments = comments_then_delete_reservation
+            before = len(disappearing.mutations)
+            with self.assertRaisesRegex(
+                WorkstreamGenerationError,
+                "generation_continue_reservation_lost",
+            ):
+                disappearing_transport.continue_reservation(
+                    reservation_id=reservation["reservation_id"],
+                    reservation_sha256=reservation["reservation_sha256"],
+                )
+            self.assertEqual(len(disappearing.mutations), before)
+
+            cli_client = deepcopy(pending_snapshot)
+            cli_argv = [
+                "workstream_generation.py", "continue", WORKSTREAM,
+                "--reservation-id", reservation["reservation_id"],
+                "--reservation-sha256", reservation["reservation_sha256"],
+                "--apply",
+            ]
+            stdout = io.StringIO()
+            with patch.object(sys, "argv", cli_argv), patch(
+                "workstream_generation._route_and_client",
+                return_value=(cli_client, AUTHORITY),
+            ), patch(
+                "workstream_generation.plan_payload",
+                return_value={"source": {
+                    **deepcopy(source), "bytes": b"authenticated plan",
+                }},
+            ), patch(
+                "workstream_generation.strict_candidate_loader",
+                return_value=Loader(cli_client),
+            ), patch.object(sys, "stdout", stdout):
+                self.assertEqual(main(), 0)
+            cli_output = json.loads(stdout.getvalue())
+            self.assertEqual(cli_output["command"], "continue")
+            self.assertEqual(
+                cli_output["reservation_id"], reservation["reservation_id"],
+            )
+            cli_writes = len(cli_client.mutations)
+            stdout = io.StringIO()
+            with patch.object(sys, "argv", cli_argv), patch(
+                "workstream_generation._route_and_client",
+                return_value=(cli_client, AUTHORITY),
+            ), patch(
+                "workstream_generation.plan_payload",
+                return_value={"source": {
+                    **deepcopy(source), "bytes": b"authenticated plan",
+                }},
+            ), patch(
+                "workstream_generation.strict_candidate_loader",
+                return_value=Loader(cli_client),
+            ), patch.object(sys, "stdout", stdout):
+                self.assertEqual(main(), 0)
+            self.assertEqual(len(cli_client.mutations), cli_writes)
+
+            schema5_client = deepcopy(pending_snapshot)
+            schema5 = {
+                key: deepcopy(value) for key, value in reservation.items()
+                if key not in {
+                    "remote_id", "reservation_sha256", "reservation_id",
+                    "native_root_material_sha256",
+                    "root_transition_receipt_ref",
+                    "root_transition_receipt_sha256",
+                }
+            }
+            schema5["schema_version"] = 5
+            schema5["reservation_id"] = (
+                "wsgr_" + _digest(schema5)[:32]
+            )
+            schema5_comment = next(
+                item for item in schema5_client.comments
+                if item.get("id") == reservation["remote_id"]
+            )
+            schema5_comment["body"] = encode_generation_reservation(schema5)
+            schema5_sha = _digest(schema5)
+            with self.assertRaisesRegex(
+                WorkstreamGenerationError,
+                "generation_continue_schema_unavailable:schema5",
+            ):
+                continuation_transport(schema5_client).continue_reservation(
+                    reservation_id=schema5["reservation_id"],
+                    reservation_sha256=schema5_sha,
+                )
 
             for crash_call, error in (
                 (2, "crash_after_v6_candidate_seal"),
@@ -1880,6 +2161,22 @@ class GenerationTransitionTests(unittest.TestCase):
                         remote_head="e" * 40,
                         expected_native_root_sha256=expected_sha,
                     )
+                if crash_call == 4:
+                    pending = pending_generation_reservations(
+                        current.comments, workstream_id=WORKSTREAM,
+                        authenticated_route=AUTHORITY,
+                    )[0]
+                    with self.assertRaisesRegex(
+                        WorkstreamGenerationError,
+                        "generation_abort_after_preparation_replay_required",
+                    ):
+                        transport.abort(
+                            reservation_id=pending["reservation_id"],
+                            reservation_sha256=pending[
+                                "reservation_sha256"
+                            ],
+                            reason="writer stopped", created_at="abort-race",
+                        )
                 retry_and_assert(current, expected_sha)
 
             after_finalization = deepcopy(base)
