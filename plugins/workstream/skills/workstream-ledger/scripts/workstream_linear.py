@@ -104,7 +104,7 @@ query WorkstreamResumeRoot($issueId: String!, $after: String) {
   issue(id: $issueId) {
     id identifier title description url updatedAt archivedAt
     parent { id identifier }
-    project { id }
+    project { id name }
     team { id organization { id } }
     assignee { id }
     state { id name type }

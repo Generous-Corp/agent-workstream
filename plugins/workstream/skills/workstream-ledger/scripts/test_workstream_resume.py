@@ -736,6 +736,23 @@ class ResumeTests(unittest.TestCase):
         context = MODULE.compact_context(self.snapshot(), "pulp continuity GEN-37 #3")
         self.assertEqual(context["workstream_id"], "GEN-37")
 
+    def test_compact_context_exposes_recovered_linear_project_name(self):
+        snapshot = self.snapshot()
+        snapshot["root"]["project"] = {
+            "id": "project", "name": "Linear Integration",
+        }
+
+        context = MODULE.compact_context(snapshot, "GEN-37")
+
+        self.assertEqual(context["project_name"], "Linear Integration")
+
+    def test_invalid_recovered_linear_project_name_fails_closed(self):
+        snapshot = self.snapshot()
+        snapshot["root"]["project"] = {"id": "project", "name": "   "}
+
+        with self.assertRaisesRegex(MODULE.ResumeError, "invalid_linear_project_name"):
+            MODULE.compact_context(snapshot, "GEN-37")
+
     def test_missing_plan_revision_fails_closed(self):
         snapshot = self.snapshot(); del snapshot["root"]["plan_revision"]
         with self.assertRaises(MODULE.ResumeError):

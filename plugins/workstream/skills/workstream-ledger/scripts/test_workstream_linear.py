@@ -1285,7 +1285,7 @@ class LinearTransportTests(unittest.TestCase):
             "url": "https://linear/GEN-37", "updatedAt": "now",
             "state": {"name": "In Progress", "type": "started"},
             "team": {"id": "team", "organization": {"id": "workspace"}},
-            "project": {"id": "project"},
+            "project": {"id": "project", "name": "Linear Integration"},
         }
 
         def child(identifier, comment_id, *, has_next=False):
@@ -1337,6 +1337,9 @@ class LinearTransportTests(unittest.TestCase):
             "GEN-37", include_child_comments=True,
         )
 
+        self.assertEqual(
+            snapshot["root"]["project"]["name"], "Linear Integration",
+        )
         self.assertEqual(
             [comment["id"] for comment in snapshot["child_comments"]["GEN-38"]],
             ["comment-a"],

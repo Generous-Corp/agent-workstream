@@ -68,6 +68,7 @@ from workstream_projection_history import (
 TOKEN = re.compile(r"\b[A-Z][A-Z0-9]*-\d+\b", re.I)
 MAX_WORKSTREAM_IDENTIFIER_BYTES = 128
 MAX_PLAN_REVISION_BYTES = 256
+MAX_PROJECT_NAME_BYTES = 512
 MAX_REVISION = (1 << 63) - 1
 TERMINAL = {"done", "completed", "cancelled", "canceled", "superseded"}
 MATERIAL_OBLIGATION_TERMS = ("requirement", "blocker", "blocked", "followup", "decision")
@@ -2519,6 +2520,14 @@ def compact_context(
         expected_missing_terminal_closures=expected_missing_terminal_closures,
     )
     root = clean["root"]
+    project = root.get("project")
+    project_name = project.get("name") if isinstance(project, dict) else None
+    if project_name is not None and (
+        not isinstance(project_name, str)
+        or not project_name.strip()
+        or len(project_name.encode("utf-8")) > MAX_PROJECT_NAME_BYTES
+    ):
+        raise ResumeError("invalid_linear_project_name")
 
     def history_summary(
         events: list[dict[str, Any]], *, include_latest: bool = True,
@@ -2632,6 +2641,7 @@ def compact_context(
             ),
         },
         "workstream_id": root["identifier"].upper(),
+        "project_name": project_name,
         "context_url": root["url"],
         "plan_revision": root["plan_revision"],
         "description_plan_revision": root.get(

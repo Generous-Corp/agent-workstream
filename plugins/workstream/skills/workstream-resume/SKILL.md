@@ -58,18 +58,19 @@ Success requires `resume_authority` to be `full`;
 inspection-only is not authority. `plan_generation_pending` is non-executable:
 run its exact remediation, then retry.
 
-After successful recovery, carry the resolved canonical token in the existing
-tab without replacing its title:
+After successful recovery, carry the token using the exact `project_name` from
+that full result:
 
 ```sh
-python3 "<absolute directory of this SKILL.md>/scripts/workstream_tab.py" GEN-123
+python3 "<absolute directory of this SKILL.md>/scripts/workstream_tab.py" GEN-123 --project-name "<exact recovered project_name>"
 ```
 
-An unresolved cmux/Herdr surface is an optional no-op and never downgrades
-`resume_authority: full`. Use exact inherited identity; conflicts refuse. Codex
-session titles and visible tabs are separate namespaces. Claim success only if
-the adapter returns `updated` or `unchanged` plus exact title readback. Resume
-refusal denies execution authority.
+For a manager-generated title, add `--automatic-title` with its exact previously
+observed manager value; never infer it from cwd, shell, or title shape. Missing
+needed provenance or an unavailable/unresolved adapter is an optional no-op and
+never downgrades `resume_authority: full`. Use exact inherited identity;
+conflicts refuse. Visible tabs never grant authority. Claim title success only
+after `updated`/`unchanged` plus exact readback; resume refusal denies authority.
 
 Retain the authenticated route/source, generation/frontiers, open children,
 next action, checkpoint, worktree/repository/Shipyard facts, and

@@ -131,11 +131,16 @@ def _surface_context(cmux: str, target: str, runner: Runner) -> SurfaceContext |
     return SurfaceContext(**fields)
 
 
-def _read_title(cmux: str, context: SurfaceContext, runner: Runner) -> str:
+def _read_title(
+    cmux: str, context: SurfaceContext, runner: Runner, *,
+    allow_unavailable: bool = False,
+) -> str | None:
     result = _run(runner, [
         cmux, "list-pane-surfaces", "--pane", context.pane,
         "--workspace", context.workspace, "--window", context.window, "--json",
-    ])
+    ], allow_unavailable=allow_unavailable)
+    if result is None:
+        return None
     value = _json_result(result, "invalid_cmux_surface_response")
     surfaces = value.get("surfaces")
     if not isinstance(surfaces, list):
@@ -144,9 +149,32 @@ def _read_title(cmux: str, context: SurfaceContext, runner: Runner) -> str:
         item for item in surfaces
         if isinstance(item, dict) and item.get("ref") == context.surface
     ]
+    if not matches and allow_unavailable:
+        return None
     if len(matches) != 1 or not isinstance(matches[0].get("title"), str):
         raise TabTitleError("cmux_target_title_unresolved")
     return matches[0]["title"]
+
+
+def _adapter_title_plan(
+    before: str, token: str, *, project_name: str | None,
+    automatic_title: str | None,
+) -> tuple[str, str | None, str | None]:
+    try:
+        status, title = plan_title(
+            before, token, project_name=project_name,
+            automatic_title=automatic_title,
+        )
+    except TabTitleError as error:
+        reason = str(error)
+        if reason in {
+            "project_name_required_for_generated_title",
+            "invalid_project_name",
+            "automatic_title_changed",
+        }:
+            return "unavailable", None, reason
+        raise
+    return status, title, None
 
 
 def _herdr_tab(
@@ -210,7 +238,16 @@ def _apply_herdr_title(
             "status": "unavailable", "reason": "herdr_target_unresolved",
             "token": token, "manager": "herdr",
         }
-    status, after = plan_title(before_tab["label"], token)
+    status, after, unavailable_reason = _adapter_title_plan(
+        before_tab["label"], token, project_name=project_name,
+        automatic_title=automatic_title,
+    )
+    if unavailable_reason is not None:
+        return {
+            "status": "unavailable", "reason": unavailable_reason,
+            "token": token, "manager": "herdr",
+        }
+    assert after is not None
     if status == "updated":
         _run(
             runner, [herdr, "tab", "rename", tab_id, after],
@@ -258,8 +295,22 @@ def apply_title(
         raise
     if context is None:
         return {"status": "unavailable", "reason": "cmux_unavailable", "token": token}
-    before = _read_title(cmux, context, runner)
-    status, after = plan_title(before, token)
+    before = _read_title(cmux, context, runner, allow_unavailable=True)
+    if before is None:
+        return {
+            "status": "unavailable", "reason": "cmux_target_unresolved",
+            "token": token,
+        }
+    status, after, unavailable_reason = _adapter_title_plan(
+        before, token, project_name=project_name,
+        automatic_title=automatic_title,
+    )
+    if unavailable_reason is not None:
+        return {
+            "status": "unavailable", "reason": unavailable_reason,
+            "token": token,
+        }
+    assert after is not None
     if status == "updated":
         _run(runner, [
             cmux, "rename-tab", "--surface", context.surface,

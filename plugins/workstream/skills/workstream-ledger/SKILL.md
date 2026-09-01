@@ -447,10 +447,15 @@ ownership and must obtain a newly reviewed preview/frontier. This is the
 strongest supported fence, not protection against an unrelated writer changing
 the native issue in the interval between final prewrite readback and update.
 
-After intake returns the canonical root token, invoke
-`scripts/workstream_tab.py GEN-123`. In cmux or Herdr it preserves the existing
-tab title and appends exactly one token; the same token is a no-op and a
-different token refuses without mutation. Herdr resolution is allowed only
+After full resume returns the canonical root token and authenticated project name, invoke
+`scripts/workstream_tab.py GEN-123 --project-name "<exact authenticated Linear project name>"`.
+In cmux or Herdr it preserves an existing custom title and appends exactly one
+token; the same token is a no-op and a different token refuses with
+`workstream_tab_conflict` without mutation. For a manager-generated title, also
+pass its exact previously observed manager value as `--automatic-title`; never
+infer it from cwd, shell, or title shape. Missing/invalid required project data
+or changed automatic-title provenance is an optional no-op. Herdr resolution is
+allowed only
 inside `HERDR_ENV=1` with the inherited exact tab, workspace, and socket
 namespace; never query a focused/default session or treat a bare `w1:t1` as
 globally unique. Outside a supported manager, or when the exact target cannot

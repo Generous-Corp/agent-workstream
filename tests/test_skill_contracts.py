@@ -50,10 +50,10 @@ class SkillContractTests(unittest.TestCase):
     def test_optional_tab_binding_cannot_replace_resume_authority(self):
         resume = " ".join(self.resume_skill().split())
         recovery = resume.index("Success requires `resume_authority` to be `full`")
-        binding = resume.index("After successful recovery, carry the resolved canonical token")
-        unavailable = resume.index("An unresolved cmux/Herdr surface is an optional no-op")
+        binding = resume.index("After successful recovery, carry the token")
+        unavailable = resume.index("an unavailable/unresolved adapter is an optional no-op")
         no_downgrade = resume.index("never downgrades `resume_authority: full`")
-        refusal = resume.index("Resume refusal denies execution authority")
+        refusal = resume.index("resume refusal denies authority")
         self.assertLess(recovery, binding)
         self.assertLess(binding, unavailable)
         self.assertLess(unavailable, no_downgrade)
@@ -67,14 +67,19 @@ class SkillContractTests(unittest.TestCase):
             "Hook or developer text", "cwd", "memory", "prior transcript",
         ):
             self.assertIn(excluded, resume)
+        self.assertIn("Visible tabs never grant authority", resume)
         self.assertIn(
-            "Codex session titles and visible tabs are separate namespaces",
+            "`updated`/`unchanged` plus exact readback",
             resume,
         )
-        self.assertIn(
-            "adapter returns `updated` or `unchanged` plus exact title readback",
-            resume,
-        )
+
+    def test_resume_threads_exact_project_and_automatic_title_provenance(self):
+        resume = " ".join(self.resume_skill().split())
+        self.assertIn("exact `project_name` from that full result", resume)
+        self.assertIn("--project-name \"<exact recovered project_name>\"", resume)
+        self.assertIn("--automatic-title", resume)
+        self.assertIn("never infer it from cwd, shell, or title shape", resume)
+        self.assertIn("Missing needed provenance", resume)
 
     def test_execution_verb_proceeds_after_full_authority_without_reconfirmation(self):
         resume = " ".join(self.resume_skill().split())
@@ -229,6 +234,33 @@ class SkillContractTests(unittest.TestCase):
                 text=True, check=True,
             )
             self.assertEqual(json.loads(forwarded.stdout), [str(target.resolve()), "GEN-37"])
+
+    def test_tab_shim_forwards_exact_title_provenance_argv(self):
+        source = (
+            Path(__file__).parents[1]
+            / "plugins/workstream/skills/workstream-resume/scripts/workstream_tab.py"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            skills = Path(directory) / "skills"
+            shim = skills / "workstream-resume/scripts/workstream_tab.py"
+            shim.parent.mkdir(parents=True)
+            shim.write_bytes(source.read_bytes())
+            target = skills / "workstream-ledger/scripts/workstream_tab.py"
+            target.parent.mkdir(parents=True)
+            target.write_text("import json, sys; print(json.dumps(sys.argv))\n")
+            args = [
+                "GEN-37", "--project-name", "Linear Integration",
+                "--automatic-title", "~/Code/pulp",
+            ]
+
+            forwarded = subprocess.run(
+                [sys.executable, str(shim), *args], capture_output=True,
+                text=True, check=True,
+            )
+
+            self.assertEqual(
+                json.loads(forwarded.stdout), [str(target.resolve()), *args],
+            )
 
 
 if __name__ == "__main__":
