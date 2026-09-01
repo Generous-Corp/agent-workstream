@@ -530,6 +530,11 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.50 keeps root checkpoint recovery safe when Linear advances the
+root timestamp for the operator's own comment: fresh previews bind that exact
+timestamp, while postwrite proof normalizes it only after a confirmed own
+append and still fences the complete structural graph and comment frontier.
+
 Version 0.4.49 adds the authenticated root material-boundary checkpoint
 operator, exact crash replay, true-root and deterministic-slot proof, and
 postwrite ordinary-resume and native-graph verification.

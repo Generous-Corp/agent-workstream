@@ -48,6 +48,20 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
+def _root_authority_graph(graph: dict[str, Any]) -> dict[str, Any]:
+    """Exclude only Linear's self-mutating root comment timestamp.
+
+    ``commentCreate`` advances the parent issue's ``updatedAt`` even though it
+    does not change any native workstream authority.  The exact timestamp is
+    still fenced immediately before a write by ``_root_surface``; this
+    normalized graph is used only to compare authority after our own append
+    and to make a checkpoint-only replay deterministic.
+    """
+    normalized = deepcopy(graph)
+    normalized["root"].pop("updatedAt", None)
+    return normalized
+
+
 def _json_argument(value: str, *, field: str, expected: type) -> Any:
     try:
         parsed = json.loads(value)
@@ -285,7 +299,8 @@ def _prepare(args: argparse.Namespace, client: Any, route: dict[str, str]):
         "deterministic_slot_id": ledger_boundary_slot_id(
             workstream_id, material.revision, serialization, route,
         ),
-        "graph_sha256": _digest(graph_after),
+        "graph_sha256": _digest(_root_authority_graph(graph_after)),
+        "root_updated_at": root.get("updatedAt"),
         "root_state": {
             "id": root.get("id"), "identifier": root.get("identifier"),
             "status": root.get("status"), "status_type": root.get("status_type"),
@@ -308,8 +323,39 @@ def _root_surface(client: Any, route: dict[str, str], token: str) -> dict[str, A
     )
     _validate_authority(graph, token, route)
     return {
-        "graph": graph, "graph_sha256": _digest(graph),
+        "graph": graph,
+        "graph_sha256": _digest(graph),
+        "authority_graph_sha256": _digest(_root_authority_graph(graph)),
     }
+
+
+def _same_root_authority(
+    observed: dict[str, Any], expected: dict[str, Any],
+) -> bool:
+    """Compare every native root field except its own comment timestamp."""
+    return (
+        observed.get("authority_graph_sha256")
+        == expected.get("authority_graph_sha256")
+    )
+
+
+def _comments_match_owned_append(
+    before: list[dict[str, Any]], after: list[dict[str, Any]], *,
+    remote_id: str, wrote: bool,
+) -> bool:
+    """Prove a stage changed the root ledger by exactly its own receipt."""
+    before_by_id = {item.get("id"): item for item in before}
+    after_by_id = {item.get("id"): item for item in after}
+    if len(before_by_id) != len(before) or len(after_by_id) != len(after):
+        return False
+    if any(after_by_id.get(key) != value for key, value in before_by_id.items()):
+        return False
+    expected_ids = set(before_by_id)
+    if wrote:
+        if remote_id in expected_ids:
+            return False
+        expected_ids.add(remote_id)
+    return set(after_by_id) == expected_ids
 
 
 def _partial_apply_error(
@@ -336,8 +382,9 @@ def _partial_apply_error(
             "receipt": projection_receipt,
         },
         "replay_guidance": (
-            "Rerun the exact apply with the same material revision, preview "
-            "digest, timestamp, execution inputs, and authenticated route/source."
+            "Rerun the zero-write checkpoint preview against the exact durable "
+            "receipts, review its fresh digest, then apply with the same material "
+            "revision, timestamp, execution inputs, and authenticated route/source."
         ),
     })
 
@@ -410,9 +457,14 @@ def run(
     if fenced != preview:
         raise LinearTransportError("checkpoint_preview_stale_reload_required")
     native_before = _root_surface(client, route, preview["workstream_id"])
-    if native_before["graph_sha256"] != preview["graph_sha256"]:
+    if (
+        native_before["authority_graph_sha256"] != preview["graph_sha256"]
+        or native_before["graph"]["root"].get("updatedAt")
+        != preview["root_updated_at"]
+    ):
         raise LinearTransportError("checkpoint_native_root_prewrite_drift")
     before_persist = adapter._state()
+    comments_before_checkpoint = adapter._comments()
     already_persisted = any(
         item["event_id"] == preview["checkpoint"]["event_id"]
         for item in before_persist.checkpoints
@@ -446,14 +498,28 @@ def run(
             "checkpoint_receipt_remote_slot_mismatch", preview,
             checkpoint_receipt=receipt,
         )
-    if _root_surface(
+    after_checkpoint_surface = _root_surface(
         client, route, preview["workstream_id"],
-    ) != native_before:
+    )
+    comments_after_checkpoint = adapter._comments()
+    checkpoint_remote_id = receipt["acknowledgement"]["remote_id"]
+    checkpoint_surface_matches = (
+        _same_root_authority(after_checkpoint_surface, native_before)
+        if not already_persisted else after_checkpoint_surface == native_before
+    )
+    if (
+        not checkpoint_surface_matches
+        or not _comments_match_owned_append(
+            comments_before_checkpoint, comments_after_checkpoint,
+            remote_id=checkpoint_remote_id, wrote=not already_persisted,
+        )
+    ):
         raise _partial_apply_error(
             "checkpoint_applied_but_native_root_drift", preview,
             checkpoint_receipt=receipt,
         )
     projection_receipt = None
+    comments_before_projection = comments_after_checkpoint
     if not projection_replay:
         projection_adapter = LinearProjectionAdapter(
             client, issue_id=preview["workstream_id"],
@@ -468,11 +534,21 @@ def run(
         except (LinearTransportError, OSError, TimeoutError) as error:
             try:
                 state = projection_adapter.state()
-                if not any(
-                    event == preview["projection_candidate"]
-                    for event in state.events
-                ):
+                recovered = next((
+                    event for event in state.events
+                    if event == preview["projection_candidate"]
+                ), None)
+                remote_id = state.remote_ids.get(
+                    preview["projection_candidate"]["event_id"],
+                )
+                if recovered is None or not isinstance(remote_id, str):
                     raise StopIteration
+                projection_receipt = {
+                    "event_id": recovered["event_id"],
+                    "remote_id": remote_id,
+                    "revision": state.revision,
+                    "recovered_after_transport_failure": True,
+                }
             except (LinearTransportError, OSError, StopIteration, TimeoutError):
                 raise _partial_apply_error(
                     "checkpoint_projection_apply_unknown_replay_required",
@@ -483,7 +559,25 @@ def run(
             "event_id": preview["projection_candidate"]["event_id"],
             "disposition": "existing",
         }
-    if _root_surface(client, route, preview["workstream_id"]) != native_before:
+    after_projection_surface = _root_surface(
+        client, route, preview["workstream_id"],
+    )
+    comments_after_projection = adapter._comments()
+    projection_remote_id = projection_receipt.get("remote_id") or ""
+    projection_surface_matches = (
+        after_projection_surface == after_checkpoint_surface
+        if projection_replay else _same_root_authority(
+            after_projection_surface, after_checkpoint_surface,
+        )
+    )
+    if (
+        not projection_surface_matches
+        or (not projection_replay and not projection_remote_id)
+        or not _comments_match_owned_append(
+            comments_before_projection, comments_after_projection,
+            remote_id=projection_remote_id, wrote=not projection_replay,
+        )
+    ):
         raise _partial_apply_error(
             "checkpoint_postwrite_native_root_drift_reconcile_required",
             preview, checkpoint_receipt=receipt,
@@ -500,7 +594,9 @@ def run(
             checkpoint_receipt=receipt,
             projection_receipt=projection_receipt,
         ) from error
-    if _root_surface(client, route, preview["workstream_id"]) != native_before:
+    if _root_surface(
+        client, route, preview["workstream_id"],
+    ) != after_projection_surface or adapter._comments() != comments_after_projection:
         raise _partial_apply_error(
             "checkpoint_applied_but_resume_native_root_drift", preview,
             checkpoint_receipt=receipt,
