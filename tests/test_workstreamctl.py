@@ -198,11 +198,18 @@ class WorkstreamCtlTests(unittest.TestCase):
 
     def test_tab_title_dispatches_safe_cmux_adapter(self):
         with mock.patch.object(MODULE.os, "execv") as execute:
-            MODULE.main(["tab-title", "GEN-37"])
+            MODULE.main([
+                "tab-title", "GEN-37", "--project-name", "Linear Integration",
+                "--automatic-title", "~/Code/pulp",
+            ])
         script = MODULE.SCRIPTS / "workstream_tab.py"
         execute.assert_called_once_with(
             MODULE.sys.executable,
-            [MODULE.sys.executable, str(script), "GEN-37"],
+            [
+                MODULE.sys.executable, str(script), "GEN-37",
+                "--project-name", "Linear Integration",
+                "--automatic-title", "~/Code/pulp",
+            ],
         )
 
     def test_child_event_dispatches_exact_child_material_writer(self):

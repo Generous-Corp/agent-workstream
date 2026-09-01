@@ -16,8 +16,17 @@ import stat
 import subprocess
 import sys
 import tempfile
-import tomllib
 from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    print(
+        "python_runtime_unsupported:requires_python_3_11_or_newer:"
+        "rerun_with_a_python_3_11_or_newer_interpreter",
+        file=sys.stderr,
+    )
+    raise SystemExit(2) from None
 
 MARKETPLACE = "generous-workstream"
 PLUGIN_ID = "workstream@generous-workstream"

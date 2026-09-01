@@ -447,10 +447,15 @@ ownership and must obtain a newly reviewed preview/frontier. This is the
 strongest supported fence, not protection against an unrelated writer changing
 the native issue in the interval between final prewrite readback and update.
 
-After intake returns the canonical root token, invoke
-`scripts/workstream_tab.py GEN-123`. In cmux or Herdr it preserves the existing
-tab title and appends exactly one token; the same token is a no-op and a
-different token refuses without mutation. Herdr resolution is allowed only
+After full resume returns the canonical root token and authenticated project name, invoke
+`scripts/workstream_tab.py GEN-123 --project-name "<exact authenticated Linear project name>"`.
+In cmux or Herdr it preserves an existing custom title and appends exactly one
+token; the same token is a no-op and a different token refuses with
+`workstream_tab_conflict` without mutation. For a manager-generated title, also
+pass its exact previously observed manager value as `--automatic-title`; never
+infer it from cwd, shell, or title shape. Missing/invalid required project data
+or changed automatic-title provenance is an optional no-op. Herdr resolution is
+allowed only
 inside `HERDR_ENV=1` with the inherited exact tab, workspace, and socket
 namespace; never query a focused/default session or treat a bare `w1:t1` as
 globally unique. Outside a supported manager, or when the exact target cannot
@@ -529,6 +534,11 @@ scope, or resistance to an authorized person editing/deleting comments. No
 live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
+
+Version 0.4.52 persists authenticated closure-receipt bodies while keeping
+ordinary resume bounded, and treats cmux/Herdr title binding as an optional
+adapter that uses only authenticated project-name and exact automatic-title
+provenance.
 
 Version 0.4.51 aligns generation and projection terminal-seed frontiers and
 authenticates legacy dependency grants whose immutable schema predates the
@@ -819,8 +829,14 @@ fresh-session review receipt bound to the exact snapshot, closure input,
 repository-qualified head set, and aggregate landing truth. The receipt names and digests the durable review
 artifact and declares procedural independence under a shared Linear credential;
 it does not claim cryptographic agent identity.
-Resume derives lifecycle status and the closure receipt digest from that durable
-projection rather than mutable issue prose.
+Reconcile appends the immutable closure receipt body before the `Done`
+lifecycle and binds that lifecycle to the receipt's exact projection event ID
+and SHA-256. A response lost after either append replays without a duplicate;
+a conflicting, ambiguous, or altered receipt refuses. Ordinary resume exposes
+only the bounded event ID, digest, and snapshot digest, while full-history
+audit returns the validated receipt body. Resume derives lifecycle status and
+that receipt binding from the durable projection rather than mutable issue
+prose.
 
 ### Fresh-session resume
 
@@ -1235,6 +1251,15 @@ provider/session from the current remote checkpoint, and refuses any stale,
 uncheckpointed, dirty, mismatched, or unlineaged authority. It emits no prompt
 or secret. Owner-only profile publication currently requires macOS. See [the
 exact bridge and digest contract](references/shipyard-launch-profile.md).
+
+For tracked work, a bare `shipyard ship --pr` is validation only and is not a
+workstream handoff. Submit through `shipyard pr --workstream-id <handle>
+--context-url <exact recovered context URL>` whenever that path is available.
+If the exact PR/head already exists, repair only that same object with
+`shipyard runner steward-handoff --repo <owner/repo> --pr <number> --head
+<exact head> --workstream-id <handle> --context-url <exact recovered context
+URL>`; review its dry run, then apply. Never create a replacement PR, queue
+item, Linear issue, or project merely to add correlation metadata.
 
 ## Abrupt termination
 

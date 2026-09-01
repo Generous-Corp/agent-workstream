@@ -410,6 +410,71 @@ def _active_closure_review(state: Any, snapshot_sha256: str) -> dict[str, Any] |
     return current
 
 
+def _active_closure_receipt(state: Any, snapshot_sha256: str) -> dict[str, Any] | None:
+    matches = [
+        event for event in state.events
+        if event["kind"] == "closure_receipt"
+        and event["key"] == snapshot_sha256
+        and event["value"] != TOMBSTONE
+    ]
+    if len(matches) > 1:
+        raise ReconcileError("closure_receipt_ambiguous")
+    return matches[0] if matches else None
+
+
+def _assert_closure_only_suffix(
+    state: Any, snapshot: dict[str, Any], snapshot_sha256: str,
+) -> None:
+    """Permit response-loss replay only across this snapshot's receipt/lifecycle writes."""
+    base = snapshot.get("projection_events") or []
+    base_ids = [event.get("event_id") for event in base]
+    state_ids = [event.get("event_id") for event in state.events]
+    if state_ids[:len(base_ids)] != base_ids:
+        raise ReconcileError("lifecycle_projection_stale_reload_required")
+    suffix = list(state.events[len(base_ids):])
+    if not suffix:
+        return
+    is_receipt = lambda event: (
+        event["kind"] == "closure_receipt"
+        and event["key"] == snapshot_sha256
+    )
+    is_lifecycle = lambda event: (
+        event["kind"] == "lifecycle"
+        and event["key"] == "root"
+        and event["value"].get("snapshot_sha256") == snapshot_sha256
+    )
+    exact_suffix = (
+        len(suffix) == 1 and (is_receipt(suffix[0]) or is_lifecycle(suffix[0]))
+    ) or (
+        len(suffix) == 2
+        and is_receipt(suffix[0])
+        and is_lifecycle(suffix[1])
+        and suffix[1]["value"].get("closure_receipt_event_id")
+        == suffix[0]["event_id"]
+    )
+    if not exact_suffix:
+        raise ReconcileError("lifecycle_projection_stale_reload_required")
+
+
+def _closure_receipt_result(
+    state: Any, lifecycle: dict[str, Any],
+) -> dict[str, Any] | None:
+    event_id = lifecycle.get("closure_receipt_event_id")
+    if event_id is None:
+        return None
+    matches = [
+        event for event in state.events
+        if event["kind"] == "closure_receipt" and event["event_id"] == event_id
+    ]
+    if len(matches) != 1:
+        raise ReconcileError("closure_receipt_missing_or_ambiguous")
+    return {
+        "event_id": event_id,
+        "sha256": lifecycle["closure_receipt_sha256"],
+        "body": deepcopy(matches[0]["value"]),
+    }
+
+
 def _validate_review_event_order(
     state: Any, *, implementer_session_id: str, review_event: dict[str, Any],
 ) -> None:
@@ -613,9 +678,11 @@ def reconcile_lifecycle(
     closure_input_sha256 = canonical_digest(closure_input)
     state = adapter.state()
     if state.revision != snapshot.get("projection_revision"):
-        raise ReconcileError("lifecycle_projection_stale_reload_required")
+        _assert_closure_only_suffix(state, snapshot, snapshot_sha256)
     current = _active_lifecycle(state)
     closure_receipt = None
+    closure_receipt_event = None
+    writes: list[dict[str, Any]] = []
     status = "Landed — acceptance review required"
     if independent_review is not None:
         implementer_session_id = _implementer_session(snapshot)
@@ -663,6 +730,37 @@ def reconcile_lifecycle(
             })
         status = "Done"
 
+        closure_receipt_event = _active_closure_receipt(state, snapshot_sha256)
+        if closure_receipt_event is not None:
+            if closure_receipt_event["value"] != closure_receipt:
+                raise ReconcileError("closure_receipt_conflict")
+        else:
+            if state.revision != snapshot.get("projection_revision"):
+                raise ReconcileError("lifecycle_projection_stale_reload_required")
+            if snapshot_fence is not None and closure_snapshot_digest(
+                snapshot_fence()
+            ) != snapshot_sha256:
+                raise ReconcileError("closure_snapshot_changed_reload_required")
+            receipt_event = build_projection_event(
+                workstream_id=token, kind="closure_receipt",
+                key=snapshot_sha256, value=closure_receipt,
+                plan_revision=adapter.plan_revision,
+                expected_revision=state.revision, created_at=created_at,
+                authority=adapter.authority,
+            )
+            writes.append(adapter.append(receipt_event))
+            state = adapter.state()
+            closure_receipt_event = _active_closure_receipt(
+                state, snapshot_sha256,
+            )
+            if (
+                closure_receipt_event is None
+                or closure_receipt_event["event_id"] != receipt_event["event_id"]
+                or closure_receipt_event["value"] != closure_receipt
+            ):
+                raise ReconcileError("closure_receipt_readback_not_exact")
+            current = _active_lifecycle(state)
+
     lifecycle = {
         "status": status,
         "closure_input_sha256": closure_input_sha256,
@@ -670,6 +768,10 @@ def reconcile_lifecycle(
         "independent_review": deepcopy(independent_review),
         "closure_receipt_sha256": (
             canonical_digest(closure_receipt) if closure_receipt is not None else None
+        ),
+        "closure_receipt_event_id": (
+            closure_receipt_event["event_id"]
+            if closure_receipt_event is not None else None
         ),
     }
     if len(repository_truths) == 1:
@@ -698,8 +800,11 @@ def reconcile_lifecycle(
         ):
             return {
                 "workstream_id": token, "status": "Done",
-                "projection_revision": state.revision, "writes": [],
+                "projection_revision": state.revision, "writes": writes,
                 "lifecycle": current["value"], "readback_verified": True,
+                "closure_receipt": _closure_receipt_result(
+                    state, current["value"],
+                ),
             }
         if not (
             independent_review is not None
@@ -710,8 +815,9 @@ def reconcile_lifecycle(
     if current is not None and current["value"] == lifecycle:
         return {
             "workstream_id": token, "status": status,
-            "projection_revision": state.revision, "writes": [],
+            "projection_revision": state.revision, "writes": writes,
             "lifecycle": lifecycle, "readback_verified": True,
+            "closure_receipt": _closure_receipt_result(state, lifecycle),
         }
     event = build_projection_event(
         workstream_id=token, kind="lifecycle", key="root", value=lifecycle,
@@ -721,6 +827,7 @@ def reconcile_lifecycle(
         authority=adapter.authority,
     )
     receipt = adapter.append(event)
+    writes.append(receipt)
     final = adapter.state()
     observed = _active_lifecycle(final)
     if observed is None or observed["event_id"] != event["event_id"] or observed["value"] != lifecycle:
@@ -729,8 +836,9 @@ def reconcile_lifecycle(
         raise ReconcileError("closure_snapshot_changed_after_append")
     return {
         "workstream_id": token, "status": status,
-        "projection_revision": final.revision, "writes": [receipt],
+        "projection_revision": final.revision, "writes": writes,
         "lifecycle": lifecycle, "readback_verified": True,
+        "closure_receipt": _closure_receipt_result(final, lifecycle),
     }
 
 

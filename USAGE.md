@@ -53,14 +53,15 @@ cmux, paste the same token or Linear URL into any new agent or terminal. Durable
 state remains in Linear in either case. See the [cmux API](https://cmux.com/docs/api)
 for its tab and workspace automation surface.
 
-The agent runs `workstreamctl tab-title GEN-123` after intake or resume. It
-appends the token to an existing human-readable title, does nothing when that
-token is already present, and refuses to overwrite a different workstream
-token. Outside cmux, the command exits successfully without changing anything.
-Codex or Claude may separately rename its own provider session/thread; that
-message does not rename a cmux or HerdR tab and is never copied into one by
-Agent Workstream. Manager-tab binding requires a successfully resolved stable
-workstream token.
+After full resume, the agent runs
+`workstreamctl tab-title GEN-123 --project-name "<exact recovered project_name>"`.
+It adds `--automatic-title` only with the
+exact previously observed manager-generated value, never a cwd/title heuristic.
+The adapter preserves custom titles, refuses another token, and treats missing
+needed provenance or an unavailable/unresolved cmux or Herdr target as an
+optional no-op. Codex or Claude session titles are separate and never grant
+workstream authority; successful binding requires full recovery plus exact
+manager-title readback.
 
 Useful follow-ups are:
 

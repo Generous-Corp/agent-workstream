@@ -57,6 +57,7 @@ from workstream_child_dependencies import (
     LinearChildDependencyAdapter, rebind_authenticated_dependency_graph,
 )
 from workstream_child_closure import canonical_digest, terminal_child_readback
+from workstream_scope import repository_key
 
 
 RESERVATION_PREFIX = "<!-- workstream-generation-reservation:v2:"
@@ -350,7 +351,29 @@ def prepare_generation_operator_contract(
     }
     for (kind, key), event in sorted(predecessor_heads.items()):
         identity = {"kind": kind, "key": key, "event_id": event["event_id"]}
-        if (kind, key) == ("source", "root"):
+        if (kind, key) == ("scope", "root"):
+            value = deepcopy(event["value"])
+            primary_key = value.get("primary_repository")
+            primary_repositories = [
+                repository for repository in value.get("repositories", [])
+                if repository_key(repository) == primary_key
+            ]
+            if len(primary_repositories) != 1:
+                raise WorkstreamGenerationError(
+                    "generation_prepare_primary_repository_ambiguous"
+                )
+            predecessor_head = primary_repositories[0].get("exact_head")
+            primary_repositories[0]["exact_head"] = remote_head
+            complete_items.append({"kind": kind, "key": key, "value": value})
+            carried.append({
+                **identity,
+                "mode": (
+                    "exact_value_copy"
+                    if predecessor_head == remote_head
+                    else "primary_head_rebound_to_verified_remote_head"
+                ),
+            })
+        elif (kind, key) == ("source", "root"):
             complete_items.append({"kind": kind, "key": key,
                                    "value": deepcopy(target_source)})
             carried.append({**identity, "mode": "replaced_by_exact_target_source"})
@@ -443,11 +466,6 @@ def prepare_generation_operator_contract(
             0, {}, legacy_event_ids=[], legacy_events_sha256=None,
             quarantine_count=0, quarantine_sha256=_value_digest([]),
         )
-        seed_manifest = {
-            **empty_contract, "projection": seed_items, "retirements": [],
-            "terminal_child_evidence_seeds": seeds,
-            "terminal_child_evidence_seed_predecessor": binding,
-        }
         seed_identities = {
             (item["kind"], item["key"]) for item in seed_items
         } | {("disposition", "root")}
@@ -460,6 +478,77 @@ def prepare_generation_operator_contract(
             remote_ids=getattr(target, "remote_ids", {}),
             snapshot=deepcopy(target.snapshot),
         )
+        current_seed_scope = target_heads.get(("scope", "root"))
+        seed_contract = (
+            projection_review_contract(seed_target)
+            if current_seed_scope is not None else empty_contract
+        )
+        seed_manifest = {
+            **seed_contract, "projection": seed_items, "retirements": [],
+            "terminal_child_evidence_seeds": seeds,
+            "terminal_child_evidence_seed_predecessor": binding,
+        }
+        if (
+            current_seed_scope is not None
+            and current_seed_scope["value"] != scope
+        ):
+            current_scope = current_seed_scope["value"]
+            primary_key = scope["primary_repository"]
+            current_primary = [
+                repository
+                for repository in current_scope.get("repositories", [])
+                if repository_key(repository) == primary_key
+            ]
+            desired_primary = [
+                repository for repository in scope.get("repositories", [])
+                if repository_key(repository) == primary_key
+            ]
+            expected_scope = deepcopy(current_scope)
+            expected_primary = [
+                repository
+                for repository in expected_scope.get("repositories", [])
+                if repository_key(repository) == primary_key
+            ]
+            if (
+                len(current_primary) != 1
+                or len(desired_primary) != 1
+                or len(expected_primary) != 1
+                or current_scope.get("primary_repository") != primary_key
+                or desired_primary[0].get("exact_head") != remote_head
+                or not re.fullmatch(
+                    r"[0-9a-f]{40}(?:[0-9a-f]{24})?",
+                    str(current_primary[0].get("exact_head", "")),
+                )
+            ):
+                raise WorkstreamGenerationError(
+                    "generation_prepare_target_primary_head_transition_invalid"
+                )
+            expected_primary[0]["exact_head"] = remote_head
+            if expected_scope != scope:
+                raise WorkstreamGenerationError(
+                    "generation_prepare_target_scope_drift"
+                )
+            if (
+                not isinstance(target_disposition, dict)
+                or set(target_disposition) != {
+                    "disposition", "remote_head", "recovered_from_checkpoint",
+                }
+                or target_disposition.get("remote_head") != remote_head
+                or target_disposition.get("disposition")
+                not in {"attach", "create_successor"}
+            ):
+                raise WorkstreamGenerationError(
+                    "generation_prepare_target_disposition_missing_for_head_transition"
+                )
+            seed_manifest["terminal_child_evidence_seed_head_transition"] = {
+                "repository_key": primary_key,
+                "from_exact_head": current_primary[0]["exact_head"],
+                "to_exact_head": remote_head,
+                "from_scope_event_id": current_seed_scope["event_id"],
+                "from_scope_value_sha256": canonical_digest(current_scope),
+                "disposition": deepcopy(target_disposition),
+                "input_frontier_sha256": binding["input_frontier_sha256"],
+            }
         normalized_seed = prepare_terminal_child_evidence_seeds(
             seed_manifest, graph, seed_target, remote_head=remote_head,
             comments=comments,

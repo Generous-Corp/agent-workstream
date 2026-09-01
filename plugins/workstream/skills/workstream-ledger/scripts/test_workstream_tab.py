@@ -77,10 +77,15 @@ class FakeHerdr:
 
 
 class WorkstreamTabTests(unittest.TestCase):
-    def apply(self, title="Linear", token="GEN-37"):
+    def apply(
+        self, title="Linear", token="GEN-37", *, project_name=None,
+        automatic_title=None,
+    ):
         fake = FakeCmux(title)
         result = tab.apply_title(
-            token, target="surface:7", runner=fake, which=lambda _: "/opt/cmux",
+            token, target="surface:7", project_name=project_name,
+            automatic_title=automatic_title, runner=fake,
+            which=lambda _: "/opt/cmux",
         )
         return fake, result
 
@@ -93,9 +98,39 @@ class WorkstreamTabTests(unittest.TestCase):
         ])
         self.assertEqual(fake.calls[3][-1], "Linear · GEN-37")
 
-    def test_empty_title_becomes_token_without_separator(self):
-        _, result = self.apply("   ")
-        self.assertEqual(result["title"], "GEN-37")
+    def test_unnamed_title_becomes_project_label_and_token(self):
+        _, result = self.apply("   ", project_name="Linear Integration")
+        self.assertEqual(result["title"], "Linear Integration · GEN-37")
+
+    def test_exact_automatic_title_is_replaced_but_custom_title_is_preserved(self):
+        fake, generated = self.apply(
+            "~/Code/pulp", project_name="Linear Integration",
+            automatic_title="~/Code/pulp",
+        )
+        self.assertEqual(generated["title"], "Linear Integration · GEN-37")
+        self.assertEqual(fake.calls[3][-1], "Linear Integration · GEN-37")
+
+        _, custom = self.apply(
+            "My project", project_name="Linear Integration",
+        )
+        self.assertEqual(custom["title"], "My project · GEN-37")
+
+    def test_missing_or_stale_generated_title_provenance_is_optional_noop(self):
+        for title, options, error in (
+            ("", {}, "project_name_required_for_generated_title"),
+            ("pulp", {"project_name": "Linear", "automatic_title": "zsh"},
+             "automatic_title_changed"),
+            ("", {"project_name": "GEN-37 project"}, "invalid_project_name"),
+        ):
+            with self.subTest(title=title, error=error):
+                fake = FakeCmux(title)
+                result = tab.apply_title(
+                    "GEN-37", target="surface:7", runner=fake,
+                    which=lambda _: "/opt/cmux", **options,
+                )
+                self.assertEqual(result["status"], "unavailable")
+                self.assertEqual(result["reason"], error)
+                self.assertNotIn("rename-tab", [call[1] for call in fake.calls])
 
     def test_same_token_is_a_zero_mutation_noop(self):
         fake, result = self.apply("Linear · gen-37")
@@ -113,6 +148,13 @@ class WorkstreamTabTests(unittest.TestCase):
                         which=lambda _: "/opt/cmux",
                     )
                 self.assertNotIn("rename-tab", [call[1] for call in fake.calls])
+
+        fake = FakeCmux("Linear · GEN-38")
+        with self.assertRaisesRegex(tab.TabTitleError, "workstream_tab_conflict"):
+            tab.apply_title(
+                "GEN-37", target="surface:7", runner=fake,
+                which=lambda _: "/opt/cmux",
+            )
 
     def test_non_cmux_fallback_is_successful_and_does_not_probe(self):
         called = False
@@ -192,16 +234,55 @@ class WorkstreamTabTests(unittest.TestCase):
             self.assertEqual(tab.main(["GEN-37"]), 2)
         self.assertEqual(stderr.getvalue().strip(), "workstream-tab: cmux_command_failed")
 
+    def test_cli_forwards_explicit_project_and_automatic_title_contract(self):
+        result = {"status": "updated", "token": "GEN-37"}
+        with mock.patch.object(tab, "apply_title", return_value=result) as apply, \
+             mock.patch.object(sys, "stdout", new_callable=io.StringIO):
+            self.assertEqual(tab.main([
+                "GEN-37", "--surface", "surface:7",
+                "--project-name", "Linear Integration",
+                "--automatic-title", "~/Code/pulp",
+            ]), 0)
+        apply.assert_called_once_with(
+            "GEN-37", target="surface:7", project_name="Linear Integration",
+            automatic_title="~/Code/pulp",
+        )
+
+    def test_pre_mutation_title_unavailable_or_missing_target_is_optional_noop(self):
+        for mode in ("command_unavailable", "target_missing"):
+            with self.subTest(mode=mode):
+                fake = FakeCmux()
+
+                def runner(argv, **kwargs):
+                    result = fake(argv, **kwargs)
+                    if argv[1] == "list-pane-surfaces":
+                        if mode == "command_unavailable":
+                            return subprocess.CompletedProcess(
+                                argv, 1, "", "socket stopped",
+                            )
+                        result.stdout = '{"surfaces":[]}'
+                    return result
+
+                result = tab.apply_title(
+                    "GEN-37", target="surface:7", runner=runner,
+                    which=lambda _: "/opt/cmux",
+                )
+                self.assertEqual(result, {
+                    "status": "unavailable", "reason": "cmux_target_unresolved",
+                    "token": "GEN-37",
+                })
+                self.assertNotIn("rename-tab", [call[1] for call in fake.calls])
+
     def test_malformed_title_read_fails_closed(self):
         fake = FakeCmux()
 
         def runner(argv, **kwargs):
             result = fake(argv, **kwargs)
             if argv[1] == "list-pane-surfaces":
-                result.stdout = '{"surfaces":[]}'
+                result.stdout = '{"surfaces":"not-a-list"}'
             return result
 
-        with self.assertRaisesRegex(tab.TabTitleError, "cmux_target_title_unresolved"):
+        with self.assertRaisesRegex(tab.TabTitleError, "invalid_cmux_surface_response"):
             tab.apply_title(
                 "GEN-37", target="surface:7", runner=runner,
                 which=lambda _: "/opt/cmux",
@@ -219,6 +300,27 @@ class WorkstreamTabTests(unittest.TestCase):
                 "GEN-37", target="surface:7", runner=fake,
                 which=lambda _: "/opt/cmux",
             )
+
+    def test_post_rename_readback_unavailable_remains_fatal(self):
+        fake = FakeCmux("Linear")
+        reads = 0
+
+        def runner(argv, **kwargs):
+            nonlocal reads
+            if argv[1] == "list-pane-surfaces":
+                reads += 1
+                if reads == 2:
+                    return subprocess.CompletedProcess(
+                        argv, 1, "", "socket stopped",
+                    )
+            return fake(argv, **kwargs)
+
+        with self.assertRaisesRegex(tab.TabTitleError, "cmux_command_failed"):
+            tab.apply_title(
+                "GEN-37", target="surface:7", runner=runner,
+                which=lambda _: "/opt/cmux",
+            )
+        self.assertIn("rename-tab", [call[1] for call in fake.calls])
 
     @staticmethod
     def herdr_env(socket="/tmp/herdr-a.sock"):
@@ -251,7 +353,7 @@ class WorkstreamTabTests(unittest.TestCase):
         self.assertNotIn(["tab", "rename"], [call[1:3] for call in fake.calls])
 
         conflicting = FakeHerdr("Linear · GEN-38")
-        with self.assertRaisesRegex(tab.TabTitleError, "conflicting_workstream_token"):
+        with self.assertRaisesRegex(tab.TabTitleError, "workstream_tab_conflict"):
             tab.apply_title(
                 "GEN-37", environ=self.herdr_env(), runner=conflicting,
                 which=lambda _: None,
@@ -259,6 +361,40 @@ class WorkstreamTabTests(unittest.TestCase):
         self.assertNotIn(
             ["tab", "rename"], [call[1:3] for call in conflicting.calls],
         )
+
+    def test_herdr_unnamed_and_exact_automatic_titles_use_project_label(self):
+        for before, automatic_title in (("", None), ("~/Code/pulp", "~/Code/pulp")):
+            with self.subTest(before=before):
+                fake = FakeHerdr(before)
+                result = tab.apply_title(
+                    "GEN-37", environ=self.herdr_env(), runner=fake,
+                    which=lambda _: None, project_name="Linear Integration",
+                    automatic_title=automatic_title,
+                )
+                self.assertEqual(result["title"], "Linear Integration · GEN-37")
+                self.assertEqual([call[1:3] for call in fake.calls], [
+                    ["tab", "get"], ["tab", "rename"], ["tab", "get"],
+                ])
+
+    def test_herdr_missing_or_stale_generated_provenance_is_optional_noop(self):
+        for before, options, reason in (
+            ("", {}, "project_name_required_for_generated_title"),
+            ("~/Code/pulp", {
+                "project_name": "Linear Integration",
+                "automatic_title": "zsh",
+            }, "automatic_title_changed"),
+        ):
+            with self.subTest(before=before, reason=reason):
+                fake = FakeHerdr(before)
+                result = tab.apply_title(
+                    "GEN-37", environ=self.herdr_env(), runner=fake,
+                    which=lambda _: None, **options,
+                )
+                self.assertEqual(result["status"], "unavailable")
+                self.assertEqual(result["reason"], reason)
+                self.assertNotIn(
+                    ["tab", "rename"], [call[1:3] for call in fake.calls],
+                )
 
     def test_herdr_missing_identity_binary_or_target_is_optional_noop(self):
         called = False

@@ -60,6 +60,12 @@ explicitly through Shipyard's corresponding agent-route flags). See
 [Shipyard's launch-profile contract](https://github.com/Generous-Corp/Shipyard/blob/main/docs/launch-profile.md)
 for the lower-level steward-handoff form and trusted-consumer setup.
 
+Do not substitute bare `shipyard ship --pr` for this tracked handoff: it can
+validate the head without binding the workstream/context receipt. When a PR was
+already submitted that way, use Shipyard's exact-head `runner steward-handoff`
+dry-run and apply path on the existing PR; do not create another PR or queue
+item.
+
 ## Fail-closed gates
 
 Profile creation refuses terminal, inspection-only, stale-lifecycle,

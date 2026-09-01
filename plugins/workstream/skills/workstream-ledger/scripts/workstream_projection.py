@@ -572,11 +572,15 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
     seed_transition_allowed = seeds_allowed | {
         "terminal_child_evidence_seed_head_transition"
     }
+    predecessor_seed_transition_allowed = predecessor_seeds_allowed | {
+        "terminal_child_evidence_seed_head_transition"
+    }
     source_transition_allowed = required | {"terminal_child_source_transition"}
     if not isinstance(manifest, dict) or frozenset(manifest) not in {
         frozenset(required), frozenset(repairs_allowed),
         frozenset(seeds_allowed), frozenset(predecessor_seeds_allowed),
         frozenset(seed_transition_allowed),
+        frozenset(predecessor_seed_transition_allowed),
         frozenset(source_transition_allowed),
     }:
         raise LinearProjectionError("manifest_review_contract_required")
@@ -878,6 +882,15 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             raise LinearProjectionError(
                 "invalid_terminal_child_evidence_seed_head_transition"
             )
+    if (
+        predecessor is not None
+        and seed_head_transition is not None
+        and predecessor["input_frontier_sha256"]
+        != seed_head_transition["input_frontier_sha256"]
+    ):
+        raise LinearProjectionError(
+            "terminal_child_evidence_seed_input_frontier_mismatch"
+        )
     transition = manifest.get("terminal_child_source_transition")
     if transition is not None:
         if not isinstance(transition, dict) or set(transition) != {

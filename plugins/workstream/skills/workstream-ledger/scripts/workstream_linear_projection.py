@@ -67,7 +67,8 @@ PROJECTION_PREFIX = "<!-- workstream-projection:v1:"
 PROJECTION_RE = re.compile(r"<!-- workstream-projection:v1:([A-Za-z0-9_-]+) -->")
 KINDS = {
     "scope", "relation", "choice", "evidence_contract", "source",
-    "provenance", "disposition", "closure_review", "lifecycle", "cas_activation",
+    "provenance", "disposition", "closure_review", "closure_receipt",
+    "lifecycle", "cas_activation",
     "quarantine_disposition", "child_closure",
     "child_extension_authorization", "child_dependency_authorization",
     "child_mutation_authorization", "existing_child_origin_seal",
@@ -1721,6 +1722,65 @@ def validate_projection_event(event: dict[str, Any]) -> None:
                 or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("repository_truth_sha256", "")))
             ):
                 raise LinearProjectionError("invalid_projection_closure_review")
+    if event["kind"] == "closure_receipt":
+        common_fields = {
+            "criteria_checked", "children_checked", "evidence_categories_checked",
+            "excluded", "deterministic_checks_passed", "semantic_review_invoked",
+            "semantic_review_passed", "resume_token", "context_url",
+            "plan_revision", "root_revision", "final_disposition",
+            "snapshot_sha256", "closure_input_sha256", "independent_review",
+        }
+        single_fields = {*common_fields, "github", "shipyard_receipt_sha256"}
+        aggregate_fields = {
+            *common_fields, "repositories", "repository_truth_sha256",
+        }
+        if (
+            tombstone
+            or event["supersedes_event_id"] is not None
+            or event["key"] != value.get("snapshot_sha256")
+            or frozenset(value) not in {
+                frozenset(single_fields), frozenset(aggregate_fields)
+            }
+            or value.get("resume_token") != event["workstream_id"]
+            or value.get("plan_revision") != event["plan_revision"]
+            or value.get("final_disposition") != "Done"
+            or value.get("deterministic_checks_passed") is not True
+            or value.get("semantic_review_invoked") is not True
+            or value.get("semantic_review_passed") is not True
+            or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("snapshot_sha256", "")))
+            or not re.fullmatch(r"[0-9a-f]{64}", str(value.get("closure_input_sha256", "")))
+            or not isinstance(value.get("criteria_checked"), list)
+            or not isinstance(value.get("children_checked"), list)
+            or not isinstance(value.get("evidence_categories_checked"), list)
+            or not isinstance(value.get("excluded"), list)
+            or not isinstance(value.get("context_url"), str)
+            or not value["context_url"]
+            or not isinstance(value.get("root_revision"), int)
+            or isinstance(value.get("root_revision"), bool)
+            or value["root_revision"] < 0
+            or not isinstance(value.get("independent_review"), dict)
+            or value["independent_review"].get("snapshot_sha256")
+            != value["snapshot_sha256"]
+            or value["independent_review"].get("closure_input_sha256")
+            != value["closure_input_sha256"]
+        ):
+            raise LinearProjectionError("invalid_projection_closure_receipt")
+        if set(value) == single_fields:
+            if (
+                not isinstance(value.get("github"), dict)
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}", str(value.get("shipyard_receipt_sha256", ""))
+                )
+            ):
+                raise LinearProjectionError("invalid_projection_closure_receipt")
+        else:
+            if (
+                not isinstance(value.get("repositories"), list)
+                or len(value["repositories"]) < 2
+                or value.get("repository_truth_sha256")
+                != hashlib.sha256(_canonical(value["repositories"])).hexdigest()
+            ):
+                raise LinearProjectionError("invalid_projection_closure_receipt")
     if event["kind"] == "disposition" and not tombstone:
         if value.get("disposition") not in {"attach", "create_successor"}:
             raise LinearProjectionError("invalid_projection_disposition")
@@ -1743,11 +1803,14 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             "closure_input_sha256", "snapshot_sha256", "independent_review",
             "closure_receipt_sha256",
         }
-        if set(value) not in (required_v1, required_v2):
+        required_v3 = {*required_v1, "closure_receipt_event_id"}
+        required_v4 = {*required_v2, "closure_receipt_event_id"}
+        if set(value) not in (required_v1, required_v2, required_v3, required_v4):
             raise LinearProjectionError("invalid_projection_lifecycle_fields")
         if value["status"] not in {"In Progress", "Landed — acceptance review required", "Done"}:
             raise LinearProjectionError("invalid_projection_lifecycle_status")
-        if set(value) == required_v1 and (
+        single_repository = set(value) in (required_v1, required_v3)
+        if single_repository and (
             not isinstance(value["github"], dict)
             or not isinstance(value["shipyard_receipt"], dict)
         ):
@@ -1755,11 +1818,11 @@ def validate_projection_event(event: dict[str, Any]) -> None:
         repository_truths = (
             [{"repository_key": value["shipyard_receipt"].get("repository_key"),
               "github": value["github"], "shipyard_receipt": value["shipyard_receipt"]}]
-            if set(value) == required_v1 else value["repositories"]
+            if single_repository else value["repositories"]
         )
         if (
             not isinstance(repository_truths, list)
-            or len(repository_truths) < (1 if set(value) == required_v1 else 2)
+            or len(repository_truths) < (1 if single_repository else 2)
         ):
             raise LinearProjectionError("invalid_projection_lifecycle:repositories")
         seen_repository_keys: set[str] = set()
@@ -1807,7 +1870,7 @@ def validate_projection_event(event: dict[str, Any]) -> None:
                 or shipyard.get("receipt_sha256") != shipyard_digest
             ):
                 raise LinearProjectionError("invalid_projection_lifecycle:shipyard_receipt")
-        if set(value) == required_v2 and value.get("repository_truth_sha256") != hashlib.sha256(
+        if not single_repository and value.get("repository_truth_sha256") != hashlib.sha256(
             _canonical(repository_truths)
         ).hexdigest():
             raise LinearProjectionError("invalid_projection_lifecycle:repository_truth_sha256")
@@ -1838,8 +1901,8 @@ def validate_projection_event(event: dict[str, Any]) -> None:
                 for truth in repository_truths
             }
             if not (
-                (set(value) == required_v1 and set(review) == review_v1 and review.get("schema_version") == 1)
-                or (set(value) == required_v2 and set(review) == review_v2 and review.get("schema_version") == 2)
+                (single_repository and set(review) == review_v1 and review.get("schema_version") == 1)
+                or (not single_repository and set(review) == review_v2 and review.get("schema_version") == 2)
             ):
                 raise LinearProjectionError("invalid_projection_lifecycle:independent_review")
             if (
@@ -1860,19 +1923,27 @@ def validate_projection_event(event: dict[str, Any]) -> None:
                                          "review_artifact_identity"))
             ):
                 raise LinearProjectionError("invalid_projection_lifecycle:independent_review")
-            if set(value) == required_v1 and (
+            if single_repository and (
                 review.get("repository_key") != repository_truths[0]["repository_key"]
                 or review.get("exact_head") != repository_truths[0]["github"]["pr_head"]
             ):
                 raise LinearProjectionError("invalid_projection_lifecycle:independent_review")
-            if set(value) == required_v2 and (
+            if not single_repository and (
                 review.get("repository_heads") != aggregate_heads
                 or review.get("repository_truth_sha256") != value["repository_truth_sha256"]
             ):
                 raise LinearProjectionError("invalid_projection_lifecycle:independent_review")
             if not re.fullmatch(r"[0-9a-f]{64}", str(value["closure_receipt_sha256"])):
                 raise LinearProjectionError("done_requires_closure_receipt")
-        elif value["independent_review"] is not None or value["closure_receipt_sha256"] is not None:
+            if "closure_receipt_event_id" in value and not re.fullmatch(
+                r"wsp_[0-9a-f]{32}", str(value["closure_receipt_event_id"])
+            ):
+                raise LinearProjectionError("done_requires_closure_receipt_event")
+        elif (
+            value["independent_review"] is not None
+            or value["closure_receipt_sha256"] is not None
+            or value.get("closure_receipt_event_id") is not None
+        ):
             raise LinearProjectionError("non_done_lifecycle_has_closure_receipt")
     if event["kind"] == "choice" and not tombstone and value.get("event_id") != event["key"]:
         raise LinearProjectionError("projection_choice_key_mismatch")
@@ -2577,6 +2648,7 @@ def _reduce_projection_comments_impl(
         "source": source,
         "provenance": by_kind["provenance"],
         "closure_reviews": by_kind["closure_review"],
+        "closure_receipts": by_kind["closure_receipt"],
         "disposition": by_kind["disposition"][0] if by_kind["disposition"] else None,
         "lifecycle": by_kind["lifecycle"][0] if by_kind["lifecycle"] else None,
         "quarantine_disposition": quarantine_disposition,
@@ -2596,6 +2668,52 @@ def _reduce_projection_comments_impl(
             "stale_plan_count": len(stale_events),
         },
     }
+    lifecycle = snapshot["lifecycle"]
+    if lifecycle is not None and lifecycle.get("status") == "Done" and (
+        "closure_receipt_event_id" in lifecycle
+    ):
+        matching_receipts = [
+            event for event in active.values()
+            if event["kind"] == "closure_receipt"
+            and event["event_id"] == lifecycle["closure_receipt_event_id"]
+        ]
+        if len(matching_receipts) != 1:
+            raise LinearProjectionError("lifecycle_closure_receipt_missing_or_ambiguous")
+        receipt_event = matching_receipts[0]
+        lifecycle_event = active.get(("lifecycle", "root"))
+        if (
+            lifecycle_event is None
+            or events.index(receipt_event) >= events.index(lifecycle_event)
+        ):
+            raise LinearProjectionError("lifecycle_closure_receipt_order_invalid")
+        receipt_value = receipt_event["value"]
+        if (
+            receipt_value.get("snapshot_sha256") != lifecycle["snapshot_sha256"]
+            or receipt_value.get("closure_input_sha256")
+            != lifecycle["closure_input_sha256"]
+            or hashlib.sha256(_canonical(receipt_value)).hexdigest()
+            != lifecycle["closure_receipt_sha256"]
+            or receipt_value.get("independent_review")
+            != lifecycle["independent_review"]
+            or (
+                "github" in lifecycle
+                and (
+                    receipt_value.get("github") != lifecycle["github"]
+                    or receipt_value.get("shipyard_receipt_sha256")
+                    != lifecycle["shipyard_receipt"]["receipt_sha256"]
+                )
+            )
+            or (
+                "repositories" in lifecycle
+                and (
+                    receipt_value.get("repositories")
+                    != lifecycle["repositories"]
+                    or receipt_value.get("repository_truth_sha256")
+                    != lifecycle["repository_truth_sha256"]
+                )
+            )
+        ):
+            raise LinearProjectionError("lifecycle_closure_receipt_binding_mismatch")
     if identity_history_candidates:
         final_scope = heads.get(("scope", "root"))
         frontier = events[-1]

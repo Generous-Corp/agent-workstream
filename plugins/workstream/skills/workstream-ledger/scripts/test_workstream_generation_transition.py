@@ -726,6 +726,8 @@ class GenerationTransitionTests(unittest.TestCase):
 
     def test_prepare_continues_canonical_seed_through_activation_readiness(self):
         from types import SimpleNamespace
+        predecessor_head = "b" * 40
+        target_head = "e" * 40
         predecessor = adapter(self.client, OLD).state()
         base = deepcopy(list(predecessor.events))
         scope = next(
@@ -733,9 +735,14 @@ class GenerationTransitionTests(unittest.TestCase):
             if (event["kind"], event["key"]) == ("scope", "root")
         )["value"]
         scope["child_ownership"] = {"GEN-72": "github.com:id:R_repo"}
+        next(
+            repository for repository in scope["repositories"]
+            if repository["provider_repository_id"] == "R_repo"
+        )["exact_head"] = predecessor_head
         evidence_old = {
             "owning_child": "GEN-72", "plan_revision": OLD,
-            "repository_key": "github.com:id:R_repo", "exact_head": "e" * 40,
+            "repository_key": "github.com:id:R_repo",
+            "exact_head": predecessor_head,
         }
         predecessor_events = [*base, {
             "schema_version": 2, "kind": "evidence_contract", "key": "terminal",
@@ -766,7 +773,7 @@ class GenerationTransitionTests(unittest.TestCase):
              "event_id": "wsp_" + "d" * 32, "value": evidence_new},
             {"schema_version": 2, "kind": "disposition", "key": "root",
              "event_id": "wsp_" + "e" * 32,
-             "value": {"disposition": "attach", "remote_head": "e" * 40,
+             "value": {"disposition": "attach", "remote_head": target_head,
                        "recovered_from_checkpoint": None}},
         ]
         closure = {
@@ -813,7 +820,40 @@ class GenerationTransitionTests(unittest.TestCase):
 
         def normalize_seed(manifest, _graph, target, **_kwargs):
             result = deepcopy(manifest)
-            result.update(workstream_projection.projection_review_contract(target))
+            target_contract = workstream_projection.projection_review_contract(target)
+            desired_scope = next(
+                item["value"] for item in result["projection"]
+                if (item["kind"], item["key"]) == ("scope", "root")
+            )
+            desired_primary = next(
+                repository for repository in desired_scope["repositories"]
+                if repository["provider_repository_id"] == "R_repo"
+            )
+            current_scope_event = workstream_projection._active_heads(target).get(
+                ("scope", "root")
+            )
+            if current_scope_event is not None:
+                current_primary = next(
+                    repository
+                    for repository in current_scope_event["value"]["repositories"]
+                    if repository["provider_repository_id"] == "R_repo"
+                )
+                if current_primary["exact_head"] != target_head:
+                    transition = result[
+                        "terminal_child_evidence_seed_head_transition"
+                    ]
+                    self.assertEqual(desired_primary["exact_head"], target_head)
+                    self.assertEqual(transition["from_exact_head"], predecessor_head)
+                    self.assertEqual(transition["to_exact_head"], target_head)
+                    self.assertEqual(
+                        transition["from_scope_event_id"],
+                        current_scope_event["event_id"],
+                    )
+                    self.assertEqual(
+                        result["expected_projection_revision"],
+                        target_contract["expected_projection_revision"],
+                    )
+            result.update(target_contract)
             return result
 
         def normalize_repair(manifest, _graph, _target):
@@ -861,9 +901,23 @@ class GenerationTransitionTests(unittest.TestCase):
                         "identity": f"https://example.test/{NEW}", "sha256": NEW,
                     },
                     created_at="2026-08-31T23:00:00Z",
-                    remote_head="e" * 40,
+                    remote_head=target_head,
                     started_state=STARTED_STATE,
                 )
+
+        seed_repair = run(target_events)
+        self.assertEqual(
+            seed_repair["projection_preview"]["phase"], "terminal_evidence_seed",
+        )
+        seed_manifest = seed_repair["projection_preview"]["manifest"]
+        desired_scope = next(
+            item["value"] for item in seed_manifest["projection"]
+            if (item["kind"], item["key"]) == ("scope", "root")
+        )
+        target_events.append({
+            **deepcopy(common[0]), "event_id": "wsp_" + "2" * 32,
+            "value": desired_scope,
+        })
 
         repair = run(target_events)
         self.assertEqual(

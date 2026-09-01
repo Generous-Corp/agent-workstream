@@ -11,6 +11,8 @@ import tempfile
 import time
 import unittest
 
+import workstream_linear_projection as projection_module
+
 from test_workstream_closure import ClosureTests
 from test_workstream_linear_projection import (
     AUTHORITY, FakeProjectionClient, legacy_comment, legacy_event,
@@ -19,7 +21,7 @@ from test_workstream_linear_projection import (
 from workstream_child_dependencies import LinearChildDependencyAdapter
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
-    projection_slot_id,
+    LinearProjectionError, projection_slot_id,
 )
 from workstream_reconcile import (
     _bounded_command, authenticated_reconcile_snapshot, canonical_digest,
@@ -376,7 +378,22 @@ class ReconcileTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "Done")
         self.assertRegex(result["lifecycle"]["closure_receipt_sha256"], r"^[0-9a-f]{64}$")
-        self.assertEqual(len(client.comments), 3)
+        self.assertEqual(len(client.comments), 4)
+        state = self.adapter(client).state()
+        receipts = [
+            event for event in state.events if event["kind"] == "closure_receipt"
+        ]
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0]["value"]["final_disposition"], "Done")
+        self.assertEqual(
+            result["lifecycle"]["closure_receipt_event_id"],
+            receipts[0]["event_id"],
+        )
+        self.assertEqual(result["closure_receipt"], {
+            "event_id": receipts[0]["event_id"],
+            "sha256": result["lifecycle"]["closure_receipt_sha256"],
+            "body": receipts[0]["value"],
+        })
 
     def test_done_restart_after_remote_write_replays_without_second_write(self):
         client = FakeProjectionClient()
@@ -394,7 +411,7 @@ class ReconcileTests(unittest.TestCase):
         post["root"]["closure_receipt"] = first["lifecycle"]["closure_receipt_sha256"]
         post["lifecycle"] = first["lifecycle"]
         post["projection_events"] = list(self.adapter(client).state().events)
-        post["projection_revision"] = 3
+        post["projection_revision"] = 4
         post["closure_reviews"] = [receipt]
         replay = reconcile_lifecycle(
             snapshot=post, adapter=self.adapter(client), github=github_truth(),
@@ -402,7 +419,7 @@ class ReconcileTests(unittest.TestCase):
             independent_review=receipt, created_at="2026-08-28T12:01:00Z",
         )
         self.assertEqual(replay["writes"], [])
-        self.assertEqual(len(client.comments), 3)
+        self.assertEqual(len(client.comments), 4)
         status_only = reconcile_lifecycle(
             snapshot=post, adapter=self.adapter(client), github=github_truth(),
             shipyard=shipyard_truth(), closure_input=material,
@@ -419,7 +436,7 @@ class ReconcileTests(unittest.TestCase):
                 shipyard=shipyard_truth(), closure_input=changed,
                 independent_review=None, created_at="2026-08-28T12:03:00Z",
             )
-        self.assertEqual(len(client.comments), 3)
+        self.assertEqual(len(client.comments), 4)
 
     def test_stale_done_requires_new_exact_snapshot_review_then_repairs_done_to_done(self):
         client = FakeProjectionClient()
@@ -435,7 +452,7 @@ class ReconcileTests(unittest.TestCase):
         changed["root"]["next_action"] = "review newly discovered exact state"
         changed["lifecycle"] = first["lifecycle"]
         changed["projection_events"] = list(self.adapter(client).state().events)
-        changed["projection_revision"] = 3
+        changed["projection_revision"] = 4
         changed["closure_reviews"] = [original_review]
         with self.assertRaisesRegex(ReconcileError, "done_lifecycle_cannot"):
             reconcile_lifecycle(
@@ -443,7 +460,7 @@ class ReconcileTests(unittest.TestCase):
                 shipyard=shipyard_truth(), closure_input=material,
                 independent_review=None, created_at="2026-08-28T12:01:00Z",
             )
-        self.assertEqual(len(client.comments), 3)
+        self.assertEqual(len(client.comments), 4)
 
         new_review = self.persist_review(client, changed, material)
         repaired = reconcile_lifecycle(
@@ -455,10 +472,96 @@ class ReconcileTests(unittest.TestCase):
         self.assertNotEqual(
             repaired["lifecycle"]["snapshot_sha256"], first["lifecycle"]["snapshot_sha256"],
         )
-        self.assertEqual(len(client.comments), 5)
+        self.assertEqual(len(client.comments), 7)
         self.assertEqual(
             self.adapter(client).state().snapshot["lifecycle"], repaired["lifecycle"],
         )
+
+    def test_done_response_loss_replays_from_prewrite_snapshot_without_writes(self):
+        client = FakeProjectionClient()
+        snap = snapshot(); material = closure_input()
+        review = self.persist_review(client, snap, material)
+        prewrite = deepcopy(snap)
+        first = reconcile_lifecycle(
+            snapshot=snap, adapter=self.adapter(client), github=github_truth(),
+            shipyard=shipyard_truth(), closure_input=material,
+            independent_review=review, created_at="2026-08-28T12:00:00Z",
+        )
+        self.assertEqual(len(first["writes"]), 2)
+        replay = reconcile_lifecycle(
+            snapshot=prewrite, adapter=self.adapter(client), github=github_truth(),
+            shipyard=shipyard_truth(), closure_input=material,
+            independent_review=review, created_at="2026-08-28T12:01:00Z",
+        )
+        self.assertEqual(replay["writes"], [])
+        self.assertEqual(len(client.comments), 4)
+
+    def test_done_response_loss_refuses_unrelated_projection_suffix(self):
+        client = FakeProjectionClient()
+        snap = snapshot(); material = closure_input()
+        review = self.persist_review(client, snap, material)
+        prewrite = deepcopy(snap)
+        reconcile_lifecycle(
+            snapshot=snap, adapter=self.adapter(client), github=github_truth(),
+            shipyard=shipyard_truth(), closure_input=material,
+            independent_review=review, created_at="2026-08-28T12:00:00Z",
+        )
+        state = self.adapter(client).state()
+        unrelated = build_projection_event(
+            workstream_id="GEN-37", kind="provenance", key="unrelated-session",
+            value={
+                "agent": "codex", "machine": "M3",
+                "session_id": "unrelated-session",
+            },
+            plan_revision="sha", expected_revision=state.revision,
+            created_at="2026-08-28T12:00:30Z",
+            authority=self.adapter(client).authority,
+        )
+        self.adapter(client).append(unrelated)
+        with self.assertRaisesRegex(
+            ReconcileError, "lifecycle_projection_stale_reload_required",
+        ):
+            reconcile_lifecycle(
+                snapshot=prewrite, adapter=self.adapter(client),
+                github=github_truth(), shipyard=shipyard_truth(),
+                closure_input=material, independent_review=review,
+                created_at="2026-08-28T12:01:00Z",
+            )
+        self.assertEqual(len(client.comments), 5)
+
+    def test_done_receipt_tamper_and_duplicate_are_refused(self):
+        for mutation in ("tamper", "duplicate"):
+            with self.subTest(mutation=mutation):
+                client = FakeProjectionClient()
+                snap = snapshot(); material = closure_input()
+                review = self.persist_review(client, snap, material)
+                reconcile_lifecycle(
+                    snapshot=snap, adapter=self.adapter(client), github=github_truth(),
+                    shipyard=shipyard_truth(), closure_input=material,
+                    independent_review=review, created_at="2026-08-28T12:00:00Z",
+                )
+                state = self.adapter(client).state()
+                receipt = next(
+                    event for event in state.events
+                    if event["kind"] == "closure_receipt"
+                )
+                comment = next(
+                    item for item in client.comments
+                    if item["id"] == state.remote_ids[receipt["event_id"]]
+                )
+                if mutation == "tamper":
+                    altered = deepcopy(receipt)
+                    altered["value"]["context_url"] += "/tampered"
+                    altered["event_id"] = projection_module._event_id(altered)
+                    comment["body"] = encode_projection_comment(altered)
+                    expected = "lifecycle_closure_receipt_missing_or_ambiguous"
+                else:
+                    client.comments.append({
+                        **deepcopy(comment), "id": "duplicate-closure-receipt",
+                    })
+                    expected = "duplicate_projection_event_id"
+                with self.assertRaisesRegex(LinearProjectionError, expected):
+                    self.adapter(client).state()
 
     def test_same_session_or_stale_review_refuses_before_write(self):
         for mutation in ("same_session", "stale_snapshot"):

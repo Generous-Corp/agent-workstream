@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -19,6 +20,41 @@ SPEC.loader.exec_module(MODULE)
 
 
 class PluginManagerTests(unittest.TestCase):
+    def test_manager_refuses_missing_tomllib_before_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory) / ".local/state/agent-workstream"
+            harness = """
+import builtins
+import runpy
+import sys
+
+real_import = builtins.__import__
+
+def blocked_import(name, *args, **kwargs):
+    if name == "tomllib":
+        raise ModuleNotFoundError("No module named 'tomllib'")
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = blocked_import
+script = sys.argv[1]
+sys.argv = [script, "update"]
+runpy.run_path(script, run_name="__main__")
+"""
+            env = os.environ.copy()
+            env["HOME"] = directory
+            process = subprocess.run(
+                [sys.executable, "-c", harness, str(SCRIPT)],
+                text=True, capture_output=True, env=env, check=False,
+            )
+            self.assertEqual(process.returncode, 2)
+            self.assertEqual(process.stdout, "")
+            self.assertEqual(
+                process.stderr.strip(),
+                "python_runtime_unsupported:requires_python_3_11_or_newer:"
+                "rerun_with_a_python_3_11_or_newer_interpreter",
+            )
+            self.assertFalse(state_root.exists())
+
     def plugin(self, root: Path, version: str = "1.2.3") -> Path:
         for manifest in MODULE.MANIFESTS.values():
             path = root / manifest
