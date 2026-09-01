@@ -396,13 +396,20 @@ def prepare_generation_operator_contract(
                                    "value": deepcopy(event["value"])})
             carried.append({**identity, "mode": "exact_value_copy"})
 
-    desired_projection_disposition = projection_disposition_value(
-        graph, complete_items, remote_head=remote_head,
-        workstream_id=workstream_id,
-    )
-    disposition_matches_remote_head = (
-        target_disposition == desired_projection_disposition
-    )
+    def target_disposition_matches(
+        projection: list[dict[str, Any]],
+    ) -> bool:
+        """Derive disposition only once the target projection can activate.
+
+        Earlier phases may intentionally expose multiple predecessor worktree
+        authorities.  They do not need a target disposition yet, and asking
+        the disposition reducer to choose one would turn a valid seed preview
+        into an unrelated ambiguity refusal.
+        """
+        return target_disposition == projection_disposition_value(
+            graph, projection, remote_head=remote_head,
+            workstream_id=workstream_id,
+        )
 
     terminal_stage: dict[str, Any] | None = None
     phase = "complete_projection"
@@ -437,10 +444,6 @@ def prepare_generation_operator_contract(
         scope = next(
             item["value"] for item in seed_items
             if (item["kind"], item["key"]) == ("scope", "root")
-        )
-        desired_seed_disposition = projection_disposition_value(
-            graph, seed_items, remote_head=remote_head,
-            workstream_id=workstream_id,
         )
         seeds: list[dict[str, Any]] = []
         for child_id in sorted(closure_heads):
@@ -502,6 +505,10 @@ def prepare_generation_operator_contract(
             current_seed_scope is not None
             and current_seed_scope["value"] != scope
         ):
+            desired_seed_disposition = projection_disposition_value(
+                graph, seed_items, remote_head=remote_head,
+                workstream_id=workstream_id,
+            )
             current_scope = current_seed_scope["value"]
             primary_key = scope["primary_repository"]
             current_primary = [
@@ -708,7 +715,7 @@ def prepare_generation_operator_contract(
                 if all(
                     identity in current_values and current_values[identity] == value
                     for identity, value in desired_values.items()
-                ) and disposition_matches_remote_head:
+                ) and target_disposition_matches(manifest["projection"]):
                     phase = "activation_ready"
     else:
         desired_values = {
@@ -731,7 +738,7 @@ def prepare_generation_operator_contract(
         if all(
             identity in target_heads and target_heads[identity]["value"] == value
             for identity, value in desired_values.items()
-        ) and disposition_matches_remote_head:
+        ) and target_disposition_matches(complete_items):
             phase = "activation_ready"
     _reviewed_manifest(manifest)
 

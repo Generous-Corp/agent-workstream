@@ -542,6 +542,10 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.54 delays target-disposition derivation until the candidate
+projection is otherwise activation-ready, so an intentionally ambiguous
+predecessor provenance set cannot block a valid terminal-evidence seed preview.
+
 Version 0.4.53 binds terminal-seed head transitions to both the exact old scope
 and disposition before advancing them together, and adds fail-closed in-place
 reconciliation for a regressed canonical locator that must equal the unique

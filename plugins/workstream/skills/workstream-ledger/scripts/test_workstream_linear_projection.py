@@ -1161,19 +1161,26 @@ class ProjectionTests(unittest.TestCase):
             },
             "children": [child], "child_comments": {},
         }
-        prepared = prepare_generation_operator_contract(
-            comments=deepcopy(client.comments), graph=deepcopy(raw_graph),
-            workstream_id="GEN-37", authority=AUTHORITY,
-            description_plan_revision=predecessor_plan,
-            target_source={
-                "identity": "https://example.test/new-plan", "sha256": PLAN,
-            },
-            created_at="2026-09-01T07:47:35Z", remote_head=HEAD,
-            started_state={
-                "id": "started", "name": "In Progress", "type": "started",
-                "team_id": "team",
-            },
-        )
+        with mock.patch(
+            "workstream_projection.projection_disposition_value",
+            side_effect=AssertionError(
+                "seed preview must not derive an activation disposition"
+            ),
+        ) as disposition_reducer:
+            prepared = prepare_generation_operator_contract(
+                comments=deepcopy(client.comments), graph=deepcopy(raw_graph),
+                workstream_id="GEN-37", authority=AUTHORITY,
+                description_plan_revision=predecessor_plan,
+                target_source={
+                    "identity": "https://example.test/new-plan", "sha256": PLAN,
+                },
+                created_at="2026-09-01T07:47:35Z", remote_head=HEAD,
+                started_state={
+                    "id": "started", "name": "In Progress",
+                    "type": "started", "team_id": "team",
+                },
+            )
+        disposition_reducer.assert_not_called()
         manifest = prepared["projection_preview"]["manifest"]
         self.assertEqual(prepared["projection_preview"]["phase"],
                          "terminal_evidence_seed")
