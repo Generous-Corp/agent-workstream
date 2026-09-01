@@ -16,8 +16,12 @@ from copy import deepcopy
 import hashlib
 import hmac
 import json
+import os
 import re
 import sys
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
 import uuid
 from typing import Any, Callable
 
@@ -52,6 +56,7 @@ from workstream_successor import choose_disposition
 from workstream_child_dependencies import (
     LinearChildDependencyAdapter, rebind_authenticated_dependency_graph,
 )
+from workstream_child_closure import canonical_digest, terminal_child_readback
 
 
 RESERVATION_PREFIX = "<!-- workstream-generation-reservation:v2:"
@@ -66,6 +71,12 @@ FINALIZATION_RE = re.compile(
     r"<!-- workstream-generation-finalization:v1:([A-Za-z0-9_-]+) -->"
 )
 FINALIZATION_ID = re.compile(r"wsgf_[0-9a-f]{32}")
+PREPARE_STARTED_STATE_QUERY = """
+query WorkstreamGenerationPrepareState($teamId: String!, $stateId: String!) {
+  team(id: $teamId) { id organization { id } }
+  workflowState(id: $stateId) { id name type team { id } }
+}
+"""
 
 
 class WorkstreamGenerationError(LinearTransportError):
@@ -114,6 +125,9 @@ def _validate_retirement(value: dict[str, Any], predecessor: str, epoch: int) ->
         "predecessor_plan_revision", "retired_at", "retired_writer_epoch",
         "provenance_event_ids", "checkpoint_event_ids", "declaration_sha256",
     }
+    schema_version = value.get("schema_version") if isinstance(value, dict) else None
+    if schema_version == 2:
+        fields.update({"schema_version", "authenticated_quiescence"})
     if not isinstance(value, dict) or set(value) != fields:
         raise WorkstreamGenerationError("invalid_generation_retirement_proof")
     unsigned = {key: deepcopy(item) for key, item in value.items()
@@ -129,6 +143,14 @@ def _validate_retirement(value: dict[str, Any], predecessor: str, epoch: int) ->
             for field in ("provenance_event_ids", "checkpoint_event_ids")
         )
         or value["declaration_sha256"] != _digest(unsigned)
+        or (
+            schema_version == 2
+            and (
+                not isinstance(value.get("authenticated_quiescence"), dict)
+                or value["retired_at"]
+                != value["authenticated_quiescence"].get("observed_at")
+            )
+        )
     ):
         raise WorkstreamGenerationError("invalid_generation_retirement_proof")
 
@@ -145,6 +167,514 @@ def build_retirement_proof(
         "checkpoint_event_ids": sorted(set(checkpoint_event_ids)),
     }
     return {**proof, "declaration_sha256": _digest(proof)}
+
+
+def build_authenticated_retirement_proof(
+    *, predecessor_plan_revision: str, observed_at: str,
+    retired_writer_epoch: int, provenance_event_ids: list[str],
+    checkpoint_event_ids: list[str], authority: dict[str, str],
+    selected_generation: dict[str, Any], material: Any,
+    predecessor_projection_contract: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind retirement to authenticated frontiers later serialized by activation."""
+    quiescence = {
+        "schema_version": 1,
+        "observed_at": observed_at,
+        "authenticated_route": deepcopy(authority),
+        "selected_generation": {
+            "plan_revision": selected_generation["plan_revision"],
+            "activation_epoch": selected_generation["activation_epoch"],
+            "transition_tip_event_id": selected_generation[
+                "transition_tip_event_id"
+            ],
+        },
+        "material_revision": material.revision,
+        "material_event_ids": sorted(event.event_id for event in material.events),
+        "checkpoint_event_ids": sorted(checkpoint_event_ids),
+        "predecessor_projection": deepcopy(predecessor_projection_contract),
+        "ordering": (
+            "activation_reservation_must_follow_exact_frontiers_and_blocks_"
+            "upgraded_predecessor_writers"
+        ),
+    }
+    proof = {
+        "schema_version": 2,
+        "predecessor_plan_revision": predecessor_plan_revision,
+        "retired_at": observed_at,
+        "retired_writer_epoch": retired_writer_epoch,
+        "provenance_event_ids": sorted(set(provenance_event_ids)),
+        "checkpoint_event_ids": sorted(set(checkpoint_event_ids)),
+        "authenticated_quiescence": quiescence,
+    }
+    return {**proof, "declaration_sha256": _digest(proof)}
+
+
+def prepare_generation_operator_contract(
+    *, comments: list[dict[str, Any]], graph: dict[str, Any],
+    workstream_id: str, authority: dict[str, str],
+    description_plan_revision: str | None, target_source: dict[str, str],
+    created_at: str, remote_head: str, started_state: dict[str, str],
+) -> dict[str, Any]:
+    """Build the complete zero-write review contract for a new generation.
+
+    This intentionally produces a first projection phase rather than pretending
+    that predecessor terminal closures can simply be copied into an inactive
+    generation.  Every predecessor head is classified as carried, staged, or
+    computed; an unclassified key is a protocol error.
+    """
+    from workstream_projection import (
+        _active_heads, _contract_from_heads, _reviewed_manifest,
+        _value_digest, prepare_terminal_child_evidence_seeds,
+        prepare_terminal_child_repairs, projection_review_contract,
+        terminal_child_evidence_seed_predecessor_contract,
+    )
+
+    if (
+        not isinstance(created_at, str) or not created_at
+        or set(target_source) != {"identity", "sha256"}
+        or not isinstance(target_source["identity"], str)
+        or not target_source["identity"]
+        or not HEX64.fullmatch(str(target_source["sha256"]))
+        or not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", remote_head)
+        or set(started_state) != {"id", "name", "type", "team_id"}
+        or not isinstance(started_state["id"], str) or not started_state["id"]
+        or not isinstance(started_state["name"], str) or not started_state["name"]
+        or str(started_state["type"]).lower() != "started"
+        or started_state["team_id"] != authority.get("team_id")
+    ):
+        raise WorkstreamGenerationError(
+            "generation_prepare_exact_source_and_timestamps_required"
+        )
+    selected = select_plan_generation(
+        comments, workstream_id=workstream_id,
+        description_plan_revision=description_plan_revision,
+        authenticated_route=authority,
+    )
+    predecessor_plan = selected["plan_revision"]
+    target_plan = target_source["sha256"]
+    if predecessor_plan == target_plan:
+        raise WorkstreamGenerationError("generation_target_already_active")
+    epoch = (
+        selected["activation_epoch"]
+        if selected["activation_epoch"] is not None else -1
+    ) + 1
+    predecessor = reduce_projection_comments(
+        comments, workstream_id=workstream_id,
+        expected_plan_revision=predecessor_plan,
+        authenticated_route=authority,
+    )
+    target = reduce_projection_comments(
+        comments, workstream_id=workstream_id,
+        expected_plan_revision=target_plan,
+        authenticated_route=authority,
+    )
+    predecessor_heads = _active_heads(predecessor)
+    target_heads = _active_heads(target)
+    target_disposition = target_heads.get(("disposition", "root"), {}).get(
+        "value", {}
+    )
+    disposition_matches_remote_head = (
+        isinstance(target_disposition, dict)
+        and target_disposition.get("remote_head") == remote_head
+    )
+    required = {("scope", "root"), ("source", "root")}
+    missing = sorted(required - set(predecessor_heads))
+    if missing:
+        raise WorkstreamGenerationError(
+            "generation_prepare_predecessor_projection_incomplete:"
+            + ",".join(f"{kind}:{key}" for kind, key in missing)
+        )
+
+    checkpoints = reduce_generation_checkpoint_comments(
+        comments, workstream_id=workstream_id,
+        authenticated_route=authority,
+    )
+    provenance_ids = sorted(
+        event["event_id"] for (kind, _key), event in predecessor_heads.items()
+        if kind == "provenance"
+    )
+    checkpoint_ids = sorted(
+        item["event_id"] for item in checkpoints.checkpoints
+        if item["plan_revision"] == predecessor_plan
+    )
+    material = reduce_event_comments(comments, workstream_id=workstream_id)
+    retirement = build_authenticated_retirement_proof(
+        predecessor_plan_revision=predecessor_plan,
+        observed_at=created_at, retired_writer_epoch=epoch,
+        provenance_event_ids=provenance_ids,
+        checkpoint_event_ids=checkpoint_ids,
+        authority=authority, selected_generation=selected, material=material,
+        predecessor_projection_contract=projection_review_contract(predecessor),
+    )
+
+    closure_heads = {
+        key: event for (kind, key), event in predecessor_heads.items()
+        if kind == "child_closure"
+    }
+    terminal_evidence: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for (kind, key), event in predecessor_heads.items():
+        if kind != "evidence_contract":
+            continue
+        owner = str(event["value"].get("owning_child", "")).upper()
+        if owner in closure_heads:
+            terminal_evidence.setdefault(owner, []).append((key, event))
+    if set(closure_heads) != set(terminal_evidence):
+        incomplete = sorted(set(closure_heads) - set(terminal_evidence))
+        raise WorkstreamGenerationError(
+            "generation_prepare_terminal_evidence_incomplete:"
+            + ",".join(incomplete)
+        )
+
+    complete_items: list[dict[str, Any]] = []
+    carried: list[dict[str, str]] = []
+    staged: list[dict[str, Any]] = []
+    computed: list[dict[str, str]] = []
+    terminal_evidence_keys = {
+        key for values in terminal_evidence.values() for key, _event in values
+    }
+    for (kind, key), event in sorted(predecessor_heads.items()):
+        identity = {"kind": kind, "key": key, "event_id": event["event_id"]}
+        if (kind, key) == ("source", "root"):
+            complete_items.append({"kind": kind, "key": key,
+                                   "value": deepcopy(target_source)})
+            carried.append({**identity, "mode": "replaced_by_exact_target_source"})
+        elif kind == "disposition":
+            computed.append({**identity, "mode": "computed_from_verified_remote_head"})
+        elif kind == "child_closure":
+            staged.append({**identity, "phase": "terminal_child_closure_repair"})
+        elif kind == "evidence_contract":
+            value = deepcopy(event["value"])
+            value["plan_revision"] = target_plan
+            value.pop("predecessor_closure_authority", None)
+            complete_items.append({"kind": kind, "key": key, "value": value})
+            carried.append({
+                **identity,
+                "mode": (
+                    "predecessor_terminal_evidence_seed"
+                    if key in terminal_evidence_keys else "plan_rebound_exact_value_copy"
+                ),
+            })
+        else:
+            complete_items.append({"kind": kind, "key": key,
+                                   "value": deepcopy(event["value"])})
+            carried.append({**identity, "mode": "exact_value_copy"})
+
+    terminal_stage: dict[str, Any] | None = None
+    phase = "complete_projection"
+    manifest: dict[str, Any]
+    if closure_heads:
+        seed_items = [
+            deepcopy(item) for item in complete_items
+            if item["kind"] in {"scope", "source", "provenance"}
+            or (
+                item["kind"] == "evidence_contract"
+                and item["key"] in terminal_evidence_keys
+            )
+        ]
+        scope = next(
+            item["value"] for item in seed_items
+            if (item["kind"], item["key"]) == ("scope", "root")
+        )
+        seeds: list[dict[str, Any]] = []
+        for child_id in sorted(closure_heads):
+            matches = [
+                child for child in graph.get("children", [])
+                if str(child.get("identifier", "")).upper() == child_id
+            ]
+            if len(matches) != 1:
+                raise WorkstreamGenerationError(
+                    f"generation_prepare_terminal_child_ambiguous:{child_id}"
+                )
+            readback = terminal_child_readback(matches[0])
+            seeds.append({
+                "child_identifier": child_id,
+                "child_issue_id": readback["child_issue_id"],
+                "expected_child_readback_sha256": canonical_digest(readback),
+                "expected_assignee_id": readback["assignee_id"],
+                "evidence_keys": sorted(
+                    key for key, _event in terminal_evidence[child_id]
+                ),
+            })
+        desired_contracts = {
+            item["key"]: item["value"] for item in seed_items
+            if item["kind"] == "evidence_contract"
+        }
+        binding, _authorities = terminal_child_evidence_seed_predecessor_contract(
+            graph, target, comments, workstream_id=workstream_id,
+            predecessor_plan_revision=predecessor_plan,
+            desired_scope=scope, seeds=seeds,
+            desired_contracts=desired_contracts,
+        )
+        empty_contract = _contract_from_heads(
+            0, {}, legacy_event_ids=[], legacy_events_sha256=None,
+            quarantine_count=0, quarantine_sha256=_value_digest([]),
+        )
+        seed_manifest = {
+            **empty_contract, "projection": seed_items, "retirements": [],
+            "terminal_child_evidence_seeds": seeds,
+            "terminal_child_evidence_seed_predecessor": binding,
+        }
+        seed_identities = {
+            (item["kind"], item["key"]) for item in seed_items
+        } | {("disposition", "root")}
+        seed_events = tuple(
+            event for event in target.events
+            if (event["kind"], event["key"]) in seed_identities
+        )
+        seed_target = SimpleNamespace(
+            revision=len(seed_events), events=seed_events,
+            remote_ids=getattr(target, "remote_ids", {}),
+            snapshot=deepcopy(target.snapshot),
+        )
+        normalized_seed = prepare_terminal_child_evidence_seeds(
+            seed_manifest, graph, seed_target, remote_head=remote_head,
+            comments=comments,
+        )
+        seed_values = {
+            (item["kind"], item["key"]): item["value"]
+            for item in normalized_seed["projection"]
+        }
+        allowed_seed = (
+            set(seed_values)
+            | {(item["kind"], item["key"]) for item in complete_items}
+            | {("child_closure", child_id) for child_id in closure_heads}
+            | {("disposition", "root")}
+        )
+        if not set(target_heads).issubset(allowed_seed):
+            unexpected = sorted(set(target_heads) - allowed_seed)
+            raise WorkstreamGenerationError(
+                "generation_prepare_noncanonical_target_prefix:"
+                + ",".join(f"{kind}:{key}" for kind, key in unexpected)
+            )
+        seed_satisfied = all(
+            identity in target_heads
+            and target_heads[identity]["value"] == value
+            for identity, value in seed_values.items()
+        ) and ("disposition", "root") in target_heads
+        if not seed_satisfied:
+            phase = "terminal_evidence_seed"
+            manifest = normalized_seed
+            terminal_stage = {
+                "state": "terminal_evidence_seed_required",
+                "children": [seed["child_identifier"] for seed in seeds],
+            }
+        else:
+            repairs: list[dict[str, Any]] = []
+            for seed in seeds:
+                child_id = seed["child_identifier"]
+                approved = sorted([
+                    {
+                        "key": key, "event_id": event["event_id"],
+                        "value_sha256": canonical_digest(event["value"]),
+                    }
+                    for (kind, key), event in target_heads.items()
+                    if kind == "evidence_contract"
+                    and event["value"].get("owning_child") == child_id
+                ], key=lambda item: (item["key"], item["event_id"]))
+                if [item["key"] for item in approved] != seed["evidence_keys"]:
+                    raise WorkstreamGenerationError(
+                        f"generation_prepare_target_evidence_changed:{child_id}"
+                    )
+                repairs.append({
+                    "child_identifier": child_id,
+                    "child_issue_id": seed["child_issue_id"],
+                    "expected_child_readback_sha256": seed[
+                        "expected_child_readback_sha256"
+                    ],
+                    "expected_assignee_id": seed["expected_assignee_id"],
+                    "approved_evidence_heads": approved,
+                })
+            repair_manifest = {
+                **projection_review_contract(target),
+                "projection": [
+                    {"kind": kind, "key": key,
+                     "value": deepcopy(event["value"])}
+                    for (kind, key), event in sorted(target_heads.items())
+                    if kind != "disposition"
+                ],
+                "retirements": [], "terminal_child_repairs": repairs,
+            }
+            normalized_repair = prepare_terminal_child_repairs(
+                repair_manifest, graph, target,
+            )
+            repair_values = {
+                (item["kind"], item["key"]): item["value"]
+                for item in normalized_repair["projection"]
+            }
+            repair_satisfied = all(
+                identity in target_heads
+                and target_heads[identity]["value"] == value
+                for identity, value in repair_values.items()
+            )
+            if not repair_satisfied:
+                phase = "terminal_closure_repair"
+                manifest = normalized_repair
+                terminal_stage = {
+                    "state": "terminal_closure_repair_required",
+                    "children": [seed["child_identifier"] for seed in seeds],
+                }
+            else:
+                terminal_stage = {
+                    "state": "terminal_children_carried",
+                    "children": [seed["child_identifier"] for seed in seeds],
+                }
+                current_values = {
+                    (kind, key): event["value"]
+                    for (kind, key), event in target_heads.items()
+                    if kind != "disposition"
+                }
+                desired_values = {
+                    (item["kind"], item["key"]): item["value"]
+                    for item in complete_items
+                }
+                # Target closures are derived from authenticated live state;
+                # they replace predecessor closure values in the final set.
+                desired_values.update({
+                    identity: value for identity, value in current_values.items()
+                    if identity[0] == "child_closure"
+                })
+                allowed_final = set(desired_values) | {("disposition", "root")}
+                if not set(target_heads).issubset(allowed_final):
+                    unexpected = sorted(set(target_heads) - allowed_final)
+                    raise WorkstreamGenerationError(
+                        "generation_prepare_noncanonical_target_prefix:"
+                        + ",".join(f"{kind}:{key}" for kind, key in unexpected)
+                    )
+                manifest = {
+                    **projection_review_contract(target),
+                    "projection": [
+                        {"kind": kind, "key": key, "value": deepcopy(value)}
+                        for (kind, key), value in sorted(desired_values.items())
+                    ],
+                    "retirements": [],
+                }
+                if all(
+                    identity in current_values and current_values[identity] == value
+                    for identity, value in desired_values.items()
+                ) and disposition_matches_remote_head:
+                    phase = "activation_ready"
+    else:
+        desired_values = {
+            (item["kind"], item["key"]): item["value"]
+            for item in complete_items
+        }
+        allowed = set(desired_values) | {("disposition", "root")}
+        if not set(target_heads).issubset(allowed) or any(
+            identity in target_heads
+            and target_heads[identity]["value"] != desired_values[identity]
+            for identity in set(target_heads) & set(desired_values)
+        ):
+            raise WorkstreamGenerationError(
+                "generation_prepare_noncanonical_target_prefix"
+            )
+        manifest = {
+            **projection_review_contract(target),
+            "projection": complete_items, "retirements": [],
+        }
+        if all(
+            identity in target_heads and target_heads[identity]["value"] == value
+            for identity, value in desired_values.items()
+        ) and disposition_matches_remote_head:
+            phase = "activation_ready"
+    _reviewed_manifest(manifest)
+
+    classified = {
+        (item["kind"], item["key"])
+        for item in [*carried, *staged, *computed]
+    }
+    if classified != set(predecessor_heads):
+        omitted = sorted(set(predecessor_heads) - classified)
+        extra = sorted(classified - set(predecessor_heads))
+        raise WorkstreamGenerationError(
+            "generation_prepare_active_key_classification_incomplete:"
+            f"omitted={omitted}:extra={extra}"
+        )
+    contract = {
+        "schema_version": 1,
+        "workstream_id": workstream_id,
+        "created_at": created_at,
+        "authenticated_route": deepcopy(authority),
+        "source": deepcopy(target_source),
+        "native_transition": {
+            "operation": "reopen",
+            "target_state": deepcopy(started_state),
+        },
+        "remote_head": remote_head,
+        "generation": {
+            "from_plan_revision": predecessor_plan,
+            "target_plan_revision": target_plan,
+            "activation_epoch": epoch,
+            "previous_control_event_id": selected["transition_tip_event_id"],
+        },
+        "frontiers": {
+            "material_revision": material.revision,
+            "predecessor_projection": projection_review_contract(predecessor),
+            "target_projection": projection_review_contract(target),
+            "predecessor_checkpoint_event_ids": checkpoint_ids,
+        },
+        "retirement_proof": retirement,
+        "projection_preview": {
+            "apply": False,
+            "writes_performed": 0,
+            "manifest": manifest,
+            "active_key_accounting": {
+                "carried": carried, "staged": staged, "computed": computed,
+            },
+            "terminal_child_stage": terminal_stage,
+            "phase": phase,
+            "next_gate": {
+                "terminal_evidence_seed": "review_and_apply_terminal_evidence_seed",
+                "terminal_closure_repair": "review_and_apply_terminal_closure_repair",
+                "complete_projection": "review_and_apply_target_projection",
+                "activation_ready": "preview_generation_activation",
+            }[phase],
+        },
+    }
+    return {**contract, "contract_sha256": _digest(contract)}
+
+
+def validate_activation_operator_contract(
+    contract: dict[str, Any], *, source: dict[str, str], workstream_id: str,
+    authority: dict[str, str], comments: list[dict[str, Any]],
+    graph: dict[str, Any], description_plan_revision: str | None,
+    created_at: str, remote_head: str | None,
+) -> dict[str, Any]:
+    """Require the exact live activation-ready prepare output at CLI activation."""
+    from workstream_root_transition import validate_operator_contract
+
+    if not isinstance(contract, dict):
+        raise WorkstreamGenerationError(
+            "generation_operator_contract_invalid"
+        )
+    native = (graph.get("root") or {}).get("state") or {}
+    started_state = {
+        "id": native.get("id"), "name": native.get("name"),
+        "type": native.get("type"), "team_id": authority["team_id"],
+    }
+    target_state = (
+        ((contract.get("native_transition") or {}).get("target_state") or {})
+        if isinstance(contract, dict) else {}
+    )
+    if (
+        str(native.get("type", "")).lower() != "started"
+        or started_state != target_state
+        or created_at != contract.get("created_at")
+        or (remote_head is not None and remote_head != contract.get("remote_head"))
+    ):
+        raise WorkstreamGenerationError(
+            "generation_operator_contract_native_or_invocation_mismatch"
+        )
+    authorization = validate_operator_contract(
+        contract, source=source, token=workstream_id,
+        authority=authority, comments=comments, graph=graph,
+        started_state=started_state,
+        description_plan_revision=description_plan_revision,
+    )
+    return {
+        "authorization": authorization,
+        "retirement_proof": deepcopy(contract["retirement_proof"]),
+        "remote_head": contract["remote_head"],
+    }
 
 
 def _validate_candidate_receipt(
@@ -253,13 +783,15 @@ def _validate_reservation(value: dict[str, Any]) -> None:
         "candidate_resume_sha256", "retirement", "created_at",
     }
     schema_version = value.get("schema_version")
-    if schema_version in {3, 4}:
+    if schema_version in {3, 4, 5}:
         fields.add("native_root_sha256")
-    if schema_version == 4:
+    if schema_version in {4, 5}:
         fields.update({"activation_checkpoint", "remote_head"})
+    if schema_version == 5:
+        fields.add("operator_contract_sha256")
     if (
         set(value) != fields
-        or schema_version not in {2, 3, 4}
+        or schema_version not in {2, 3, 4, 5}
         or not RESERVATION_ID.fullmatch(str(value.get("reservation_id", "")))
         or value.get("mode") not in {"bootstrap", "activate"}
         or not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", str(value.get("workstream_id", "")))
@@ -291,11 +823,11 @@ def _validate_reservation(value: dict[str, Any]) -> None:
         )
         or not isinstance(value.get("created_at"), str) or not value["created_at"]
         or (
-            schema_version in {3, 4}
+            schema_version in {3, 4, 5}
             and not HEX64.fullmatch(str(value.get("native_root_sha256", "")))
         )
         or (
-            schema_version == 4
+            schema_version in {4, 5}
             and (
                 (value.get("activation_checkpoint") is not None
                  and not isinstance(value.get("activation_checkpoint"), dict))
@@ -308,6 +840,10 @@ def _validate_reservation(value: dict[str, Any]) -> None:
                     != (value.get("remote_head") is None))
             )
         )
+        or (
+            schema_version == 5
+            and not HEX64.fullmatch(str(value.get("operator_contract_sha256", "")))
+        )
     ):
         raise WorkstreamGenerationError("invalid_generation_reservation")
     previous = value["previous_control_event_id"]
@@ -316,7 +852,7 @@ def _validate_reservation(value: dict[str, Any]) -> None:
     _validate_retirement(
         value["retirement"], value["from_plan_revision"], value["activation_epoch"],
     )
-    if schema_version == 4 and value["activation_checkpoint"] is not None:
+    if schema_version in {4, 5} and value["activation_checkpoint"] is not None:
         try:
             validate_checkpoint(value["activation_checkpoint"])
         except (TypeError, ValueError) as error:
@@ -757,7 +1293,7 @@ def pending_generation_reservations(
                 ), None)
                 if (
                     reservation is not None
-                    and (reservation.get("schema_version") != 4
+                    and (reservation.get("schema_version") not in {4, 5}
                          or reservation.get("mode") == "bootstrap"
                          or token in finalized_tokens)
                 ):
@@ -957,6 +1493,7 @@ def assert_generation_write_authority(
 CandidateLoader = Callable[[str], dict[str, Any]]
 NativeRootLoader = Callable[[], dict[str, Any]]
 SourceLoader = Callable[[], dict[str, str]]
+OperatorValidator = Callable[[], dict[str, Any]]
 
 
 def native_root_activation_proof(
@@ -1014,6 +1551,8 @@ class GenerationTransport:
         legacy_description_plan_revision: str | None = None,
         native_root_loader: NativeRootLoader | None = None,
         source_loader: SourceLoader | None = None,
+        operator_validator: OperatorValidator | None = None,
+        operator_contract_sha256: str | None = None,
     ):
         self.client = client
         self.issue_id = issue_id
@@ -1023,7 +1562,87 @@ class GenerationTransport:
         self.legacy_description_plan_revision = legacy_description_plan_revision
         self.native_root_loader = native_root_loader
         self.source_loader = source_loader
+        self.operator_validator = operator_validator
+        if operator_contract_sha256 is not None and not HEX64.fullmatch(
+            operator_contract_sha256
+        ):
+            raise WorkstreamGenerationError("generation_operator_contract_digest_invalid")
+        self.operator_contract_sha256 = operator_contract_sha256
         self._capability_checked = False
+
+    def _validate_operator(self, retirement: dict[str, Any]) -> None:
+        if self.operator_validator is None:
+            return
+        authorization = self.operator_validator()
+        if (
+            not isinstance(authorization, dict)
+            or authorization.get("retirement_proof") != retirement
+        ):
+            raise WorkstreamGenerationError(
+                "generation_operator_contract_live_state_drift"
+            )
+
+    def _pending_operator_replay(
+        self, comments: list[dict[str, Any]], *, target_plan_revision: str,
+        retirement: dict[str, Any], created_at: str,
+    ) -> bool:
+        """Recognize only a seal reserved by this exact reviewed contract."""
+        if self.operator_contract_sha256 is None:
+            return False
+        selected = select_plan_generation(
+            comments, workstream_id=self.workstream_id,
+            description_plan_revision=self.legacy_description_plan_revision,
+            authenticated_route=self.authority,
+        )
+        from_plan = selected["plan_revision"]
+        if from_plan == target_plan_revision:
+            return False
+        epoch = (
+            selected["activation_epoch"]
+            if selected["activation_epoch"] is not None else -1
+        ) + 1
+        reservation = self._matching_reservation(
+            comments, mode="activate", from_plan=from_plan,
+            to_plan=target_plan_revision, epoch=epoch,
+            previous_control=selected["transition_tip_event_id"],
+            retirement=retirement, created_at=created_at,
+        )
+        if reservation is None:
+            return False
+        if (
+            reservation.get("schema_version") != 5
+            or reservation.get("operator_contract_sha256")
+            != self.operator_contract_sha256
+        ):
+            raise WorkstreamGenerationError(
+                "generation_pending_operator_contract_mismatch"
+            )
+        target_state = self._states(comments, target_plan_revision)[0]
+        seals = [
+            event for event in target_state.events
+            if event["kind"] == "generation_candidate_seal"
+            and event["key"] == reservation["reservation_id"]
+        ]
+        if not seals:
+            return False
+        if len(seals) != 1:
+            raise WorkstreamGenerationError("generation_pending_candidate_seal_ambiguous")
+        value = seals[0]["value"]
+        if (
+            value.get("reservation_sha256") != reservation["reservation_sha256"]
+            or value.get("retirement") != retirement
+            or value.get("source") != reservation["source"]
+            or value.get("previous_control_event_id")
+            != reservation["previous_control_event_id"]
+            or value.get("activation_epoch") != reservation["activation_epoch"]
+            or (value.get("from") or {}).get("plan_revision") != from_plan
+            or (value.get("to") or {}).get("plan_revision")
+            != target_plan_revision
+        ):
+            raise WorkstreamGenerationError(
+                "generation_pending_candidate_seal_mismatch"
+            )
+        return True
 
     def _native_root_proof(
         self, expected_sha256: str | None, *, require_reviewed: bool,
@@ -1156,6 +1775,44 @@ class GenerationTransport:
             raise WorkstreamGenerationError(
                 "generation_retirement_frontier_mismatch"
             )
+        if retirement.get("schema_version") == 2:
+            from workstream_projection import projection_review_contract
+
+            quiescence = retirement.get("authenticated_quiescence") or {}
+            selected = select_plan_generation(
+                comments, workstream_id=self.workstream_id,
+                description_plan_revision=self.legacy_description_plan_revision,
+                authenticated_route=self.authority,
+            )
+            material = reduce_event_comments(
+                comments, workstream_id=self.workstream_id,
+            )
+            expected_quiescence = {
+                "schema_version": 1,
+                "observed_at": retirement["retired_at"],
+                "authenticated_route": self.authority,
+                "selected_generation": {
+                    "plan_revision": selected["plan_revision"],
+                    "activation_epoch": selected["activation_epoch"],
+                    "transition_tip_event_id": selected[
+                        "transition_tip_event_id"
+                    ],
+                },
+                "material_revision": material.revision,
+                "material_event_ids": sorted(
+                    event.event_id for event in material.events
+                ),
+                "checkpoint_event_ids": expected_predecessor_checkpoints,
+                "predecessor_projection": projection_review_contract(from_state),
+                "ordering": (
+                    "activation_reservation_must_follow_exact_frontiers_and_blocks_"
+                    "upgraded_predecessor_writers"
+                ),
+            }
+            if quiescence != expected_quiescence:
+                raise WorkstreamGenerationError(
+                    "generation_retirement_quiescence_frontier_mismatch"
+                )
         return {
             "provenance_event_ids": expected_provenance_ids,
             "checkpoint_event_ids": expected_predecessor_checkpoints,
@@ -1201,6 +1858,7 @@ class GenerationTransport:
         native_root_sha256: str | None = None,
         activation_checkpoint: dict[str, Any] | None = None,
         remote_head: str | None = None,
+        operator_contract_sha256: str | None = None,
     ) -> dict[str, Any]:
         checkpoints = reduce_generation_checkpoint_comments(
             comments, workstream_id=self.workstream_id,
@@ -1230,7 +1888,10 @@ class GenerationTransport:
             from_state=from_state, checkpoints=checkpoints,
         )
         unsigned = {
-            "schema_version": (4 if native_root_sha256 is not None else 2),
+            "schema_version": (
+                5 if operator_contract_sha256 is not None
+                else (4 if native_root_sha256 is not None else 2)
+            ),
             "workstream_id": self.workstream_id,
             "authority": self.authority, "mode": mode,
             "from_plan_revision": from_plan, "to_plan_revision": to_plan,
@@ -1254,6 +1915,8 @@ class GenerationTransport:
             unsigned["native_root_sha256"] = native_root_sha256
             unsigned["activation_checkpoint"] = deepcopy(activation_checkpoint)
             unsigned["remote_head"] = remote_head
+        if operator_contract_sha256 is not None:
+            unsigned["operator_contract_sha256"] = operator_contract_sha256
         value = {**unsigned, "reservation_id": "wsgr_" + _digest(unsigned)[:32]}
         _validate_reservation(value)
         return value
@@ -1430,6 +2093,28 @@ class GenerationTransport:
                     authenticated_route=self.authority,
                 )
                 event = matching[0]
+                reservation_matches = [
+                    item for item in reduce_generation_reservations(
+                        comments, workstream_id=self.workstream_id,
+                        authenticated_route=self.authority,
+                    )
+                    if item["reservation_id"]
+                    == event["value"]["reservation_id"]
+                    and item["reservation_sha256"]
+                    == event["value"]["reservation_sha256"]
+                ]
+                if len(reservation_matches) > 1:
+                    raise WorkstreamGenerationError(
+                        "generation_historical_reservation_ambiguous"
+                    )
+                if reservation_matches and (
+                    reservation_matches[0].get("schema_version") == 5
+                    and reservation_matches[0].get("operator_contract_sha256")
+                    != self.operator_contract_sha256
+                ):
+                    raise WorkstreamGenerationError(
+                        "generation_historical_operator_contract_mismatch"
+                    )
                 if validate_activation_inputs:
                     carried = event["value"].get("activation_checkpoint")
                     if carried != expected_activation_checkpoint:
@@ -1737,6 +2422,11 @@ class GenerationTransport:
             )
             if replay:
                 return replay
+        if not self._pending_operator_replay(
+            comments, target_plan_revision=target_plan_revision,
+            retirement=retirement, created_at=created_at,
+        ):
+            self._validate_operator(retirement)
         selected = select_plan_generation(
             comments, workstream_id=self.workstream_id,
             description_plan_revision=self.legacy_description_plan_revision,
@@ -1964,6 +2654,11 @@ class GenerationTransport:
                     "two_phase_finalization": finalization,
                     "final_candidate": prepared_post["receipt"],
                 }
+        if not self._pending_operator_replay(
+            comments, target_plan_revision=target_plan_revision,
+            retirement=retirement, created_at=created_at,
+        ):
+            self._validate_operator(retirement)
         selected = select_plan_generation(
             comments, workstream_id=self.workstream_id,
             description_plan_revision=self.legacy_description_plan_revision,
@@ -2050,6 +2745,7 @@ class GenerationTransport:
                 ),
                 activation_checkpoint=activation_checkpoint,
                 remote_head=remote_head,
+                operator_contract_sha256=self.operator_contract_sha256,
             )
             stored = self._append_reservation(reservation)
         else:
@@ -2062,7 +2758,7 @@ class GenerationTransport:
             raise WorkstreamGenerationError(
                 "generation_reservation_native_root_proof_mismatch"
             )
-        if reservation.get("schema_version") == 4 and (
+        if reservation.get("schema_version") in {4, 5} and (
             reservation.get("activation_checkpoint") != activation_checkpoint
             or reservation.get("remote_head") != remote_head
             or reservation.get("source") != target_source
@@ -2073,6 +2769,11 @@ class GenerationTransport:
             )
         comments = self._comments()
         self._assert_reservation_live(comments, reservation)
+        if not self._pending_operator_replay(
+            comments, target_plan_revision=target_plan_revision,
+            retirement=retirement, created_at=created_at,
+        ):
+            self._validate_operator(retirement)
         from_state, to_state = self._states(comments, from_plan, target_plan_revision)
         selected_before_seal = select_plan_generation(
             comments, workstream_id=self.workstream_id,
@@ -2213,7 +2914,7 @@ class GenerationTransport:
                  allowed_generation_reservation_id=reservation["reservation_id"],
                  allow_retired_generation_control=True)
         after = self._comments()
-        if reservation.get("schema_version") == 4:
+        if reservation.get("schema_version") in {4, 5}:
             self._assert_reservation_live(after, reservation)
             prepared = select_plan_generation(
                 after, workstream_id=self.workstream_id,
@@ -2611,18 +3312,41 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--linear-project-id")
     value.add_argument("--linear-endpoint", default="https://api.linear.app/graphql")
     commands = value.add_subparsers(dest="command", required=True)
-    for name in ("bootstrap", "activate"):
+    for name in ("bootstrap", "activate", "prepare"):
         command = commands.add_parser(name)
         command.add_argument("token")
-        command.add_argument("--plan-source", required=(name == "bootstrap"))
+        command.add_argument(
+            "--plan-source", required=(name in {"bootstrap", "prepare"})
+        )
         command.add_argument("--plan-identity")
         command.add_argument("--created-at", required=True)
         command.add_argument("--max-bytes", type=int, default=DEFAULT_RESUME_MAX_BYTES)
         command.add_argument("--max-items", type=int, default=100)
-        command.add_argument("--apply", action="store_true")
+        if name != "prepare":
+            command.add_argument("--apply", action="store_true")
+        else:
+            command.add_argument(
+                "--remote-head", required=True,
+                help="authenticated exact repository head for target disposition",
+            )
+            command.add_argument(
+                "--started-state-id", required=True,
+                help="reviewed Linear started-state UUID for native root reopen",
+            )
+            command.add_argument(
+                "--manifest-output",
+                help=(
+                    "atomically write the exact nested projection manifest for "
+                    "the next projection preview/apply"
+                ),
+            )
         if name == "activate":
+            command.add_argument(
+                "--operator-contract",
+                help="exact activation_ready JSON emitted by generation prepare",
+            )
             command.add_argument("--retirement-proof",
-                                 help="reviewed JSON file containing the durable retirement proof")
+                                 help=argparse.SUPPRESS)
             command.add_argument("--abort-reservation-id")
             command.add_argument("--abort-reservation-sha256")
             command.add_argument("--abort-reason")
@@ -2647,11 +3371,31 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
+        if args.command == "activate" and args.retirement_proof:
+            raise WorkstreamGenerationError(
+                "generation_legacy_retirement_proof_cannot_authorize_operator"
+            )
+        aborting = args.command == "activate" and args.abort_reservation_id
+        if not aborting and (
+            not args.plan_source
+            or (args.command == "activate" and not args.operator_contract)
+        ):
+            raise WorkstreamGenerationError(
+                "generation_candidate_cli_arguments_incomplete"
+            )
+        if (
+            args.command == "activate" and args.apply and not aborting
+            and not HEX64.fullmatch(str(args.expected_native_root_sha256 or ""))
+        ):
+            raise WorkstreamGenerationError(
+                "generation_activate_apply_requires_reviewed_native_root_proof"
+            )
         client, authority = _route_and_client(args)
         if args.command == "activate" and args.abort_reservation_id:
             if (
                 not args.apply or not args.abort_reservation_sha256
-                or not args.abort_reason or args.plan_source or args.retirement_proof
+                or not args.abort_reason or args.plan_source
+                or args.retirement_proof or args.operator_contract
             ):
                 raise WorkstreamGenerationError("invalid_generation_abort_cli")
             transport = GenerationTransport(
@@ -2666,9 +3410,79 @@ def main() -> int:
             json.dump(output, sys.stdout, ensure_ascii=False, sort_keys=True, indent=2)
             sys.stdout.write("\n")
             return 0
-        if not args.plan_source or (args.command == "activate" and not args.retirement_proof):
-            raise WorkstreamGenerationError("generation_candidate_cli_arguments_incomplete")
         source = plan_payload(args.plan_source, args.plan_identity or args.plan_source)["source"]
+        if args.command == "prepare":
+            state_result = client.execute(PREPARE_STARTED_STATE_QUERY, {
+                "teamId": authority["team_id"], "stateId": args.started_state_id,
+            })
+            state = state_result.get("workflowState") or {}
+            team = state_result.get("team") or {}
+            if (
+                team.get("id") != authority["team_id"]
+                or (team.get("organization") or {}).get("id")
+                != authority["workspace_id"]
+                or state.get("id") != args.started_state_id
+                or (state.get("team") or {}).get("id") != authority["team_id"]
+                or str(state.get("type", "")).lower() != "started"
+                or not isinstance(state.get("name"), str) or not state["name"]
+            ):
+                raise WorkstreamGenerationError(
+                    "generation_prepare_started_state_readback_mismatch"
+                )
+            started_state = {
+                "id": state["id"], "name": state["name"],
+                "type": state["type"], "team_id": authority["team_id"],
+            }
+            linear_transport = LinearGraphQLTransport(
+                client, team_id=authority["team_id"],
+                workspace_id=authority["workspace_id"],
+                project_id=authority["project_id"],
+            )
+            graph = linear_transport.snapshot_for_root(
+                args.token.upper(), include_description=True,
+                include_child_comments=True,
+            )
+            comments = LinearProjectionAdapter(
+                client, issue_id=args.token.upper(),
+                workstream_id=args.token.upper(),
+                plan_revision=source["sha256"], **authority,
+            )._comments()
+            output = prepare_generation_operator_contract(
+                comments=comments, graph=graph,
+                workstream_id=args.token.upper(), authority=authority,
+                description_plan_revision=graph["root"].get("plan_revision"),
+                target_source={
+                    "identity": source["identity"], "sha256": source["sha256"],
+                },
+                created_at=args.created_at,
+                remote_head=args.remote_head,
+                started_state=started_state,
+            )
+            if args.manifest_output:
+                destination = Path(args.manifest_output)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                encoded = json.dumps(
+                    output["projection_preview"]["manifest"],
+                    ensure_ascii=False, sort_keys=True, indent=2,
+                ) + "\n"
+                descriptor, temporary = tempfile.mkstemp(
+                    prefix=f".{destination.name}.", dir=destination.parent,
+                )
+                try:
+                    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                        handle.write(encoded)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary, destination)
+                except BaseException:
+                    try:
+                        os.unlink(temporary)
+                    except FileNotFoundError:
+                        pass
+                    raise
+            json.dump(output, sys.stdout, ensure_ascii=False, sort_keys=True, indent=2)
+            sys.stdout.write("\n")
+            return 0
         activation_checkpoint = None
         if args.command == "activate" and args.activation_checkpoint:
             if (
@@ -2695,8 +3509,53 @@ def main() -> int:
             workspace_id=authority["workspace_id"],
             project_id=authority["project_id"],
         )
-        initial_root_snapshot = linear_transport.snapshot_for_root(args.token.upper())
+        initial_root_snapshot = linear_transport.snapshot_for_root(
+            args.token.upper(), include_description=True,
+            include_child_comments=(args.command == "activate"),
+        )
         description_plan_revision = initial_root_snapshot["root"].get("plan_revision")
+        operator_contract = None
+        activation_operator_validator = None
+        if args.command == "activate":
+            with open(args.operator_contract, encoding="utf-8") as handle:
+                operator_contract = json.load(handle)
+
+            def activation_operator_validator() -> dict[str, Any]:
+                graph_before = linear_transport.snapshot_for_root(
+                    args.token.upper(), include_description=True,
+                    include_child_comments=True,
+                )
+                adapter = LinearProjectionAdapter(
+                    client, issue_id=args.token.upper(),
+                    workstream_id=args.token.upper(),
+                    plan_revision=source["sha256"], **authority,
+                )
+                comments_before = adapter._comments()
+                graph_after = linear_transport.snapshot_for_root(
+                    args.token.upper(), include_description=True,
+                    include_child_comments=True,
+                )
+                comments_after = adapter._comments()
+                graph_fence = linear_transport.snapshot_for_root(
+                    args.token.upper(), include_description=True,
+                    include_child_comments=True,
+                )
+                if (
+                    graph_before != graph_after or graph_after != graph_fence
+                    or comments_before != comments_after
+                ):
+                    raise WorkstreamGenerationError(
+                        "generation_operator_snapshot_changed_during_read"
+                    )
+                return validate_activation_operator_contract(
+                    operator_contract, source={
+                        "identity": source["identity"], "sha256": source["sha256"],
+                    }, workstream_id=args.token.upper(), authority=authority,
+                    comments=comments_after, graph=graph_fence,
+                    description_plan_revision=graph_fence["root"].get("plan_revision"),
+                    created_at=args.created_at, remote_head=args.remote_head,
+                )
+
         transport = GenerationTransport(
             client, issue_id=args.token.upper(), workstream_id=args.token.upper(),
             authority=authority, candidate_loader=loader,
@@ -2711,11 +3570,18 @@ def main() -> int:
                 )["source"])
                 if args.command == "activate" else None
             ),
+            operator_validator=activation_operator_validator,
+            operator_contract_sha256=(
+                _digest(operator_contract)
+                if isinstance(operator_contract, dict) else None
+            ),
         )
         retirement = None
         if args.command == "activate":
-            with open(args.retirement_proof, encoding="utf-8") as handle:
-                retirement = json.load(handle)
+            retirement = (
+                operator_contract.get("retirement_proof")
+                if isinstance(operator_contract, dict) else None
+            )
         if not args.apply and args.command == "activate":
             output = transport.preview_activate(
                 target_plan_revision=source["sha256"],

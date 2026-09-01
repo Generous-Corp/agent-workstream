@@ -3451,6 +3451,117 @@ def reconcile_required_projection(
     return result
 
 
+class ProjectionPreviewAdapter:
+    """In-memory append adapter used to prove an exact projection batch.
+
+    It starts from one authenticated live comment snapshot and implements only
+    the projection methods used by ``reconcile_required_projection``.  No
+    GraphQL client is retained, so preview cannot accidentally mutate Linear.
+    """
+
+    def __init__(
+        self, adapter: LinearProjectionAdapter,
+        comments: list[dict[str, Any]],
+    ) -> None:
+        self.workstream_id = adapter.workstream_id
+        self.plan_revision = adapter.plan_revision
+        self.workspace_id = adapter.workspace_id
+        self.team_id = adapter.team_id
+        self.project_id = adapter.project_id
+        self.root_issue_id = adapter.root_issue_id
+        self._authority = deepcopy(adapter.authority)
+        self._comments = deepcopy(comments)
+        self.receipts: list[dict[str, Any]] = []
+
+    @property
+    def authority(self) -> dict[str, str]:
+        return deepcopy(self._authority)
+
+    def state(self) -> Any:
+        return reduce_projection_comments(
+            self._comments, workstream_id=self.workstream_id,
+            expected_plan_revision=self.plan_revision,
+            authenticated_route=self.authority,
+        )
+
+    def append(self, event: dict[str, Any], **_fences: Any) -> dict[str, Any]:
+        before = self.state()
+        if event["expected_revision"] != before.revision:
+            raise LinearProjectionError("projection_preview_revision_mismatch")
+        remote_id = projection_slot_id(
+            self.workstream_id, self.plan_revision, before.revision,
+            self.authority,
+        )
+        body = encode_projection_comment(event)
+        self._comments.append({
+            "id": remote_id, "body": body,
+            "createdAt": event["created_at"], "updatedAt": event["created_at"],
+        })
+        receipt = {
+            "preview": True, "remote_id": remote_id,
+            "event_id": event["event_id"], "event": deepcopy(event),
+            "event_sha256": _value_digest(event),
+        }
+        self.receipts.append(receipt)
+        return receipt
+
+    def activate_v2(
+        self, *, created_at: str, expected_revision: int | None = None,
+        expected_legacy_event_ids: list[str] | None = None,
+        expected_legacy_events_sha256: str | None = None,
+    ) -> dict[str, Any] | None:
+        before = self.state()
+        if any(event["schema_version"] == 2 for event in before.events) \
+                or not before.events:
+            return None
+        legacy_ids = [event["event_id"] for event in before.events]
+        legacy_sha256 = _value_digest(list(before.events))
+        if (
+            (expected_revision is not None and before.revision != expected_revision)
+            or (
+                expected_legacy_event_ids is not None
+                and legacy_ids != expected_legacy_event_ids
+            )
+            or (
+                expected_legacy_events_sha256 is not None
+                and legacy_sha256 != expected_legacy_events_sha256
+            )
+        ):
+            raise LinearProjectionError(
+                "projection_v2_activation_stale_reload_required"
+            )
+        event = build_projection_event(
+            workstream_id=self.workstream_id, kind="cas_activation", key="root",
+            value={
+                "legacy_digest_kind": "canonical-full-events-v1",
+                "legacy_event_ids": legacy_ids,
+                "legacy_events_sha256": legacy_sha256,
+            },
+            plan_revision=self.plan_revision,
+            expected_revision=before.revision, created_at=created_at,
+            authority=self.authority,
+        )
+        return self.append(event)
+
+
+def projection_preview_sha256(result: dict[str, Any]) -> str:
+    """Bind the exact deterministic zero-write result reviewed before apply."""
+    return _value_digest(result)
+
+
+def require_matching_projection_preview(
+    *, created_at: str | None, expected_sha256: str | None,
+    observed_sha256: str,
+) -> None:
+    if (
+        not isinstance(created_at, str) or not created_at
+        or expected_sha256 != observed_sha256
+    ):
+        raise LinearProjectionError(
+            "projection_apply_requires_matching_reviewed_preview"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("token")
@@ -3468,8 +3579,29 @@ def main() -> int:
     )
     parser.add_argument("--config")
     parser.add_argument("--linear-endpoint", default="https://api.linear.app/graphql")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--preview", action="store_true",
+        help="validate and simulate the exact batch without any Linear write",
+    )
+    mode.add_argument(
+        "--apply", action="store_true",
+        help="apply a batch previously reviewed with --preview",
+    )
+    parser.add_argument(
+        "--created-at",
+        help="exact reviewed UTC timestamp; required for safe --apply",
+    )
+    parser.add_argument(
+        "--expected-preview-sha256",
+        help="exact preview digest required for safe --apply",
+    )
     args = parser.parse_args()
     try:
+        if args.apply and (not args.created_at or not args.expected_preview_sha256):
+            raise LinearProjectionError(
+                "projection_apply_requires_matching_reviewed_preview"
+            )
         token = extract_token(args.token)
         manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
         authenticated_source = plan_payload(args.plan_source, args.plan_identity)["source"]
@@ -3680,6 +3812,42 @@ def main() -> int:
                 authenticated_route=route,
             )
 
+        created_at = args.created_at or datetime.now(
+            timezone.utc
+        ).isoformat().replace("+00:00", "Z")
+        preview_adapter = ProjectionPreviewAdapter(adapter, comments)
+        preview_result = reconcile_required_projection(
+            preview_adapter, snapshot, manifest, remote_head=args.remote_head,
+            created_at=created_at,
+            authenticated_source=authenticated_source,
+            relation_target_resolver=resolver,
+            terminal_child_fence=terminal_child_fence,
+            projection_input_fence=projection_input_fence,
+            checkpoint_fence=checkpoint_fence,
+            projection_comments=comments,
+            projection_input_snapshot=projection_input_graph,
+            expected_projection_input_frontier=(
+                expected_projection_input_frontier
+            ),
+            legacy_unresolved_relation_heads=legacy_unresolved_relation_heads,
+        )
+        preview = {
+            "apply": False, "writes_performed": 0,
+            "created_at": created_at,
+            "simulated_result": preview_result,
+        }
+        preview_digest = projection_preview_sha256(preview)
+        preview["preview_sha256"] = preview_digest
+        if args.preview:
+            json.dump(preview, sys.stdout, ensure_ascii=False, sort_keys=True, indent=2)
+            sys.stdout.write("\n")
+            return 0
+        require_matching_projection_preview(
+            created_at=args.created_at,
+            expected_sha256=args.expected_preview_sha256,
+            observed_sha256=preview_digest,
+        )
+
         description_before_write = transport.snapshot_for_root(
             token, include_description=True,
         )["root"].get("description")
@@ -3688,7 +3856,7 @@ def main() -> int:
         )
         result = reconcile_required_projection(
             adapter, snapshot, manifest, remote_head=args.remote_head,
-            created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            created_at=created_at,
             authenticated_source=authenticated_source,
             relation_target_resolver=resolver,
             terminal_child_fence=terminal_child_fence,
@@ -3702,6 +3870,7 @@ def main() -> int:
             legacy_unresolved_relation_heads=legacy_unresolved_relation_heads,
         )
         result["canonical_description_fence"] = description_fence
+        result["reviewed_preview_sha256"] = preview_digest
         # Double-collect graph and comments so a concurrent root/child/checkpoint
         # mutation cannot be certified from a mixed pre/post-write snapshot.
         final_comments = LinearCommentEventAdapter(

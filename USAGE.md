@@ -90,7 +90,7 @@ so any change after review refuses before writing.
 | Resume elsewhere | `Resume GEN-123 and reconcile live state before continuing.` |
 | Change the work | `Record this new requirement in GEN-123 and continue.` |
 | Inspect progress | `Show status, blockers, and changes since the last checkpoint for GEN-123.` |
-| Hand off safely | `Checkpoint GEN-123 with exact location, head, evidence, and next action.` |
+| Agent/session handoff | `Checkpoint GEN-123 with exact location, head, evidence, and next action.` |
 | Attempt completion | `Adversarially verify whether GEN-123 can close.` |
 
 The Linear URL may be used wherever the stable token is accepted. Starting from
@@ -99,19 +99,26 @@ other machines must be able to retrieve the original artifact.
 
 ### Continue with the token
 
-For a handle/URL/tab-title resume request, with or without additional
-instructions, the agent's first command is:
+For a cold/fresh handle request, status check, or consequential tracking or
+lifecycle boundary, the agent's first command is:
 
 ```sh
 python3 "<absolute directory of the SKILL.md loaded for this turn>/scripts/workstream_resume.py" GEN-123
 ```
 
-The agent substitutes the runtime-supplied loaded skill path directly; it does
-not search the filesystem, inspect cwd/environment, probe `PATH`, or execute the
-placeholder. Initial recovery always omits `--include-history` and runs before
-memory, worktree, repository, or PR inspection. A second full-history call is
-reserved for the point when an explicitly requested audit or closure pass
-actually begins.
+The cold path substitutes the runtime-supplied loaded skill path directly; it
+does not search the filesystem, inspect cwd/environment, probe `PATH`, or
+execute the placeholder. Initial recovery always omits `--include-history`
+and runs before memory, worktree, repository, or PR inspection.
+
+A warm `continue` nudge does not repeat resume when the exact same provider
+session and workstream retain the prior full route, source, generation,
+frontiers, worktree, repository head, and Shipyard binding. It may continue
+authorized implementation and exact-head Shipyard delivery handoff or landing while buffering
+tracking deltas locally. Live resume and reconciliation are still required
+before any Linear mutation, lifecycle/ownership transition, agent/session
+handoff, or closure/certification. A second full-history call is reserved for
+the point when an explicitly requested audit or closure pass actually begins.
 
 ## Deterministic helpers
 
@@ -156,6 +163,21 @@ plugins/workstream/bin/workstreamctl shipyard-profile GEN-123 \
 Those are secondary repository-local CLI examples; installation does not add
 `workstreamctl` to global `PATH`.
 
+If Linear has a narrow transient availability failure, a current active owner
+may continue local/provider implementation and independently fenced exact-head
+Shipyard delivery handoff or landing when the same warm provider session
+retains its prior full authority and every exact execution binding. This is agent workflow
+policy, not a daemon-enforced grant or reusable cache. New sessions and auth,
+semantic, generation, budget, or ambiguous post-write failures still stop.
+Material tracking deltas remain in the local outbox, while Linear mutations,
+lifecycle changes, closure, and resume or agent/session handoff certification wait for fresh
+full-resume reconciliation. See **Transient tracking outage** in the skill.
+
+A **Shipyard delivery handoff** means exact-head custody submission to
+Shipyard under its own fences and is allowed. An **agent/session handoff**
+means transferring workstream execution authority to another agent/session
+and requires live recovery and certification.
+
 `shipyard-profile` derives provider and session from the latest acknowledged
 checkpoint, performs a fresh authenticated full-authority resume, validates the
 exact clean GitHub worktree and active Shipyard lineage, and writes a new
@@ -191,9 +213,19 @@ routing detail, and older history with counts/digests. Add `--include-history`
 for an audit or closure pass; explicit
 byte/item caps still fail loudly rather than truncating required current state.
 Full-authority output requires the append-only scope, source, provenance, and
-attach/successor disposition projection. A reviewed projection manifest can be
-applied idempotently with `workstreamctl projection GEN-123 manifest.json
---remote-head <40-or-64-hex-head> --plan-source ./PLAN.md --plan-identity <URL>`;
+attach/successor disposition projection. Before replacing a plan, use
+`workstreamctl generation prepare GEN-123 --plan-source ./PLAN.md
+--plan-identity <URL> --remote-head <head> --created-at <UTC>
+--started-state-id <started-state-uuid>
+--manifest-output ./target-projection.json > generation-review.json` to derive a
+zero-write, all-keys-accounted target manifest and retirement proof. Terminal
+evidence and closure are explicit staged phases; rerunning the same command
+after each apply derives the next manifest until `activation_ready`. Only the
+exact authenticated prefix of the prior phase is accepted. Preview a reviewed projection
+with `workstreamctl projection GEN-123 manifest.json --remote-head <head>
+--plan-source ./PLAN.md --created-at <UTC> --preview`, then apply the unchanged
+batch with `--apply --expected-preview-sha256 <preview-sha256>` and the same
+timestamp. A flagless invocation refuses before live access;
 the manifest fences the exact current projection revision and active
 key/event/value-digest set. Retirement is explicit and names the reviewed head;
 omission never deletes live state. A stale review refuses before writing. A
@@ -201,6 +233,19 @@ positional JSON snapshot to `workstreamctl resume` is always inspection-only
 and therefore requires `--inspection-only`; only a live authenticated Linear
 read can produce full-authority output. The command writes only reviewed
 changes and verifies a complete live readback.
+
+Before a reviewed generation activation, two native root mutations have a
+supported, separately fenced front door. Preview `workstreamctl root-transition
+plan-url GEN-123 --to <same-document-blob/main-URL>` to replace one pinned
+canonical locator without changing other description text, or preview
+`workstreamctl root-transition reopen GEN-123 --state-id <started-state-UUID>`
+to reopen the same terminal root. Apply requires the previewed snapshot,
+comment-frontier, and operation/target intent digests. Linear has no conditional `issueUpdate`; the command
+uses a deterministic append-only reservation plus immediate pre/post readback
+and explicitly does not claim cross-writer atomicity. An interrupted pre-update
+reservation requires a fresh reviewed preview; a new process never inherits
+write ownership merely by finding it. Full instructions are in
+the workstream-ledger skill's `references/root-transition.md`.
 
 After a PR lands, `workstreamctl reconcile --help` exposes the explicit GitHub,
 Shipyard fixed-argv, plan, and closure-input arguments. The command records

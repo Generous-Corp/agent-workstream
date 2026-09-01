@@ -93,6 +93,9 @@ GENERATION_RETIREMENT_FIELDS = {
     "predecessor_plan_revision", "retired_at", "retired_writer_epoch",
     "provenance_event_ids", "checkpoint_event_ids", "declaration_sha256",
 }
+GENERATION_RETIREMENT_V2_FIELDS = {
+    *GENERATION_RETIREMENT_FIELDS, "schema_version", "authenticated_quiescence",
+}
 GENERATION_SEAL_FIELDS = {
     "schema_version", "reservation_id", "reservation_sha256", "from", "to",
     "source", "graph_frontier_sha256", "candidate_resume_sha256",
@@ -749,7 +752,9 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             or not isinstance(value.get("source"), dict)
             or set(value["source"]) != GENERATION_SOURCE_FIELDS
             or not isinstance(value.get("retirement"), dict)
-            or set(value["retirement"]) != GENERATION_RETIREMENT_FIELDS
+            or set(value["retirement"]) not in (
+                GENERATION_RETIREMENT_FIELDS, GENERATION_RETIREMENT_V2_FIELDS,
+            )
             or not re.fullmatch(r"wsgr_[0-9a-f]{32}", str(value.get("reservation_id", "")))
             or not all(re.fullmatch(r"[0-9a-f]{64}", str(value.get(field, "")))
                        for field in (
@@ -792,6 +797,71 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             ):
                 raise LinearProjectionError(error_name)
         retirement = value["retirement"]
+        retirement_unsigned = {
+            key: deepcopy(item) for key, item in retirement.items()
+            if key != "declaration_sha256"
+        }
+        quiescence = retirement.get("authenticated_quiescence")
+        retirement_is_v2 = set(retirement) == GENERATION_RETIREMENT_V2_FIELDS
+        authenticated_retirement_invalid = retirement_is_v2 and (
+            retirement.get("schema_version") != 2
+        )
+        if retirement_is_v2 and not authenticated_retirement_invalid:
+            route = quiescence.get("authenticated_route") if isinstance(quiescence, dict) else None
+            selected_generation = quiescence.get("selected_generation") if isinstance(quiescence, dict) else None
+            authenticated_retirement_invalid = (
+                not isinstance(quiescence, dict)
+                or set(quiescence) != {
+                    "schema_version", "observed_at", "authenticated_route",
+                    "selected_generation", "material_revision",
+                    "material_event_ids", "checkpoint_event_ids",
+                    "predecessor_projection", "ordering",
+                }
+                or quiescence.get("schema_version") != 1
+                or quiescence.get("observed_at") != retirement.get("retired_at")
+                or set(route or {}) != AUTHORITY_FIELDS
+                or not all(isinstance(route.get(field), str) and route[field]
+                           for field in AUTHORITY_FIELDS)
+                or set(selected_generation or {}) != {
+                    "plan_revision", "activation_epoch", "transition_tip_event_id",
+                }
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str((selected_generation or {}).get("plan_revision", "")),
+                )
+                or (
+                    (selected_generation or {}).get("activation_epoch") is not None
+                    and (
+                        not isinstance(
+                            (selected_generation or {}).get("activation_epoch"), int,
+                        )
+                        or isinstance(
+                            (selected_generation or {}).get("activation_epoch"), bool,
+                        )
+                    )
+                )
+                or (
+                    (selected_generation or {}).get("transition_tip_event_id") is not None
+                    and not isinstance(
+                        (selected_generation or {}).get("transition_tip_event_id"), str,
+                    )
+                )
+                or not isinstance(quiescence.get("material_revision"), int)
+                or isinstance(quiescence.get("material_revision"), bool)
+                or quiescence.get("material_revision") < 0
+                or not isinstance(quiescence.get("material_event_ids"), list)
+                or quiescence.get("material_event_ids")
+                != sorted(set(quiescence.get("material_event_ids") or []))
+                or not all(isinstance(item, str) and item
+                           for item in quiescence.get("material_event_ids") or [])
+                or quiescence.get("checkpoint_event_ids")
+                != retirement.get("checkpoint_event_ids")
+                or not isinstance(quiescence.get("predecessor_projection"), dict)
+                or quiescence.get("ordering") != (
+                    "activation_reservation_must_follow_exact_frontiers_and_blocks_"
+                    "upgraded_predecessor_writers"
+                )
+            )
         if (
             not re.fullmatch(r"[0-9a-f]{64}", str(retirement.get("predecessor_plan_revision", "")))
             or not isinstance(retirement.get("retired_at"), str)
@@ -806,6 +876,9 @@ def validate_projection_event(event: dict[str, Any]) -> None:
                 for field in ("provenance_event_ids", "checkpoint_event_ids")
             )
             or not re.fullmatch(r"[0-9a-f]{64}", str(retirement.get("declaration_sha256", "")))
+            or retirement["declaration_sha256"]
+            != hashlib.sha256(_canonical(retirement_unsigned)).hexdigest()
+            or authenticated_retirement_invalid
             or value["source"].get("sha256") != value["to"]["plan_revision"]
             or value["source"].get("identity") != value["to"]["source_identity"]
             or retirement["predecessor_plan_revision"] != value["from"]["plan_revision"]

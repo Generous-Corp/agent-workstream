@@ -19,6 +19,9 @@ class SkillContractTests(unittest.TestCase):
             / "plugins/workstream/skills/workstream-resume/SKILL.md"
         ).read_text()
 
+    def usage(self) -> str:
+        return (Path(__file__).parents[1] / "USAGE.md").read_text()
+
     def test_start_restore_makes_ingress_recovery_conditional(self):
         skill = self.skill()
         start = skill.split("## Start or restore", 1)[1].split(
@@ -32,11 +35,11 @@ class SkillContractTests(unittest.TestCase):
         self.assertLess(flush, skip)
         self.assertLess(skip, no_probe)
 
-    def test_handle_only_resume_is_first_bounded_action(self):
+    def test_cold_handle_resume_is_first_bounded_action(self):
         resume = self.resume_skill()
         command = resume.index('python3 "<absolute directory of this SKILL.md>/scripts/workstream_resume.py"')
         substitute = resume.index("Substitute the runtime-supplied directory")
-        cwd_warning = resume.index("Before repository, memory, worktree")
+        cwd_warning = resume.index("On the cold path, before repository, memory, worktree")
         path_warning = resume.index("Do not probe `workstreamctl` on `PATH`")
         history_warning = resume.index("`--include-history` during initial recovery")
         self.assertLess(command, substitute)
@@ -59,7 +62,7 @@ class SkillContractTests(unittest.TestCase):
     def test_handle_and_visible_title_authority_are_explicit(self):
         resume = " ".join(self.resume_skill().split())
         self.assertIn("current user message directly", resume)
-        self.assertIn("That message is the only handle source", resume)
+        self.assertIn("That message is the only cold-start handle source", resume)
         for excluded in (
             "Hook or developer text", "cwd", "memory", "prior transcript",
         ):
@@ -83,12 +86,102 @@ class SkillContractTests(unittest.TestCase):
         self.assertLess(verbs, proceed)
         self.assertLess(proceed, no_confirmation)
 
+    def test_warm_session_continue_does_not_repeat_resume_or_claim_mutation_authority(self):
+        resume = " ".join(self.resume_skill().split())
+        warm = resume.index("It is warm only when this exact provider session")
+        retained = resume.index("material/projection/checkpoint frontiers")
+        bypass = resume.index("do not rerun resume merely to reconfirm authority")
+        delivery = resume.index("independently fenced exact-head Shipyard delivery")
+        command = resume.index("Cold/fresh requests")
+        mutation = resume.index("Before any Linear mutation")
+        policy = resume.index("agent workflow policy, not a daemon-enforced grant")
+        self.assertLess(warm, retained)
+        self.assertLess(retained, bypass)
+        self.assertLess(bypass, delivery)
+        self.assertLess(delivery, command)
+        self.assertLess(command, mutation)
+        self.assertLess(mutation, policy)
+        self.assertIn("durable local material-delta journal", resume)
+        self.assertIn("The plugin installs no hosted runtime or reusable authority cache", resume)
+
+    def test_cold_or_consequential_boundary_requires_live_recovery(self):
+        resume = " ".join(self.resume_skill().split())
+        self.assertIn("A pasted result, prior provider session", resume)
+        self.assertIn("One bare continuation nudge may select that sole warm retained workstream", resume)
+        self.assertIn("status checks", resume)
+        self.assertIn("must run this as the first functional command", resume)
+        self.assertIn("agent/session handoff", resume)
+        self.assertIn("perform live resume and reconcile the pending journal", resume)
+        self.assertIn("Auth, semantic, generation, budget", resume)
+
+    def test_unreachable_degraded_runtime_is_not_packaged(self):
+        scripts = (
+            Path(__file__).parents[1]
+            / "plugins/workstream/skills/workstream-ledger/scripts"
+        )
+        self.assertFalse((scripts / "workstream_degraded_execution.py").exists())
+        self.assertFalse((scripts / "test_workstream_degraded_execution.py").exists())
+        self.assertNotIn("workstream_degraded_execution.py", self.skill())
+
+    def test_ledger_can_activate_on_a_later_exact_warm_turn(self):
+        ledger = " ".join(self.skill().split())
+        required = (
+            "on a later warm turn when exact same-provider-session retained-full "
+            "bindings satisfy `workstream-resume` warm classification"
+        )
+        self.assertIn(required, ledger)
+        frontmatter = ledger.split("---", 2)[1]
+        self.assertIn(required.replace("`", ""), frontmatter.replace("`", ""))
+        self.assertNotIn(
+            "only after workstream-resume has returned a bounded authoritative "
+            "snapshot in this turn",
+            ledger,
+        )
+
+    def test_usage_distinguishes_cold_recovery_from_warm_continue(self):
+        usage = " ".join(self.usage().split())
+        self.assertIn(
+            "For a cold/fresh handle request, status check, or consequential "
+            "tracking or lifecycle boundary, the agent's first command is",
+            usage,
+        )
+        self.assertIn("A warm `continue` nudge does not repeat resume", usage)
+        self.assertIn(
+            "Live resume and reconciliation are still required before any Linear mutation",
+            usage,
+        )
+        self.assertNotIn(
+            "For a handle/URL/tab-title resume request, with or without additional "
+            "instructions, the agent's first command is",
+            usage,
+        )
+
+    def test_delivery_and_authority_handoffs_are_not_conflated(self):
+        for name, document in (
+            ("resume", self.resume_skill()),
+            ("ledger", self.skill()),
+            ("usage", self.usage()),
+        ):
+            flat = " ".join(document.replace("**", "").split())
+            with self.subTest(document=name):
+                self.assertIn(
+                    "Shipyard delivery handoff means exact-head custody submission "
+                    "to Shipyard under its own fences and is allowed",
+                    flat,
+                )
+                self.assertIn(
+                    "agent/session handoff means transferring workstream execution "
+                    "authority to another agent/session and requires live recovery "
+                    "and certification",
+                    flat,
+                )
+
     def test_resume_entry_is_small_and_owns_fresh_handle_trigger(self):
         resume = self.resume_skill()
         ledger = self.skill()
         flat = " ".join(resume.split())
-        self.assertLess(len(resume.encode()), 3000)
-        self.assertLessEqual(len(resume.splitlines()), 60)
+        self.assertLess(len(resume.encode()), 5500)
+        self.assertLessEqual(len(resume.splitlines()), 90)
         self.assertIn("existing workstream handle", resume)
         self.assertIn("after workstream-resume has returned", ledger)
         command = resume.split("```sh", 1)[1].split("```", 1)[0]
@@ -105,7 +198,7 @@ class SkillContractTests(unittest.TestCase):
         codex = json.loads((plugin / ".codex-plugin/plugin.json").read_text())
         claude = json.loads((plugin / ".claude-plugin/plugin.json").read_text())
         self.assertEqual(codex["version"], claude["version"])
-        self.assertEqual(codex["version"], "0.4.47")
+        self.assertEqual(codex["version"], "0.4.48")
         shim = plugin / "skills/workstream-resume/scripts/workstream_resume.py"
         target = plugin / "skills/workstream-ledger/scripts/workstream_resume.py"
         self.assertTrue(shim.is_file())

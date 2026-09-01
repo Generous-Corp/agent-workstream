@@ -1,6 +1,6 @@
 ---
 name: workstream-ledger
-description: Preserve and update evolving project goals, tasks, decisions, dependencies, PR state, evidence, and closure in a durable Linear-backed workstream. Use directly for new plan intake, or after workstream-resume has returned a bounded authoritative snapshot in this turn. For any handle-led turn, including mutation, audit, or closure, do not load this skill first.
+description: Preserve and update evolving project goals, tasks, decisions, dependencies, PR state, evidence, and closure in a durable Linear-backed workstream. Use directly for new plan intake, after workstream-resume has returned bounded authority in the current turn, or on a later warm turn when exact same-provider-session retained-full bindings satisfy workstream-resume warm classification. For any cold handle-led turn, including mutation, audit, or closure, do not load this skill first.
 ---
 
 # Workstream ledger
@@ -255,24 +255,76 @@ python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_generation.py" \
 ```
 
 Do not bootstrap a description-backed root. For a reviewed plan replacement,
-first build the complete candidate projection, then provide a structured
-retirement proof for the current active epoch:
+derive the complete zero-write operator contract from authenticated live state
+and the exact target plan:
+
+```sh
+workstreamctl generation prepare GEN-123 --plan-source ./PLAN.md \
+  --plan-identity <canonical-immutable-plan-url> \
+  --remote-head <authenticated-exact-head> \
+  --created-at <reviewed-utc-time> \
+  --started-state-id <authenticated-linear-started-state-uuid> \
+  --manifest-output ./target-projection.json \
+  > generation-review.json
+```
+
+`prepare` has no apply mode. `--manifest-output` atomically writes the exact
+nested `projection_preview.manifest` consumed by the next projection command;
+do not copy or edit that payload by hand. It accounts for every active projection
+key and
+emits an authenticated predecessor-quiescence proof, the exact reviewed native
+reopen state, and the first target manifest. The proof binds the current route,
+selected generation, material/checkpoint frontiers, and predecessor projection;
+generation reservation revalidates those frontiers before it can retire the
+predecessor. For terminal
+children it uses predecessor-authorized evidence seeding and explicitly stages
+closure repair and later keys; it never copies a closure as authority. After
+each manifest is applied, rerun the same `prepare` command. It recognizes only
+the authenticated canonical prefix it emitted and advances through evidence
+seed, closure repair, remaining projection, and `activation_ready`. Any other
+nonempty inactive candidate refuses rather than being merged or guessed.
+
+Projection has an explicit safe preview/apply path. Reuse the preview's exact
+timestamp and digest:
+
+```sh
+workstreamctl projection GEN-123 target-projection.json \
+  --remote-head <authenticated-exact-head> --plan-source ./PLAN.md \
+  --plan-identity <canonical-immutable-plan-url> \
+  --created-at <reviewed-utc-time> --preview > projection-preview.json
+workstreamctl projection GEN-123 target-projection.json \
+  --remote-head <same-head> --plan-source ./PLAN.md \
+  --plan-identity <same-url> --created-at <same-time> \
+  --apply --expected-preview-sha256 <preview-sha256>
+```
+
+There is no implicit apply mode. A flagless invocation refuses before live
+access, and `--apply` refuses unless both the reviewed timestamp and preview
+digest are supplied.
+After the target projection is complete, rerun `generation prepare` and use its
+exact `activation_ready` operator contract for the reviewed `root-transition`
+locator migration and reopen described below. Once that exact root is in the
+contract's authenticated `started` state, preview activation. Activation
+recomputes the contract from a stable live graph/comment pair and again after
+reservation immediately before the authority-changing seal. Exact historical
+replay/finalization uses the original contract-bound stored artifacts rather
+than requiring the obsolete pre-activation view. A caller-authored retirement
+file or an edited phase/self-digest cannot authorize it:
 
 ```sh
 workstreamctl generation activate GEN-123 --plan-source ./PLAN.md \
   --plan-identity <canonical-immutable-plan-url> \
-  --retirement-proof ./retirement.json \
+  --operator-contract ./generation-review.json \
   --created-at <reviewed-utc-time>
 ```
 
-Review the preview's `native_root_activation_proof`, reopen the same existing
-root through the separately authorized Linear workflow when it is terminal,
-then apply with the unchanged proof digest:
+Review the preview's `native_root_activation_proof`, then apply with the
+unchanged proof digest:
 
 ```sh
 workstreamctl generation activate GEN-123 --plan-source ./PLAN.md \
   --plan-identity <canonical-immutable-plan-url> \
-  --retirement-proof ./retirement.json \
+  --operator-contract ./generation-review.json \
   --created-at <reviewed-utc-time> \
   --expected-native-root-sha256 <preview-sha256> --apply
 ```
@@ -291,7 +343,7 @@ the authenticated repository head used for disposition:
 python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_generation.py" \
   activate GEN-123 --plan-source ./PLAN.md \
   --plan-identity <canonical-immutable-plan-url> \
-  --retirement-proof ./retirement.json \
+  --operator-contract ./generation-review.json \
   --activation-checkpoint ./pending-checkpoint.json \
   --remote-head <authenticated-exact-head> \
   --created-at <reviewed-utc-time> --apply
@@ -371,6 +423,30 @@ reviewed replacement can reserve and activate from the revision advanced by
 that abort. The generation
 transport uses `commentCreate` only and never calls `issueUpdate`.
 
+When a reviewed generation transition needs either of the two mutable native
+root changes that generation deliberately does not own, use the separate
+`workstreamctl root-transition` surface. `plan-url` changes exactly one labeled
+same-document pinned GitHub blob URL to its reviewed `blob/main` locator while
+preserving every other description byte. `reopen` changes the same exact
+terminal root to the authenticated Linear `started` state embedded in the exact
+prepared `activation_ready` generation contract. Both commands require that
+contract and its authenticated plan source, and are zero-write previews unless
+`--apply` is supplied. Apply requires the previewed root-snapshot, complete
+comment-frontier, and intent digests. See
+[`references/root-transition.md`](references/root-transition.md).
+
+These mutations do not change append-only generation authority. Linear has no
+conditional `issueUpdate`, so the supported transport does not call the native
+write atomic: it first wins one deterministic append-only reservation for the
+reviewed snapshot, then performs immediate prewrite and postwrite readback.
+Apply also requires the previewed intent digest, which binds the operation and
+target. Exact replay after the native update is a no-op; drift or a competing
+reservation refuses. A crash after reservation creation but before the native
+update leaves an explicit pending intent: another process cannot claim its
+ownership and must obtain a newly reviewed preview/frontier. This is the
+strongest supported fence, not protection against an unrelated writer changing
+the native issue in the interval between final prewrite readback and update.
+
 After intake returns the canonical root token, invoke
 `scripts/workstream_tab.py GEN-123`. In cmux or Herdr it preserves the existing
 tab title and appends exactly one token; the same token is a no-op and a
@@ -400,6 +476,28 @@ pending row or advance its revision by last-writer-wins. Both `apply` and
 `apply_with_rebase` refuse adapters that declare neither true atomic CAS nor a
 lossless append-only event log. `apply_with_rebase` reloads the live revision
 and retries a stable event ID after `RevisionConflict`.
+
+#### Transient tracking outage
+
+A narrow Linear transport failure must not stop an already-authorized warm
+provider session from doing independently authorized work. Apply the
+`workstream-resume` warm-session predicate: the same provider session and
+workstream must retain its prior live `full` result plus exact route, source, generation,
+frontiers, owner/session, worktree, repository head, and Shipyard run. This is
+agent workflow policy, not a daemon-enforced or transferable grant.
+
+That session may continue provider/local implementation and independently
+fenced exact-head Shipyard delivery handoff or landing. A **Shipyard delivery
+handoff** means exact-head custody submission to Shipyard under its own fences
+and is allowed. An **agent/session handoff** means transferring workstream
+execution authority to another agent/session and requires live recovery and
+certification. Buffer every material discovery
+through this journal; do not attempt a Linear write while transport is
+unavailable. Before any Linear mutation, scope/ownership/root/generation
+transition, attach/successor selection, agent/session handoff, semantic closure,
+or resume or agent/session handoff certification, obtain a fresh authenticated full resume and
+reconcile stable event IDs idempotently. Fresh/cold sessions and auth,
+semantic, generation, budget, or ambiguous post-write refusals fail closed.
 
 `scripts/workstream_linear_events.py` is the dependency-free authenticated
 Linear `MutationAdapter`. It stores one immutable material delta per issue
@@ -431,6 +529,11 @@ scope, or resistance to an authorized person editing/deleting comments. No
 live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
+
+Version 0.4.48 adds phase-aware generation preparation, explicit reviewed
+projection and native-root transitions, exact crash replay, and warm-session
+continuation that keeps authorized delivery moving while tracking is
+temporarily unavailable.
 
 Version 0.4.47 accepts description-less legacy terminal children only when
 strict closure, evidence, ownership, exact-head, and native-readback proof
@@ -708,8 +811,10 @@ projection rather than mutable issue prose.
 
 ### Fresh-session resume
 
-If `workstream-resume` already returned the bounded authoritative snapshot in
-this turn, retain it and do not repeat initial recovery.
+If `workstream-resume` returned the bounded authoritative snapshot in the
+current turn, retain it and do not repeat initial recovery. The same applies on
+a later warm turn when exact same-provider-session retained-full bindings
+satisfy `workstream-resume` warm classification.
 
 When a new agent receives `ABC-123` (or its Linear URL/tab title), with or
 without continuation instructions, the first action is the default bounded
@@ -1091,7 +1196,7 @@ Before continuing in another agent session:
    acknowledge the restored objective, decisions, open items, head, and next
    action. Do not close the source beforehand.
 
-When a configured Shipyard handoff needs a native launch profile, create it
+When a configured Shipyard delivery handoff needs a native launch profile, create it
 only after step 4 with the bundled product helper resolved from this skill:
 
 ```sh
