@@ -106,7 +106,8 @@ def _require_hydrated_resume(context: dict[str, Any]) -> None:
     route = deferred.get("audit_route") if isinstance(deferred, dict) else None
     if (
         (envelope is not None and envelope not in {
-            "bounded_authority_v1", "fixed_frontier_authority_v1",
+            "verbose_current_detail_v1", "bounded_authority_v1",
+            "fixed_frontier_authority_v1",
         })
         or deferred_state not in {
             "verbose_current_detail_deferred",
@@ -114,14 +115,16 @@ def _require_hydrated_resume(context: dict[str, Any]) -> None:
             "fixed_frontier_authority_envelope",
         }
         or not isinstance(route, dict)
-        or route.get("representation") != "full_validated"
-        or not isinstance(route.get("command"), str)
-        or not route["command"]
+        or route.get("representation") != "compact_validated"
+        or route.get("launcher") != "current_workstream_resume_skill_script"
+        or not isinstance(route.get("args"), list)
+        or not route["args"]
+        or not all(isinstance(part, str) and part for part in route["args"])
     ):
         raise ShipyardProfileError("resume_envelope_hydration_route_missing")
     # Profile construction binds exact checkpoint/worktree/scope values. It
     # must never reinterpret digest-bound excerpts as those exact values.
-    raise ShipyardProfileError("resume_envelope_requires_full_validated_hydration")
+    raise ShipyardProfileError("resume_envelope_requires_compact_validated_hydration")
 
 
 def _positive_int(value: Any, label: str, *, allow_zero: bool = False) -> int:

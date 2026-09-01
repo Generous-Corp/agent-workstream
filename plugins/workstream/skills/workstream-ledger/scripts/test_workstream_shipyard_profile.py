@@ -218,15 +218,21 @@ class ShipyardProfileTests(unittest.TestCase):
                 "state": "fixed_frontier_authority_envelope",
                 "audit_route": {
                     "command": (
-                        "workstreamctl resume GEN-37 --include-history "
+                        "workstreamctl resume GEN-37 "
                         "--max-bytes 2147483647 --max-items 2147483647"
                     ),
-                    "representation": "full_validated",
+                    "command_role": "display_only",
+                    "launcher": "current_workstream_resume_skill_script",
+                    "args": [
+                        "GEN-37", "--max-bytes", "2147483647",
+                        "--max-items", "2147483647",
+                    ],
+                    "representation": "compact_validated",
                 },
             }
             with self.assertRaisesRegex(
                 MODULE.ShipyardProfileError,
-                "resume_envelope_requires_full_validated_hydration",
+                "resume_envelope_requires_compact_validated_hydration",
             ):
                 MODULE.build_launch_profile(
                     context, "GEN-37", self.git(root),
@@ -484,8 +490,10 @@ class ShipyardProfileTests(unittest.TestCase):
                         MODULE._canonical(hydrated)
                     ).hexdigest(),
                     "audit_route": {
-                        "command": "workstreamctl resume GEN-37 --include-history",
-                        "representation": "full_validated",
+                        "command": "workstreamctl resume GEN-37 --max-bytes 999999",
+                        "launcher": "current_workstream_resume_skill_script",
+                        "args": ["GEN-37", "--max-bytes", "999999"],
+                        "representation": "compact_validated",
                     },
                 },
             }

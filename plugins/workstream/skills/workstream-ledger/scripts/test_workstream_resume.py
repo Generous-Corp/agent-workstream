@@ -3,6 +3,8 @@ import base64
 import hashlib
 import io
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -1250,9 +1252,7 @@ class ResumeTests(unittest.TestCase):
             snapshot, "GEN-37", max_bytes=64 * 1024,
             require_projection_authority=True,
         )
-        unbounded_bytes = len(json.dumps(
-            unbounded, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-        ).encode())
+        unbounded_bytes = len(MODULE._default_output_bytes(unbounded))
         self.assertGreater(unbounded_bytes, 46_879)
         self.assertLess(unbounded_bytes, 49_000)
         with mock.patch.object(MODULE, "_CURRENT_DETAIL_EXCERPT_LIMITS", ()), \
@@ -1278,26 +1278,54 @@ class ResumeTests(unittest.TestCase):
         second = MODULE.compact_context(
             snapshot, "GEN-37", require_projection_authority=True,
         )
-        encoded = json.dumps(
-            first, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-        ).encode()
+        encoded = MODULE._default_output_bytes(first)
         self.assertLessEqual(len(encoded), MODULE.DEFAULT_RESUME_MAX_BYTES)
         self.assertEqual(first, second)
         self.assertEqual(snapshot, before)
         self.assertEqual(first["resume_authority"], "full")
         self.assertEqual(
+            first["context_schema"]["envelope"],
+            "verbose_current_detail_v1",
+        )
+        self.assertEqual(
             first["deferred_audit_detail"]["state"],
             "verbose_current_detail_deferred",
         )
         self.assertGreater(first["deferred_audit_detail"]["field_count"], 0)
+        self.assertTrue(
+            first["deferred_audit_detail"]["hydration_required_before_action"]
+        )
         self.assertRegex(
             first["deferred_audit_detail"]["fields_sha256"], r"^[0-9a-f]{64}$",
         )
         self.assertEqual(
             first["deferred_audit_detail"]["audit_route"]["command"],
+            "workstreamctl resume GEN-37 "
+            "--max-bytes 2147483647 --max-items 2147483647",
+        )
+        self.assertEqual(
+            first["deferred_audit_detail"]["full_history_route"]["command"],
             "workstreamctl resume GEN-37 --include-history "
             "--max-bytes 2147483647 --max-items 2147483647",
         )
+        audit_route = first["deferred_audit_detail"]["audit_route"]
+        self.assertEqual(
+            audit_route["launcher"],
+            "current_workstream_resume_skill_script",
+        )
+        self.assertEqual(audit_route["args"], [
+            "GEN-37", "--max-bytes", "2147483647",
+            "--max-items", "2147483647",
+        ])
+        launcher = (
+            Path(MODULE.__file__).resolve().parents[2]
+            / "workstream-resume" / "scripts" / "workstream_resume.py"
+        )
+        help_result = subprocess.run(
+            [sys.executable, str(launcher), "--help"],
+            capture_output=True, check=False,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr.decode())
         for field in first["deferred_audit_detail"]["fields"]:
             self.assertTrue(field["json_pointer"].startswith("/"))
             self.assertRegex(field["sha256"], r"^[0-9a-f]{64}$")
@@ -1319,6 +1347,63 @@ class ResumeTests(unittest.TestCase):
         self.assertIn("Keep the fixed 24 KiB", first["decisions"][0]["decision"])
         self.assertEqual(len(first["children"]), 6)
         self.assertTrue(all(child["next_action"] for child in first["children"]))
+
+        with mock.patch.object(MODULE, "_CURRENT_DETAIL_EXCERPT_LIMITS", ()):
+            bounded = MODULE.compact_context(
+                snapshot, "GEN-37", require_projection_authority=True,
+            )
+        self.assertEqual(
+            bounded["context_schema"]["envelope"], "bounded_authority_v1",
+        )
+        self.assertEqual(
+            bounded["deferred_audit_detail"]["state"],
+            "bounded_authority_envelope",
+        )
+        self.assertTrue(
+            bounded["deferred_audit_detail"]
+            ["hydration_required_before_action"]
+        )
+        self.assertLessEqual(
+            len(MODULE._default_output_bytes(bounded)),
+            MODULE.DEFAULT_RESUME_MAX_BYTES,
+        )
+
+    def test_oversized_exact_metadata_is_a_semantic_refusal_not_byte_stranding(self):
+        cases = (
+            ("identifier", "GEN-" + ("7" * 129),
+             "workstream identifier exceeds schema byte limit"),
+            ("plan_revision", "p" * 257,
+             "plan revision exceeds schema byte limit"),
+            ("revision", 1 << 63,
+             "root revision must be a non-negative 64-bit integer"),
+        )
+        for field, value, error in cases:
+            with self.subTest(field=field):
+                snapshot = self.snapshot()
+                snapshot["root"][field] = value
+                token = value if field == "identifier" else "GEN-37"
+                with self.assertRaisesRegex(MODULE.ResumeError, error):
+                    MODULE.compact_context(snapshot, token)
+
+        snapshot = self.full_authority_snapshot(self.snapshot())
+        snapshot["authenticated_route"]["unbounded-extra-route-key"] = "x"
+        with self.assertRaisesRegex(
+            MODULE.ResumeError, "invalid_authenticated_route",
+        ):
+            MODULE.compact_context(
+                snapshot, "GEN-37", require_projection_authority=True,
+            )
+
+        snapshot = self.snapshot()
+        snapshot["authenticated_route"] = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root",
+            "unbounded-extra-route-key": "x",
+        }
+        with self.assertRaisesRegex(
+            MODULE.ResumeError, "invalid_authenticated_route",
+        ):
+            MODULE.compact_context(snapshot, "GEN-37")
 
     def test_high_cardinality_structured_state_uses_bounded_authority_envelope(self):
         snapshot = self.snapshot()
@@ -1354,16 +1439,14 @@ class ResumeTests(unittest.TestCase):
             snapshot, "GEN-37", max_bytes=8 * 1024 * 1024,
             require_projection_authority=True,
         )
-        self.assertGreater(len(json.dumps(
-            unbounded, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-        ).encode()), 2 * 1024 * 1024)
+        self.assertGreater(
+            len(MODULE._default_output_bytes(unbounded)), 2 * 1024 * 1024,
+        )
 
         context = MODULE.compact_context(
             snapshot, "GEN-37", require_projection_authority=True,
         )
-        encoded = json.dumps(
-            context, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-        ).encode()
+        encoded = MODULE._default_output_bytes(context)
         self.assertLessEqual(len(encoded), MODULE.DEFAULT_RESUME_MAX_BYTES)
         self.assertEqual(context["resume_authority"], "full")
         self.assertEqual(
@@ -1373,6 +1456,10 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(
             context["deferred_audit_detail"]["state"],
             "fixed_frontier_authority_envelope",
+        )
+        self.assertTrue(
+            context["deferred_audit_detail"]
+            ["hydration_required_before_action"]
         )
         self.assertEqual(
             context["authority_scope"]["execution_frontier"],
@@ -1396,6 +1483,24 @@ class ResumeTests(unittest.TestCase):
                 unbounded["decisions"], ensure_ascii=False, sort_keys=True,
                 separators=(",", ":"),
             ).encode()).hexdigest(),
+        )
+        child_field = next(
+            field for field in context["deferred_audit_detail"]["fields"]
+            if field["json_pointer"] == "/children"
+        )
+        self.assertEqual(
+            child_field["sha256"], hashlib.sha256(json.dumps(
+                unbounded["children"], ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode()).hexdigest(),
+        )
+        self.assertNotIn(
+            "--include-history",
+            context["deferred_audit_detail"]["audit_route"]["command"],
+        )
+        self.assertIn(
+            "--include-history",
+            context["deferred_audit_detail"]["full_history_route"]["command"],
         )
         child = context["execution_frontier"]["children"][0]
         self.assertEqual(child[1], "In Progress")
@@ -1429,6 +1534,57 @@ class ResumeTests(unittest.TestCase):
                 snapshot, "GEN-37", require_projection_authority=True,
             )
 
+    def test_fixed_frontier_obligation_rows_retain_exact_source_indexes(self):
+        context = {
+            "context_schema": {
+                "name": "agent-workstream.resume-context", "version": 2,
+                "representation": "compact_validated",
+            },
+            "workstream_id": "GEN-37", "plan_revision": "a" * 64,
+            "root_revision": 3, "material_event_revision": 3,
+            "resume_authority": "full",
+            "uncheckpointed_material_obligations": [{
+                "event_id": "root-event", "kind": "requirement",
+                "payload": {"requirement": "root action"},
+            }],
+            "children": [{
+                "identifier": "GEN-38", "status": "In Progress",
+                "next_action": "child action",
+                "uncheckpointed_material_obligations": [{
+                    "event_id": "child-event", "kind": "followup",
+                    "payload": {"followup": "child followup"},
+                }],
+                "pending_child_proposals": [{
+                    "proposal_id": "proposal-1", "next_action": "review proposal",
+                }],
+            }],
+            "decisions": [], "choice_events": [], "relations": [],
+        }
+        envelope = MODULE._fixed_frontier_authority_envelope(
+            context, token="GEN-37",
+        )
+        rows = envelope["execution_frontier"]["obligations"]
+        self.assertEqual([row[0] for row in rows], [
+            ["root", 0], ["child", 0, 0], ["proposal", 0, 0],
+        ])
+        self.assertEqual(
+            envelope["execution_frontier"]["columns"]["obligations"],
+            ["source", "child", "id", "kind", "action"],
+        )
+        self.assertEqual(
+            envelope["deferred_audit_detail"]["obligation_selector_rules"],
+            {
+                "root": ".uncheckpointed_material_obligations[source[1]]",
+                "child": (
+                    ".children[source[1]].uncheckpointed_material_obligations"
+                    "[source[2]]"
+                ),
+                "proposal": (
+                    ".children[source[1]].pending_child_proposals[source[2]]"
+                ),
+            },
+        )
+
     def test_max_item_child_frontier_cannot_reintroduce_byte_refusal(self):
         snapshot = self.snapshot()
         snapshot["decisions"] = []
@@ -1436,9 +1592,9 @@ class ResumeTests(unittest.TestCase):
             "identifier": f"GEN-{38 + index}",
             "title": f"Executable child {index} " + ("t" * 500),
             "status": "In Progress", "status_type": "started",
-            "owner": f"owner-{index}",
-            "next_action": f"Execute child {index} next " + ("n" * 1200),
-            "blocker": {"text": f"blocker-{index} " + ("b" * 900)},
+            "owner": "\\\n" * 10,
+            "next_action": "\n\\" * 10,
+            "blocker": "\\\n" * 10,
             "review_condition": f"review-{index} " + ("v" * 700),
             "reconciliation_blockers": [{
                 "kind": "drift", "field": "state", "expected": "x" * 800,
@@ -1450,9 +1606,7 @@ class ResumeTests(unittest.TestCase):
         context = MODULE.compact_context(
             snapshot, "GEN-37", require_projection_authority=True,
         )
-        encoded = json.dumps(
-            context, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-        ).encode()
+        encoded = MODULE._default_output_bytes(context)
         self.assertLessEqual(len(encoded), MODULE.DEFAULT_RESUME_MAX_BYTES)
         self.assertEqual(context["resume_authority"], "full")
         self.assertEqual(
@@ -1465,9 +1619,15 @@ class ResumeTests(unittest.TestCase):
             context["execution_frontier"]["columns"]["children"],
             ["id", "status", "owner", "repository", "next", "blocker"],
         )
-        self.assertEqual(context["execution_frontier"]["children"][0][:3], [
-            "GEN-38", "started", "owner-0",
-        ])
+        first_child = context["execution_frontier"]["children"][0]
+        self.assertEqual(first_child[:2], ["GEN-38", "started"])
+        self.assertIn("~#", first_child[2])
+        for row in context["execution_frontier"]["children"]:
+            for cell in row:
+                if isinstance(cell, str):
+                    self.assertLessEqual(
+                        len(json.dumps(cell, ensure_ascii=False).encode()), 24,
+                    )
 
     def test_checkpoint_fence_uses_ordered_position_not_stale_writer_revision(self):
         prefix = {
@@ -1893,6 +2053,35 @@ class ResumeTests(unittest.TestCase):
             ), mock.patch.object(MODULE.sys, "stdout", stdout):
                 self.assertEqual(MODULE.main(), 0)
         self.assertEqual(json.loads(stdout.getvalue())["resume_authority"], "inspection_only")
+
+    def test_cli_stdout_uses_exact_budgeted_serializer_including_newline(self):
+        payload = {"padding": "", "resume_authority": "inspection_only"}
+        payload["padding"] = "x" * (
+            MODULE.DEFAULT_RESUME_MAX_BYTES
+            - len(MODULE._default_output_bytes(payload))
+        )
+        self.assertEqual(
+            len(MODULE._default_output_bytes(payload)),
+            MODULE.DEFAULT_RESUME_MAX_BYTES,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "snapshot.json"
+            path.write_text("{}", encoding="utf-8")
+            stdout = io.StringIO()
+            with mock.patch.object(
+                MODULE.sys, "argv", [
+                    "workstream_resume.py", "GEN-37", str(path),
+                    "--inspection-only",
+                ],
+            ), mock.patch.object(
+                MODULE, "compact_context", return_value=payload,
+            ), mock.patch.object(MODULE.sys, "stdout", stdout):
+                self.assertEqual(MODULE.main(), 0)
+        emitted = stdout.getvalue().encode("utf-8")
+        self.assertEqual(emitted, MODULE._default_output_bytes(payload))
+        self.assertEqual(len(emitted), MODULE.DEFAULT_RESUME_MAX_BYTES)
+        self.assertTrue(emitted.endswith(b"\n"))
+        self.assertEqual(emitted.count(b"\n"), 1)
 
 
 if __name__ == "__main__":

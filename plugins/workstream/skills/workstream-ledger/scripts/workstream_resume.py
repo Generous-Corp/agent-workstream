@@ -60,6 +60,9 @@ from workstream_projection_history import (
 
 
 TOKEN = re.compile(r"\b[A-Z][A-Z0-9]*-\d+\b", re.I)
+MAX_WORKSTREAM_IDENTIFIER_BYTES = 128
+MAX_PLAN_REVISION_BYTES = 256
+MAX_REVISION = (1 << 63) - 1
 TERMINAL = {"done", "completed", "cancelled", "canceled", "superseded"}
 MATERIAL_OBLIGATION_TERMS = ("requirement", "blocker", "blocked", "followup", "decision")
 MATERIAL_OBLIGATION_KEYS = {
@@ -1072,17 +1075,28 @@ def validate_snapshot(
     identifier = root.get("identifier") or root.get("id")
     if not isinstance(identifier, str) or not TOKEN.fullmatch(identifier.upper()):
         raise ResumeError("root must contain one Linear issue identifier")
+    if len(identifier.encode("utf-8")) > MAX_WORKSTREAM_IDENTIFIER_BYTES:
+        raise ResumeError("workstream identifier exceeds schema byte limit")
     if token and identifier.upper() != extract_token(token):
         raise ResumeError("token/root mismatch")
     for field in ("url", "plan_revision", "revision"):
         if field not in root or root[field] in (None, ""):
             raise ResumeError(f"root missing {field}")
-    if not isinstance(root["revision"], int) or root["revision"] < 0:
-        raise ResumeError("root revision must be a non-negative integer")
-    if "issue_revision" in root and (
-        not isinstance(root["issue_revision"], int) or root["issue_revision"] < 0
+    if (
+        not isinstance(root["plan_revision"], str)
+        or len(root["plan_revision"].encode("utf-8")) > MAX_PLAN_REVISION_BYTES
     ):
-        raise ResumeError("issue revision must be a non-negative integer")
+        raise ResumeError("plan revision exceeds schema byte limit")
+    if (
+        type(root["revision"]) is not int
+        or not 0 <= root["revision"] <= MAX_REVISION
+    ):
+        raise ResumeError("root revision must be a non-negative 64-bit integer")
+    if "issue_revision" in root and (
+        type(root["issue_revision"]) is not int
+        or not 0 <= root["issue_revision"] <= MAX_REVISION
+    ):
+        raise ResumeError("issue revision must be a non-negative 64-bit integer")
     root_next_action = root.get("next_action")
     if "next_action" in root and (
         not isinstance(root_next_action, str) or not root_next_action.strip()
@@ -1364,12 +1378,22 @@ def validate_snapshot(
     ):
         raise ResumeError("invalid_lifecycle_recovery")
     authenticated_route = snapshot.get("authenticated_route")
+    route_fields = {
+        "workspace_id", "team_id", "project_id", "root_issue_id",
+    }
+    if authenticated_route is not None and (
+        not isinstance(authenticated_route, dict)
+        or set(authenticated_route) != route_fields
+        or not all(
+            isinstance(authenticated_route[field], str)
+            and authenticated_route[field]
+            for field in route_fields
+        )
+    ):
+        raise ResumeError("invalid_authenticated_route")
     active: dict[tuple[str, str], dict[str, Any]] = {}
     if projection_events:
-        if not isinstance(authenticated_route, dict) or not all(
-            isinstance(authenticated_route.get(field), str) and authenticated_route[field]
-            for field in ("workspace_id", "team_id", "project_id", "root_issue_id")
-        ):
+        if authenticated_route is None:
             raise ResumeError("projection_authenticated_route_missing")
         if projection_recovery.get("state") != "current":
             raise ResumeError("projection_not_current")
@@ -1691,6 +1715,17 @@ _VERBOSE_CURRENT_TEXT_KEYS = {
 _CURRENT_DETAIL_EXCERPT_LIMITS = (768, 384, 192, 96, 48)
 
 
+def _default_output_text(context: dict[str, Any]) -> str:
+    """Serialize exactly as ordinary CLI stdout, including its newline."""
+    return json.dumps(
+        context, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ) + "\n"
+
+
+def _default_output_bytes(context: dict[str, Any]) -> bytes:
+    return _default_output_text(context).encode("utf-8")
+
+
 def _utf8_head_tail(value: str, limit: int) -> str:
     """Return a deterministic, UTF-8-safe actionable excerpt."""
     marker = " …[audit detail deferred]… "
@@ -1894,6 +1929,7 @@ def _bounded_authority_envelope(
     result["execution_frontier"] = frontier
     result["deferred_audit_detail"] = {
         "state": "bounded_authority_envelope",
+        "hydration_required_before_action": True,
         "algorithm": "validated-current-frontier-v1",
         "full_context_sha256": hashlib.sha256(json.dumps(
             context, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -1927,12 +1963,14 @@ def _fixed_frontier_authority_envelope(
                 value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
             )
         encoded = value.encode("utf-8")
-        if len(encoded) <= limit:
+        if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) <= limit:
             return value
         truncated_cell_count += 1
-        marker = "…#" + hashlib.sha256(encoded).hexdigest()[:8]
+        marker = "~#" + hashlib.sha256(encoded).hexdigest()[:8]
         prefix = value
-        while prefix and len((prefix + marker).encode("utf-8")) > limit:
+        while prefix and len(json.dumps(
+            prefix + marker, ensure_ascii=False,
+        ).encode("utf-8")) > limit:
             prefix = prefix[:-1]
         return prefix + marker
 
@@ -1955,19 +1993,26 @@ def _fixed_frontier_authority_envelope(
         brief(field(item, "blocker")),
     ] for item in context.get("children", [])]
     obligations = [[
-        None, brief(field(item, "event_id")), brief(field(item, "kind")),
+        ["root", index], None, brief(field(item, "event_id")),
+        brief(field(item, "kind")),
         brief(field(item, "payload")),
-    ] for item in context.get("uncheckpointed_material_obligations", [])]
-    for child in context.get("children", []):
+    ] for index, item in enumerate(
+        context.get("uncheckpointed_material_obligations", [])
+    )]
+    for child_index, child in enumerate(context.get("children", [])):
         child_id = brief(field(child, "identifier", "id"))
-        for item in child.get("uncheckpointed_material_obligations", []):
+        for item_index, item in enumerate(
+            child.get("uncheckpointed_material_obligations", [])
+        ):
             obligations.append([
-                child_id, brief(field(item, "event_id")),
+                ["child", child_index, item_index], child_id,
+                brief(field(item, "event_id")),
                 brief(field(item, "kind")), brief(field(item, "payload")),
             ])
-        for item in child.get("pending_child_proposals", []):
+        for item_index, item in enumerate(child.get("pending_child_proposals", [])):
             obligations.append([
-                child_id, brief(field(item, "event_id", "proposal_id", "id")),
+                ["proposal", child_index, item_index], child_id,
+                brief(field(item, "event_id", "proposal_id", "id")),
                 "pending_child_proposal", brief(item),
             ])
     decisions = [[
@@ -2030,7 +2075,7 @@ def _fixed_frontier_authority_envelope(
             ),
             "omitted_items_claimed_executable": False,
             "truncated_cell_count": truncated_cell_count,
-            "truncated_cell_marker": "…#<sha256-prefix>",
+            "truncated_cell_marker": "~#<sha256-prefix>",
             "truncated_cell_rule": "hydrate selected source row before action",
         },
         "execution_frontier": {
@@ -2039,7 +2084,7 @@ def _fixed_frontier_authority_envelope(
             "dependencies": dependencies,
             "columns": {
                 "children": ["id", "status", "owner", "repository", "next", "blocker"],
-                "obligations": ["child", "id", "kind", "action"],
+                "obligations": ["source", "child", "id", "kind", "action"],
                 "decisions": ["id", "status", "action"],
                 "choices": ["id", "status", "action"],
                 "dependencies": ["type", "target"],
@@ -2051,6 +2096,7 @@ def _fixed_frontier_authority_envelope(
         "authenticated_source": source_brief,
         "deferred_audit_detail": {
             "state": "fixed_frontier_authority_envelope",
+            "hydration_required_before_action": True,
             "algorithm": "fixed-six-slot-frontier-v1",
             "fields": all_fields,
             "fields_sha256": hashlib.sha256(json.dumps(
@@ -2064,16 +2110,21 @@ def _fixed_frontier_authority_envelope(
             "hydration_selectors": {
                 "root": "{status:.status,next_action:.next_action,blocker:.blocker}",
                 "children": ".children[<row>]",
-                "obligations": ".uncheckpointed_material_obligations[<row>]",
                 "decisions": ".decisions[<row>]",
                 "choices": ".choice_events[<row>]",
                 "dependencies": ".relations[<row>]",
                 "checkpoint": ".latest_checkpoint",
                 "disposition": ".disposition",
             },
+            "obligation_selector_rules": {
+                "root": ".uncheckpointed_material_obligations[source[1]]",
+                "child": ".children[source[1]].uncheckpointed_material_obligations[source[2]]",
+                "proposal": ".children[source[1]].pending_child_proposals[source[2]]",
+            },
             "hydration_recipe": (
-                "run audit_route.command, pipe its full_validated JSON to "
-                "jq -c '<hydration_selectors entry with row substituted>', "
+                "resolve audit_route.launcher, append audit_route.args, pipe "
+                "its compact_validated JSON to "
+                "jq -c '<hydration selector or obligation rule>', "
                 "then verify the owning top-level field SHA-256"
             ),
         },
@@ -2314,7 +2365,7 @@ def compact_context(
     ) + len(clean["provenance"])
     if max_items < 0 or item_count > max_items:
         raise ResumeError(f"resume_context_over_item_budget:{item_count}>{max_items}")
-    encoded = json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    encoded = _default_output_bytes(context)
     if (
         len(encoded) > max_bytes
         and not include_history
@@ -2323,11 +2374,30 @@ def compact_context(
         original_bytes = len(encoded)
         audit_route = {
             "command": (
+                f"workstreamctl resume {normalized_token} "
+                "--max-bytes 2147483647 --max-items 2147483647"
+            ),
+            "command_role": "display_only",
+            "launcher": "current_workstream_resume_skill_script",
+            "args": [
+                normalized_token, "--max-bytes", "2147483647",
+                "--max-items", "2147483647",
+            ],
+            "representation": "compact_validated",
+            "locator_format": "RFC6901 JSON Pointer",
+        }
+        full_history_route = {
+            "command": (
                 f"workstreamctl resume {normalized_token} --include-history "
                 "--max-bytes 2147483647 --max-items 2147483647"
             ),
+            "command_role": "display_only",
+            "launcher": "current_workstream_resume_skill_script",
+            "args": [
+                normalized_token, "--include-history", "--max-bytes",
+                "2147483647", "--max-items", "2147483647",
+            ],
             "representation": "full_validated",
-            "locator_format": "RFC6901 JSON Pointer",
         }
         for excerpt_limit in _CURRENT_DETAIL_EXCERPT_LIMITS:
             candidate, summary = _compact_verbose_current_detail(
@@ -2341,11 +2411,14 @@ def compact_context(
                 separators=(",", ":"),
             ).encode()).hexdigest()
             summary["audit_route"] = audit_route
+            summary["full_history_route"] = full_history_route
+            summary["hydration_required_before_action"] = True
+            candidate["context_schema"] = dict(candidate["context_schema"])
+            candidate["context_schema"]["envelope"] = (
+                "verbose_current_detail_v1"
+            )
             candidate["deferred_audit_detail"] = summary
-            candidate_encoded = json.dumps(
-                candidate, ensure_ascii=False, sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
+            candidate_encoded = _default_output_bytes(candidate)
             if len(candidate_encoded) <= max_bytes:
                 context = candidate
                 encoded = candidate_encoded
@@ -2359,10 +2432,10 @@ def compact_context(
                     original_bytes
                 )
                 candidate["deferred_audit_detail"]["audit_route"] = audit_route
-                candidate_encoded = json.dumps(
-                    candidate, ensure_ascii=False, sort_keys=True,
-                    separators=(",", ":"),
-                ).encode()
+                candidate["deferred_audit_detail"]["full_history_route"] = (
+                    full_history_route
+                )
+                candidate_encoded = _default_output_bytes(candidate)
                 if len(candidate_encoded) <= max_bytes:
                     context = candidate
                     encoded = candidate_encoded
@@ -2375,10 +2448,10 @@ def compact_context(
                 original_bytes
             )
             candidate["deferred_audit_detail"]["audit_route"] = audit_route
-            candidate_encoded = json.dumps(
-                candidate, ensure_ascii=False, sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
+            candidate["deferred_audit_detail"]["full_history_route"] = (
+                full_history_route
+            )
+            candidate_encoded = _default_output_bytes(candidate)
             if len(candidate_encoded) <= max_bytes:
                 context = candidate
                 encoded = candidate_encoded
@@ -2566,8 +2639,7 @@ def main() -> int:
     ) as error:
         print(f"workstream resume refused: {error}", file=sys.stderr)
         return 2
-    json.dump(output, sys.stdout, ensure_ascii=False, sort_keys=True, indent=2)
-    sys.stdout.write("\n")
+    sys.stdout.write(_default_output_text(output))
     return 0
 
 

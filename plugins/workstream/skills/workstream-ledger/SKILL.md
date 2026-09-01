@@ -796,11 +796,16 @@ instead of being duplicated into every agent prompt.
 If validated current state would still exceed 24 KiB, ordinary resume emits
 actionable head/tail excerpts or a fixed-column frontier after every semantic
 and contradiction check has passed. `deferred_audit_detail` binds deferred
-fields by JSON Pointer, byte count, and SHA-256 and supplies the exact
-full-history audit command. In the fixed envelope, a cell ending in the
-declared digest marker requires hydration: combine the audit command with its
-collection's `hydration_selectors` entry, verify the owning top-level digest,
-then act. `resume_authority: full` describes authenticated validation;
+fields by JSON Pointer, byte count, and SHA-256. Its high-cap compact
+`audit_route` is the digest-verifiable hydration surface; `full_history_route`
+is the separate lossless audit. Resolve their
+`current_workstream_resume_skill_script` launcher as current Python plus the
+workstream-resume SKILL's absolute `scripts/workstream_resume.py`, then append
+`args`; it never depends on PATH. Whenever `deferred_audit_detail.state` is not
+`none`, hydrate before execution. In the fixed envelope, combine the compact
+route with `hydration_selectors` or the source-indexed obligation selector
+rule, verify the owning top-level digest, then act. `resume_authority: full`
+describes authenticated validation;
 `authority_scope` explicitly prevents treating hashed excerpts as exact
 instructions. The Shipyard loader performs a second authenticated, digest-
 verified compact hydration automatically rather than interpreting envelope
