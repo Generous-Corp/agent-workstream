@@ -24,7 +24,7 @@ def fail(message: str) -> int:
 
 def usage() -> int:
     print(
-        "usage: workstreamctl {plan|intake|resume|projection|material-repair|repository-identity|repository-identity-seal|reconcile|shipyard-profile|ingress|tab-title|child-origin-repair|child-event|child-checkpoint|child-proposal-activate} [args...]\n"
+        "usage: workstreamctl {plan|intake|resume|generation|projection|material-repair|repository-identity|repository-identity-seal|reconcile|shipyard-profile|ingress|tab-title|child-origin-repair|child-event|child-checkpoint|child-proposal-activate} [args...]\n"
         "       workstreamctl linear inspect [--config PATH] [--team-id ID --project-id ID]\n"
         "       workstreamctl config validate [path]\n\n"
         "These commands expose existing deterministic helpers. They do not claim a hosted live-status service."
@@ -40,6 +40,7 @@ def main(argv: list[str]) -> int:
         "plan": "workstream_plan.py",
         "intake": "workstream_intake.py",
         "resume": "workstream_resume.py",
+        "generation": "workstream_generation.py",
         "projection": "workstream_projection.py",
         "material-repair": "workstream_material_repair.py",
         "repository-identity": "workstream_repository_identity.py",

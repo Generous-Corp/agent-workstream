@@ -28,8 +28,9 @@ Resolve launcher `current_workstream_resume_skill_script` as current Python plus
 this SKILL's absolute resume script, then append `args`; never use PATH.
 
 If recovery refuses, report its exact error and stop. Do not fall back to local
-context or load the lifecycle skill. Success requires `resume_authority` to be
-`full`; inspection-only or unavailable authority is not permission to continue.
+context or load the lifecycle skill. Success requires `resume_authority` to be `full`;
+inspection-only is not authority. `plan_generation_pending` is non-executable:
+run its exact remediation, then retry.
 
 After successful recovery, carry the resolved canonical token in the existing
 tab without replacing its title:

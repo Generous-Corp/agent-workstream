@@ -106,6 +106,10 @@ GENERATION_CONTROL_V3_FIELDS = {
     *GENERATION_CONTROL_FIELDS,
     "activation_checkpoint", "activation_checkpoint_sha256",
 }
+GENERATION_CONTROL_V4_FIELDS = {
+    *GENERATION_CONTROL_V3_FIELDS,
+    "native_root_sha256",
+}
 
 
 class LinearProjectionError(LinearTransportError):
@@ -722,7 +726,12 @@ def validate_projection_event(event: dict[str, Any]) -> None:
                 GENERATION_CONTROL_V3_FIELDS
                 if event["kind"] == "generation_transition"
                 and value.get("schema_version") == 3
-                else GENERATION_CONTROL_FIELDS
+                else (
+                    GENERATION_CONTROL_V4_FIELDS
+                    if event["kind"] == "generation_transition"
+                    and value.get("schema_version") == 4
+                    else GENERATION_CONTROL_FIELDS
+                )
             )
         )
         if (
@@ -731,7 +740,7 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             or event["supersedes_event_id"] is not None
             or set(value) != required_fields
             or value.get("schema_version") not in (
-                {2, 3} if event["kind"] == "generation_transition" else {2}
+                {2, 3, 4} if event["kind"] == "generation_transition" else {2}
             )
             or not isinstance(value.get("from"), dict)
             or not isinstance(value.get("to"), dict)
@@ -836,28 +845,39 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             raise LinearProjectionError(error_name)
         if (
             event["kind"] == "generation_transition"
-            and value.get("schema_version") == 3
+            and value.get("schema_version") in {3, 4}
         ):
             from workstream_checkpoint import validate_checkpoint
 
             checkpoint = value.get("activation_checkpoint")
-            try:
-                if not isinstance(checkpoint, dict):
-                    raise ValueError("checkpoint missing")
-                validate_checkpoint(checkpoint)
-            except (ValueError, TypeError) as error:
-                raise LinearProjectionError(error_name) from error
+            if checkpoint is None and value.get("schema_version") == 4:
+                if value.get("activation_checkpoint_sha256") is not None:
+                    raise LinearProjectionError(error_name)
+            else:
+                try:
+                    if not isinstance(checkpoint, dict):
+                        raise ValueError("checkpoint missing")
+                    validate_checkpoint(checkpoint)
+                except (ValueError, TypeError) as error:
+                    raise LinearProjectionError(error_name) from error
+                if (
+                    checkpoint["workstream_id"] != event["workstream_id"]
+                    or checkpoint["plan_revision"] != value["to"]["plan_revision"]
+                    or checkpoint["root_revision"] != value["to"]["material_revision"]
+                    or checkpoint["acknowledgement"] != {
+                        "state": "pending", "remote_id": None,
+                        "applied_revision": None,
+                    }
+                    or checkpoint["event_id"] not in value["to"]["checkpoint_event_ids"]
+                    or value["activation_checkpoint_sha256"]
+                    != hashlib.sha256(_canonical(checkpoint)).hexdigest()
+                ):
+                    raise LinearProjectionError(error_name)
             if (
-                checkpoint["workstream_id"] != event["workstream_id"]
-                or checkpoint["plan_revision"] != value["to"]["plan_revision"]
-                or checkpoint["root_revision"] != value["to"]["material_revision"]
-                or checkpoint["acknowledgement"] != {
-                    "state": "pending", "remote_id": None,
-                    "applied_revision": None,
-                }
-                or checkpoint["event_id"] not in value["to"]["checkpoint_event_ids"]
-                or value["activation_checkpoint_sha256"]
-                != hashlib.sha256(_canonical(checkpoint)).hexdigest()
+                value.get("schema_version") == 4
+                and not re.fullmatch(
+                    r"[0-9a-f]{64}", str(value.get("native_root_sha256", ""))
+                )
             ):
                 raise LinearProjectionError(error_name)
     if event["kind"] == "cas_activation":
@@ -2630,9 +2650,19 @@ def select_plan_generation(
         if event["workstream_id"] != workstream_id:
             raise LinearProjectionError("workstream_id_mismatch")
         encoded_events.append(event)
-    transitions = [
+    all_transitions = [
         event for event in encoded_events
         if event["kind"] == "generation_transition"
+    ]
+    from workstream_generation import finalized_generation_transition_ids
+    finalized = finalized_generation_transition_ids(
+        comments, workstream_id=workstream_id,
+        authenticated_route=authenticated_route,
+    )
+    transitions = [
+        event for event in all_transitions
+        if event["value"].get("schema_version") != 4
+        or event["event_id"] in finalized
     ]
     geneses = [
         event for event in encoded_events if event["kind"] == "generation_genesis"
@@ -2795,6 +2825,44 @@ def select_plan_generation(
         "activation_epoch": tip["value"]["activation_epoch"],
         "authority_origin": tip["kind"],
     }
+
+
+def bind_active_plan_generation(
+    graph: dict[str, Any], comments: list[dict[str, Any]], *,
+    workstream_id: str, selected: dict[str, Any],
+    authenticated_route: dict[str, str],
+) -> dict[str, Any]:
+    """Apply one selected generation's plan and execution authority to a graph."""
+    result = deepcopy(graph)
+    root = result.get("root")
+    if not isinstance(root, dict):
+        raise LinearProjectionError("generation_root_missing")
+    description_revision = root.get("plan_revision")
+    root["description_plan_revision"] = description_revision
+    root["plan_revision"] = selected["plan_revision"]
+    root["generation_transition_tip_event_id"] = selected[
+        "transition_tip_event_id"
+    ]
+    root["generation_activation_epoch"] = selected["activation_epoch"]
+    root["generation_authority_origin"] = selected["authority_origin"]
+    from workstream_generation import selected_generation_execution_status
+    generation_status = selected_generation_execution_status(
+        comments, workstream_id=workstream_id,
+        transition_event_id=selected["transition_tip_event_id"],
+        authenticated_route=authenticated_route,
+    )
+    if generation_status is not None:
+        if generation_status != {
+            "authority": "generation_local", "name": "In Progress",
+            "type": "started",
+        }:
+            raise LinearProjectionError("invalid_generation_execution_status")
+        root["issue_status"] = root.get("status")
+        root["issue_status_type"] = root.get("status_type")
+        root["status"] = generation_status["name"]
+        root["status_type"] = generation_status["type"]
+        root["generation_execution_status"] = deepcopy(generation_status)
+    return result
 
 
 def _inspect_unsealed_identity_history(

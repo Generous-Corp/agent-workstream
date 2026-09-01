@@ -14,8 +14,11 @@ from workstream_delta import Delta
 from workstream_generation import (
     GenerationTransport, WorkstreamGenerationError, _digest,
     build_retirement_proof, generation_quarantine_metadata, main, parser,
+    encode_generation_finalization, generation_finalization_slot_id,
+    native_root_activation_proof,
     pending_generation_reservations, reduce_generation_checkpoint_comments,
-    selected_activation_checkpoints,
+    reduce_generation_finalizations, selected_activation_checkpoints,
+    selected_generation_execution_status,
     strict_candidate_loader,
 )
 from workstream_checkpoint import build_checkpoint
@@ -59,6 +62,7 @@ class FakeClient:
         self.description = f"Plan revision: {OLD}"
         self.graph_nonce = "initial"
         self.graph_status = "In Progress"
+        self.graph_status_type = "started"
         self.children: list[dict] = []
         self.before_issue_create = None
 
@@ -72,7 +76,7 @@ class FakeClient:
             "team": {"id": "team", "organization": {"id": "workspace"}},
             "assignee": None,
             "state": {"id": "state", "name": self.graph_status,
-                      "type": "started"},
+                      "type": self.graph_status_type},
         }
 
     def execute(self, query, variables):
@@ -332,6 +336,387 @@ class GenerationTransitionTests(unittest.TestCase):
                 if item["plan_revision"] == predecessor
             ),
         )
+
+    def native_root_sha(self, client=None):
+        client = client or self.client
+        snapshot = LinearGraphQLTransport(
+            client, workspace_id="workspace", team_id="team", project_id="project",
+        ).snapshot_for_root(WORKSTREAM)
+        return native_root_activation_proof(
+            snapshot, workstream_id=WORKSTREAM, issue_id=WORKSTREAM,
+            authority=AUTHORITY,
+        )["sha256"]
+
+    def native_fenced_transport(self):
+        linear = LinearGraphQLTransport(
+            self.client, workspace_id="workspace", team_id="team",
+            project_id="project",
+        )
+        return GenerationTransport(
+            self.client, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
+            authority=AUTHORITY, candidate_loader=self.loader,
+            legacy_description_plan_revision=OLD,
+            native_root_loader=lambda: linear.snapshot_for_root(WORKSTREAM),
+        )
+
+    def native_and_source_fenced_transport(self, source_state):
+        linear = LinearGraphQLTransport(
+            self.client, workspace_id="workspace", team_id="team",
+            project_id="project",
+        )
+        return GenerationTransport(
+            self.client, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
+            authority=AUTHORITY, candidate_loader=self.loader,
+            legacy_description_plan_revision=OLD,
+            native_root_loader=lambda: linear.snapshot_for_root(WORKSTREAM),
+            source_loader=lambda: deepcopy(source_state),
+        )
+
+    def test_terminal_native_root_refuses_preview_and_apply_before_first_write(self):
+        project_full(self.client, NEW)
+        self.client.graph_status = "Done"
+        transport = self.native_fenced_transport()
+        writes = len(self.client.mutations)
+
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_activation_requires_reviewed_nonterminal_root",
+        ):
+            transport.preview_activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=self.retirement(),
+            )
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_activation_requires_reviewed_nonterminal_root",
+        ):
+            transport.activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=self.retirement(),
+                expected_native_root_sha256="0" * 64,
+            )
+        self.assertEqual(len(self.client.mutations), writes)
+        self.assertEqual(select_plan_generation(
+            self.client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=OLD, authenticated_route=AUTHORITY,
+        )["plan_revision"], OLD)
+
+    def test_todo_native_root_is_not_accepted_as_in_progress(self):
+        project_full(self.client, NEW)
+        self.client.graph_status = "Todo"
+        self.client.graph_status_type = "unstarted"
+        transport = self.native_fenced_transport()
+        writes = len(self.client.mutations)
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_activation_requires_reviewed_in_progress_root",
+        ):
+            transport.preview_activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=self.retirement(),
+            )
+        self.assertEqual(len(self.client.mutations), writes)
+
+    def test_bootstrap_terminal_native_cache_has_no_late_activation_gate(self):
+        client = FakeClient()
+        client.description = "Next action: Continue."
+        client.graph_status = "Done"
+        client.graph_status_type = "completed"
+        project_full(client, OLD)
+        transport = GenerationTransport(
+            client, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
+            authority=AUTHORITY, candidate_loader=Loader(client),
+            legacy_description_plan_revision=None,
+        )
+        receipt = transport.bootstrap(
+            target_plan_revision=OLD, created_at="bootstrap",
+        )
+        self.assertEqual(receipt["activated_plan_revision"], OLD)
+        self.assertEqual(select_plan_generation(
+            client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=None, authenticated_route=AUTHORITY,
+        )["plan_revision"], OLD)
+
+    def test_reviewed_native_root_proof_replays_idempotently(self):
+        project_full(self.client, NEW)
+        transport = self.native_fenced_transport()
+        preview = transport.preview_activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+        )
+        proof = preview["native_root_activation_proof"]
+        first = transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+            expected_native_root_sha256=proof["sha256"],
+        )
+        writes = len(self.client.mutations)
+        replay = transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+            expected_native_root_sha256=proof["sha256"],
+        )
+
+        self.assertFalse(first["replay"])
+        self.assertTrue(replay["replay"])
+        self.assertEqual(len(self.client.mutations), writes)
+        self.assertEqual(replay["native_root_activation_proof"], proof)
+
+    def test_native_status_race_leaves_recoverable_reservation_not_authority(self):
+        project_full(self.client, NEW)
+        transport = self.native_fenced_transport()
+        proof = transport.preview_activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+        )["native_root_activation_proof"]
+
+        def close_after_first_write(_item, client):
+            client.before_each_create = None
+            client.graph_status = "Done"
+
+        self.client.before_each_create = close_after_first_write
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_activation_requires_reviewed_nonterminal_root",
+        ):
+            transport.activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=self.retirement(),
+                expected_native_root_sha256=proof["sha256"],
+            )
+        self.assertEqual(select_plan_generation(
+            self.client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=OLD, authenticated_route=AUTHORITY,
+        )["plan_revision"], OLD)
+        pending = pending_generation_reservations(
+            self.client.comments, workstream_id=WORKSTREAM,
+            authenticated_route=AUTHORITY,
+        )
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["to_plan_revision"], NEW)
+        self.assertEqual(pending[0]["native_root_sha256"], proof["sha256"])
+
+    def test_native_status_race_after_preparation_keeps_old_authority(self):
+        project_full(self.client, NEW)
+        source = {"identity": f"https://example.test/{NEW}", "sha256": NEW}
+        transport = self.native_and_source_fenced_transport(source)
+        proof = transport.preview_activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+        )["native_root_activation_proof"]
+
+        def close_when_transition_is_written(item, client):
+            body = item.get("body") or ""
+            if PROJECTION_PREFIX not in body:
+                return
+            match = PROJECTION_RE.findall(body)
+            if len(match) == 1 and _decode_projection(match[0])["kind"] == \
+                    "generation_transition":
+                client.graph_status = "Done"
+                client.graph_status_type = "completed"
+
+        self.client.before_each_create = close_when_transition_is_written
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_activation_requires_reviewed_nonterminal_root",
+        ):
+            transport.activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=self.retirement(),
+                expected_native_root_sha256=proof["sha256"],
+            )
+        selected = select_plan_generation(
+            self.client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=OLD, authenticated_route=AUTHORITY,
+        )
+        self.assertEqual(selected["plan_revision"], OLD)
+        pending = pending_generation_reservations(
+            self.client.comments, workstream_id=WORKSTREAM,
+            authenticated_route=AUTHORITY,
+        )
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["source"], source)
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_abort_after_preparation_replay_required",
+        ):
+            transport.abort(
+                reservation_id=pending[0]["reservation_id"],
+                reservation_sha256=pending[0]["reservation_sha256"],
+                reason="writer stopped", created_at="later",
+            )
+        self.client.before_each_create = None
+        self.client.graph_status = "In Progress"
+        self.client.graph_status_type = "started"
+        replay = transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+            expected_native_root_sha256=proof["sha256"],
+        )
+        self.assertTrue(replay["replay"])
+        self.assertEqual(select_plan_generation(
+            self.client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=OLD, authenticated_route=AUTHORITY,
+        )["plan_revision"], NEW)
+        self.assertEqual(pending_generation_reservations(
+            self.client.comments, workstream_id=WORKSTREAM,
+            authenticated_route=AUTHORITY,
+        ), [])
+
+    def test_canonical_source_changes_at_first_write_never_activates(self):
+        project_full(self.client, NEW)
+        source = {"identity": f"https://example.test/{NEW}", "sha256": NEW}
+        transport = self.native_and_source_fenced_transport(source)
+        proof = transport.preview_activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+        )["native_root_activation_proof"]
+
+        def drift_source_at_first_write(_item, _client):
+            self.client.before_each_create = None
+            source["sha256"] = OTHER
+
+        self.client.before_each_create = drift_source_at_first_write
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_canonical_source_changed_during_activation",
+        ):
+            transport.activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=self.retirement(),
+                expected_native_root_sha256=proof["sha256"],
+            )
+        self.assertEqual(select_plan_generation(
+            self.client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=OLD, authenticated_route=AUTHORITY,
+        )["plan_revision"], OLD)
+
+    def test_canonical_source_changes_during_finalization_is_not_success(self):
+        project_full(self.client, NEW)
+        source = {"identity": f"https://example.test/{NEW}", "sha256": NEW}
+        transport = self.native_and_source_fenced_transport(source)
+        proof = transport.preview_activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+        )["native_root_activation_proof"]
+
+        def drift_source_at_finalization(item, _client):
+            if "workstream-generation-finalization:v1" in (item.get("body") or ""):
+                source["sha256"] = OTHER
+
+        self.client.before_each_create = drift_source_at_finalization
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_canonical_source_changed_during_activation",
+        ):
+            transport.activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=self.retirement(),
+                expected_native_root_sha256=proof["sha256"],
+            )
+        # The finalization is immutable, but stale canonical bytes can never be
+        # reported as success; ordinary resume observes this exact digest drift.
+        self.assertEqual(select_plan_generation(
+            self.client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=OLD, authenticated_route=AUTHORITY,
+        )["plan_revision"], NEW)
+
+    def test_schema_v4_finalization_lost_response_replays_without_writes(self):
+        project_full(self.client, NEW)
+        source = {"identity": f"https://example.test/{NEW}", "sha256": NEW}
+        transport = self.native_and_source_fenced_transport(source)
+        proof = transport.preview_activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+        )["native_root_activation_proof"]
+        self.client.commit_then_fail_at.add(len(self.client.mutations) + 4)
+        first = transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+            expected_native_root_sha256=proof["sha256"],
+        )
+        writes = len(self.client.mutations)
+        replay = transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+            expected_native_root_sha256=proof["sha256"],
+        )
+        self.assertFalse(first["replay"])
+        self.assertTrue(replay["replay"])
+        self.assertEqual(len(self.client.mutations), writes)
+        self.assertEqual(
+            selected_generation_execution_status(
+                self.client.comments, workstream_id=WORKSTREAM,
+                transition_event_id=replay["event_id"],
+                authenticated_route=AUTHORITY,
+            )["name"],
+            "In Progress",
+        )
+
+    def test_generation_local_status_prevents_native_done_after_final_fence(self):
+        project_full(self.client, NEW)
+        source = {"identity": f"https://example.test/{NEW}", "sha256": NEW}
+        transport = self.native_and_source_fenced_transport(source)
+        proof = transport.preview_activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+        )["native_root_activation_proof"]
+
+        def close_during_finalization(item, client):
+            if "workstream-generation-finalization:v1" in (item.get("body") or ""):
+                client.graph_status = "Done"
+                client.graph_status_type = "completed"
+
+        self.client.before_each_create = close_during_finalization
+        receipt = transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+            expected_native_root_sha256=proof["sha256"],
+        )
+        status = selected_generation_execution_status(
+            self.client.comments, workstream_id=WORKSTREAM,
+            transition_event_id=receipt["event_id"],
+            authenticated_route=AUTHORITY,
+        )
+        self.assertEqual(status, {
+            "authority": "generation_local", "name": "In Progress",
+            "type": "started",
+        })
+        self.assertEqual(self.client.graph_status, "Done")
+
+    def test_forged_finalization_binding_is_a_planted_contradiction(self):
+        project_full(self.client, NEW)
+        source = {"identity": f"https://example.test/{NEW}", "sha256": NEW}
+        transport = self.native_and_source_fenced_transport(source)
+        proof = transport.preview_activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+        )["native_root_activation_proof"]
+        receipt = transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+            expected_native_root_sha256=proof["sha256"],
+        )
+        forged = deepcopy(receipt["two_phase_finalization"])
+        forged.pop("remote_id", None)
+        forged["source"]["sha256"] = OTHER
+        unsigned = {key: deepcopy(value) for key, value in forged.items()
+                    if key != "finalization_id"}
+        forged["finalization_id"] = "wsgf_" + _digest(unsigned)[:32]
+        self.client.comments.append({
+            "id": generation_finalization_slot_id(forged),
+            "body": encode_generation_finalization(forged),
+            "createdAt": "2026-08-31T00:00:00Z",
+            "updatedAt": "2026-08-31T00:00:00Z",
+        })
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_finalization_binding_mismatch",
+        ):
+            reduce_generation_finalizations(
+                self.client.comments, workstream_id=WORKSTREAM,
+                authenticated_route=AUTHORITY,
+            )
 
     def activate(self, target=NEW, predecessor=OLD, epoch=0):
         if not adapter(self.client, target).state().events:
@@ -2309,6 +2694,7 @@ class GenerationTransitionTests(unittest.TestCase):
                 "bound_graph_frontier_sha256": "1" * 64,
                 "bound_candidate_resume_sha256": "2" * 64,
             }
+            generation._native_root_proof.return_value = None
             root_transport = MagicMock()
             root_transport.snapshot_for_root.return_value = {
                 "root": {"plan_revision": OLD},
@@ -2317,6 +2703,7 @@ class GenerationTransitionTests(unittest.TestCase):
                 "workstream_generation.py", "activate", WORKSTREAM,
                 "--plan-source", plan_file.name, "--created-at", "now",
                 "--retirement-proof", proof_file.name, "--apply",
+                "--expected-native-root-sha256", "0" * 64,
             ]
             final_candidate = {
                 "graph_frontier_sha256": "1" * 64,
@@ -2547,6 +2934,8 @@ class GenerationTransitionTests(unittest.TestCase):
                 "--plan-identity", new_plan.name,
                 "--retirement-proof", proof.name,
                 "--created-at", "now", "--apply",
+                "--expected-native-root-sha256",
+                self.native_root_sha(activate_client),
             ])
         self.assertEqual((code, error), (0, ""))
         output = json.loads(raw)
@@ -2601,12 +2990,19 @@ class GenerationTransitionTests(unittest.TestCase):
                 "--activation-checkpoint", checkpoint_file.name,
                 "--remote-head", "e" * 40,
                 "--created-at", "checkpoint", "--apply",
+                "--expected-native-root-sha256",
+                self.native_root_sha(checkpoint_client),
             ])
         self.assertEqual((code, error), (0, ""))
         checkpoint_output = json.loads(raw)
         self.assertEqual(checkpoint_output["final_active_plan_revision"], new_digest)
         transition = adapter(checkpoint_client, old_digest).state().events[-1]
-        self.assertEqual(transition["value"]["schema_version"], 3)
+        self.assertEqual(transition["value"]["schema_version"], 4)
+        self.assertEqual(
+            checkpoint_output["two_phase_finalization"]["execution_status"],
+            {"authority": "generation_local", "name": "In Progress",
+             "type": "started"},
+        )
         selected = select_plan_generation(
             checkpoint_client.comments, workstream_id=WORKSTREAM,
             description_plan_revision=old_digest, authenticated_route=AUTHORITY,
@@ -2641,6 +3037,8 @@ class GenerationTransitionTests(unittest.TestCase):
                 "--plan-identity", later_plan.name,
                 "--retirement-proof", proof.name,
                 "--created-at", "later", "--apply",
+                "--expected-native-root-sha256",
+                self.native_root_sha(activate_client),
             ])
         self.assertEqual((code, error), (0, ""))
         with tempfile.NamedTemporaryFile("w", suffix=".json") as proof:
@@ -2651,6 +3049,8 @@ class GenerationTransitionTests(unittest.TestCase):
                 "--plan-identity", new_plan.name,
                 "--retirement-proof", proof.name,
                 "--created-at", "now", "--apply",
+                "--expected-native-root-sha256",
+                self.native_root_sha(activate_client),
             ])
         self.assertEqual((code, error), (0, ""))
         replay_output = json.loads(raw)
@@ -2689,9 +3089,16 @@ class GenerationTransitionTests(unittest.TestCase):
                 "--plan-identity", new_plan.name,
                 "--retirement-proof", proof.name,
                 "--created-at", "now", "--apply",
+                "--expected-native-root-sha256",
+                self.native_root_sha(drift_client),
             ])
         self.assertEqual(code, 2)
-        self.assertIn("authority_changed_with_post_read_drift", error)
+        self.assertRegex(
+            error,
+            "authority_changed_with_post_read_drift|"
+            "generation_native_root_review_proof_mismatch|"
+            "generation_prepared_candidate_changed",
+        )
 
     def test_production_cli_surface_has_bootstrap_activate_apply_and_abort(self):
         parsed = parser().parse_args([
@@ -2707,19 +3114,38 @@ class GenerationTransitionTests(unittest.TestCase):
         self.assertEqual((parsed.command, parsed.abort_reason), ("activate", "reviewed"))
 
     def test_projection_cli_binding_treats_description_as_diagnostic(self):
-        graph = {"root": {"plan_revision": OLD, "identifier": WORKSTREAM}}
+        graph = {"root": {
+            "plan_revision": OLD, "identifier": WORKSTREAM,
+            "status": "Done", "status_type": "completed",
+        }}
         candidate = bind_projection_plan_generation(
             graph, self.client.comments, workstream_id=WORKSTREAM,
             requested_plan_revision=NEW, authenticated_route=AUTHORITY,
         )
         self.assertEqual(candidate["root"]["plan_revision"], NEW)
         self.assertEqual(candidate["root"]["description_plan_revision"], OLD)
-        self.activate()
+        project_full(self.client, NEW)
+        transport = self.native_and_source_fenced_transport({
+            "identity": f"https://example.test/{NEW}", "sha256": NEW,
+        })
+        proof = transport.preview_activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+        )["native_root_activation_proof"]
+        transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+            expected_native_root_sha256=proof["sha256"],
+        )
         active = bind_projection_plan_generation(
             graph, self.client.comments, workstream_id=WORKSTREAM,
             requested_plan_revision=NEW, authenticated_route=AUTHORITY,
         )
         self.assertEqual(active["root"]["plan_revision"], NEW)
+        self.assertEqual(active["root"]["status"], "In Progress")
+        self.assertEqual(active["root"]["status_type"], "started")
+        self.assertEqual(active["root"]["issue_status"], "Done")
+        self.assertEqual(active["root"]["issue_status_type"], "completed")
         with self.assertRaisesRegex(LinearProjectionError, "plan_retired"):
             bind_projection_plan_generation(
                 graph, self.client.comments, workstream_id=WORKSTREAM,

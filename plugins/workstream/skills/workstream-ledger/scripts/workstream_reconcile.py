@@ -34,6 +34,7 @@ from workstream_linear_projection import (
 )
 from workstream_plan import plan_payload
 from workstream_projection import stable_live_readback
+from workstream_projection import bind_projection_plan_generation
 from workstream_resume import (
     add_material_history, closure_snapshot_digest, extract_token, ResumeError,
 )
@@ -66,11 +67,17 @@ def authenticated_reconcile_snapshot(
     reread: Callable[[], tuple[dict[str, Any], list[dict[str, Any]]]],
 ) -> dict[str, Any]:
     """Attach live dependency authority before lifecycle snapshot validation."""
-    candidate = deepcopy(graph)
+    candidate = bind_projection_plan_generation(
+        graph, comments, workstream_id=token,
+        requested_plan_revision=authenticated_source["sha256"],
+        authenticated_route=authenticated_route,
+    )
     candidate["dependency_graph"] = (
         dependency_adapter.read_authorized_graph_for_snapshot(
-            graph, comments,
-            generation_selector_plan_revision=graph["root"].get("plan_revision"),
+            candidate, comments,
+            generation_selector_plan_revision=candidate["root"].get(
+                "description_plan_revision"
+            ),
             reread=reread,
         )
     )

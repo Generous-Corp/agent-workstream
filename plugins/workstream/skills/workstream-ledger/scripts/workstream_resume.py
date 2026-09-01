@@ -38,12 +38,13 @@ from workstream_linear_events import (
     reduce_event_comments,
 )
 from workstream_linear_projection import (
-    _inspect_unsealed_identity_history, inspect_unsealed_identity_history,
+    _inspect_unsealed_identity_history, bind_active_plan_generation,
+    inspect_unsealed_identity_history,
     LinearProjectionError,
     reduce_projection_comments, select_plan_generation, TOMBSTONE,
     validate_projection_event,
 )
-from workstream_plan import plan_payload
+from workstream_plan import canonical_plan_url, plan_payload, same_plan_document
 from workstream_relation_readback import read_relation_targets
 from workstream_choices import ChoiceError, reduce_choices
 from workstream_evidence import evidence_errors
@@ -79,6 +80,243 @@ RAW_TRANSCRIPT_KEYS = {"raw_transcript", "transcript"}
 
 class ResumeError(ValueError):
     pass
+
+
+def apply_generation_execution_status(
+    root: dict[str, Any], generation_status: dict[str, str] | None,
+) -> None:
+    """Prefer finalized generation-local status while retaining native truth."""
+    if generation_status is None:
+        return
+    if generation_status != {
+        "authority": "generation_local", "name": "In Progress",
+        "type": "started",
+    }:
+        raise ResumeError("invalid_generation_execution_status")
+    root["issue_status"] = root.get("status")
+    root["issue_status_type"] = root.get("status_type")
+    root["status"] = generation_status["name"]
+    root["status_type"] = generation_status["type"]
+    root["generation_execution_status"] = deepcopy(generation_status)
+
+
+def plan_generation_freshness(
+    *, token: str, description: str, active_source: dict[str, Any],
+    comments: list[dict[str, Any]], authenticated_route: dict[str, str],
+) -> dict[str, Any] | None:
+    """Return a non-executable recovery surface when live plan authority moved.
+
+    The active immutable source remains audit authority.  The single labeled
+    canonical locator is only a freshness sentinel: changed bytes never become
+    executable until the append-only generation protocol selects them.
+    """
+    canonical = canonical_plan_url(description)
+    active_identity = active_source.get("identity") or active_source.get("url")
+    active_sha256 = active_source.get("sha256")
+    if (
+        not isinstance(active_identity, str) or not active_identity
+        or not isinstance(active_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", active_sha256)
+    ):
+        raise ResumeError("plan_generation_active_source_incomplete")
+    if not same_plan_document(canonical, active_identity):
+        raise ResumeError(
+            "canonical_plan_source_conflicts_active_generation:"
+            "keep exactly one locator for the active plan document"
+        )
+    live_source = plan_payload(canonical, canonical)["source"]
+    from workstream_generation import (
+        generation_ledger_frontier_tokens, pending_generation_reservations,
+    )
+
+    pending = pending_generation_reservations(
+        comments, workstream_id=token,
+        authenticated_route=authenticated_route,
+    )
+    prepared_tokens = set(generation_ledger_frontier_tokens(
+        comments, workstream_id=token,
+    ))
+    if live_source["sha256"] == active_sha256 and not pending:
+        return None
+    reservations = []
+    for item in pending:
+        reservations.append({
+            "reservation_id": item["reservation_id"],
+            "reservation_sha256": item["reservation_sha256"],
+            "from_plan_revision": item["from_plan_revision"],
+            "to_plan_revision": item["to_plan_revision"],
+            "created_at": item["created_at"],
+            "continue": {
+                "available": True,
+                "command": [
+                    "workstreamctl", "generation", "activate", token,
+                    "--plan-source", canonical,
+                    "--plan-identity", "<reviewed-immutable-plan-url>",
+                    "--retirement-proof", "<same-retirement-proof.json>",
+                    "--created-at", item["created_at"], "--apply",
+                ],
+                "requirement": "replay the exact reviewed operation inputs",
+            },
+            "abort": {
+                "command": [
+                    "workstreamctl", "generation", "activate", token,
+                    "--abort-reservation-id", item["reservation_id"],
+                    "--abort-reservation-sha256", item["reservation_sha256"],
+                    "--abort-reason", "<reviewed-reason>",
+                    "--created-at", "<reviewed-utc-time>", "--apply",
+                ],
+                "requirement": "abort only after proving the original writer stopped",
+            },
+        })
+        if item.get("schema_version") == 4:
+            reservations[-1]["native_root_sha256"] = item["native_root_sha256"]
+            replay_inputs = {
+                "source": item["source"],
+                "retirement_proof": item["retirement"],
+                "activation_checkpoint": item["activation_checkpoint"],
+                "remote_head": item["remote_head"],
+                "created_at": item["created_at"],
+                "expected_native_root_sha256": item["native_root_sha256"],
+            }
+            reservations[-1]["replay_inputs"] = replay_inputs
+            replay_stem = f"workstream-generation-{item['reservation_id']}"
+            retirement_path = replay_stem + "-retirement.json"
+            command = [
+                "workstreamctl", "generation", "activate", token,
+                "--plan-source", item["source"]["identity"],
+                "--plan-identity", item["source"]["identity"],
+                "--retirement-proof", retirement_path,
+                "--created-at", item["created_at"],
+                "--expected-native-root-sha256", item["native_root_sha256"],
+            ]
+            materialize_files = [{
+                "path": retirement_path,
+                "content": item["retirement"],
+                "sha256": hashlib.sha256(json.dumps(
+                    item["retirement"], ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")).hexdigest(),
+            }]
+            if item["activation_checkpoint"] is not None:
+                checkpoint_path = replay_stem + "-checkpoint.json"
+                command.extend([
+                    "--activation-checkpoint", checkpoint_path,
+                    "--remote-head", item["remote_head"],
+                ])
+                materialize_files.append({
+                    "path": checkpoint_path,
+                    "content": item["activation_checkpoint"],
+                    "sha256": hashlib.sha256(json.dumps(
+                        item["activation_checkpoint"], ensure_ascii=False,
+                        sort_keys=True, separators=(",", ":"),
+                    ).encode("utf-8")).hexdigest(),
+                })
+            command.append("--apply")
+            reservations[-1]["continue"]["command"] = command
+            reservations[-1]["continue"]["materialize_files"] = (
+                materialize_files
+            )
+            reservations[-1]["continue"]["requirement"] = (
+                "write each exact content value to its named path, verify its "
+                "sha256, then execute this exact argv"
+            )
+            reservation_token = (
+                f"generation:{item['reservation_id']}:"
+                f"{item['reservation_sha256']}"
+            )
+            if reservation_token in prepared_tokens:
+                reservations[-1]["abort"] = {
+                    "available": False,
+                    "reason": (
+                        "authority preparation is durable; replay the exact "
+                        "reservation to finalize after restoring its reviewed state"
+                    ),
+                }
+        else:
+            reservations[-1]["continue"] = {
+                "available": False,
+                "reason": (
+                    "legacy v2/v3 reservation lacks complete replay inputs; "
+                    "abort it after writer-death review, then preview a new activation"
+                ),
+            }
+    return {
+        "resume_authority": "plan_generation_pending",
+        "executable": False,
+        "workstream_id": token,
+        "active_source": {
+            "identity": active_identity, "sha256": active_sha256,
+        },
+        "canonical_live_source": {
+            "identity": canonical, "sha256": live_source["sha256"],
+        },
+        "pending_generation_reservations": reservations,
+        "remediation": {
+            "reason": (
+                "generation_transition_incomplete" if reservations
+                else "canonical_plan_bytes_changed_without_generation_activation"
+            ),
+            "command": [
+                "workstreamctl", "generation", "activate", token,
+                "--plan-source", canonical,
+                "--plan-identity", "<reviewed-immutable-plan-url>",
+                "--retirement-proof", "<reviewed-retirement-proof.json>",
+                "--created-at", "<reviewed-utc-time>",
+                "--expected-native-root-sha256", "<preview-sha256>", "--apply",
+            ],
+            "required_postcondition": (
+                "ordinary resume returns full authority for the new immutable "
+                "source and a nonterminal native root"
+            ),
+        },
+    }
+
+
+def bound_plan_generation_pending(
+    value: dict[str, Any], *, max_bytes: int,
+) -> dict[str, Any]:
+    encoded = _default_output_bytes(value)
+    if len(encoded) <= max_bytes:
+        return value
+    reservations = value.get("pending_generation_reservations") or []
+    deferred = {
+        "original_bytes": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "reservation_count": len(reservations),
+        "reservations_sha256": hashlib.sha256(
+            json.dumps(
+                reservations, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+    bounded = {
+        "resume_authority": "plan_generation_pending",
+        "executable": False,
+        "workstream_id": value.get("workstream_id"),
+        "active_plan_sha256": (value.get("active_source") or {}).get("sha256"),
+        "canonical_live_plan_sha256": (
+            value.get("canonical_live_source") or {}
+        ).get("sha256"),
+        "pending_transition": deferred,
+        "remediation": {
+            "reason": (value.get("remediation") or {}).get("reason"),
+            "command": [
+                "workstreamctl", "resume", value.get("workstream_id"),
+                "--max-bytes", str(max(DEFAULT_RESUME_MAX_BYTES, len(encoded) + 1)),
+            ],
+            "command_role": "display_only_hydration",
+            "execution_rule": (
+                "hydrate this exact digest-bound pending surface; then run its "
+                "generation replay or abort remediation before execution"
+            ),
+        },
+    }
+    if len(_default_output_bytes(bounded)) > max_bytes:
+        raise ResumeError(
+            f"resume_context_over_budget:{len(_default_output_bytes(bounded))}>{max_bytes}"
+        )
+    return bounded
 
 
 def _is_terminal(item: dict[str, Any]) -> bool:
@@ -1048,7 +1286,9 @@ def add_material_history(
                     "Review and disposition quarantined v1 projection events"
                 )
         else:
-            result["root"]["issue_status"] = result["root"].get("status")
+            result["root"].setdefault(
+                "issue_status", result["root"].get("status")
+            )
             result["root"]["status"] = lifecycle["status"]
             result["root"]["closure_receipt"] = lifecycle.get("closure_receipt_sha256")
     return result
@@ -2349,6 +2589,9 @@ def compact_context(
         "root_revision": root["revision"],
         "issue_revision": root.get("issue_revision"),
         "status": root.get("status"),
+        "native_issue_status": root.get("issue_status"),
+        "native_issue_status_type": root.get("issue_status_type"),
+        "generation_execution_status": root.get("generation_execution_status"),
         "next_action": root.get("next_action"),
         "blocker": root.get("blocker"),
         "children": children,
@@ -2614,6 +2857,10 @@ def main() -> int:
             live_graph_snapshot = transport.snapshot_for_root(
                 token, include_child_comments=True, include_description=True,
             )
+            # The canonical-plan label is also part of the authenticated native
+            # root readback used by dependency and lifecycle fences. Read it
+            # without removing it from the shared snapshot.
+            root_description = live_graph_snapshot["root"].get("description", "")
             complete_route = route if all(
                 route.get(field) for field in ("workspace_id", "team_id", "project_id")
             ) else {}
@@ -2628,18 +2875,9 @@ def main() -> int:
                 description_plan_revision=live_graph_snapshot["root"]["plan_revision"],
                 authenticated_route=route,
             )
-            live_graph_snapshot["root"]["plan_revision"] = generation["plan_revision"]
-            live_graph_snapshot["root"]["description_plan_revision"] = generation[
-                "description_plan_revision"
-            ]
-            live_graph_snapshot["root"]["generation_transition_tip_event_id"] = (
-                generation["transition_tip_event_id"]
-            )
-            live_graph_snapshot["root"]["generation_activation_epoch"] = (
-                generation["activation_epoch"]
-            )
-            live_graph_snapshot["root"]["generation_authority_origin"] = (
-                generation["authority_origin"]
+            live_graph_snapshot = bind_active_plan_generation(
+                live_graph_snapshot, comments, workstream_id=token,
+                selected=generation, authenticated_route=route,
             )
             from workstream_linear_projection import (
                 child_mutation_authorizations_from_comments,
@@ -2722,6 +2960,35 @@ def main() -> int:
                         client, relations,
                     ),
                 )
+                freshness = plan_generation_freshness(
+                    token=token,
+                    description=root_description,
+                    active_source=authenticated_source,
+                    comments=comments,
+                    authenticated_route=route,
+                )
+                if freshness is not None:
+                    freshness["authenticated_route"] = route
+                    freshness["root"] = {
+                        "id": live_graph_snapshot["root"].get("id"),
+                        "identifier": live_graph_snapshot["root"].get("identifier"),
+                        "project_id": (
+                            live_graph_snapshot["root"].get("project") or {}
+                        ).get("id"),
+                        "native_status_observed": live_graph_snapshot["root"].get(
+                            "issue_status",
+                            live_graph_snapshot["root"].get("status"),
+                        ),
+                        "native_status_type_observed": live_graph_snapshot["root"].get(
+                            "issue_status_type",
+                            live_graph_snapshot["root"].get("status_type"),
+                        ),
+                    }
+                    freshness = bound_plan_generation_pending(
+                        freshness, max_bytes=args.max_bytes,
+                    )
+                    sys.stdout.write(_default_output_text(freshness))
+                    return 0
                 snapshot["dependency_graph"] = LinearChildDependencyAdapter(
                     client,
                     workspace_id=route["workspace_id"],
