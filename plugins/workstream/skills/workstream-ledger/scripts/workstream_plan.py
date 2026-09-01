@@ -210,7 +210,15 @@ def _write_ssh_wrapper(directory: str) -> str:
 def _github_ssh_blob_bytes(
     owner: str, repository: str, revision: str, path: str,
 ) -> bytes:
-    """Fetch one bounded GitHub snapshot over SSH in a disposable bare repo."""
+    """Fetch one bounded GitHub blob over SSH in a disposable partial repo.
+
+    A shallow fetch alone still transfers every blob reachable from the selected
+    commit.  Keep the authenticated Git transport, but make ``origin`` a
+    command-scoped promisor remote: the first request fetches commit/tree
+    metadata without blobs and ``git show`` lazily requests only the plan blob.
+    The remote configuration is repeated on both commands instead of persisted,
+    so the disposable repository never becomes a reusable credential surface.
+    """
     remote = f"git@github.com:{owner}/{repository}.git"
     with tempfile.TemporaryDirectory(prefix="workstream-plan-") as directory:
         repository_path = str(Path(directory) / "repository.git")
@@ -223,10 +231,17 @@ def _github_ssh_blob_bytes(
             ["git", "init", "--bare", "--quiet", repository_path],
             environment=environment, timeout=GIT_SHOW_TIMEOUT_SECONDS,
         )
+        promisor_remote = [
+            "-c", "protocol.version=2",
+            "-c", f"remote.origin.url={remote}",
+            "-c", "remote.origin.promisor=true",
+            "-c", "remote.origin.partialclonefilter=blob:none",
+        ]
         _run_bounded(
             [
-                "git", "-C", repository_path, "fetch", "--quiet", "--no-tags",
-                "--depth=1", remote,
+                "git", "-C", repository_path, *promisor_remote,
+                "fetch", "--quiet", "--no-tags", "--depth=1",
+                "--filter=blob:none", "origin",
                 revision if EXACT_GIT_COMMIT.fullmatch(revision)
                 else "refs/heads/main",
             ],
@@ -234,9 +249,9 @@ def _github_ssh_blob_bytes(
         )
         return _run_bounded(
             [
-                "git", "-C", repository_path, "show", "--no-ext-diff",
-                "--no-textconv",
-                f"{revision if EXACT_GIT_COMMIT.fullmatch(revision) else 'FETCH_HEAD'}:{path}",
+                "git", "-C", repository_path, *promisor_remote,
+                "show", "--no-ext-diff", "--no-textconv",
+                f"FETCH_HEAD:{path}",
             ],
             environment=environment, timeout=GIT_SHOW_TIMEOUT_SECONDS,
         )
