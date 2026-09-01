@@ -43,7 +43,7 @@ from workstream_linear_projection import (
     reduce_projection_comments, select_plan_generation, TOMBSTONE,
     validate_projection_event,
 )
-from workstream_plan import plan_payload
+from workstream_plan import canonical_plan_url, plan_payload, same_plan_document
 from workstream_relation_readback import read_relation_targets
 from workstream_choices import ChoiceError, reduce_choices
 from workstream_evidence import evidence_errors
@@ -74,6 +74,114 @@ RAW_TRANSCRIPT_KEYS = {"raw_transcript", "transcript"}
 
 class ResumeError(ValueError):
     pass
+
+
+def plan_generation_freshness(
+    *, token: str, description: str, active_source: dict[str, Any],
+    comments: list[dict[str, Any]], authenticated_route: dict[str, str],
+) -> dict[str, Any] | None:
+    """Return a non-executable recovery surface when live plan authority moved.
+
+    The active immutable source remains audit authority.  The single labeled
+    canonical locator is only a freshness sentinel: changed bytes never become
+    executable until the append-only generation protocol selects them.
+    """
+    canonical = canonical_plan_url(description)
+    active_identity = active_source.get("identity") or active_source.get("url")
+    active_sha256 = active_source.get("sha256")
+    if (
+        not isinstance(active_identity, str) or not active_identity
+        or not isinstance(active_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", active_sha256)
+    ):
+        raise ResumeError("plan_generation_active_source_incomplete")
+    if not same_plan_document(canonical, active_identity):
+        raise ResumeError(
+            "canonical_plan_source_conflicts_active_generation:"
+            "keep exactly one locator for the active plan document"
+        )
+    live_source = plan_payload(canonical, canonical)["source"]
+    from workstream_generation import pending_generation_reservations
+
+    pending = pending_generation_reservations(
+        comments, workstream_id=token,
+        authenticated_route=authenticated_route,
+    )
+    if live_source["sha256"] == active_sha256 and not pending:
+        return None
+    reservations = []
+    for item in pending:
+        reservations.append({
+            "reservation_id": item["reservation_id"],
+            "reservation_sha256": item["reservation_sha256"],
+            "from_plan_revision": item["from_plan_revision"],
+            "to_plan_revision": item["to_plan_revision"],
+            "created_at": item["created_at"],
+            "continue": {
+                "available": True,
+                "command": [
+                    "workstreamctl", "generation", "activate", token,
+                    "--plan-source", canonical,
+                    "--plan-identity", "<reviewed-immutable-plan-url>",
+                    "--retirement-proof", "<same-retirement-proof.json>",
+                    "--created-at", item["created_at"], "--apply",
+                ],
+                "requirement": "replay the exact reviewed operation inputs",
+            },
+            "abort": {
+                "command": [
+                    "workstreamctl", "generation", "activate", token,
+                    "--abort-reservation-id", item["reservation_id"],
+                    "--abort-reservation-sha256", item["reservation_sha256"],
+                    "--abort-reason", "<reviewed-reason>",
+                    "--created-at", "<reviewed-utc-time>", "--apply",
+                ],
+                "requirement": "abort only after proving the original writer stopped",
+            },
+        })
+        if item.get("native_root_sha256") is not None:
+            reservations[-1]["native_root_sha256"] = item["native_root_sha256"]
+            reservations[-1]["continue"]["command"][-1:-1] = [
+                "--expected-native-root-sha256", item["native_root_sha256"],
+            ]
+        else:
+            reservations[-1]["continue"] = {
+                "available": False,
+                "reason": (
+                    "legacy reservation lacks a reviewed native-root proof; "
+                    "abort it after writer-death review, then preview a new activation"
+                ),
+            }
+    return {
+        "resume_authority": "plan_generation_pending",
+        "executable": False,
+        "workstream_id": token,
+        "active_source": {
+            "identity": active_identity, "sha256": active_sha256,
+        },
+        "canonical_live_source": {
+            "identity": canonical, "sha256": live_source["sha256"],
+        },
+        "pending_generation_reservations": reservations,
+        "remediation": {
+            "reason": (
+                "generation_transition_incomplete" if reservations
+                else "canonical_plan_bytes_changed_without_generation_activation"
+            ),
+            "command": [
+                "workstreamctl", "generation", "activate", token,
+                "--plan-source", canonical,
+                "--plan-identity", "<reviewed-immutable-plan-url>",
+                "--retirement-proof", "<reviewed-retirement-proof.json>",
+                "--created-at", "<reviewed-utc-time>",
+                "--expected-native-root-sha256", "<preview-sha256>", "--apply",
+            ],
+            "required_postcondition": (
+                "ordinary resume returns full authority for the new immutable "
+                "source and a nonterminal native root"
+            ),
+        },
+    }
 
 
 def _is_terminal(item: dict[str, Any]) -> bool:
@@ -2515,8 +2623,9 @@ def main() -> int:
                 project_id=route.get("project_id"),
             )
             live_graph_snapshot = transport.snapshot_for_root(
-                token, include_child_comments=True,
+                token, include_description=True, include_child_comments=True,
             )
+            root_description = live_graph_snapshot["root"].pop("description", "")
             complete_route = route if all(
                 route.get(field) for field in ("workspace_id", "team_id", "project_id")
             ) else {}
@@ -2625,6 +2734,30 @@ def main() -> int:
                         client, relations,
                     ),
                 )
+                freshness = plan_generation_freshness(
+                    token=token,
+                    description=root_description,
+                    active_source=authenticated_source,
+                    comments=comments,
+                    authenticated_route=route,
+                )
+                if freshness is not None:
+                    freshness["authenticated_route"] = route
+                    freshness["root"] = {
+                        "id": live_graph_snapshot["root"].get("id"),
+                        "identifier": live_graph_snapshot["root"].get("identifier"),
+                        "project_id": (
+                            live_graph_snapshot["root"].get("project") or {}
+                        ).get("id"),
+                        "native_status_observed": live_graph_snapshot["root"].get(
+                            "status"
+                        ),
+                        "native_status_type_observed": live_graph_snapshot["root"].get(
+                            "status_type"
+                        ),
+                    }
+                    sys.stdout.write(_default_output_text(freshness))
+                    return 0
             else:
                 snapshot["authenticated_source"] = authenticated_source
         output = compact_context(

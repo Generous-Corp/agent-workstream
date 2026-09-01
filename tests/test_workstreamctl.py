@@ -110,6 +110,15 @@ class WorkstreamCtlTests(unittest.TestCase):
             [MODULE.sys.executable, str(script), "GEN-37", "manifest.json"],
         )
 
+    def test_generation_dispatches_supported_transition_command(self):
+        with mock.patch.object(MODULE.os, "execv") as execute:
+            MODULE.main(["generation", "activate", "GEN-37", "--help"])
+        script = MODULE.SCRIPTS / "workstream_generation.py"
+        execute.assert_called_once_with(
+            MODULE.sys.executable,
+            [MODULE.sys.executable, str(script), "activate", "GEN-37", "--help"],
+        )
+
     def test_material_repair_dispatches_reviewed_dry_run_command(self):
         with mock.patch.object(MODULE.os, "execv") as execute:
             MODULE.main([

@@ -232,6 +232,8 @@ def _prospective_activation_checkpoint(
 
 
 def _validate_reservation(value: dict[str, Any]) -> None:
+    if not isinstance(value, dict):
+        raise WorkstreamGenerationError("invalid_generation_reservation")
     fields = {
         "schema_version", "reservation_id", "workstream_id", "authority",
         "mode", "from_plan_revision", "to_plan_revision", "activation_epoch",
@@ -240,9 +242,12 @@ def _validate_reservation(value: dict[str, Any]) -> None:
         "to_projection_revision", "graph_frontier_sha256",
         "candidate_resume_sha256", "retirement", "created_at",
     }
+    schema_version = value.get("schema_version")
+    if schema_version == 3:
+        fields.add("native_root_sha256")
     if (
-        not isinstance(value, dict) or set(value) != fields
-        or value.get("schema_version") != 2
+        set(value) != fields
+        or schema_version not in {2, 3}
         or not RESERVATION_ID.fullmatch(str(value.get("reservation_id", "")))
         or value.get("mode") not in {"bootstrap", "activate"}
         or not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", str(value.get("workstream_id", "")))
@@ -273,6 +278,10 @@ def _validate_reservation(value: dict[str, Any]) -> None:
             for field in ("checkpoint_event_ids", "ledger_frontier")
         )
         or not isinstance(value.get("created_at"), str) or not value["created_at"]
+        or (
+            schema_version == 3
+            and not HEX64.fullmatch(str(value.get("native_root_sha256", "")))
+        )
     ):
         raise WorkstreamGenerationError("invalid_generation_reservation")
     previous = value["previous_control_event_id"]
@@ -732,6 +741,55 @@ def assert_generation_write_authority(
 
 
 CandidateLoader = Callable[[str], dict[str, Any]]
+NativeRootLoader = Callable[[], dict[str, Any]]
+
+
+def native_root_activation_proof(
+    snapshot: dict[str, Any], *, workstream_id: str,
+    issue_id: str, authority: dict[str, str],
+) -> dict[str, Any]:
+    """Bind a reviewed nonterminal native root readback to one activation."""
+    root = snapshot.get("root") or {}
+    project = root.get("project") or {}
+    team = root.get("team") or {}
+    organization = team.get("organization") or {}
+    status = root.get("status")
+    status_type = root.get("status_type")
+    terminal = {str(status).lower(), str(status_type).lower()} & {
+        "done", "completed", "cancelled", "canceled", "superseded",
+    }
+    if (
+        root.get("id") != authority.get("root_issue_id")
+        or str(root.get("identifier", "")).upper() != workstream_id.upper()
+        or project.get("id") != authority.get("project_id")
+        or team.get("id") != authority.get("team_id")
+        or organization.get("id") != authority.get("workspace_id")
+        or not isinstance(root.get("state_id"), str) or not root["state_id"]
+        or not isinstance(status, str) or not status
+        or not isinstance(status_type, str) or not status_type
+    ):
+        raise WorkstreamGenerationError("generation_native_root_readback_mismatch")
+    if terminal:
+        raise WorkstreamGenerationError(
+            "generation_activation_requires_reviewed_nonterminal_root"
+        )
+    if status_type.lower() != "started":
+        raise WorkstreamGenerationError(
+            "generation_activation_requires_reviewed_in_progress_root"
+        )
+    value = {
+        "schema_version": 1,
+        "root_issue_id": root["id"],
+        "workstream_id": str(root["identifier"]).upper(),
+        "workspace_id": organization["id"],
+        "team_id": team["id"],
+        "project_id": project["id"],
+        "state_id": root["state_id"],
+        "status": status,
+        "status_type": status_type,
+        "updated_at": root.get("updatedAt"),
+    }
+    return {**value, "sha256": _digest(value)}
 
 
 class GenerationTransport:
@@ -739,6 +797,7 @@ class GenerationTransport:
         self, client: Any, *, issue_id: str, workstream_id: str,
         authority: dict[str, str], candidate_loader: CandidateLoader,
         legacy_description_plan_revision: str | None = None,
+        native_root_loader: NativeRootLoader | None = None,
     ):
         self.client = client
         self.issue_id = issue_id
@@ -746,7 +805,27 @@ class GenerationTransport:
         self.authority = dict(authority)
         self.candidate_loader = candidate_loader
         self.legacy_description_plan_revision = legacy_description_plan_revision
+        self.native_root_loader = native_root_loader
         self._capability_checked = False
+
+    def _native_root_proof(
+        self, expected_sha256: str | None, *, require_reviewed: bool,
+    ) -> dict[str, Any] | None:
+        if self.native_root_loader is None:
+            return None
+        proof = native_root_activation_proof(
+            self.native_root_loader(), workstream_id=self.workstream_id,
+            issue_id=self.issue_id, authority=self.authority,
+        )
+        if require_reviewed and (
+            not isinstance(expected_sha256, str)
+            or not hmac.compare_digest(proof["sha256"], expected_sha256)
+        ):
+            raise WorkstreamGenerationError(
+                "generation_native_root_review_proof_mismatch:"
+                f"expected {proof['sha256']} from preview"
+            )
+        return proof
 
     def _comments(self) -> list[dict[str, Any]]:
         adapter = LinearProjectionAdapter(
@@ -877,6 +956,7 @@ class GenerationTransport:
         self, *, comments: list[dict[str, Any]], mode: str, from_plan: str,
         to_plan: str, epoch: int, previous_control: str | None,
         candidate: dict[str, Any], retirement: dict[str, Any], created_at: str,
+        native_root_sha256: str | None = None,
     ) -> dict[str, Any]:
         checkpoints = reduce_generation_checkpoint_comments(
             comments, workstream_id=self.workstream_id,
@@ -906,7 +986,8 @@ class GenerationTransport:
             from_state=from_state, checkpoints=checkpoints,
         )
         unsigned = {
-            "schema_version": 2, "workstream_id": self.workstream_id,
+            "schema_version": (3 if native_root_sha256 is not None else 2),
+            "workstream_id": self.workstream_id,
             "authority": self.authority, "mode": mode,
             "from_plan_revision": from_plan, "to_plan_revision": to_plan,
             "activation_epoch": epoch,
@@ -921,6 +1002,12 @@ class GenerationTransport:
             "candidate_resume_sha256": candidate["receipt"]["snapshot_sha256"],
             "retirement": retirement, "created_at": created_at,
         }
+        if native_root_sha256 is not None:
+            if not HEX64.fullmatch(native_root_sha256):
+                raise WorkstreamGenerationError(
+                    "generation_native_root_review_proof_mismatch"
+                )
+            unsigned["native_root_sha256"] = native_root_sha256
         value = {**unsigned, "reservation_id": "wsgr_" + _digest(unsigned)[:32]}
         _validate_reservation(value)
         return value
@@ -1294,6 +1381,7 @@ class GenerationTransport:
         remote_head: str | None = None,
     ) -> dict[str, Any]:
         """Validate activation inputs without creating a remote artifact."""
+        native_root = self._native_root_proof(None, require_reviewed=False)
         comments = self._comments()
         replay_from = (
             retirement.get("predecessor_plan_revision")
@@ -1406,13 +1494,20 @@ class GenerationTransport:
                 prospective_event
             ),
             "candidate": receipt,
+            "native_root_activation_proof": native_root,
         }
 
     def activate(
         self, *, target_plan_revision: str, created_at: str,
         retirement: dict[str, Any], activation_checkpoint: dict[str, Any] | None = None,
         remote_head: str | None = None,
+        expected_native_root_sha256: str | None = None,
     ) -> dict[str, Any]:
+        # This exact readback is reviewed from preview and is checked before
+        # every possible first write. Generation never silently reopens roots.
+        native_root = self._native_root_proof(
+            expected_native_root_sha256, require_reviewed=True,
+        )
         comments = self._comments()
         replay_from = (
             retirement.get("predecessor_plan_revision")
@@ -1427,7 +1522,13 @@ class GenerationTransport:
                 expected_remote_head=remote_head,
             )
             if replay:
-                return replay
+                final_native = self._native_root_proof(
+                    expected_native_root_sha256, require_reviewed=True,
+                )
+                return (
+                    {**replay, "native_root_activation_proof": final_native}
+                    if final_native is not None else replay
+                )
         selected = select_plan_generation(
             comments, workstream_id=self.workstream_id,
             description_plan_revision=self.legacy_description_plan_revision,
@@ -1503,11 +1604,21 @@ class GenerationTransport:
                 to_plan=target_plan_revision, epoch=epoch,
                 previous_control=previous_control, candidate=candidate,
                 retirement=retirement, created_at=created_at,
+                native_root_sha256=(
+                    native_root["sha256"] if native_root is not None else None
+                ),
             )
             stored = self._append_reservation(reservation)
         else:
             stored = reservation
         reservation = stored
+        if (
+            native_root is not None
+            and reservation.get("native_root_sha256") != native_root["sha256"]
+        ):
+            raise WorkstreamGenerationError(
+                "generation_reservation_native_root_proof_mismatch"
+            )
         comments = self._comments()
         self._assert_reservation_live(comments, reservation)
         from_state, to_state = self._states(comments, from_plan, target_plan_revision)
@@ -1628,6 +1739,9 @@ class GenerationTransport:
         ):
             raise WorkstreamGenerationError("generation_final_fence_changed")
         # Authority changes here and only here.  No append follows this call.
+        self._native_root_proof(
+            expected_native_root_sha256, require_reviewed=True,
+        )
         receipt = LinearProjectionAdapter(
             self.client, issue_id=self.issue_id, workstream_id=self.workstream_id,
             plan_revision=from_plan, **self.authority,
@@ -1641,6 +1755,9 @@ class GenerationTransport:
         )
         if final["plan_revision"] != target_plan_revision or final["activation_epoch"] != epoch:
             raise WorkstreamGenerationError("generation_activation_not_observed")
+        post_native = self._native_root_proof(
+            expected_native_root_sha256, require_reviewed=True,
+        )
         return {
             **receipt,
             "activated_plan_revision": target_plan_revision,
@@ -1650,6 +1767,7 @@ class GenerationTransport:
                 "quarantined_legacy_writes"
             ],
             "replay": False,
+            "native_root_activation_proof": post_native,
         }
 
 
@@ -1974,6 +2092,13 @@ def parser() -> argparse.ArgumentParser:
                 "--remote-head",
                 help="authenticated remote head used for checkpoint-bound disposition",
             )
+            command.add_argument(
+                "--expected-native-root-sha256",
+                help=(
+                    "exact nonterminal root readback digest emitted by reviewed preview; "
+                    "required with activate --apply"
+                ),
+            )
     return value
 
 
@@ -2023,15 +2148,20 @@ def main() -> int:
             activation_remote_head=getattr(args, "remote_head", None),
             activation_created_at=args.created_at,
         )
-        description_plan_revision = LinearGraphQLTransport(
+        linear_transport = LinearGraphQLTransport(
             client, team_id=authority["team_id"],
             workspace_id=authority["workspace_id"],
             project_id=authority["project_id"],
-        ).snapshot_for_root(args.token.upper())["root"].get("plan_revision")
+        )
+        initial_root_snapshot = linear_transport.snapshot_for_root(args.token.upper())
+        description_plan_revision = initial_root_snapshot["root"].get("plan_revision")
         transport = GenerationTransport(
             client, issue_id=args.token.upper(), workstream_id=args.token.upper(),
             authority=authority, candidate_loader=loader,
             legacy_description_plan_revision=description_plan_revision,
+            native_root_loader=lambda: linear_transport.snapshot_for_root(
+                args.token.upper()
+            ),
         )
         retirement = None
         if args.command == "activate":
@@ -2052,11 +2182,16 @@ def main() -> int:
                 target_plan_revision=source["sha256"], created_at=args.created_at,
             )
         else:
+            if not args.expected_native_root_sha256:
+                raise WorkstreamGenerationError(
+                    "generation_activate_apply_requires_reviewed_native_root_proof"
+                )
             output = transport.activate(
                 target_plan_revision=source["sha256"], created_at=args.created_at,
                 retirement=retirement,
                 activation_checkpoint=activation_checkpoint,
                 remote_head=args.remote_head,
+                expected_native_root_sha256=args.expected_native_root_sha256,
             )
         if args.apply:
             selected, final_candidate = strict_active_generation_receipt(
@@ -2086,6 +2221,12 @@ def main() -> int:
                 )
             else:
                 output["post_read_status"] = "authority_bound_post_read_match"
+            post_native = transport._native_root_proof(
+                getattr(args, "expected_native_root_sha256", None),
+                require_reviewed=(args.command == "activate"),
+            )
+            if post_native is not None:
+                output["final_native_root"] = post_native
         json.dump(output, sys.stdout, ensure_ascii=False, sort_keys=True, indent=2)
         sys.stdout.write("\n")
         return 0

@@ -234,8 +234,8 @@ review. Never supersede merely because the deterministic child is absent.
 
 ### Append-only plan-generation authority
 
-An existing root changes plan generations only through
-`scripts/workstream_generation.py`; never update its issue description to make
+An existing root changes plan generations only through the supported
+`workstreamctl generation` command; never update its issue description to make
 a new digest authoritative. Before the first generation-control event, a
 legacy root with exactly one description `Plan revision` remains compatible and
 that line selects its plan. Once a schema-v2 genesis or activation exists, the
@@ -257,12 +257,29 @@ first build the complete candidate projection, then provide a structured
 retirement proof for the current active epoch:
 
 ```sh
-python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_generation.py" \
-  activate GEN-123 --plan-source ./PLAN.md \
+workstreamctl generation activate GEN-123 --plan-source ./PLAN.md \
   --plan-identity <canonical-immutable-plan-url> \
   --retirement-proof ./retirement.json \
-  --created-at <reviewed-utc-time> --apply
+  --created-at <reviewed-utc-time>
 ```
+
+Review the preview's `native_root_activation_proof`, reopen the same existing
+root through the separately authorized Linear workflow when it is terminal,
+then apply with the unchanged proof digest:
+
+```sh
+workstreamctl generation activate GEN-123 --plan-source ./PLAN.md \
+  --plan-identity <canonical-immutable-plan-url> \
+  --retirement-proof ./retirement.json \
+  --created-at <reviewed-utc-time> \
+  --expected-native-root-sha256 <preview-sha256> --apply
+```
+
+Apply refuses before its first append if that exact root is terminal or the
+reviewed readback changed. It fences the same proof immediately before and
+after the authority-changing append. A crash reservation is reported by
+ordinary resume with exact replay and reviewed-abort guidance; it is never
+silently treated as executable old authority.
 
 When the reviewed replacement needs a root checkpoint to keep the ordinary
 resume surface within its default budget, provide that pending checkpoint and

@@ -14,6 +14,7 @@ from workstream_delta import Delta
 from workstream_generation import (
     GenerationTransport, WorkstreamGenerationError, _digest,
     build_retirement_proof, generation_quarantine_metadata, main, parser,
+    native_root_activation_proof,
     pending_generation_reservations, reduce_generation_checkpoint_comments,
     selected_activation_checkpoints,
     strict_candidate_loader,
@@ -59,6 +60,7 @@ class FakeClient:
         self.description = f"Plan revision: {OLD}"
         self.graph_nonce = "initial"
         self.graph_status = "In Progress"
+        self.graph_status_type = "started"
         self.children: list[dict] = []
         self.before_issue_create = None
 
@@ -72,7 +74,7 @@ class FakeClient:
             "team": {"id": "team", "organization": {"id": "workspace"}},
             "assignee": None,
             "state": {"id": "state", "name": self.graph_status,
-                      "type": "started"},
+                      "type": self.graph_status_type},
         }
 
     def execute(self, query, variables):
@@ -315,6 +317,132 @@ class GenerationTransitionTests(unittest.TestCase):
                 if item["plan_revision"] == predecessor
             ),
         )
+
+    def native_root_sha(self, client=None):
+        client = client or self.client
+        snapshot = LinearGraphQLTransport(
+            client, workspace_id="workspace", team_id="team", project_id="project",
+        ).snapshot_for_root(WORKSTREAM)
+        return native_root_activation_proof(
+            snapshot, workstream_id=WORKSTREAM, issue_id=WORKSTREAM,
+            authority=AUTHORITY,
+        )["sha256"]
+
+    def native_fenced_transport(self):
+        linear = LinearGraphQLTransport(
+            self.client, workspace_id="workspace", team_id="team",
+            project_id="project",
+        )
+        return GenerationTransport(
+            self.client, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
+            authority=AUTHORITY, candidate_loader=self.loader,
+            legacy_description_plan_revision=OLD,
+            native_root_loader=lambda: linear.snapshot_for_root(WORKSTREAM),
+        )
+
+    def test_terminal_native_root_refuses_preview_and_apply_before_first_write(self):
+        project_full(self.client, NEW)
+        self.client.graph_status = "Done"
+        transport = self.native_fenced_transport()
+        writes = len(self.client.mutations)
+
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_activation_requires_reviewed_nonterminal_root",
+        ):
+            transport.preview_activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=self.retirement(),
+            )
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_activation_requires_reviewed_nonterminal_root",
+        ):
+            transport.activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=self.retirement(),
+                expected_native_root_sha256="0" * 64,
+            )
+        self.assertEqual(len(self.client.mutations), writes)
+        self.assertEqual(select_plan_generation(
+            self.client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=OLD, authenticated_route=AUTHORITY,
+        )["plan_revision"], OLD)
+
+    def test_todo_native_root_is_not_accepted_as_in_progress(self):
+        project_full(self.client, NEW)
+        self.client.graph_status = "Todo"
+        self.client.graph_status_type = "unstarted"
+        transport = self.native_fenced_transport()
+        writes = len(self.client.mutations)
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_activation_requires_reviewed_in_progress_root",
+        ):
+            transport.preview_activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=self.retirement(),
+            )
+        self.assertEqual(len(self.client.mutations), writes)
+
+    def test_reviewed_native_root_proof_replays_idempotently(self):
+        project_full(self.client, NEW)
+        transport = self.native_fenced_transport()
+        preview = transport.preview_activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+        )
+        proof = preview["native_root_activation_proof"]
+        first = transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+            expected_native_root_sha256=proof["sha256"],
+        )
+        writes = len(self.client.mutations)
+        replay = transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+            expected_native_root_sha256=proof["sha256"],
+        )
+
+        self.assertFalse(first["replay"])
+        self.assertTrue(replay["replay"])
+        self.assertEqual(len(self.client.mutations), writes)
+        self.assertEqual(replay["native_root_activation_proof"], proof)
+
+    def test_native_status_race_leaves_recoverable_reservation_not_authority(self):
+        project_full(self.client, NEW)
+        transport = self.native_fenced_transport()
+        proof = transport.preview_activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+        )["native_root_activation_proof"]
+
+        def close_after_first_write(_item, client):
+            client.before_each_create = None
+            client.graph_status = "Done"
+
+        self.client.before_each_create = close_after_first_write
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_activation_requires_reviewed_nonterminal_root",
+        ):
+            transport.activate(
+                target_plan_revision=NEW, created_at="now",
+                retirement=self.retirement(),
+                expected_native_root_sha256=proof["sha256"],
+            )
+        self.assertEqual(select_plan_generation(
+            self.client.comments, workstream_id=WORKSTREAM,
+            description_plan_revision=OLD, authenticated_route=AUTHORITY,
+        )["plan_revision"], OLD)
+        pending = pending_generation_reservations(
+            self.client.comments, workstream_id=WORKSTREAM,
+            authenticated_route=AUTHORITY,
+        )
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["to_plan_revision"], NEW)
+        self.assertEqual(pending[0]["native_root_sha256"], proof["sha256"])
 
     def activate(self, target=NEW, predecessor=OLD, epoch=0):
         if not adapter(self.client, target).state().events:
@@ -2280,6 +2408,7 @@ class GenerationTransitionTests(unittest.TestCase):
                 "bound_graph_frontier_sha256": "1" * 64,
                 "bound_candidate_resume_sha256": "2" * 64,
             }
+            generation._native_root_proof.return_value = None
             root_transport = MagicMock()
             root_transport.snapshot_for_root.return_value = {
                 "root": {"plan_revision": OLD},
@@ -2288,6 +2417,7 @@ class GenerationTransitionTests(unittest.TestCase):
                 "workstream_generation.py", "activate", WORKSTREAM,
                 "--plan-source", plan_file.name, "--created-at", "now",
                 "--retirement-proof", proof_file.name, "--apply",
+                "--expected-native-root-sha256", "0" * 64,
             ]
             final_candidate = {
                 "graph_frontier_sha256": "1" * 64,
@@ -2513,6 +2643,8 @@ class GenerationTransitionTests(unittest.TestCase):
                 "--plan-identity", new_plan.name,
                 "--retirement-proof", proof.name,
                 "--created-at", "now", "--apply",
+                "--expected-native-root-sha256",
+                self.native_root_sha(activate_client),
             ])
         self.assertEqual((code, error), (0, ""))
         output = json.loads(raw)
@@ -2567,6 +2699,8 @@ class GenerationTransitionTests(unittest.TestCase):
                 "--activation-checkpoint", checkpoint_file.name,
                 "--remote-head", "e" * 40,
                 "--created-at", "checkpoint", "--apply",
+                "--expected-native-root-sha256",
+                self.native_root_sha(checkpoint_client),
             ])
         self.assertEqual((code, error), (0, ""))
         checkpoint_output = json.loads(raw)
@@ -2607,6 +2741,8 @@ class GenerationTransitionTests(unittest.TestCase):
                 "--plan-identity", later_plan.name,
                 "--retirement-proof", proof.name,
                 "--created-at", "later", "--apply",
+                "--expected-native-root-sha256",
+                self.native_root_sha(activate_client),
             ])
         self.assertEqual((code, error), (0, ""))
         with tempfile.NamedTemporaryFile("w", suffix=".json") as proof:
@@ -2617,6 +2753,8 @@ class GenerationTransitionTests(unittest.TestCase):
                 "--plan-identity", new_plan.name,
                 "--retirement-proof", proof.name,
                 "--created-at", "now", "--apply",
+                "--expected-native-root-sha256",
+                self.native_root_sha(activate_client),
             ])
         self.assertEqual((code, error), (0, ""))
         replay_output = json.loads(raw)
@@ -2655,9 +2793,15 @@ class GenerationTransitionTests(unittest.TestCase):
                 "--plan-identity", new_plan.name,
                 "--retirement-proof", proof.name,
                 "--created-at", "now", "--apply",
+                "--expected-native-root-sha256",
+                self.native_root_sha(drift_client),
             ])
         self.assertEqual(code, 2)
-        self.assertIn("authority_changed_with_post_read_drift", error)
+        self.assertRegex(
+            error,
+            "authority_changed_with_post_read_drift|"
+            "generation_native_root_review_proof_mismatch",
+        )
 
     def test_production_cli_surface_has_bootstrap_activate_apply_and_abort(self):
         parsed = parser().parse_args([

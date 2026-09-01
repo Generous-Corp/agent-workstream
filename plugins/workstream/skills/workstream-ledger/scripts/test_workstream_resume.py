@@ -22,6 +22,107 @@ import workstream_resume as MODULE
 
 
 class ResumeTests(unittest.TestCase):
+    def generation_sources(self):
+        canonical = "https://github.com/acme/plans/blob/main/PLAN.md"
+        immutable = (
+            "https://github.com/acme/plans/blob/" + "1" * 40 + "/PLAN.md"
+        )
+        return canonical, immutable
+
+    def test_plan_generation_freshness_unchanged_is_full_eligible(self):
+        canonical, immutable = self.generation_sources()
+        active = {"identity": immutable, "sha256": "a" * 64}
+        with mock.patch.object(MODULE, "plan_payload", return_value={
+            "source": {"identity": canonical, "sha256": "a" * 64},
+        }), mock.patch(
+            "workstream_generation.pending_generation_reservations",
+            return_value=[],
+        ):
+            self.assertIsNone(MODULE.plan_generation_freshness(
+                token="GEN-37", description=f"Canonical plan: {canonical}",
+                active_source=active, comments=[], authenticated_route={
+                    "workspace_id": "workspace", "team_id": "team",
+                    "project_id": "project", "root_issue_id": "root",
+                },
+            ))
+
+    def test_plan_generation_drift_returns_non_executable_bounded_remediation(self):
+        canonical, immutable = self.generation_sources()
+        active = {"identity": immutable, "sha256": "a" * 64}
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root",
+        }
+        with mock.patch.object(MODULE, "plan_payload", return_value={
+            "source": {"identity": canonical, "sha256": "b" * 64},
+        }), mock.patch(
+            "workstream_generation.pending_generation_reservations",
+            return_value=[],
+        ):
+            result = MODULE.plan_generation_freshness(
+                token="GEN-37", description=f"Canonical plan: {canonical}",
+                active_source=active, comments=[], authenticated_route=route,
+            )
+        self.assertEqual(result["resume_authority"], "plan_generation_pending")
+        self.assertFalse(result["executable"])
+        self.assertEqual(result["active_source"]["sha256"], "a" * 64)
+        self.assertEqual(result["canonical_live_source"]["sha256"], "b" * 64)
+        self.assertIn("generation", result["remediation"]["command"])
+        self.assertLess(len(json.dumps(result).encode()), 24 * 1024)
+
+    def test_pending_generation_reservation_surfaces_exact_replay_or_abort(self):
+        canonical, immutable = self.generation_sources()
+        reservation = {
+            "reservation_id": "wsgr_" + "1" * 32,
+            "reservation_sha256": "2" * 64,
+            "from_plan_revision": "a" * 64,
+            "to_plan_revision": "b" * 64,
+            "created_at": "2026-08-31T12:00:00Z",
+            "native_root_sha256": "3" * 64,
+        }
+        with mock.patch.object(MODULE, "plan_payload", return_value={
+            "source": {"identity": canonical, "sha256": "b" * 64},
+        }), mock.patch(
+            "workstream_generation.pending_generation_reservations",
+            return_value=[reservation],
+        ):
+            result = MODULE.plan_generation_freshness(
+                token="GEN-37", description=f"Canonical plan: {canonical}",
+                active_source={"identity": immutable, "sha256": "a" * 64},
+                comments=[], authenticated_route={
+                    "workspace_id": "workspace", "team_id": "team",
+                    "project_id": "project", "root_issue_id": "root",
+                },
+            )
+        pending = result["pending_generation_reservations"][0]
+        self.assertEqual(pending["reservation_id"], reservation["reservation_id"])
+        self.assertIn("--abort-reservation-id", pending["abort"]["command"])
+        self.assertIn("2026-08-31T12:00:00Z", pending["continue"]["command"])
+        self.assertIn("--expected-native-root-sha256", pending["continue"]["command"])
+
+    def test_zero_multiple_or_different_canonical_plan_refuses_without_fetch(self):
+        canonical, immutable = self.generation_sources()
+        active = {"identity": immutable, "sha256": "a" * 64}
+        descriptions = (
+            "No canonical plan here",
+            f"Canonical plan: {canonical}\nCanonical plan: https://example.test/other.md",
+            "Canonical plan: https://github.com/acme/plans/blob/main/OTHER.md",
+        )
+        for description in descriptions:
+            with self.subTest(description=description), mock.patch.object(
+                MODULE, "plan_payload"
+            ) as fetch:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "canonical_plan_source_(missing|ambiguous)|"
+                    "canonical_plan_source_conflicts_active_generation",
+                ):
+                    MODULE.plan_generation_freshness(
+                        token="GEN-37", description=description,
+                        active_source=active, comments=[], authenticated_route={},
+                    )
+                fetch.assert_not_called()
+
     def snapshot(self):
         return {"root": {"identifier": "GEN-37", "url": "https://linear/GEN-37", "plan_revision": "sha",
                           "revision": 7, "status": "In Progress", "next_action": "resume"},
@@ -1774,7 +1875,7 @@ class ResumeTests(unittest.TestCase):
              mock.patch.object(MODULE.sys, "stdout"):
             self.assertEqual(MODULE.main(), 0)
         transport.snapshot_for_root.assert_called_once_with(
-            "GEN-37", include_child_comments=True,
+            "GEN-37", include_description=True, include_child_comments=True,
         )
         comments.comments.assert_called_once_with()
 
@@ -1805,7 +1906,7 @@ class ResumeTests(unittest.TestCase):
             client, team_id="team", workspace_id="workspace", project_id="project"
         )
         transport.snapshot_for_root.assert_called_once_with(
-            "GEN-37", include_child_comments=True,
+            "GEN-37", include_description=True, include_child_comments=True,
         )
         comments.comments.assert_called_once_with()
 
@@ -1899,6 +2000,12 @@ class ResumeTests(unittest.TestCase):
         transport.snapshot_for_root.side_effect = lambda *_args, **_kwargs: copy.deepcopy({
             **graph, "children": [dict(child) for child in graph["children"]],
             "child_comments": child_comments,
+            "root": {
+                **graph["root"],
+                "description": (
+                    "Canonical plan: " + authenticated_source["identity"]
+                ),
+            },
         })
         comments = mock.Mock()
         comments.comments.return_value = comments_payload
