@@ -55,6 +55,7 @@ def _bound_predecessor_generation(
     event: dict[str, Any], projection_history: list[dict[str, Any]],
     authority: dict[str, Any],
     selected_transition_tip_event_id: str | None,
+    authorized_prepared_transition_event_id: str | None,
 ) -> list[dict[str, Any]]:
     """Recover the exact reviewed prefix across its final activation append."""
     predecessor = _generation(
@@ -79,8 +80,10 @@ def _bound_predecessor_generation(
     from_frontier = value.get("from") if isinstance(value, dict) else None
     to_frontier = value.get("to") if isinstance(value, dict) else None
     if (
-        not isinstance(selected_transition_tip_event_id, str)
-        or transition.get("event_id") != selected_transition_tip_event_id
+        transition.get("event_id") not in {
+            selected_transition_tip_event_id,
+            authorized_prepared_transition_event_id,
+        }
         or transition.get("kind") != "generation_transition"
         or transition.get("workstream_id") != event.get("workstream_id")
         or transition.get("plan_revision")
@@ -106,6 +109,7 @@ def _carried_predecessor_authority(
     event: dict[str, Any], projection_history: list[dict[str, Any]],
     current_scope: dict[str, Any],
     selected_transition_tip_event_id: str | None = None,
+    authorized_prepared_transition_event_id: str | None = None,
 ) -> dict[str, Any] | None:
     contract = event.get("value")
     authority = (
@@ -169,6 +173,7 @@ def _carried_predecessor_authority(
     predecessor = _bound_predecessor_generation(
         event, projection_history, authority,
         selected_transition_tip_event_id,
+        authorized_prepared_transition_event_id,
     )
     if (
         not predecessor
@@ -240,11 +245,13 @@ def carried_predecessor_evidence_authority(
     event: dict[str, Any], projection_history: list[dict[str, Any]],
     current_scope: dict[str, Any], *,
     selected_transition_tip_event_id: str | None = None,
+    authorized_prepared_transition_event_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Validate and return one persisted predecessor-closure carry proof."""
     return _carried_predecessor_authority(
         event, projection_history, current_scope,
         selected_transition_tip_event_id,
+        authorized_prepared_transition_event_id,
     )
 
 
@@ -252,6 +259,7 @@ def closure_bound_historical_evidence(
     projection_events: list[dict[str, Any]], current_scope: dict[str, Any],
     projection_history: list[dict[str, Any]] | None = None,
     *, selected_transition_tip_event_id: str | None = None,
+    authorized_prepared_transition_event_id: str | None = None,
 ) -> frozenset[str]:
     """Return active evidence event IDs authorized at a closed child's old head.
 
@@ -270,6 +278,7 @@ def closure_bound_historical_evidence(
             authority = _carried_predecessor_authority(
                 event, projection_history, current_scope,
                 selected_transition_tip_event_id,
+                authorized_prepared_transition_event_id,
             )
             if authority is not None:
                 carried[event["event_id"]] = authority

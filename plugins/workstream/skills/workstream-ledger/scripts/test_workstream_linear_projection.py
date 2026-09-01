@@ -3433,6 +3433,39 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(result["activated_plan_revision"], PLAN)
         self.assertEqual(candidate_loader(PLAN)["resume_authority"], "full")
 
+        # A schema-v4/6 preparation deliberately exists before its
+        # finalization selects the new generation.  The carried terminal
+        # evidence (the production shape used by GEN-70/GEN-72) may consume
+        # only the exact separately authorized preparation event.
+        prepared_comments = [*client.comments, {
+            "id": "00000000-0000-4000-8000-000000000000",
+            "body": encode_checkpoint_comment(activation_checkpoint),
+        }]
+        prepared_snapshot = add_material_history(
+            deepcopy(graph), prepared_comments, "GEN-37",
+            authenticated_route=AUTHORITY, authenticated_source=source,
+        )
+        with self.assertRaisesRegex(
+            ResumeError, "carried_evidence_authority_invalid",
+        ):
+            compact_context(
+                prepared_snapshot, "GEN-37",
+                require_projection_authority=True,
+            )
+        with self.assertRaisesRegex(
+            ResumeError, "carried_evidence_authority_invalid",
+        ):
+            compact_context(
+                prepared_snapshot, "GEN-37",
+                require_projection_authority=True,
+                authorized_prepared_transition_event_id="wsp_" + "0" * 32,
+            )
+        self.assertEqual(compact_context(
+            prepared_snapshot, "GEN-37",
+            require_projection_authority=True,
+            authorized_prepared_transition_event_id=result["event_id"],
+        )["resume_authority"], "full")
+
         selected = select_plan_generation(
             client.comments, workstream_id="GEN-37",
             description_plan_revision=predecessor_plan,

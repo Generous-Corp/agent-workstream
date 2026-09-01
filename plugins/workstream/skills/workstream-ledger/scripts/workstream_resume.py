@@ -1382,6 +1382,7 @@ def validate_snapshot(
     require_projection_authority: bool = False,
     require_dependency_graph: bool | None = None,
     expected_missing_terminal_closures: frozenset[str] = frozenset(),
+    authorized_prepared_transition_event_id: str | None = None,
 ) -> dict[str, Any]:
     if require_dependency_graph is None:
         require_dependency_graph = require_projection_authority
@@ -1910,6 +1911,9 @@ def validate_snapshot(
                         projection_events, scope, projection_history,
                         selected_transition_tip_event_id=root.get(
                             "generation_transition_tip_event_id"
+                        ),
+                        authorized_prepared_transition_event_id=(
+                            authorized_prepared_transition_event_id
                         ),
                     )
                 )
@@ -2580,6 +2584,7 @@ def compact_context(
     include_history: bool = False,
     require_dependency_graph: bool | None = None,
     expected_missing_terminal_closures: frozenset[str] = frozenset(),
+    authorized_prepared_transition_event_id: str | None = None,
 ) -> dict[str, Any]:
     normalized_token = extract_token(token)
     clean = validate_snapshot(
@@ -2587,6 +2592,9 @@ def compact_context(
         require_projection_authority=require_projection_authority,
         require_dependency_graph=require_dependency_graph,
         expected_missing_terminal_closures=expected_missing_terminal_closures,
+        authorized_prepared_transition_event_id=(
+            authorized_prepared_transition_event_id
+        ),
     )
     root = clean["root"]
     project = root.get("project")
