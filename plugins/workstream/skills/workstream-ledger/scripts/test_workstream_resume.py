@@ -750,9 +750,13 @@ class ResumeTests(unittest.TestCase):
         for name in ("   ", "x" * (MODULE.MAX_PROJECT_NAME_BYTES + 1), 7):
             with self.subTest(name=name):
                 snapshot = self.snapshot()
+                snapshot["children"] = []
                 snapshot["root"]["project"] = {"id": "project", "name": name}
+                snapshot = self.full_authority_snapshot(snapshot)
 
-                context = MODULE.compact_context(snapshot, "GEN-37")
+                context = MODULE.compact_context(
+                    snapshot, "GEN-37", require_projection_authority=True,
+                )
 
                 self.assertEqual(context["resume_authority"], "full")
                 self.assertIsNone(context["project_name"])
