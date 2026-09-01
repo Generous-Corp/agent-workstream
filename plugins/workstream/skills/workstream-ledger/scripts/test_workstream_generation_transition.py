@@ -17,6 +17,7 @@ from workstream_generation import (
     GenerationTransport, WorkstreamGenerationError, _digest,
     build_retirement_proof, generation_quarantine_metadata, main, parser,
     prepare_generation_operator_contract,
+    validate_activation_operator_contract,
     encode_generation_finalization, generation_finalization_slot_id,
     native_root_activation_proof,
     pending_generation_reservations, reduce_generation_checkpoint_comments,
@@ -41,6 +42,7 @@ from workstream_linear_projection import (
 )
 from workstream_projection import bind_projection_plan_generation
 from workstream_resume import compact_context as real_compact_context
+from workstream_root_transition import RootTransitionError
 
 
 WORKSTREAM = "GEN-37"
@@ -412,6 +414,107 @@ class GenerationTransitionTests(unittest.TestCase):
             key: value for key, value in first.items()
             if key != "contract_sha256"
         }))
+
+    def test_operator_gate_recomputes_prepare_and_rejects_forged_ready_phase(self):
+        predecessor = adapter(self.client, OLD)
+        predecessor.append(build_projection_event(
+            workstream_id=WORKSTREAM, kind="choice", key="must-carry",
+            value={
+                "event_id": "must-carry",
+                "decision": "preserve this required choice",
+            },
+            plan_revision=OLD, expected_revision=predecessor.state().revision,
+            created_at="predecessor-choice", authority=AUTHORITY,
+        ))
+        graph = LinearGraphQLTransport(
+            self.client, workspace_id="workspace", team_id="team",
+            project_id="project",
+        ).snapshot_for_root(
+            WORKSTREAM, include_description=True, include_child_comments=True,
+        )
+        activation_graph = deepcopy(graph)
+        activation_graph["root"]["state"] = {
+            "id": STARTED_STATE["id"], "name": STARTED_STATE["name"],
+            "type": STARTED_STATE["type"],
+        }
+        incomplete = self.generation_preparation()
+        self.assertEqual(
+            incomplete["projection_preview"]["phase"], "complete_projection",
+        )
+        target = adapter(self.client, NEW)
+        revision = target.state().revision
+        omitted_choice = None
+        for index, item in enumerate(
+            incomplete["projection_preview"]["manifest"]["projection"]
+        ):
+            if (item["kind"], item["key"]) == ("choice", "must-carry"):
+                omitted_choice = item
+                continue
+            target.append(build_projection_event(
+                workstream_id=WORKSTREAM, kind=item["kind"], key=item["key"],
+                value=deepcopy(item["value"]), plan_revision=NEW,
+                expected_revision=revision, created_at=f"target-{index}",
+                authority=AUTHORITY,
+            ))
+            revision += 1
+        self.assertIsNotNone(omitted_choice)
+        target.append(build_projection_event(
+            workstream_id=WORKSTREAM, kind="disposition", key="root",
+            value={
+                "disposition": "attach", "remote_head": "e" * 40,
+                "recovered_from_checkpoint": None,
+            },
+            plan_revision=NEW, expected_revision=revision,
+            created_at="target-disposition", authority=AUTHORITY,
+        ))
+        revision += 1
+        partial = self.generation_preparation()
+        self.assertEqual(
+            partial["projection_preview"]["phase"], "complete_projection",
+        )
+        forged = deepcopy(partial)
+        forged["projection_preview"]["phase"] = "activation_ready"
+        forged["projection_preview"]["next_gate"] = "preview_generation_activation"
+        forged["contract_sha256"] = _digest({
+            key: value for key, value in forged.items()
+            if key != "contract_sha256"
+        })
+        before_comments = deepcopy(self.client.comments)
+        before_mutations = deepcopy(self.client.mutations)
+        with self.assertRaisesRegex(
+            RootTransitionError,
+            "operator_contract_not_exact_live_prepare_output",
+        ):
+            validate_activation_operator_contract(
+                forged, source=forged["source"], workstream_id=WORKSTREAM,
+                authority=AUTHORITY, comments=deepcopy(self.client.comments),
+                graph=activation_graph,
+                description_plan_revision=OLD,
+                created_at=forged["created_at"], remote_head=forged["remote_head"],
+            )
+        self.assertEqual(self.client.comments, before_comments)
+        self.assertEqual(self.client.mutations, before_mutations)
+
+        target.append(build_projection_event(
+            workstream_id=WORKSTREAM,
+            kind=omitted_choice["kind"], key=omitted_choice["key"],
+            value=deepcopy(omitted_choice["value"]), plan_revision=NEW,
+            expected_revision=revision, created_at="target-required-choice",
+            authority=AUTHORITY,
+        ))
+        ready = self.generation_preparation()
+        self.assertEqual(ready["projection_preview"]["phase"], "activation_ready")
+        activation = validate_activation_operator_contract(
+            ready, source=ready["source"], workstream_id=WORKSTREAM,
+            authority=AUTHORITY, comments=deepcopy(self.client.comments),
+            graph=activation_graph,
+            description_plan_revision=OLD,
+            created_at=ready["created_at"], remote_head=ready["remote_head"],
+        )
+        self.assertEqual(
+            activation["authorization"]["contract_sha256"],
+            ready["contract_sha256"],
+        )
 
     def test_prepare_refuses_nonempty_inactive_candidate_without_mutation(self):
         project_full(self.client, NEW)
@@ -1748,7 +1851,7 @@ class GenerationTransitionTests(unittest.TestCase):
             )
             self.assertEqual(child["uncheckpointed_material_obligations"], [])
 
-    def test_activation_cli_preview_validates_retirement_and_writes_nothing(self):
+    def test_activation_cli_refuses_legacy_retirement_file_without_writes(self):
         project_full(self.client, NEW)
         checkpoint = self.activation_checkpoint()
         retirement = self.retirement()
@@ -1779,21 +1882,13 @@ class GenerationTransitionTests(unittest.TestCase):
             }), patch.object(sys, "stdout", stdout), patch.object(
                 sys, "stderr", stderr,
             ):
-                self.assertEqual(main(), 0)
-        self.assertEqual(stderr.getvalue(), "")
-        self.assertEqual(len(self.client.mutations), writes)
-        output = json.loads(stdout.getvalue())
-        self.assertFalse(output["apply"])
-        self.assertEqual(output["retirement_frontier"], {
-            "provenance_event_ids": retirement["provenance_event_ids"],
-            "checkpoint_event_ids": [],
-        })
-        self.assertEqual(
-            output["prospective_target_disposition"][
-                "recovered_from_checkpoint"
-            ],
-            checkpoint["event_id"],
+                self.assertEqual(main(), 2)
+        self.assertIn(
+            "generation_legacy_retirement_proof_cannot_authorize_operator",
+            stderr.getvalue(),
         )
+        self.assertEqual(len(self.client.mutations), writes)
+        self.assertEqual(stdout.getvalue(), "")
 
     def test_activation_preview_refuses_unrelated_pending_boundary(self):
         project_full(self.client, NEW)
@@ -3104,7 +3199,7 @@ class GenerationTransitionTests(unittest.TestCase):
             argv = [
                 "workstream_generation.py", "activate", WORKSTREAM,
                 "--plan-source", plan_file.name, "--created-at", "now",
-                "--retirement-proof", proof_file.name, "--apply",
+                "--operator-contract", proof_file.name, "--apply",
                 "--expected-native-root-sha256", "0" * 64,
             ]
             final_candidate = {
@@ -3120,6 +3215,12 @@ class GenerationTransitionTests(unittest.TestCase):
                 return_value=root_transport,
             ), patch("workstream_generation.GenerationTransport",
                      return_value=generation), patch(
+                "workstream_generation.validate_activation_operator_contract",
+                return_value={
+                    "authorization": {}, "retirement_proof": self.retirement(),
+                    "remote_head": "e" * 40,
+                },
+            ), patch(
                 "workstream_generation.strict_active_generation_receipt",
                 return_value=({"plan_revision": OLD}, final_candidate),
             ), patch.object(
@@ -3248,7 +3349,7 @@ class GenerationTransitionTests(unittest.TestCase):
             argv = [
                 "workstream_generation.py", "activate", WORKSTREAM,
                 "--plan-source", plan_file.name,
-                "--retirement-proof", proof_file.name,
+                "--operator-contract", proof_file.name,
                 "--activation-checkpoint", checkpoint_file.name,
                 "--remote-head", "e" * 40,
                 "--max-items", "101", "--created-at", "now", "--apply",
@@ -3276,9 +3377,16 @@ class GenerationTransitionTests(unittest.TestCase):
 
         def invoke(client, argv):
             stdout, stderr = io.StringIO(), io.StringIO()
+            def authorize(contract, **kwargs):
+                return {
+                    "authorization": {}, "retirement_proof": contract,
+                    "remote_head": kwargs.get("remote_head") or "e" * 40,
+                }
             with patch.object(sys, "argv", ["workstream_generation.py", *argv]), \
                     patch("workstream_generation._route_and_client",
                           return_value=(client, AUTHORITY)), patch(
+                    "workstream_generation.validate_activation_operator_contract",
+                    side_effect=authorize), patch(
                     "workstream_generation.compact_context",
                     wraps=real_compact_context) as compact, patch.object(
                     sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
@@ -3334,7 +3442,7 @@ class GenerationTransitionTests(unittest.TestCase):
             code, raw, error, compact = invoke(activate_client, [
                 "activate", WORKSTREAM, "--plan-source", new_plan.name,
                 "--plan-identity", new_plan.name,
-                "--retirement-proof", proof.name,
+                "--operator-contract", proof.name,
                 "--created-at", "now", "--apply",
                 "--expected-native-root-sha256",
                 self.native_root_sha(activate_client),
@@ -3388,7 +3496,7 @@ class GenerationTransitionTests(unittest.TestCase):
             code, raw, error, compact = invoke(checkpoint_client, [
                 "activate", WORKSTREAM, "--plan-source", new_plan.name,
                 "--plan-identity", new_plan.name,
-                "--retirement-proof", proof.name,
+                "--operator-contract", proof.name,
                 "--activation-checkpoint", checkpoint_file.name,
                 "--remote-head", "e" * 40,
                 "--created-at", "checkpoint", "--apply",
@@ -3437,7 +3545,7 @@ class GenerationTransitionTests(unittest.TestCase):
             code, _raw, error, _compact = invoke(activate_client, [
                 "activate", WORKSTREAM, "--plan-source", later_plan.name,
                 "--plan-identity", later_plan.name,
-                "--retirement-proof", proof.name,
+                "--operator-contract", proof.name,
                 "--created-at", "later", "--apply",
                 "--expected-native-root-sha256",
                 self.native_root_sha(activate_client),
@@ -3449,7 +3557,7 @@ class GenerationTransitionTests(unittest.TestCase):
             code, raw, error, _compact = invoke(activate_client, [
                 "activate", WORKSTREAM, "--plan-source", new_plan.name,
                 "--plan-identity", new_plan.name,
-                "--retirement-proof", proof.name,
+                "--operator-contract", proof.name,
                 "--created-at", "now", "--apply",
                 "--expected-native-root-sha256",
                 self.native_root_sha(activate_client),
@@ -3489,7 +3597,7 @@ class GenerationTransitionTests(unittest.TestCase):
             code, _raw, error, _compact = invoke(drift_client, [
                 "activate", WORKSTREAM, "--plan-source", new_plan.name,
                 "--plan-identity", new_plan.name,
-                "--retirement-proof", proof.name,
+                "--operator-contract", proof.name,
                 "--created-at", "now", "--apply",
                 "--expected-native-root-sha256",
                 self.native_root_sha(drift_client),

@@ -267,6 +267,13 @@ def prepare_generation_operator_contract(
     )
     predecessor_heads = _active_heads(predecessor)
     target_heads = _active_heads(target)
+    target_disposition = target_heads.get(("disposition", "root"), {}).get(
+        "value", {}
+    )
+    disposition_matches_remote_head = (
+        isinstance(target_disposition, dict)
+        and target_disposition.get("remote_head") == remote_head
+    )
     required = {("scope", "root"), ("source", "root")}
     missing = sorted(required - set(predecessor_heads))
     if missing:
@@ -541,7 +548,7 @@ def prepare_generation_operator_contract(
                 if all(
                     identity in current_values and current_values[identity] == value
                     for identity, value in desired_values.items()
-                ):
+                ) and disposition_matches_remote_head:
                     phase = "activation_ready"
     else:
         desired_values = {
@@ -564,7 +571,7 @@ def prepare_generation_operator_contract(
         if all(
             identity in target_heads and target_heads[identity]["value"] == value
             for identity, value in desired_values.items()
-        ) and ("disposition", "root") in target_heads:
+        ) and disposition_matches_remote_head:
             phase = "activation_ready"
     _reviewed_manifest(manifest)
 
@@ -621,6 +628,50 @@ def prepare_generation_operator_contract(
         },
     }
     return {**contract, "contract_sha256": _digest(contract)}
+
+
+def validate_activation_operator_contract(
+    contract: dict[str, Any], *, source: dict[str, str], workstream_id: str,
+    authority: dict[str, str], comments: list[dict[str, Any]],
+    graph: dict[str, Any], description_plan_revision: str | None,
+    created_at: str, remote_head: str | None,
+) -> dict[str, Any]:
+    """Require the exact live activation-ready prepare output at CLI activation."""
+    from workstream_root_transition import validate_operator_contract
+
+    if not isinstance(contract, dict):
+        raise WorkstreamGenerationError(
+            "generation_operator_contract_invalid"
+        )
+    native = (graph.get("root") or {}).get("state") or {}
+    started_state = {
+        "id": native.get("id"), "name": native.get("name"),
+        "type": native.get("type"), "team_id": authority["team_id"],
+    }
+    target_state = (
+        ((contract.get("native_transition") or {}).get("target_state") or {})
+        if isinstance(contract, dict) else {}
+    )
+    if (
+        str(native.get("type", "")).lower() != "started"
+        or started_state != target_state
+        or created_at != contract.get("created_at")
+        or (remote_head is not None and remote_head != contract.get("remote_head"))
+    ):
+        raise WorkstreamGenerationError(
+            "generation_operator_contract_native_or_invocation_mismatch"
+        )
+    authorization = validate_operator_contract(
+        contract, source=source, token=workstream_id,
+        authority=authority, comments=comments, graph=graph,
+        started_state=started_state,
+        description_plan_revision=description_plan_revision,
+    )
+    return {
+        "authorization": authorization,
+        "retirement_proof": deepcopy(contract["retirement_proof"]),
+        "remote_head": contract["remote_head"],
+    }
 
 
 def _validate_candidate_receipt(
@@ -3147,8 +3198,12 @@ def parser() -> argparse.ArgumentParser:
                 help="reviewed Linear started-state UUID for native root reopen",
             )
         if name == "activate":
+            command.add_argument(
+                "--operator-contract",
+                help="exact activation_ready JSON emitted by generation prepare",
+            )
             command.add_argument("--retirement-proof",
-                                 help="reviewed JSON file containing the durable retirement proof")
+                                 help=argparse.SUPPRESS)
             command.add_argument("--abort-reservation-id")
             command.add_argument("--abort-reservation-sha256")
             command.add_argument("--abort-reason")
@@ -3177,7 +3232,8 @@ def main() -> int:
         if args.command == "activate" and args.abort_reservation_id:
             if (
                 not args.apply or not args.abort_reservation_sha256
-                or not args.abort_reason or args.plan_source or args.retirement_proof
+                or not args.abort_reason or args.plan_source
+                or args.retirement_proof or args.operator_contract
             ):
                 raise WorkstreamGenerationError("invalid_generation_abort_cli")
             transport = GenerationTransport(
@@ -3192,7 +3248,13 @@ def main() -> int:
             json.dump(output, sys.stdout, ensure_ascii=False, sort_keys=True, indent=2)
             sys.stdout.write("\n")
             return 0
-        if not args.plan_source or (args.command == "activate" and not args.retirement_proof):
+        if args.command == "activate" and args.retirement_proof:
+            raise WorkstreamGenerationError(
+                "generation_legacy_retirement_proof_cannot_authorize_operator"
+            )
+        if not args.plan_source or (
+            args.command == "activate" and not args.operator_contract
+        ):
             raise WorkstreamGenerationError("generation_candidate_cli_arguments_incomplete")
         source = plan_payload(args.plan_source, args.plan_identity or args.plan_source)["source"]
         if args.command == "prepare":
@@ -3271,7 +3333,10 @@ def main() -> int:
             workspace_id=authority["workspace_id"],
             project_id=authority["project_id"],
         )
-        initial_root_snapshot = linear_transport.snapshot_for_root(args.token.upper())
+        initial_root_snapshot = linear_transport.snapshot_for_root(
+            args.token.upper(), include_description=True,
+            include_child_comments=(args.command == "activate"),
+        )
         description_plan_revision = initial_root_snapshot["root"].get("plan_revision")
         transport = GenerationTransport(
             client, issue_id=args.token.upper(), workstream_id=args.token.upper(),
@@ -3290,8 +3355,22 @@ def main() -> int:
         )
         retirement = None
         if args.command == "activate":
-            with open(args.retirement_proof, encoding="utf-8") as handle:
-                retirement = json.load(handle)
+            with open(args.operator_contract, encoding="utf-8") as handle:
+                operator_contract = json.load(handle)
+            comments = LinearProjectionAdapter(
+                client, issue_id=args.token.upper(),
+                workstream_id=args.token.upper(),
+                plan_revision=source["sha256"], **authority,
+            )._comments()
+            operator = validate_activation_operator_contract(
+                operator_contract, source={
+                    "identity": source["identity"], "sha256": source["sha256"],
+                }, workstream_id=args.token.upper(), authority=authority,
+                comments=comments, graph=initial_root_snapshot,
+                description_plan_revision=description_plan_revision,
+                created_at=args.created_at, remote_head=args.remote_head,
+            )
+            retirement = operator["retirement_proof"]
         if not args.apply and args.command == "activate":
             output = transport.preview_activate(
                 target_plan_revision=source["sha256"],

@@ -200,113 +200,83 @@ def _validate_authority(
 def validate_operator_contract(
     contract: dict[str, Any], *, source: dict[str, str], token: str,
     authority: dict[str, str], comments: list[dict[str, Any]],
+    graph: dict[str, Any], started_state: dict[str, str],
     description_plan_revision: str | None,
 ) -> dict[str, Any]:
     """Authenticate the prepared candidate and predecessor quiescence contract."""
     from workstream_generation import (
-        _validate_retirement, GenerationTransport,
-        reduce_generation_checkpoint_comments,
+        prepare_generation_operator_contract,
     )
-    from workstream_linear_events import reduce_event_comments
-    from workstream_linear_projection import (
-        reduce_projection_comments, select_plan_generation,
-    )
-    from workstream_projection import projection_review_contract
 
     if not isinstance(contract, dict):
         raise RootTransitionError("root_transition_operator_contract_invalid")
-    unsigned = {key: deepcopy(value) for key, value in contract.items()
-                if key != "contract_sha256"}
     if (
         contract.get("schema_version") != 1
-        or contract.get("contract_sha256") != _digest(unsigned)
         or contract.get("workstream_id") != token
         or contract.get("authenticated_route") != authority
         or contract.get("source") != source
-        or (contract.get("projection_preview") or {}).get("phase")
-        != "activation_ready"
+        or not isinstance(contract.get("created_at"), str)
+        or not isinstance(contract.get("remote_head"), str)
     ):
         raise RootTransitionError("root_transition_operator_contract_invalid")
-    generation = contract.get("generation") or {}
-    selected = select_plan_generation(
-        comments, workstream_id=token,
-        description_plan_revision=description_plan_revision,
-        authenticated_route=authority,
-    )
-    expected_generation = {
-        "from_plan_revision": selected["plan_revision"],
-        "target_plan_revision": source["sha256"],
-        "activation_epoch": (
-            selected["activation_epoch"]
-            if selected["activation_epoch"] is not None else -1
-        ) + 1,
-        "previous_control_event_id": selected["transition_tip_event_id"],
-    }
-    if generation != expected_generation:
-        raise RootTransitionError("root_transition_operator_generation_mismatch")
-    native_transition = contract.get("native_transition") or {}
-    target_state = native_transition.get("target_state") or {}
-    if (
-        native_transition.get("operation") != "reopen"
-        or set(target_state) != {"id", "name", "type", "team_id"}
-        or str(target_state.get("type", "")).lower() != "started"
-        or target_state.get("team_id") != authority["team_id"]
-    ):
-        raise RootTransitionError("root_transition_operator_native_state_invalid")
-    predecessor = reduce_projection_comments(
-        comments, workstream_id=token,
-        expected_plan_revision=generation["from_plan_revision"],
-        authenticated_route=authority,
-    )
-    target = reduce_projection_comments(
-        comments, workstream_id=token,
-        expected_plan_revision=generation["target_plan_revision"],
-        authenticated_route=authority,
-    )
-    material = reduce_event_comments(comments, workstream_id=token)
-    checkpoint_ids = sorted(
-        item["event_id"] for item in reduce_generation_checkpoint_comments(
-            comments, workstream_id=token, authenticated_route=authority,
-        ).checkpoints
-        if item["plan_revision"] == generation["from_plan_revision"]
-    )
-    frontiers = contract.get("frontiers") or {}
-    if frontiers != {
-        "material_revision": material.revision,
-        "predecessor_projection": projection_review_contract(predecessor),
-        "target_projection": projection_review_contract(target),
-        "predecessor_checkpoint_event_ids": checkpoint_ids,
-    }:
-        raise RootTransitionError("root_transition_operator_frontier_mismatch")
-    retirement = contract.get("retirement_proof") or {}
-    if retirement.get("schema_version") != 2:
-        raise RootTransitionError(
-            "root_transition_authenticated_retirement_required"
-        )
     try:
-        _validate_retirement(
-            retirement, generation["from_plan_revision"],
-            generation["activation_epoch"],
-        )
-        validator = GenerationTransport(
-            object(), issue_id=token, workstream_id=token,
-            authority=authority, candidate_loader=lambda _plan: {},
-            legacy_description_plan_revision=description_plan_revision,
-        )
-        validator._validate_retirement_frontier(
-            comments, from_plan=generation["from_plan_revision"],
-            retirement=retirement, from_state=predecessor,
+        expected = prepare_generation_operator_contract(
+            comments=comments, graph=graph, workstream_id=token,
+            authority=authority,
+            description_plan_revision=description_plan_revision,
+            target_source=source, created_at=contract["created_at"],
+            remote_head=contract["remote_head"],
+            started_state=started_state,
         )
     except LinearTransportError as error:
         raise RootTransitionError(str(error)) from error
+    if not hmac.compare_digest(_canonical(expected), _canonical(contract)):
+        raise RootTransitionError(
+            "root_transition_operator_contract_not_exact_live_prepare_output"
+        )
+    if expected["projection_preview"]["phase"] != "activation_ready":
+        raise RootTransitionError(
+            "root_transition_operator_candidate_projection_incomplete"
+        )
+    generation = expected["generation"]
+    native_transition = expected["native_transition"]
+    retirement = expected["retirement_proof"]
+    frontiers = expected["frontiers"]
     return {
         "schema_version": 1,
-        "contract_sha256": contract["contract_sha256"],
+        "contract_sha256": expected["contract_sha256"],
         "source": deepcopy(source),
         "generation": deepcopy(generation),
         "native_transition": deepcopy(native_transition),
         "retirement_sha256": retirement["declaration_sha256"],
         "frontiers_sha256": _digest(frontiers),
+    }
+
+
+def authenticated_started_state(
+    client: Any, *, authority: dict[str, str], state_id: str,
+) -> dict[str, str]:
+    try:
+        state_id = canonical_native_uuid(state_id, kind="state")
+    except ValueError as error:
+        raise RootTransitionError("reviewed_started_state_id_invalid") from error
+    result = client.execute(STATE_QUERY, {
+        "teamId": authority["team_id"], "stateId": state_id,
+    })
+    state = result.get("workflowState")
+    team = result.get("team") or {}
+    if (
+        team.get("id") != authority["team_id"]
+        or (team.get("organization") or {}).get("id") != authority["workspace_id"]
+        or not isinstance(state, dict) or state.get("id") != state_id
+        or (state.get("team") or {}).get("id") != authority["team_id"]
+        or str(state.get("type", "")).lower() != "started"
+        or not isinstance(state.get("name"), str) or not state["name"]
+    ):
+        raise RootTransitionError("reviewed_started_state_readback_mismatch")
+    return {
+        "id": state["id"], "name": state["name"], "type": state["type"],
+        "team_id": (state.get("team") or {}).get("id"),
     }
 
 
@@ -355,28 +325,9 @@ class RootTransitionTransport:
         return final, final_comments
 
     def _started_state(self, state_id: str) -> dict[str, Any]:
-        try:
-            state_id = canonical_native_uuid(state_id, kind="state")
-        except ValueError as error:
-            raise RootTransitionError("reviewed_started_state_id_invalid") from error
-        result = self.client.execute(STATE_QUERY, {
-            "teamId": self.authority["team_id"], "stateId": state_id,
-        })
-        state = result.get("workflowState")
-        team = result.get("team") or {}
-        if (
-            team.get("id") != self.authority["team_id"]
-            or (team.get("organization") or {}).get("id") != self.authority["workspace_id"]
-            or not isinstance(state, dict) or state.get("id") != state_id
-            or (state.get("team") or {}).get("id") != self.authority["team_id"]
-            or str(state.get("type", "")).lower() != "started"
-            or not isinstance(state.get("name"), str) or not state["name"]
-        ):
-            raise RootTransitionError("reviewed_started_state_readback_mismatch")
-        return {
-            "id": state["id"], "name": state["name"], "type": state["type"],
-            "team_id": (state.get("team") or {}).get("id"),
-        }
+        return authenticated_started_state(
+            self.client, authority=self.authority, state_id=state_id,
+        )
 
     @staticmethod
     def _assert_reservation(
@@ -673,13 +624,25 @@ def main() -> int:
         )
         root_snapshot = linear.snapshot_for_root(
             args.token.upper(), include_description=True,
+            include_child_comments=True,
         )
+        _validate_authority(root_snapshot, args.token.upper(), authority)
         comments = LinearCommentEventAdapter(
             client, issue_id=args.token.upper(), **authority,
         ).comments()
+        target_state_id = (
+            ((contract.get("native_transition") or {}).get("target_state") or {})
+            .get("id")
+        ) if isinstance(contract, dict) else None
+        if not isinstance(target_state_id, str):
+            raise RootTransitionError("root_transition_operator_native_state_invalid")
+        started_state = authenticated_started_state(
+            client, authority=authority, state_id=target_state_id,
+        )
         operator_authorization = validate_operator_contract(
             contract, source=source, token=args.token.upper(),
             authority=authority, comments=comments,
+            graph=root_snapshot, started_state=started_state,
             description_plan_revision=root_snapshot["root"].get("plan_revision"),
         )
         transport = RootTransitionTransport(

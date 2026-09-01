@@ -297,24 +297,27 @@ workstreamctl projection GEN-123 target-projection.json \
 There is no implicit apply mode. A flagless invocation refuses before live
 access, and `--apply` refuses unless both the reviewed timestamp and preview
 digest are supplied.
-After the target projection is complete, use the generated structured
-retirement proof for the current active epoch:
+After the target projection is complete, rerun `generation prepare` and use its
+exact `activation_ready` operator contract for the reviewed `root-transition`
+locator migration and reopen described below. Once that exact root is in the
+contract's authenticated `started` state, preview activation. Activation
+recomputes the contract from live authenticated state; a caller-authored
+retirement file or an edited phase/self-digest cannot authorize it:
 
 ```sh
 workstreamctl generation activate GEN-123 --plan-source ./PLAN.md \
   --plan-identity <canonical-immutable-plan-url> \
-  --retirement-proof ./retirement.json \
+  --operator-contract ./generation-review.json \
   --created-at <reviewed-utc-time>
 ```
 
-Review the preview's `native_root_activation_proof`, reopen the same existing
-root through the separately authorized Linear workflow when it is terminal,
-then apply with the unchanged proof digest:
+Review the preview's `native_root_activation_proof`, then apply with the
+unchanged proof digest:
 
 ```sh
 workstreamctl generation activate GEN-123 --plan-source ./PLAN.md \
   --plan-identity <canonical-immutable-plan-url> \
-  --retirement-proof ./retirement.json \
+  --operator-contract ./generation-review.json \
   --created-at <reviewed-utc-time> \
   --expected-native-root-sha256 <preview-sha256> --apply
 ```
@@ -333,7 +336,7 @@ the authenticated repository head used for disposition:
 python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_generation.py" \
   activate GEN-123 --plan-source ./PLAN.md \
   --plan-identity <canonical-immutable-plan-url> \
-  --retirement-proof ./retirement.json \
+  --operator-contract ./generation-review.json \
   --activation-checkpoint ./pending-checkpoint.json \
   --remote-head <authenticated-exact-head> \
   --created-at <reviewed-utc-time> --apply

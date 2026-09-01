@@ -29,7 +29,10 @@ workstreamctl root-transition reopen GEN-123 \
 The contract must be the exact `activation_ready` output from `workstreamctl
 generation prepare`. It binds the target generation bytes/source, reviewed
 started-state readback, authenticated route, and predecessor quiescence
-frontiers. A caller-selected state UUID or unrelated plan source is refused.
+frontiers. The command recomputes the complete prepare result from current live
+state and requires exact equality; changing `phase` and recomputing the caller's
+self-digest cannot authorize an incomplete candidate. A caller-selected state
+UUID or unrelated plan source is refused.
 
 Review `intent`, `authenticated_route`, `expected_snapshot_sha256`,
 `expected_frontier_sha256`, and `intent_sha256`, then repeat the identical
