@@ -12,7 +12,10 @@ import subprocess
 import sys
 from typing import Any, Callable
 
-from workstream_checkpoint import build_checkpoint, CheckpointError
+from workstream_checkpoint import (
+    build_checkpoint, CheckpointError, canonical_authority_tip,
+    recover_latest,
+)
 from workstream_config import load_linear_api_key, resolve_linear_route
 from workstream_linear import (
     bootstrap_linear_route, HttpGraphQLClient, LinearGraphQLTransport,
@@ -46,6 +49,84 @@ def _canonical(value: Any) -> bytes:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _valid_fixed_frontier_shape(value: dict[str, Any]) -> bool:
+    """Require the producer's executable frontier and hydration contract."""
+    scope = value.get("authority_scope")
+    frontier = value.get("execution_frontier")
+    deferred = value.get("deferred_audit_detail")
+    required_frontier = {
+        "root", "children", "obligations", "decisions", "choices",
+        "dependencies", "child_dependency_graph", "columns", "checkpoint",
+        "disposition",
+    }
+    required_deferred = {
+        "state", "hydration_required_before_action", "algorithm", "fields",
+        "fields_sha256", "full_context_sha256", "hydration_selectors",
+        "obligation_selector_rules", "hydration_recipe",
+        "original_context_bytes", "audit_route", "full_history_route",
+    }
+    return (
+        isinstance(scope, dict)
+        and set(scope) == {
+            "history_validation", "execution_frontier", "item_count",
+            "omitted_items_claimed_executable", "truncated_cell_count",
+            "truncated_cell_marker", "truncated_cell_rule",
+        }
+        and scope.get("history_validation") == "complete_authenticated"
+        and scope.get("execution_frontier")
+        == "complete_digest_bound_excerpts"
+        and scope.get("omitted_items_claimed_executable") is False
+        and type(scope.get("item_count")) is int
+        and 0 <= scope["item_count"] <= 100
+        and isinstance(frontier, dict)
+        and set(frontier) == required_frontier
+        and isinstance(frontier.get("root"), dict)
+        and set(frontier["root"]) == {"status", "next", "blocker"}
+        and all(isinstance(frontier.get(key), list) for key in (
+            "children", "obligations", "decisions", "choices", "dependencies",
+        ))
+        and isinstance(frontier.get("child_dependency_graph"), dict)
+        and set(frontier["child_dependency_graph"]) == {"authority", "relations"}
+        and isinstance(frontier["child_dependency_graph"]["relations"], list)
+        and isinstance(frontier.get("columns"), dict)
+        and set(frontier["columns"]) == {
+            "children", "obligations", "decisions", "choices",
+            "dependencies", "child_dependency_graph.relations",
+        }
+        and scope["item_count"] == (
+            1 + sum(len(frontier[key]) for key in (
+                "children", "obligations", "decisions", "choices",
+                "dependencies",
+            )) + len(frontier["child_dependency_graph"]["relations"])
+        )
+        and isinstance(deferred, dict)
+        and set(deferred) == required_deferred
+        and deferred.get("state") == "fixed_frontier_authority_envelope"
+        and deferred.get("hydration_required_before_action") is True
+        and deferred.get("algorithm") == "fixed-six-slot-frontier-v1"
+        and isinstance(deferred.get("fields"), list)
+        and isinstance(deferred.get("hydration_selectors"), dict)
+        and isinstance(deferred.get("obligation_selector_rules"), dict)
+        and isinstance(deferred.get("hydration_recipe"), str)
+        and isinstance(deferred.get("original_context_bytes"), int)
+        and deferred["original_context_bytes"] > 24 * 1024
+        and isinstance(deferred.get("audit_route"), dict)
+        and isinstance(deferred.get("full_history_route"), dict)
+    )
+
+
+def _normalized_tip(
+    checkpoints: list[dict[str, Any]], token: str, plan_revision: str,
+) -> dict[str, Any]:
+    try:
+        return canonical_authority_tip(recover_latest(
+            checkpoints, token,
+            expected_plan_revision=plan_revision,
+        ))
+    except (CheckpointError, KeyError, IndexError) as error:
+        raise LinearTransportError("checkpoint_normalized_tip_unavailable") from error
 
 
 def _root_authority_graph(graph: dict[str, Any]) -> dict[str, Any]:
@@ -423,6 +504,8 @@ def _ordinary_resume(
         value = json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise LinearTransportError("checkpoint_ordinary_resume_invalid_json") from error
+    if not isinstance(value, dict):
+        raise LinearTransportError("checkpoint_ordinary_resume_invalid_json")
     if (
         value.get("resume_authority") != "full"
         or value.get("workstream_id") != token
@@ -439,26 +522,34 @@ def _ordinary_resume(
                 or dependency_graph.get("plan_revision") != source["sha256"]):
             raise LinearTransportError("checkpoint_ordinary_resume_not_bounded_full")
     else:
-        schema = value.get("context_schema") or {}
+        schema = value.get("context_schema")
         frontier = value.get("execution_frontier")
         checkpoint = frontier.get("checkpoint") if isinstance(frontier, dict) else None
-        if (schema.get("envelope") != "fixed_frontier_authority_v1"
-                or value.get("authenticated_source") != source
-                or value.get("authenticated_route") != route
+        binding = value.get("authority_binding")
+        if (not isinstance(schema, dict)
+                or set(schema) != {"name", "version", "representation", "envelope"}
+                or schema.get("name") != "agent-workstream.resume-context"
+                or schema.get("version") != 2
+                or schema.get("representation") != "compact_validated"
+                or schema.get("envelope") != "fixed_frontier_authority_v1"
+                or not isinstance(binding, dict)
+                or set(binding) != {"route_sha256", "source_sha256", "checkpoint_sha256"}
+                or binding.get("route_sha256") != _digest(route)
+                or binding.get("source_sha256") != _digest(source)
+                or not _valid_fixed_frontier_shape(value)
                 or not isinstance(frontier, dict)
-                or not isinstance(checkpoint, dict)
-                or checkpoint.get("workstream_id") != token
-                or checkpoint.get("plan_revision") != source["sha256"]
-                or not isinstance(checkpoint.get("root_revision"), int)
-                or not isinstance(checkpoint.get("checkpoint_event_id"), str)):
+                or not (
+                    isinstance(checkpoint, str)
+                    and len(checkpoint.encode("utf-8")) <= 24
+                    and __import__("re").fullmatch(r".{0,15}~#[0-9a-f]{8}", checkpoint)
+                )):
             raise LinearTransportError("checkpoint_ordinary_resume_not_bounded_full")
         if expected_checkpoint is not None:
-            expected_ack = expected_checkpoint.get("acknowledgement") or {}
-            compact_ack = checkpoint.get("acknowledgement") or {}
-            if (checkpoint.get("checkpoint_event_id") != expected_checkpoint.get("event_id")
-                    or checkpoint.get("root_revision") != expected_checkpoint.get("root_revision")
-                    or compact_ack.get("remote_id")
-                    != (expected_remote_id or expected_ack.get("remote_id"))):
+            try:
+                expected_tip = canonical_authority_tip(expected_checkpoint)
+            except CheckpointError as error:
+                raise LinearTransportError("checkpoint_expected_tip_invalid") from error
+            if binding.get("checkpoint_sha256") != _digest(expected_tip):
                 raise LinearTransportError("checkpoint_ordinary_resume_checkpoint_mismatch")
     return value
 
@@ -613,10 +704,22 @@ def run(
             preview, checkpoint_receipt=receipt,
             projection_receipt=projection_receipt,
         )
+    # The producer and consumer bind one shape only: the acknowledged chain
+    # tip recovered from every immutable checkpoint, including provenance.
+    try:
+        acknowledged_tip = _normalized_tip(
+            adapter._state().checkpoints,
+            preview["workstream_id"], preview["source"]["sha256"],
+        )
+    except (LinearTransportError, OSError, TimeoutError) as error:
+        raise _partial_apply_error(
+            "checkpoint_acknowledged_tip_unavailable", preview,
+            checkpoint_receipt=receipt, projection_receipt=projection_receipt,
+        ) from error
     try:
         resume = _ordinary_resume(
             preview["workstream_id"], args=args, route=route,
-            source=preview["source"], expected_checkpoint=preview["checkpoint"],
+            source=preview["source"], expected_checkpoint=acknowledged_tip,
             expected_remote_id=receipt["acknowledgement"]["remote_id"],
         )
     except (LinearTransportError, OSError, TimeoutError) as error:
@@ -634,12 +737,20 @@ def run(
             projection_receipt=projection_receipt,
         )
     latest_checkpoint = resume.get("latest_checkpoint") or {}
+    compact_checkpoint_ok = (
+        isinstance(resume.get("authority_binding"), dict)
+        and resume["authority_binding"].get("checkpoint_sha256")
+        == _digest(acknowledged_tip)
+    )
+    legacy_checkpoint_ok = (
+        latest_checkpoint.get("checkpoint_event_id") == receipt["event_id"]
+        and latest_checkpoint.get("root_revision") == preview["material_revision"]
+        and (latest_checkpoint.get("acknowledgement") or {}).get("remote_id")
+        == receipt["acknowledgement"]["remote_id"]
+    )
     if (
         resume.get("plan_revision") != preview["source"]["sha256"]
-        or latest_checkpoint.get("checkpoint_event_id") != receipt["event_id"]
-        or latest_checkpoint.get("root_revision") != preview["material_revision"]
-        or (latest_checkpoint.get("acknowledgement") or {}).get("remote_id")
-        != receipt["acknowledgement"]["remote_id"]
+        or not (legacy_checkpoint_ok or compact_checkpoint_ok)
     ):
         raise _partial_apply_error(
             "checkpoint_applied_but_ordinary_resume_receipt_mismatch", preview,
