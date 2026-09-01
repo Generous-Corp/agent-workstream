@@ -92,6 +92,7 @@ class FakeClient:
         self.comment_updates_root = False
         self.comment_clock = 0
         self.expanded_resume_project = False
+        self.dependency_graph = "stable-dependency-graph"
 
     def root_issue(self):
         return {
@@ -340,6 +341,10 @@ class Loader:
             "checkpoint_event_ids": checkpoint_ids,
             "projection_revision": state.revision,
             "graph_frontier_sha256": _digest(self.graph),
+            "graph_digest_schema": 2,
+            "graph_observation_sha256": _digest(self.graph),
+            "graph_material_sha256": _digest(self.graph),
+            "dependency_graph_sha256": _digest(self.client.dependency_graph),
             "snapshot_sha256": _digest(surface),
             "quarantined_legacy_writes": generation_quarantine_metadata(
                 comments, workstream_id=WORKSTREAM,
@@ -366,7 +371,119 @@ class ActivationCheckpointLoader(Loader):
         return receipt
 
 
+class GraphClockLoader(Loader):
+    """Model the strict loader's provider-owned root updatedAt observation."""
+
+    def __call__(self, plan):
+        receipt = super().__call__(plan)
+        surface = {
+            "root": {
+                "title": self.client.graph_title,
+                "status": self.client.graph_status,
+                "updatedAt": self.client.graph_nonce,
+            },
+            "children": deepcopy(self.client.children),
+            "decisions": [],
+        }
+        receipt.update(workstream_generation._graph_receipt_digests(surface))
+        return receipt
+
+
 class GenerationTransitionTests(unittest.TestCase):
+    def test_schema7_material_graph_excludes_only_root_updated_at(self):
+        original = {
+            "root": {"title": "Root", "updatedAt": "one"},
+            "children": [{"identifier": "GEN-38", "title": "Child"}],
+            "decisions": [{"id": "decision-1", "value": "keep"}],
+        }
+        baseline = workstream_generation._graph_receipt_digests(original)
+        clock = deepcopy(original)
+        clock["root"]["updatedAt"] = "two"
+        clock_receipt = workstream_generation._graph_receipt_digests(clock)
+        self.assertNotEqual(
+            baseline["graph_observation_sha256"],
+            clock_receipt["graph_observation_sha256"],
+        )
+        self.assertEqual(
+            baseline["graph_material_sha256"],
+            clock_receipt["graph_material_sha256"],
+        )
+        for label, mutate in (
+            ("root", lambda value: value["root"].update(title="Changed")),
+            ("child", lambda value: value["children"][0].update(title="Changed")),
+            ("decision", lambda value: value["decisions"][0].update(value="changed")),
+        ):
+            changed = deepcopy(original)
+            mutate(changed)
+            with self.subTest(material_drift=label):
+                self.assertNotEqual(
+                    baseline["graph_material_sha256"],
+                    workstream_generation._graph_receipt_digests(changed)[
+                        "graph_material_sha256"
+                    ],
+                )
+
+    def test_schema7_dependency_material_excludes_readback_protocol_drift(self):
+        relation = {
+            "id": "relation", "type": "blocks",
+            "blocker": {"issue_id": "one", "identifier": "GEN-38"},
+            "blocked": {"issue_id": "two", "identifier": "GEN-39"},
+            "inverse_type": "blocked_by",
+        }
+        original = {
+            "schema_version": 1,
+            "authority": "child_dependency_authorization",
+            "plan_revision": NEW,
+            "route": deepcopy(AUTHORITY),
+            "revision": 1,
+            "sha256": _digest([relation]),
+            "authorization_batches": [{"batch_id": "grant"}],
+            "relations": [relation],
+            "native_readback": "relations_and_inverseRelations",
+            "ignored_non_dependency_count": 0,
+            "observed_frontier": {
+                "material_revision": 1, "projection_revision": 2,
+                "graph_revision": 1, "graph_sha256": _digest([relation]),
+            },
+            "root_readback_sha256": "1" * 64,
+            "validation_authority": {
+                "owned_children": [{
+                    "issue_id": "one", "identifier": "GEN-38",
+                }],
+                "comments": [{"id": "before", "body": "proof"}],
+            },
+        }
+        baseline = workstream_generation._dependency_material_sha256(original)
+        protocol_drift = deepcopy(original)
+        protocol_drift["observed_frontier"]["projection_revision"] += 1
+        protocol_drift["root_readback_sha256"] = "2" * 64
+        protocol_drift["validation_authority"]["comments"].append({
+            "id": "seal", "body": "generation protocol",
+        })
+        self.assertEqual(
+            baseline,
+            workstream_generation._dependency_material_sha256(protocol_drift),
+        )
+        for label, mutate in (
+            ("relation", lambda value: value["relations"][0].update(
+                inverse_type="changed",
+            )),
+            ("grant", lambda value: value["authorization_batches"][0].update(
+                batch_id="changed",
+            )),
+            ("route", lambda value: value["route"].update(project_id="changed")),
+            ("owned", lambda value: value["validation_authority"][
+                "owned_children"
+            ][0].update(identifier="GEN-40")),
+        ):
+            changed = deepcopy(original)
+            mutate(changed)
+            with self.subTest(material_drift=label):
+                self.assertNotEqual(
+                    baseline,
+                    workstream_generation._dependency_material_sha256(changed),
+                )
+
     def test_gen14_legacy_split_producer_accepts_only_captured_prefix(self):
         from types import SimpleNamespace
         plan = "e" * 64
@@ -1425,7 +1542,7 @@ class GenerationTransitionTests(unittest.TestCase):
             source_loader=lambda: deepcopy(source_state),
         )
 
-    def test_terminal_reopen_response_loss_drives_schema6_activation_replays(self):
+    def test_terminal_reopen_response_loss_drives_schema7_activation_replays(self):
         with patch(__name__ + ".WORKSTREAM", "GEN-37"):
             client = FakeClient()
             client.allow_issue_update = True
@@ -1437,6 +1554,10 @@ class GenerationTransitionTests(unittest.TestCase):
             client.graph_state_id = "done-state"
             client.graph_status = "Done"
             client.graph_status_type = "completed"
+            client.description = (
+                f"Plan revision: {OLD}\n"
+                "Current next action: Activate the reviewed generation."
+            )
             project_full(client, OLD)
             predecessor_checkpoint = build_checkpoint(
                 workstream_id=WORKSTREAM,
@@ -1590,18 +1711,43 @@ class GenerationTransitionTests(unittest.TestCase):
             base = deepcopy(client)
             retirement = contract["retirement_proof"]
 
-            def activation_transport(current, candidate_loader=None):
+            def activation_transport(
+                current, candidate_loader=None,
+                transport_class=GenerationTransport,
+                production_loader=False,
+            ):
                 native_transport = LinearGraphQLTransport(
                     current, workspace_id="workspace", team_id="team",
                     project_id="project",
                 )
-                selected_loader = candidate_loader or Loader(current)
-                return GenerationTransport(
+                def strict_loader(prepared_event_id=None):
+                    with patch(
+                        "workstream_generation.plan_payload",
+                        return_value={"source": {
+                            **deepcopy(source),
+                        }},
+                    ):
+                        return strict_candidate_loader(
+                            current, token=WORKSTREAM, authority=AUTHORITY,
+                            plan_source="plan", plan_identity=source["identity"],
+                            activation_remote_head="e" * 40,
+                            activation_created_at=created_at,
+                            authorized_prepared_transition_event_id=(
+                                prepared_event_id
+                            ),
+                        )
+
+                selected_loader = (
+                    strict_loader() if production_loader
+                    else candidate_loader or GraphClockLoader(current)
+                )
+                return transport_class(
                     current, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
                     authority=AUTHORITY,
                     candidate_loader=selected_loader,
                     prepared_candidate_loader=lambda plan, _event_id: (
-                        selected_loader(plan)
+                        strict_loader(_event_id)(plan)
+                        if production_loader else selected_loader(plan)
                     ),
                     legacy_description_plan_revision=OLD,
                     # Match the production CLI's full operator-snapshot query
@@ -1649,7 +1795,16 @@ class GenerationTransitionTests(unittest.TestCase):
                     authenticated_route=AUTHORITY,
                 )
                 self.assertEqual(len(reservations), 1)
-                self.assertEqual(reservations[0]["schema_version"], 6)
+                self.assertEqual(reservations[0]["schema_version"], 7)
+                observed = GraphClockLoader(current)(NEW)
+                self.assertNotEqual(
+                    reservations[0]["graph_observation_sha256"],
+                    observed["graph_observation_sha256"],
+                )
+                self.assertEqual(
+                    reservations[0]["graph_material_sha256"],
+                    observed["graph_material_sha256"],
+                )
                 self.assertEqual(
                     reservations[0]["root_transition_receipt_sha256"],
                     root_receipt["sha256"],
@@ -1894,7 +2049,7 @@ class GenerationTransitionTests(unittest.TestCase):
                 )
                 return GenerationTransport(
                     current, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
-                    authority=AUTHORITY, candidate_loader=Loader(current),
+                    authority=AUTHORITY, candidate_loader=GraphClockLoader(current),
                     legacy_description_plan_revision=OLD,
                     native_root_loader=lambda: (
                         workstream_generation._activation_native_root_snapshot(
@@ -2029,6 +2184,19 @@ class GenerationTransitionTests(unittest.TestCase):
                 )
             self.assertEqual(len(wrong_root.mutations), before)
 
+            wrong_dependency = deepcopy(pending_snapshot)
+            wrong_dependency.dependency_graph = "changed-dependency-graph"
+            before = len(wrong_dependency.mutations)
+            with self.assertRaisesRegex(
+                WorkstreamGenerationError,
+                "generation_candidate_changed_after_reservation",
+            ):
+                continuation_transport(wrong_dependency).continue_reservation(
+                    reservation_id=reservation["reservation_id"],
+                    reservation_sha256=reservation["reservation_sha256"],
+                )
+            self.assertEqual(len(wrong_dependency.mutations), before)
+
             missing_receipt = deepcopy(pending_snapshot)
             missing_receipt.comments = [
                 item for item in missing_receipt.comments
@@ -2107,7 +2275,7 @@ class GenerationTransitionTests(unittest.TestCase):
                 }},
             ), patch(
                 "workstream_generation.strict_candidate_loader",
-                return_value=Loader(cli_client),
+                return_value=GraphClockLoader(cli_client),
             ), patch.object(sys, "stdout", stdout):
                 self.assertEqual(main(), 0)
             cli_output = json.loads(stdout.getvalue())
@@ -2127,7 +2295,7 @@ class GenerationTransitionTests(unittest.TestCase):
                 }},
             ), patch(
                 "workstream_generation.strict_candidate_loader",
-                return_value=Loader(cli_client),
+                return_value=GraphClockLoader(cli_client),
             ), patch.object(sys, "stdout", stdout):
                 self.assertEqual(main(), 0)
             self.assertEqual(len(cli_client.mutations), cli_writes)
@@ -2140,6 +2308,8 @@ class GenerationTransitionTests(unittest.TestCase):
                     "native_root_material_sha256",
                     "root_transition_receipt_ref",
                     "root_transition_receipt_sha256",
+                    "graph_digest_schema", "graph_observation_sha256",
+                    "graph_material_sha256", "dependency_graph_sha256",
                 }
             }
             schema5["schema_version"] = 5
@@ -2162,11 +2332,11 @@ class GenerationTransitionTests(unittest.TestCase):
                 )
 
             for crash_call, error in (
-                (2, "crash_after_v6_candidate_seal"),
-                (4, "crash_after_v6_prepared_transition"),
+                (3, "crash_after_v7_candidate_seal"),
+                (5, "crash_after_v7_prepared_transition"),
             ):
                 current = deepcopy(base)
-                stable = Loader(current)
+                stable = GraphClockLoader(current)
                 calls = {"count": 0}
 
                 def crashing_loader(plan, *, _at=crash_call, _error=error):
@@ -2185,7 +2355,7 @@ class GenerationTransitionTests(unittest.TestCase):
                         remote_head="e" * 40,
                         expected_native_root_sha256=expected_sha,
                     )
-                if crash_call == 4:
+                if crash_call == 5:
                     pending = pending_generation_reservations(
                         current.comments, workstream_id=WORKSTREAM,
                         authenticated_route=AUTHORITY,
@@ -2409,7 +2579,7 @@ class GenerationTransitionTests(unittest.TestCase):
                             self.assertEqual(
                                 len(planted.mutations), planted_writes,
                             )
-                if crash_call == 4:
+                if crash_call == 5:
                     handle_transport = activation_transport(current)
                     recovered = handle_transport.continue_reservation(
                         reservation_id=pending["reservation_id"],
@@ -2434,12 +2604,65 @@ class GenerationTransitionTests(unittest.TestCase):
                 )
                 self.assertEqual(len(finalizations), 1)
 
+            # Exercise the production strict loader—not the compact test
+            # double—through a complete schema-7 activation. Every protocol
+            # comment advances the root clock, projection frontier, and proof
+            # comments, but none changes dependency semantics.
+            production = deepcopy(base)
+            production_transport = activation_transport(
+                production, production_loader=True,
+            )
+            production_receipt = production_transport.activate(
+                target_plan_revision=NEW, created_at=created_at,
+                retirement=retirement, remote_head="e" * 40,
+                expected_native_root_sha256=reviewed_sha(production),
+            )
+            production_reservation = reduce_generation_reservations(
+                production.comments, workstream_id=WORKSTREAM,
+                authenticated_route=AUTHORITY,
+            )[0]
+            self.assertEqual(production_reservation["schema_version"], 7)
+            production_writes = len(production.mutations)
+            production_replay = activation_transport(
+                production, production_loader=True,
+            ).continue_reservation(
+                reservation_id=production_reservation["reservation_id"],
+                reservation_sha256=production_reservation[
+                    "reservation_sha256"
+                ],
+            )
+            self.assertEqual(
+                production_replay["event_id"], production_receipt["event_id"],
+            )
+            self.assertEqual(len(production.mutations), production_writes)
+
             # A candidate seal is itself a protocol comment and therefore can
             # advance Linear's root updatedAt without changing any semantic
             # authority. Bind that one clock advance append-only, then prove a
             # fresh handle-only continuation completes and replays zero-write.
             clock_client = deepcopy(base)
             historical_clock = clock_client.graph_nonce
+
+            class Schema6ClockTransport(GenerationTransport):
+                """Exercise the strict legacy schema-v6 custody path."""
+
+                def _reservation(self, *args, **kwargs):
+                    current = super()._reservation(*args, **kwargs)
+                    unsigned = {
+                        key: deepcopy(value)
+                        for key, value in current.items()
+                        if key not in {
+                            "reservation_id", "graph_digest_schema",
+                            "graph_observation_sha256",
+                            "graph_material_sha256",
+                            "dependency_graph_sha256",
+                        }
+                    }
+                    unsigned["schema_version"] = 6
+                    return {
+                        **unsigned,
+                        "reservation_id": "wsgr_" + _digest(unsigned)[:32],
+                    }
 
             class ClockLoader(Loader):
                 def __init__(self, current, override=None):
@@ -2448,24 +2671,34 @@ class GenerationTransitionTests(unittest.TestCase):
 
                 def __call__(self, plan):
                     receipt = super().__call__(plan)
-                    receipt["graph_frontier_sha256"] = _digest({
-                        "root_updated_at": (
-                            self.override
-                            if self.override is not None
-                            else self.client.graph_nonce
-                        ),
-                        "root_title": self.client.graph_title,
-                        "children": self.client.children,
-                    })
+                    surface = {
+                        "root": {
+                            "title": self.client.graph_title,
+                            "status": self.client.graph_status,
+                            "updatedAt": (
+                                self.override
+                                if self.override is not None
+                                else self.client.graph_nonce
+                            ),
+                        },
+                        "children": deepcopy(self.client.children),
+                        "decisions": [],
+                    }
+                    receipt.update(
+                        workstream_generation._graph_receipt_digests(surface)
+                    )
                     return receipt
 
-            stable_clock = ClockLoader(clock_client)
+            # Hold the reviewed schema-v6 observation through reservation and
+            # seal creation; the injected crash then exposes the provider
+            # clock advanced by that seal to the recovery client.
+            stable_clock = ClockLoader(clock_client, historical_clock)
             clock_calls = {"count": 0}
 
             def crash_after_clock_seal(plan):
                 clock_calls["count"] += 1
                 receipt = stable_clock(plan)
-                if clock_calls["count"] == 2:
+                if clock_calls["count"] == 3:
                     raise WorkstreamGenerationError(
                         "crash_after_clock_candidate_seal"
                     )
@@ -2476,6 +2709,7 @@ class GenerationTransitionTests(unittest.TestCase):
             ):
                 activation_transport(
                     clock_client, crash_after_clock_seal,
+                    Schema6ClockTransport,
                 ).activate(
                     target_plan_revision=NEW, created_at=created_at,
                     retirement=retirement, remote_head="e" * 40,
@@ -2762,7 +2996,7 @@ class GenerationTransitionTests(unittest.TestCase):
         def crash_after_seal(plan):
             loader_calls["count"] += 1
             result = stable_loader(plan)
-            if loader_calls["count"] == 2:
+            if loader_calls["count"] == 3:
                 raise WorkstreamGenerationError("simulated_operator_crash_after_seal")
             return result
 
@@ -2834,7 +3068,7 @@ class GenerationTransitionTests(unittest.TestCase):
         def crash_before_finalization(plan):
             post_calls["count"] += 1
             result = post_stable_loader(plan)
-            if post_calls["count"] == 4:
+            if post_calls["count"] == 5:
                 raise WorkstreamGenerationError("simulated_post_transition_crash")
             return result
 
@@ -2917,7 +3151,7 @@ class GenerationTransitionTests(unittest.TestCase):
         def cli_crash_after_seal(plan):
             cli_calls["count"] += 1
             result = cli_stable_loader(plan)
-            if cli_calls["count"] == 2:
+            if cli_calls["count"] == 3:
                 raise WorkstreamGenerationError("simulated_cli_crash_after_seal")
             return result
 
@@ -5216,7 +5450,7 @@ class GenerationTransitionTests(unittest.TestCase):
             nonlocal calls
             calls += 1
             result = stable_loader(plan)
-            if calls == 2:
+            if calls == 3:
                 raise WorkstreamGenerationError("simulated_crash_after_seal")
             return result
 

@@ -235,7 +235,7 @@ def plan_generation_freshness(
                 "write each exact content value to its named path, verify its "
                 "sha256, then execute this exact argv"
             )
-        elif item.get("schema_version") == 6:
+        elif item.get("schema_version") in {6, 7}:
             reservations[-1]["native_root_sha256"] = item[
                 "native_root_sha256"
             ]

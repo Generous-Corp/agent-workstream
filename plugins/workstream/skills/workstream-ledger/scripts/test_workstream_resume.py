@@ -163,7 +163,7 @@ class ResumeTests(unittest.TestCase):
         self.assertIn("2026-08-31T12:00:00Z", pending["continue"]["command"])
         self.assertIn("--expected-native-root-sha256", pending["continue"]["command"])
 
-    def test_schema6_pending_generation_surfaces_handle_only_continuation(self):
+    def test_schema6_and_schema7_pending_generation_surface_handle_only_continuation(self):
         canonical, immutable = self.generation_sources()
         reservation = {
             "schema_version": 6,
@@ -219,6 +219,12 @@ class ResumeTests(unittest.TestCase):
         prepared = surface(True)
         self.assertFalse(prepared["abort"]["available"])
         self.assertIn("replay", prepared["abort"]["reason"])
+        reservation["schema_version"] = 7
+        schema7 = surface(False)
+        self.assertTrue(schema7["continue"]["available"])
+        self.assertEqual(
+            schema7["continue"]["command"], pending["continue"]["command"],
+        )
 
     def test_non_null_generation_replay_is_exact_and_legacy_is_abort_only(self):
         canonical, immutable = self.generation_sources()
