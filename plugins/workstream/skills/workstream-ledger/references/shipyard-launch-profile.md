@@ -66,6 +66,15 @@ already submitted that way, use Shipyard's exact-head `runner steward-handoff`
 dry-run and apply path on the existing PR; do not create another PR or queue
 item.
 
+If `shipyard pr` preflight cannot resolve the repository's real skill-sync,
+version-bump, or versioning-config gates, fail without replacing them with
+dummy or no-op overrides. Push and create one PR through the repository's
+authenticated GitHub path, review and apply `shipyard runner steward-handoff`
+for that exact PR/head/workstream/context, then submit exactly one bare
+`shipyard ship --pr <number>` job for validation. In this fallback the separate
+steward receipt—not the bare validation command—owns correlation. Reuse the
+same PR, and cancel only a superseded old-head job through Shipyard.
+
 ## Fail-closed gates
 
 Profile creation refuses terminal, inspection-only, stale-lifecycle,

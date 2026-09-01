@@ -270,6 +270,12 @@ reservation requires a fresh reviewed preview; a new process never inherits
 write ownership merely by finding it. Full instructions are in
 the workstream-ledger skill's `references/root-transition.md`.
 
+If the active structured generation is already correct but its description
+locator regressed, preview `workstreamctl root-transition reconcile-plan-url
+GEN-123 --to <same-document-immutable-40-hex-blob-URL>`. This mode authenticates
+that exact active source and changes no ledger authority; choose generation
+preparation instead when the locator intentionally advances to a new plan.
+
 After a PR lands, `workstreamctl reconcile --help` exposes the explicit GitHub,
 Shipyard fixed-argv, plan, and closure-input arguments. The command records
 `Landed — acceptance review required` from exact live truth. Supplying a

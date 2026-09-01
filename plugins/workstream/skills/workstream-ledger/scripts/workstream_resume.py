@@ -104,6 +104,7 @@ def apply_generation_execution_status(
 def plan_generation_freshness(
     *, token: str, description: str, active_source: dict[str, Any],
     comments: list[dict[str, Any]], authenticated_route: dict[str, str],
+    generation: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Return a non-executable recovery surface when live plan authority moved.
 
@@ -133,6 +134,19 @@ def plan_generation_freshness(
     pending = pending_generation_reservations(
         comments, workstream_id=token,
         authenticated_route=authenticated_route,
+    )
+    structured_active_generation = (
+        isinstance(generation, dict)
+        and generation.get("authority_origin")
+        in {"generation_genesis", "generation_transition"}
+        and generation.get("plan_revision") == active_sha256
+        and re.fullmatch(
+            r"wsp_[0-9a-f]{32}",
+            str(generation.get("transition_tip_event_id", "")),
+        ) is not None
+        and isinstance(generation.get("activation_epoch"), int)
+        and not isinstance(generation.get("activation_epoch"), bool)
+        and generation["activation_epoch"] >= 0
     )
     prepared_tokens = set(generation_ledger_frontier_tokens(
         comments, workstream_id=token,
@@ -257,18 +271,51 @@ def plan_generation_freshness(
                 "generation_transition_incomplete" if reservations
                 else "canonical_plan_bytes_changed_without_generation_activation"
             ),
-            "command": [
-                "workstreamctl", "generation", "activate", token,
-                "--plan-source", canonical,
-                "--plan-identity", "<reviewed-immutable-plan-url>",
-                "--retirement-proof", "<reviewed-retirement-proof.json>",
-                "--created-at", "<reviewed-utc-time>",
-                "--expected-native-root-sha256", "<preview-sha256>", "--apply",
-            ],
+            "command": None,
+            "selection_required": True,
+            "selection_rule": (
+                "resolve the pending reservation through its exact continue or "
+                "abort contract; do not start another transition"
+                if reservations else
+                "choose exactly one available alternative from reviewed intent; "
+                "resume cannot infer whether the locator regressed or the plan "
+                "intentionally advanced"
+            ),
             "required_postcondition": (
                 "ordinary resume returns full authority for the new immutable "
                 "source and a nonterminal native root"
             ),
+            "alternatives": [{
+                "kind": "reconcile_regressed_locator",
+                "available": (
+                    not reservations
+                    and structured_active_generation
+                    and re.fullmatch(
+                        r"https://github\.com/[^/]+/[^/]+/blob/"
+                        r"[0-9a-f]{40}/.+",
+                        active_identity,
+                    ) is not None
+                ),
+                "command": [
+                    "workstreamctl", "root-transition",
+                    "reconcile-plan-url", token, "--to", active_identity,
+                ],
+                "selection_rule": (
+                    "use only when the canonical locator regressed and the "
+                    "structured active generation remains intended authority"
+                ),
+            }, {
+                "kind": "activate_new_generation",
+                "available": not reservations,
+                "command": [
+                    "workstreamctl", "generation", "prepare", token,
+                    "--plan-source", canonical,
+                ],
+                "selection_rule": (
+                    "use only when canonical bytes intentionally define a new plan; "
+                    "resume cannot infer chronology"
+                ),
+            }],
         },
     }
 
@@ -3050,6 +3097,7 @@ def main() -> int:
                     active_source=authenticated_source,
                     comments=comments,
                     authenticated_route=route,
+                    generation=generation,
                 )
                 if freshness is not None:
                     freshness["authenticated_route"] = route

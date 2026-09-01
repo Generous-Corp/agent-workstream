@@ -435,6 +435,13 @@ contract and its authenticated plan source, and are zero-write previews unless
 comment-frontier, and intent digests. See
 [`references/root-transition.md`](references/root-transition.md).
 
+If the structured active generation remains correct but the description
+locator regressed, use the distinct `root-transition reconcile-plan-url` mode
+with that active source's immutable 40-hex GitHub blob URL. It authenticates
+the unique active generation and source directly, refuses pending or ambiguous
+generation state, and preserves all other root and ledger state. Do not use it
+when the locator intentionally points to a new plan; prepare a new generation.
+
 These mutations do not change append-only generation authority. Linear has no
 conditional `issueUpdate`, so the supported transport does not call the native
 write atomic: it first wins one deterministic append-only reservation for the
@@ -534,6 +541,11 @@ scope, or resistance to an authorized person editing/deleting comments. No
 live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
+
+Version 0.4.53 binds terminal-seed head transitions to both the exact old scope
+and disposition before advancing them together, and adds fail-closed in-place
+reconciliation for a regressed canonical locator that must equal the unique
+structured active generation's authenticated immutable source.
 
 Version 0.4.52 persists authenticated closure-receipt bodies while keeping
 ordinary resume bounded, and treats cmux/Herdr title binding as an optional
@@ -1260,6 +1272,14 @@ If the exact PR/head already exists, repair only that same object with
 <exact head> --workstream-id <handle> --context-url <exact recovered context
 URL>`; review its dry run, then apply. Never create a replacement PR, queue
 item, Linear issue, or project merely to add correlation metadata.
+
+If `shipyard pr` preflight cannot resolve this repository's real gate scripts
+and versioning config, stop without substituting dummy or no-op gates. Push and
+create exactly one PR through the repository's authenticated GitHub path,
+dry-run then apply `shipyard runner steward-handoff` to that exact PR/head, and
+only then submit one bare `shipyard ship --pr <number>` validation job. The
+separate steward receipt owns workstream correlation; reuse the same PR and
+cancel only a superseded old-head validation through Shipyard.
 
 ## Abrupt termination
 

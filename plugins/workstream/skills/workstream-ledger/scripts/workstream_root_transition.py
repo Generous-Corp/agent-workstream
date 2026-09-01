@@ -30,6 +30,9 @@ from workstream_linear_events import (
     COMMENT_CREATE_CAPABILITY_QUERY, COMMENT_CREATE_MUTATION,
     LinearCommentEventAdapter,
 )
+from workstream_linear_projection import (
+    reduce_projection_comments, select_plan_generation, TOMBSTONE,
+)
 from workstream_plan import CANONICAL_PLAN_LINE, HTTPS_URL, canonical_plan_url, same_plan_document
 from workstream_plan import plan_payload
 
@@ -37,6 +40,9 @@ from workstream_plan import plan_payload
 PREFIX = "<!-- workstream-root-transition:v1:"
 PATTERN = re.compile(r"<!-- workstream-root-transition:v1:([A-Za-z0-9_-]+) -->")
 HEX64 = re.compile(r"[0-9a-f]{64}")
+IMMUTABLE_GITHUB_BLOB = re.compile(
+    r"https://github\.com/[^/]+/[^/]+/blob/[0-9a-f]{40}/.+"
+)
 TERMINAL_TYPES = {"completed", "cancelled", "canceled"}
 
 ISSUE_UPDATE = """
@@ -94,7 +100,11 @@ def snapshot_sha256(snapshot: dict[str, Any]) -> str:
 def _preserved_root(snapshot: dict[str, Any], operation: str) -> dict[str, Any]:
     value = _root_view(snapshot)
     value.pop("updated_at", None)
-    value.pop("description" if operation == "plan-url" else "state", None)
+    value.pop(
+        "description"
+        if operation in {"plan-url", "reconcile-plan-url"} else "state",
+        None,
+    )
     return value
 
 
@@ -167,10 +177,34 @@ def replace_canonical_plan_url(description: str, target: str) -> tuple[str, str]
     return description[:start] + target + description[end:], current
 
 
+def reconcile_canonical_plan_url(
+    description: str, target: str,
+) -> tuple[str, str]:
+    current = canonical_plan_url(description)
+    if not IMMUTABLE_GITHUB_BLOB.fullmatch(target):
+        raise RootTransitionError(
+            "locator_reconcile_target_must_be_immutable_github_blob"
+        )
+    if not same_plan_document(current, target):
+        raise RootTransitionError("locator_reconcile_different_plan_document")
+    spans: list[tuple[int, int]] = []
+    for line in CANONICAL_PLAN_LINE.finditer(description):
+        for match in HTTPS_URL.finditer(line.group(1)):
+            if match.group(0) == current:
+                offset = line.start(1)
+                spans.append((offset + match.start(), offset + match.end()))
+    if len(spans) != 1:
+        raise RootTransitionError(
+            "canonical_plan_url_occurrence_ambiguous:keep exactly one labeled URL"
+        )
+    start, end = spans[0]
+    return description[:start] + target + description[end:], current
+
+
 def _reservation_matches_request(
     reservation: dict[str, Any], *, operation: str, target: str,
 ) -> bool:
-    if operation == "plan-url":
+    if operation in {"plan-url", "reconcile-plan-url"}:
         return (
             reservation.get("after") == {"canonical_plan_url": target}
             and isinstance((reservation.get("update") or {}).get("description"), str)
@@ -179,6 +213,85 @@ def _reservation_matches_request(
     if operation == "reopen":
         return reservation.get("update") == {"stateId": target}
     return False
+
+
+def validate_active_locator_authorization(
+    *, source: dict[str, str], token: str, authority: dict[str, str],
+    comments: list[dict[str, Any]], graph: dict[str, Any],
+) -> dict[str, Any]:
+    """Authorize only a locator repair to one exact structured active source."""
+    if (
+        not isinstance(source, dict)
+        or set(source) != {"identity", "sha256"}
+        or not IMMUTABLE_GITHUB_BLOB.fullmatch(str(source.get("identity", "")))
+        or not HEX64.fullmatch(str(source.get("sha256", "")))
+    ):
+        raise RootTransitionError("locator_reconcile_authenticated_source_invalid")
+    try:
+        selected = select_plan_generation(
+            comments, workstream_id=token,
+            description_plan_revision=(graph.get("root") or {}).get(
+                "plan_revision"
+            ),
+            authenticated_route=authority,
+        )
+    except LinearTransportError as error:
+        raise RootTransitionError(str(error)) from error
+    if (
+        selected.get("authority_origin")
+        not in {"generation_genesis", "generation_transition"}
+        or not isinstance(selected.get("transition_tip_event_id"), str)
+        or not selected["transition_tip_event_id"]
+        or not isinstance(selected.get("activation_epoch"), int)
+        or isinstance(selected.get("activation_epoch"), bool)
+        or selected["activation_epoch"] < 0
+    ):
+        raise RootTransitionError(
+            "locator_reconcile_structured_active_generation_required"
+        )
+    if selected.get("plan_revision") != source["sha256"]:
+        raise RootTransitionError("locator_reconcile_target_not_active_source")
+    try:
+        from workstream_generation import assert_no_pending_generation_reservation
+
+        assert_no_pending_generation_reservation(
+            comments, workstream_id=token, authenticated_route=authority,
+        )
+        state = reduce_projection_comments(
+            comments, workstream_id=token,
+            expected_plan_revision=selected["plan_revision"],
+            authenticated_route=authority, authenticated_source=source,
+        )
+    except LinearTransportError as error:
+        raise RootTransitionError(str(error)) from error
+    active: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in state.events:
+        identity = (event["kind"], event["key"])
+        if event["value"] == TOMBSTONE:
+            active.pop(identity, None)
+        else:
+            active[identity] = event
+    source_event = active.get(("source", "root"))
+    if (
+        source_event is None
+        or source_event.get("value") != source
+        or state.snapshot.get("source") != source
+        or not state.events
+    ):
+        raise RootTransitionError("locator_reconcile_active_source_mismatch")
+    return {
+        "schema_version": 1,
+        "authorization_kind": "active_generation_plan_locator",
+        "source": deepcopy(source),
+        "generation": deepcopy(selected),
+        "projection": {
+            "revision": state.revision,
+            "frontier_event_id": state.events[-1]["event_id"],
+            "events_sha256": _digest(list(state.events)),
+            "source_event_id": source_event["event_id"],
+            "source_value_sha256": _digest(source_event["value"]),
+        },
+    }
 
 
 def _validate_authority(
@@ -296,9 +409,14 @@ class RootTransitionTransport:
             "schema_version", "contract_sha256", "source", "generation",
             "native_transition", "retirement_sha256", "frontiers_sha256",
         }
+        required_locator = {
+            "schema_version", "authorization_kind", "source", "generation",
+            "projection",
+        }
         if (operator_authorization is None) == (operator_validator is None):
             raise RootTransitionError("root_transition_operator_authorization_required")
         self._required_operator = required_operator
+        self._required_locator = required_locator
         self.operator_authorization = (
             self._validated_authorization(operator_authorization)
             if operator_authorization is not None else None
@@ -334,9 +452,69 @@ class RootTransitionTransport:
     def _validated_authorization(
         self, authorization: dict[str, Any] | None,
     ) -> dict[str, Any]:
+        if not isinstance(authorization, dict):
+            raise RootTransitionError("root_transition_operator_authorization_required")
+        if authorization.get("authorization_kind") == (
+            "active_generation_plan_locator"
+        ):
+            generation = authorization.get("generation")
+            projection = authorization.get("projection")
+            source = authorization.get("source")
+            valid = (
+                set(authorization) == self._required_locator
+                and authorization.get("schema_version") == 1
+                and isinstance(source, dict)
+                and set(source) == {"identity", "sha256"}
+                and IMMUTABLE_GITHUB_BLOB.fullmatch(
+                    str(source.get("identity", ""))
+                )
+                and HEX64.fullmatch(str(source.get("sha256", "")))
+                and isinstance(generation, dict)
+                and set(generation) == {
+                    "plan_revision", "description_plan_revision",
+                    "transition_tip_event_id", "activation_epoch",
+                    "authority_origin",
+                }
+                and generation.get("plan_revision") == source.get("sha256")
+                and generation.get("authority_origin")
+                in {"generation_genesis", "generation_transition"}
+                and re.fullmatch(
+                    r"wsp_[0-9a-f]{32}",
+                    str(generation.get("transition_tip_event_id", "")),
+                )
+                and isinstance(generation.get("activation_epoch"), int)
+                and not isinstance(generation.get("activation_epoch"), bool)
+                and generation["activation_epoch"] >= 0
+                and (
+                    generation.get("description_plan_revision") is None
+                    or isinstance(
+                        generation.get("description_plan_revision"), str,
+                    )
+                )
+                and isinstance(projection, dict)
+                and set(projection) == {
+                    "revision", "frontier_event_id", "events_sha256",
+                    "source_event_id", "source_value_sha256",
+                }
+                and isinstance(projection.get("revision"), int)
+                and not isinstance(projection.get("revision"), bool)
+                and projection["revision"] > 0
+                and all(
+                    re.fullmatch(r"wsp_[0-9a-f]{32}", str(projection.get(field, "")))
+                    for field in ("frontier_event_id", "source_event_id")
+                )
+                and all(
+                    HEX64.fullmatch(str(projection.get(field, "")))
+                    for field in ("events_sha256", "source_value_sha256")
+                )
+            )
+            if not valid:
+                raise RootTransitionError(
+                    "root_transition_locator_authorization_required"
+                )
+            return deepcopy(authorization)
         if (
-            not isinstance(authorization, dict)
-            or set(authorization) != self._required_operator
+            set(authorization) != self._required_operator
             or authorization.get("schema_version") != 1
             or not all(HEX64.fullmatch(str(authorization.get(field, "")))
                        for field in ("contract_sha256", "retirement_sha256",
@@ -405,6 +583,10 @@ class RootTransitionTransport:
         operator_authorization = self._authorize(snapshot, comments)
         root = snapshot["root"]
         if operation == "plan-url":
+            if operator_authorization.get("authorization_kind") is not None:
+                raise RootTransitionError(
+                    "root_transition_candidate_authorization_required"
+                )
             if target != (operator_authorization.get("source") or {}).get("identity"):
                 raise RootTransitionError(
                     "root_transition_plan_url_not_authorized_by_candidate"
@@ -415,7 +597,30 @@ class RootTransitionTransport:
             update = {"description": desired_description}
             before = {"canonical_plan_url": current}
             after = {"canonical_plan_url": target}
+        elif operation == "reconcile-plan-url":
+            if operator_authorization.get("authorization_kind") != (
+                "active_generation_plan_locator"
+            ):
+                raise RootTransitionError(
+                    "root_transition_locator_authorization_required"
+                )
+            if target != (operator_authorization.get("source") or {}).get(
+                "identity"
+            ):
+                raise RootTransitionError(
+                    "locator_reconcile_target_not_active_source"
+                )
+            desired_description, current = reconcile_canonical_plan_url(
+                root.get("description") or "", target,
+            )
+            update = {"description": desired_description}
+            before = {"canonical_plan_url": current}
+            after = {"canonical_plan_url": target}
         elif operation == "reopen":
+            if operator_authorization.get("authorization_kind") is not None:
+                raise RootTransitionError(
+                    "root_transition_candidate_authorization_required"
+                )
             authorized_state = (
                 (operator_authorization.get("native_transition") or {})
                 .get("target_state") or {}
@@ -480,6 +685,31 @@ class RootTransitionTransport:
         reserved = [item for item in comments if item.get("id") == slot]
         # Rebuild the original reviewed intent only while the original snapshot is present.
         replayed = snapshot_sha256(snapshot) != expected_snapshot_sha256
+        if (
+            operation == "reconcile-plan-url"
+            and not replayed
+            and not reserved
+            and canonical_plan_url(
+                (snapshot.get("root") or {}).get("description") or ""
+            ) == target
+        ):
+            preview = self.preview(operation=operation, target=target)
+            if preview["expected_frontier_sha256"] != expected_frontier_sha256:
+                raise RootTransitionError("root_transition_frontier_drift")
+            if preview["intent_sha256"] != expected_intent_sha256:
+                raise RootTransitionError("root_transition_intent_mismatch")
+            return {
+                "apply": True, "result": "already_current_noop",
+                "conditional_update_available": False,
+                "reservation_slot_id": None,
+                "expected_snapshot_sha256": expected_snapshot_sha256,
+                "expected_frontier_sha256": expected_frontier_sha256,
+                "final_frontier_sha256": expected_frontier_sha256,
+                "post_read_status": "reviewed_frontier_match",
+                "final_snapshot_sha256": expected_snapshot_sha256,
+                "authenticated_route": self.authority,
+                "final_root": _root_view(snapshot),
+            }
         if not replayed:
             if reserved:
                 if len(reserved) != 1:
@@ -557,7 +787,7 @@ class RootTransitionTransport:
                         if key != "intent_sha256"}
             if reservation.get("intent_sha256") != _digest(unsigned):
                 raise RootTransitionError("root_transition_replay_intent_mismatch")
-            if operation == "plan-url":
+            if operation in {"plan-url", "reconcile-plan-url"}:
                 update = reservation.get("update") or {}
                 after = reservation.get("after") or {}
                 if (
@@ -581,7 +811,7 @@ class RootTransitionTransport:
         final_root = final["root"]
         if _preserved_root(final, operation) != reservation.get("preserved_root"):
             raise RootTransitionError("root_transition_postwrite_unrelated_root_drift")
-        if operation == "plan-url":
+        if operation in {"plan-url", "reconcile-plan-url"}:
             if canonical_plan_url(final_root.get("description") or "") != target:
                 raise RootTransitionError("root_transition_postwrite_description_mismatch")
             # Exact desired text from the reservation proves unrelated prose was preserved.
@@ -627,6 +857,9 @@ def parser() -> argparse.ArgumentParser:
     plan = commands.add_parser("plan-url")
     plan.add_argument("token")
     plan.add_argument("--to", required=True)
+    reconcile = commands.add_parser("reconcile-plan-url")
+    reconcile.add_argument("token")
+    reconcile.add_argument("--to", required=True)
     reopen = commands.add_parser("reopen")
     reopen.add_argument("token")
     reopen.add_argument("--state-id", required=True)
@@ -634,6 +867,7 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--operator-contract", required=True)
         command.add_argument("--plan-source", required=True)
         command.add_argument("--plan-identity")
+    for command in (plan, reconcile, reopen):
         command.add_argument("--expected-snapshot-sha256")
         command.add_argument("--expected-frontier-sha256")
         command.add_argument("--expected-intent-sha256")
@@ -668,37 +902,64 @@ def main() -> int:
             "workspace_id", "team_id", "project_id",
         )):
             raise RootTransitionError("root_transition_configured_route_mismatch")
-        source = plan_payload(
-            args.plan_source, args.plan_identity or args.plan_source,
-        )["source"]
-        with Path(args.operator_contract).open(encoding="utf-8") as handle:
-            contract = json.load(handle)
-        target_state_id = (
-            ((contract.get("native_transition") or {}).get("target_state") or {})
-            .get("id")
-        ) if isinstance(contract, dict) else None
-        if not isinstance(target_state_id, str):
-            raise RootTransitionError("root_transition_operator_native_state_invalid")
+        if args.command == "reconcile-plan-url":
+            if not IMMUTABLE_GITHUB_BLOB.fullmatch(args.to):
+                raise RootTransitionError(
+                    "locator_reconcile_target_must_be_immutable_github_blob"
+                )
+            payload_source = plan_payload(args.to, args.to)["source"]
+            source = {
+                "identity": payload_source["identity"],
+                "sha256": payload_source["sha256"],
+            }
 
-        def operator_validator(
-            snapshot: dict[str, Any], comments: list[dict[str, Any]],
-        ) -> dict[str, Any]:
-            started_state = authenticated_started_state(
-                client, authority=authority, state_id=target_state_id,
-            )
-            return validate_operator_contract(
-                contract, source=source, token=args.token.upper(),
-                authority=authority, comments=comments,
-                graph=snapshot, started_state=started_state,
-                description_plan_revision=snapshot["root"].get("plan_revision"),
-            )
+            def operator_validator(
+                snapshot: dict[str, Any], comments: list[dict[str, Any]],
+            ) -> dict[str, Any]:
+                return validate_active_locator_authorization(
+                    source=source, token=args.token.upper(),
+                    authority=authority, comments=comments, graph=snapshot,
+                )
+        else:
+            source = plan_payload(
+                args.plan_source, args.plan_identity or args.plan_source,
+            )["source"]
+            with Path(args.operator_contract).open(encoding="utf-8") as handle:
+                contract = json.load(handle)
+            target_state_id = (
+                ((contract.get("native_transition") or {}).get("target_state") or {})
+                .get("id")
+            ) if isinstance(contract, dict) else None
+            if not isinstance(target_state_id, str):
+                raise RootTransitionError(
+                    "root_transition_operator_native_state_invalid"
+                )
+
+            def operator_validator(
+                snapshot: dict[str, Any], comments: list[dict[str, Any]],
+            ) -> dict[str, Any]:
+                started_state = authenticated_started_state(
+                    client, authority=authority, state_id=target_state_id,
+                )
+                return validate_operator_contract(
+                    contract, source=source, token=args.token.upper(),
+                    authority=authority, comments=comments,
+                    graph=snapshot, started_state=started_state,
+                    description_plan_revision=snapshot["root"].get(
+                        "plan_revision"
+                    ),
+                )
 
         transport = RootTransitionTransport(
             client, token=args.token.upper(), authority=authority,
             operator_validator=operator_validator,
         )
         operation = args.command
-        target = args.to if operation == "plan-url" else args.state_id
+        target = (
+            args.to
+            if operation in {"plan-url", "reconcile-plan-url"}
+            else args.state_id
+        )
         if operation == "plan-url" and target != source["identity"]:
             raise RootTransitionError(
                 "root_transition_plan_url_must_equal_authenticated_target_source"
