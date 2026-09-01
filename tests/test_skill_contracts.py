@@ -19,6 +19,9 @@ class SkillContractTests(unittest.TestCase):
             / "plugins/workstream/skills/workstream-resume/SKILL.md"
         ).read_text()
 
+    def usage(self) -> str:
+        return (Path(__file__).parents[1] / "USAGE.md").read_text()
+
     def test_start_restore_makes_ingress_recovery_conditional(self):
         skill = self.skill()
         start = skill.split("## Start or restore", 1)[1].split(
@@ -107,7 +110,7 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("One bare continuation nudge may select that sole warm retained workstream", resume)
         self.assertIn("status checks", resume)
         self.assertIn("must run this as the first functional command", resume)
-        self.assertIn("handoff to a new session", resume)
+        self.assertIn("agent/session handoff", resume)
         self.assertIn("perform live resume and reconcile the pending journal", resume)
         self.assertIn("Auth, semantic, generation, budget", resume)
 
@@ -120,12 +123,65 @@ class SkillContractTests(unittest.TestCase):
         self.assertFalse((scripts / "test_workstream_degraded_execution.py").exists())
         self.assertNotIn("workstream_degraded_execution.py", self.skill())
 
+    def test_ledger_can_activate_on_a_later_exact_warm_turn(self):
+        ledger = " ".join(self.skill().split())
+        required = (
+            "on a later warm turn when exact same-provider-session retained-full "
+            "bindings satisfy `workstream-resume` warm classification"
+        )
+        self.assertIn(required, ledger)
+        frontmatter = ledger.split("---", 2)[1]
+        self.assertIn(required.replace("`", ""), frontmatter.replace("`", ""))
+        self.assertNotIn(
+            "only after workstream-resume has returned a bounded authoritative "
+            "snapshot in this turn",
+            ledger,
+        )
+
+    def test_usage_distinguishes_cold_recovery_from_warm_continue(self):
+        usage = " ".join(self.usage().split())
+        self.assertIn(
+            "For a cold/fresh handle request, status check, or consequential "
+            "tracking or lifecycle boundary, the agent's first command is",
+            usage,
+        )
+        self.assertIn("A warm `continue` nudge does not repeat resume", usage)
+        self.assertIn(
+            "Live resume and reconciliation are still required before any Linear mutation",
+            usage,
+        )
+        self.assertNotIn(
+            "For a handle/URL/tab-title resume request, with or without additional "
+            "instructions, the agent's first command is",
+            usage,
+        )
+
+    def test_delivery_and_authority_handoffs_are_not_conflated(self):
+        for name, document in (
+            ("resume", self.resume_skill()),
+            ("ledger", self.skill()),
+            ("usage", self.usage()),
+        ):
+            flat = " ".join(document.replace("**", "").split())
+            with self.subTest(document=name):
+                self.assertIn(
+                    "Shipyard delivery handoff means exact-head custody submission "
+                    "to Shipyard under its own fences and is allowed",
+                    flat,
+                )
+                self.assertIn(
+                    "agent/session handoff means transferring workstream execution "
+                    "authority to another agent/session and requires live recovery "
+                    "and certification",
+                    flat,
+                )
+
     def test_resume_entry_is_small_and_owns_fresh_handle_trigger(self):
         resume = self.resume_skill()
         ledger = self.skill()
         flat = " ".join(resume.split())
-        self.assertLess(len(resume.encode()), 5000)
-        self.assertLessEqual(len(resume.splitlines()), 85)
+        self.assertLess(len(resume.encode()), 5500)
+        self.assertLessEqual(len(resume.splitlines()), 90)
         self.assertIn("existing workstream handle", resume)
         self.assertIn("after workstream-resume has returned", ledger)
         command = resume.split("```sh", 1)[1].split("```", 1)[0]

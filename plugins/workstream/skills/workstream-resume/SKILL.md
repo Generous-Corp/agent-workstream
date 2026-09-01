@@ -11,14 +11,19 @@ the same user-supplied workstream and received `resume_authority: full`, and it
 still retains the exact authenticated route, source, plan generation,
 material/projection/checkpoint frontiers, owner/session, worktree, repository
 head, and Shipyard run. A pasted result, prior provider session, inferred tab,
-memory summary, changed binding, intervening handoff, or prior refusal is cold.
+memory summary, changed binding, intervening agent/session handoff, or prior
+refusal is cold.
 One bare continuation nudge may select that sole warm retained workstream; an
 explicit different handle or multiple possible retained workstreams is cold.
 
 For a warm `continue`/`execute` nudge, do not rerun resume merely to reconfirm
 authority. Reconcile live Git and Shipyard facts and continue authorized
 provider/local implementation or independently fenced exact-head Shipyard
-delivery. If a narrow Linear read/sync transport failure occurs, append new
+delivery handoff or landing. A **Shipyard delivery handoff** means exact-head
+custody submission to Shipyard under its own fences and is allowed. An
+**agent/session handoff** means transferring workstream execution authority to
+another agent/session and requires live recovery and certification. If a
+narrow Linear read/sync transport failure occurs, append new
 requirements, decisions, blockers, and progress to the existing durable local
 material-delta journal and keep that work moving. Do not call this full or
 reconciled tracking authority.
@@ -70,7 +75,7 @@ Retain the authenticated route/source, generation/frontiers, open children,
 next action, checkpoint, worktree/repository/Shipyard facts, and
 attach-or-successor disposition. The snapshot is not live repository or
 landing truth. Before any Linear mutation, scope/ownership/root/generation
-change, attach/successor selection, handoff to a new session, or
+change, attach/successor selection, agent/session handoff, or
 closure/certification, perform live resume and reconcile the pending journal;
 failure blocks that boundary, not already-authorized implementation. For a
 status-only request, report the bounded snapshot and stop;

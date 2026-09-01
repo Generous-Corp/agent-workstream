@@ -1,6 +1,6 @@
 ---
 name: workstream-ledger
-description: Preserve and update evolving project goals, tasks, decisions, dependencies, PR state, evidence, and closure in a durable Linear-backed workstream. Use directly for new plan intake, or after workstream-resume has returned a bounded authoritative snapshot in this turn. For any handle-led turn, including mutation, audit, or closure, do not load this skill first.
+description: Preserve and update evolving project goals, tasks, decisions, dependencies, PR state, evidence, and closure in a durable Linear-backed workstream. Use directly for new plan intake, after workstream-resume has returned bounded authority in the current turn, or on a later warm turn when exact same-provider-session retained-full bindings satisfy workstream-resume warm classification. For any cold handle-led turn, including mutation, audit, or closure, do not load this skill first.
 ---
 
 # Workstream ledger
@@ -480,11 +480,15 @@ frontiers, owner/session, worktree, repository head, and Shipyard run. This is
 agent workflow policy, not a daemon-enforced or transferable grant.
 
 That session may continue provider/local implementation and independently
-fenced exact-head Shipyard handoff or landing. Buffer every material discovery
+fenced exact-head Shipyard delivery handoff or landing. A **Shipyard delivery
+handoff** means exact-head custody submission to Shipyard under its own fences
+and is allowed. An **agent/session handoff** means transferring workstream
+execution authority to another agent/session and requires live recovery and
+certification. Buffer every material discovery
 through this journal; do not attempt a Linear write while transport is
 unavailable. Before any Linear mutation, scope/ownership/root/generation
-transition, attach/successor selection, new-session handoff, semantic closure,
-or resume/handoff certification, obtain a fresh authenticated full resume and
+transition, attach/successor selection, agent/session handoff, semantic closure,
+or resume or agent/session handoff certification, obtain a fresh authenticated full resume and
 reconcile stable event IDs idempotently. Fresh/cold sessions and auth,
 semantic, generation, budget, or ambiguous post-write refusals fail closed.
 
@@ -795,8 +799,10 @@ projection rather than mutable issue prose.
 
 ### Fresh-session resume
 
-If `workstream-resume` already returned the bounded authoritative snapshot in
-this turn, retain it and do not repeat initial recovery.
+If `workstream-resume` returned the bounded authoritative snapshot in the
+current turn, retain it and do not repeat initial recovery. The same applies on
+a later warm turn when exact same-provider-session retained-full bindings
+satisfy `workstream-resume` warm classification.
 
 When a new agent receives `ABC-123` (or its Linear URL/tab title), with or
 without continuation instructions, the first action is the default bounded
@@ -1178,7 +1184,7 @@ Before continuing in another agent session:
    acknowledge the restored objective, decisions, open items, head, and next
    action. Do not close the source beforehand.
 
-When a configured Shipyard handoff needs a native launch profile, create it
+When a configured Shipyard delivery handoff needs a native launch profile, create it
 only after step 4 with the bundled product helper resolved from this skill:
 
 ```sh
