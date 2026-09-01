@@ -237,8 +237,9 @@ class WorkstreamIngressTests(unittest.TestCase):
         self.assertEqual(gh.call_count, 2)
 
     def test_explicit_machine_names_the_rotating_issue(self):
+        month = MODULE.datetime.now(MODULE.timezone.utc).strftime("%Y-%m")
         existing = [{
-            "number": 4, "title": "[Workstream ingress] m5 2026-08",
+            "number": 4, "title": f"[Workstream ingress] m5 {month}",
             "url": "https://github/private/issues/4", "state": "OPEN",
         }]
         with mock.patch.object(MODULE.subprocess, "run"), \
