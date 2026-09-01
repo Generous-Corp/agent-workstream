@@ -4517,9 +4517,17 @@ class ProjectionTests(unittest.TestCase):
                     receipt["repository_key"] = contract_value["repository_key"]
                     receipt["exact_head"] = contract_value["exact_head"]
             evidence_values.append(contract_value)
+        old_source_identity = (
+            "https://github.com/acme/plans/blob/"
+            + "1" * 40 + "/plan.md"
+        )
+        target_source_identity = (
+            "https://github.com/acme/plans/blob/"
+            + "2" * 40 + "/plan.md"
+        )
         values = evidence_values + [
             deepcopy(predecessor_events[2]["value"]),
-            {"identity": "https://example.test/plan", "sha256": plan},
+            {"identity": old_source_identity, "sha256": plan},
             {"disposition": "create_successor",
              "remote_head": old_disposition_head,
              "recovered_from_checkpoint": None}, old_scope,
@@ -4666,7 +4674,7 @@ class ProjectionTests(unittest.TestCase):
             repair_scope_event["supersedes_event_id"], events[5]["event_id"],
         )
 
-        source = {"identity": values[3]["identity"], "sha256": plan}
+        source = {"identity": target_source_identity, "sha256": plan}
         readbacks = {
             seed["child_identifier"]: seed["expected_child_readback_sha256"]
             for seed in manifest["terminal_child_evidence_seeds"]
@@ -4704,9 +4712,11 @@ class ProjectionTests(unittest.TestCase):
 
         def apply_operator_contract(adapter, operator):
             preview = operator["projection_preview"]
+            invocation = deepcopy(preview["invocation"])
+            reviewed_source = invocation.pop("source")
             return reconcile_required_projection(
                 adapter, snapshot, preview["manifest"],
-                **preview["invocation"], authenticated_source=source,
+                **invocation, authenticated_source=reviewed_source,
                 terminal_child_fence=lambda child_ids: {
                     child_id: readbacks[child_id] for child_id in child_ids
                 },
@@ -4918,6 +4928,9 @@ class ProjectionTests(unittest.TestCase):
             interrupted_operator["projection_preview"]["invocation"], {
                 "remote_head": new_head,
                 "created_at": transition["created_at"],
+                "source": {
+                    "identity": old_source_identity, "sha256": plan,
+                },
             },
         )
         interrupted_before = interrupted_adapter.state().revision
@@ -4946,9 +4959,13 @@ class ProjectionTests(unittest.TestCase):
             interrupted_adapter, newer_requested_head, later_created_at,
         )
         later_preview = later_operator["projection_preview"]
+        self.assertEqual(later_operator["source"], source)
         self.assertEqual(later_preview["invocation"], {
             "remote_head": newer_requested_head,
             "created_at": later_created_at,
+            "source": {
+                "identity": old_source_identity, "sha256": plan,
+            },
         })
         self.assertIn(
             "terminal_child_evidence_seed_head_transition",
@@ -4991,6 +5008,61 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(ordinary_replay["writes"], [])
         self.assertEqual(
             len(interrupted_client.comments), comments_before_ordinary_replay,
+        )
+
+        source_operator = prepared_operator_contract(
+            interrupted_adapter, newer_requested_head, later_created_at,
+        )
+        self.assertEqual(
+            source_operator["projection_preview"]["phase"],
+            "terminal_source_transition",
+        )
+        self.assertEqual(
+            source_operator["projection_preview"]["invocation"]["source"],
+            source,
+        )
+        source_before = interrupted_adapter.state().revision
+        source_result = apply_operator_contract(
+            interrupted_adapter, source_operator,
+        )
+        self.assertEqual(len(source_result["writes"]), 1)
+        self.assertEqual(
+            [(event["kind"], event["key"])
+             for event in interrupted_adapter.state().events[source_before:]],
+            [("source", "root")],
+        )
+        closure_operator = prepared_operator_contract(
+            interrupted_adapter, newer_requested_head, later_created_at,
+        )
+        self.assertEqual(
+            closure_operator["projection_preview"]["phase"],
+            "terminal_closure_repair",
+        )
+        closure_before = interrupted_adapter.state().revision
+        closure_result = apply_operator_contract(
+            interrupted_adapter, closure_operator,
+        )
+        self.assertGreater(len(closure_result["writes"]), 0)
+        self.assertEqual(
+            [event["kind"] for event in interrupted_adapter.state().events[
+                closure_before:
+            ]],
+            ["child_closure", "child_closure"],
+        )
+        continued = prepared_operator_contract(
+            interrupted_adapter, newer_requested_head, later_created_at,
+        )
+        if continued["projection_preview"]["phase"] != "activation_ready":
+            self.assertEqual(
+                continued["projection_preview"]["phase"],
+                "complete_projection",
+            )
+            apply_operator_contract(interrupted_adapter, continued)
+            continued = prepared_operator_contract(
+                interrupted_adapter, newer_requested_head, later_created_at,
+            )
+        self.assertEqual(
+            continued["projection_preview"]["phase"], "activation_ready",
         )
 
         for prefix_count in range(1, len(later_tail)):
@@ -5769,7 +5841,8 @@ class ProjectionTests(unittest.TestCase):
         ))
         writes_before = len(other_client.comments)
         with self.assertRaisesRegex(
-            LinearProjectionError, "projection_review_stale_reload_required",
+            LinearProjectionError,
+            "projection_review_stale_reload_required",
         ):
             prepare_terminal_child_evidence_seeds(
                 other_manifest, other_graph, other_adapter.state(),
@@ -9645,7 +9718,7 @@ class ProjectionTests(unittest.TestCase):
         client, adapter, _source, graph, children, _manifest = (
             self.multi_terminal_repair_fixture(evidence_active=False)
         )
-        main = "https://github.com/acme/plans/blob/main/PLAN.md"
+        main = "https://github.com/acme/plans/blob/" + "b" * 40 + "/PLAN.md"
         exact = "https://github.com/acme/plans/blob/" + "a" * 40 + "/PLAN.md"
         current_source = next(
             event for event in reversed(adapter.state().events)
@@ -9676,6 +9749,12 @@ class ProjectionTests(unittest.TestCase):
         } for child in children]
         transition = {
             "from_identity": main, "to_identity": exact, "sha256": PLAN,
+            "created_at": "2026-08-29T01:01:00Z",
+            "expected_revision": active.revision,
+            "from_event_id": active_heads[("source", "root")]["event_id"],
+            "from_value_sha256": canonical_digest(
+                active_heads[("source", "root")]["value"]
+            ),
             "pending_children": pending,
         }
         manifest = {
@@ -9691,6 +9770,28 @@ class ProjectionTests(unittest.TestCase):
         prepared = workstream_projection.prepare_terminal_child_source_transition(
             manifest, graph, adapter.state(),
         )
+        mixed_events = deepcopy(list(adapter.state().events))
+        mixed_source = next(
+            event for event in reversed(mixed_events)
+            if event["event_id"] == transition["from_event_id"]
+        )
+        mixed_source["schema_version"] = 1
+        mixed_source.pop("authority")
+        mixed_state = SimpleNamespace(
+            revision=len(mixed_events), events=tuple(mixed_events),
+            snapshot=deepcopy(adapter.state().snapshot),
+        )
+        mixed_manifest = deepcopy(manifest)
+        mixed_manifest.update(projection_review_contract(mixed_state))
+        writes_before_mixed_refusal = len(client.comments)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_source_transition_requires_v2_source_predecessor",
+        ):
+            workstream_projection.prepare_terminal_child_source_transition(
+                mixed_manifest, graph, mixed_state,
+            )
+        self.assertEqual(len(client.comments), writes_before_mixed_refusal)
         drifted_graph = deepcopy(graph)
         drifted_graph["children"][1]["status_type"] = "started"
         with self.assertRaisesRegex(
@@ -9751,26 +9852,94 @@ class ProjectionTests(unittest.TestCase):
                 )
         self.assertEqual(len(client.comments), writes_before_legacy_refusal)
         before = adapter.state().revision
-        result = reconcile_required_projection(
-            adapter, preview, prepared, remote_head=HEAD,
-            created_at="2026-08-29T01:01:00Z",
-            authenticated_source=authenticated,
-            relation_target_resolver=self.relation_target_resolver,
-            terminal_child_fence=lambda ids: {item: expected[item] for item in ids},
-            legacy_unresolved_relation_heads=unresolved,
-        )
-        self.assertFalse(result["resume_authority_verified"])
+        original_execute = client.execute
+
+        def crash_after_source_append(query, variables):
+            response = original_execute(query, variables)
+            if "commentCreate" in query:
+                encoded = variables.get("input", {}).get("body", "")
+                matches = projection_module.PROJECTION_RE.findall(encoded)
+                if matches and (
+                    projection_module._decode_projection(matches[0])["kind"]
+                    == "source"
+                ):
+                    raise SystemExit("simulated source transition caller death")
+            return response
+
+        client.execute = crash_after_source_append
+        try:
+            with self.assertRaisesRegex(
+                SystemExit, "simulated source transition caller death",
+            ):
+                reconcile_required_projection(
+                    adapter, preview, prepared, remote_head=HEAD,
+                    created_at="2026-08-29T01:01:00Z",
+                    authenticated_source=authenticated,
+                    relation_target_resolver=self.relation_target_resolver,
+                    terminal_child_fence=lambda ids: {
+                        item: expected[item] for item in ids
+                    },
+                    legacy_unresolved_relation_heads=unresolved,
+                )
+        finally:
+            client.execute = original_execute
         self.assertEqual(
             [(event["kind"], event["key"])
              for event in adapter.state().events[before:]],
             [("source", "root")],
         )
+        reviewed_predecessor = next(
+            event for event in reversed(adapter.state().events[:before])
+            if event["kind"] == "source" and event["key"] == "root"
+        )
+        forged_event = build_projection_event(
+            workstream_id="GEN-37", kind="source", key="root",
+            value={"identity": exact, "sha256": PLAN},
+            plan_revision=PLAN, expected_revision=before,
+            created_at="same-value-wrong-envelope",
+            supersedes_event_id=reviewed_predecessor["event_id"],
+            authority=AUTHORITY,
+        )
+        forged_state = SimpleNamespace(
+            revision=before + 1,
+            events=tuple([
+                *adapter.state().events[:before], forged_event,
+            ]),
+            snapshot=deepcopy(adapter.state().snapshot),
+        )
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_source_transition_replay_event_mismatch",
+        ):
+            workstream_projection.prepare_terminal_child_source_transition(
+                manifest, graph, forged_state,
+            )
         replay = workstream_projection.prepare_terminal_child_source_transition(
             manifest, graph, adapter.state(),
         )
         self.assertEqual(
             replay["expected_projection_revision"], adapter.state().revision,
         )
+        replay_preview, replay_unresolved = (
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37", replay, adapter,
+                authenticated_route=AUTHORITY,
+                authenticated_source=authenticated, remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        )
+        result = reconcile_required_projection(
+            adapter, replay_preview, replay, remote_head=HEAD,
+            created_at="2026-08-29T01:01:00Z",
+            authenticated_source=authenticated,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda ids: {
+                item: expected[item] for item in ids
+            },
+            legacy_unresolved_relation_heads=replay_unresolved,
+        )
+        self.assertEqual(result["writes"], [])
+        self.assertFalse(result["resume_authority_verified"])
 
         comments = mock.Mock()
         comments.comments.side_effect = lambda: [
@@ -9789,9 +9958,14 @@ class ProjectionTests(unittest.TestCase):
                 "--remote-head", HEAD, "--plan-source", "ignored",
                 "--plan-identity", exact,
                 "--max-bytes", "65536", "--max-items", "500",
-                "--apply", "--created-at", "2026-08-31T23:00:00Z",
+                "--apply", "--created-at", "2026-08-29T01:01:00Z",
                 "--expected-preview-sha256", "a" * 64,
             ]
+            inactive_binding = {
+                "mode": "inactive_candidate", "selected": None,
+                "requested_plan_revision": PLAN,
+                "controlled_plan_revisions": [PLAN],
+            }
             with mock.patch.object(workstream_projection.sys, "argv", argv), \
                  mock.patch.object(workstream_projection.sys, "stdout", output), \
                  mock.patch.object(workstream_projection, "plan_payload", return_value={
@@ -9801,6 +9975,7 @@ class ProjectionTests(unittest.TestCase):
                  mock.patch.object(workstream_projection, "HttpGraphQLClient", return_value=client), \
                  mock.patch.object(workstream_projection, "resolve_linear_route", return_value=(AUTHORITY, None)), \
                  mock.patch.object(workstream_projection, "resolve_authenticated_issue_route", return_value=AUTHORITY), \
+                 mock.patch.object(workstream_projection, "projection_generation_source_binding", return_value=inactive_binding), \
                  mock.patch.object(workstream_projection, "LinearGraphQLTransport", return_value=transport), \
                  mock.patch.object(workstream_projection, "LinearCommentEventAdapter", return_value=comments):
                 self.assertEqual(workstream_projection.main(), 0)
@@ -9838,6 +10013,7 @@ class ProjectionTests(unittest.TestCase):
                  mock.patch.object(workstream_projection, "HttpGraphQLClient", return_value=client), \
                  mock.patch.object(workstream_projection, "resolve_linear_route", return_value=(AUTHORITY, None)), \
                  mock.patch.object(workstream_projection, "resolve_authenticated_issue_route", return_value=AUTHORITY), \
+                 mock.patch.object(workstream_projection, "projection_generation_source_binding", return_value=inactive_binding), \
                  mock.patch.object(workstream_projection, "LinearGraphQLTransport", return_value=transport), \
                  mock.patch.object(workstream_projection, "LinearCommentEventAdapter", return_value=comments):
                 self.assertEqual(workstream_projection.main(), 2)
