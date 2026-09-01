@@ -2302,18 +2302,30 @@ def prepare_terminal_child_evidence_seeds(
             raise LinearProjectionError(
                 f"terminal_child_evidence_seed_owner_missing:{child_id}"
             )
-        if transition is not None and owner != primary_key:
-            raise LinearProjectionError(
-                f"terminal_child_evidence_seed_nonprimary_owner:{child_id}"
-            )
-        repository = next((
+        repositories = [
             item for item in desired_scope.get("repositories", [])
             if repository_key(item) == owner
-        ), None)
-        if repository is None:
+        ]
+        if len(repositories) != 1:
             raise LinearProjectionError(
-                f"terminal_child_evidence_seed_repository_missing:{child_id}"
+                f"terminal_child_evidence_seed_repository_ambiguous:{child_id}"
             )
+        repository = repositories[0]
+        nonprimary_transition = transition is not None and owner != primary_key
+        if nonprimary_transition:
+            current_repositories = [
+                item for item in scope_value.get("repositories", [])
+                if repository_key(item) == owner
+            ]
+            if (
+                desired_scope.get("child_ownership", {}).get(child_id) != owner
+                or len(current_repositories) != 1
+                or current_repositories[0] != repository
+            ):
+                raise LinearProjectionError(
+                    f"terminal_child_evidence_seed_nonprimary_owner_changed:"
+                    f"{child_id}"
+                )
         for key in seed["evidence_keys"]:
             identity = ("evidence_contract", key)
             item = desired_by_identity.get(identity)
@@ -2329,6 +2341,10 @@ def prepare_terminal_child_evidence_seeds(
                 contract.get("owning_child") != child_id
                 or contract.get("repository_key") != owner
                 or (
+                    nonprimary_transition
+                    and contract.get("exact_head") != repository.get("exact_head")
+                )
+                or (
                     contract.get("exact_head") != repository.get("exact_head")
                     and historical_authority is None
                 )
@@ -2336,6 +2352,14 @@ def prepare_terminal_child_evidence_seeds(
             ):
                 raise LinearProjectionError(
                     f"terminal_child_evidence_seed_contract_invalid:{child_id}:{key}"
+                )
+            if nonprimary_transition and (
+                predecessor_binding is None
+                or not isinstance(historical_authority, dict)
+            ):
+                raise LinearProjectionError(
+                    f"terminal_child_evidence_seed_nonprimary_predecessor_required:"
+                    f"{child_id}:{key}"
                 )
             current = active.get(identity)
             if (
