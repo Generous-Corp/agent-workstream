@@ -9,6 +9,7 @@ from copy import deepcopy
 from unittest import mock
 
 import workstream_child_dependencies as dependency_module
+from workstream_generation import strict_candidate_loader
 from workstream_child_dependencies import (
     authorized_dependency_graph, ChildDependencyError, DependencyGraph,
     LinearChildDependencyAdapter, dependency_relation_id,
@@ -79,6 +80,8 @@ class FakeLinear:
         self.lose_next_create_response = False
         self.page_size = 250
         self.root_plan_revision = PLAN
+        self.root_title = "Root"
+        self.root_updated_at = "now"
 
     @staticmethod
     def team():
@@ -106,11 +109,12 @@ class FakeLinear:
 
     def root(self):
         return {
-            "id": ROOT_ID, "identifier": "GEN-37", "title": "Root",
+            "id": ROOT_ID, "identifier": "GEN-37", "title": self.root_title,
             "description": (
                 f"Plan revision: {self.root_plan_revision}\nLedger revision: 0"
             ),
-            "url": "https://linear.test/root", "updatedAt": "now", "parent": None,
+            "url": "https://linear.test/root",
+            "updatedAt": self.root_updated_at, "parent": None,
             "project": {"id": "project"}, "team": self.team(), "assignee": None,
             "state": {"id": "started", "name": "In Progress", "type": "started"},
         }
@@ -298,6 +302,92 @@ class ChildDependencyTests(unittest.TestCase):
             relations=relations or [self.relation()],
             expected_frontier=frontier or FRONTIER,
         )
+
+    def strict_generation_receipt(self, fake, *, root_updated_at_override):
+        authority = {key: AUTHORITY[key] for key in (
+            "workspace_id", "team_id", "project_id", "root_issue_id",
+        )}
+        with mock.patch("workstream_generation.plan_payload", return_value={
+            "source": {"identity": "https://example.test/plan", "sha256": PLAN},
+        }), mock.patch(
+            "workstream_generation.add_child_material_history",
+            side_effect=lambda graph, *_args, **_kwargs: graph,
+        ), mock.patch(
+            "workstream_generation.add_material_history",
+            side_effect=lambda graph, *_args, **_kwargs: graph,
+        ), mock.patch(
+            "workstream_generation.rebind_authenticated_dependency_graph",
+            side_effect=lambda _joined, _comments, graph, **_kwargs: graph,
+        ), mock.patch(
+            "workstream_generation.compact_context",
+            return_value={"resume_authority": "full"},
+        ), mock.patch(
+            "workstream_generation.read_relation_targets", return_value=[],
+        ):
+            return strict_candidate_loader(
+                fake, token="GEN-37", authority=authority,
+                plan_source="plan", plan_identity=None,
+                root_updated_at_override=root_updated_at_override,
+            )(PLAN)
+
+    def test_strict_generation_clock_override_reaches_dependency_reread(self):
+        fake = FakeLinear()
+        self.apply(fake)
+        fake.root_updated_at = "protocol-comment-clock"
+        fake.root_reads = 0
+        fake.comment_reads = 0
+
+        receipt = self.strict_generation_receipt(
+            fake, root_updated_at_override="reviewed-pre-comment-clock",
+        )
+
+        self.assertEqual(receipt["resume_authority"], "full")
+        self.assertEqual(fake.root_reads, 2)
+
+    def test_strict_generation_dependency_reread_still_rejects_real_drift(self):
+        mutations = {
+            "title": lambda fake: setattr(fake, "root_title", "changed title"),
+            "child": lambda fake: fake.children.pop(),
+            "relation": lambda fake: fake.relations.append(
+                fake.native_relation(A, C)
+            ),
+            "comment": lambda fake: fake.add_material(),
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(second_read_mutation=label):
+                fake = FakeLinear()
+                self.apply(fake)
+                fake.root_updated_at = "protocol-comment-clock"
+                fake.root_reads = 0
+                fake.comment_reads = 0
+                injected = False
+
+                def inject_root(current):
+                    nonlocal injected
+                    if (
+                        label != "comment" and current.root_reads == 2
+                        and not injected
+                    ):
+                        injected = True
+                        mutation(current)
+
+                def inject_comment(current):
+                    nonlocal injected
+                    if label == "comment" and current.comment_reads == 2 and not injected:
+                        injected = True
+                        mutation(current)
+
+                fake.before_root_read = inject_root
+                fake.before_comment_read = inject_comment
+                with self.assertRaisesRegex(
+                    ChildDependencyError,
+                    "dependency_graph_frontier_changed_during_read",
+                ):
+                    self.strict_generation_receipt(
+                        fake,
+                        root_updated_at_override="reviewed-pre-comment-clock",
+                    )
+                self.assertTrue(injected)
 
     def test_batch_writes_one_native_relation_with_exact_inverse_readback(self):
         fake = FakeLinear()

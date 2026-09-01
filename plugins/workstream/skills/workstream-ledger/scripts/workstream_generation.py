@@ -4517,15 +4517,21 @@ def strict_candidate_loader(
             client, team_id=authority["team_id"],
             workspace_id=authority["workspace_id"], project_id=authority["project_id"],
         )
-        graph = transport.snapshot_for_root(
-            token, include_description=True, include_child_comments=True,
-        )
         if root_updated_at_override is not None:
             if not isinstance(root_updated_at_override, str) or not root_updated_at_override:
                 raise WorkstreamGenerationError(
                     "generation_graph_clock_historical_timestamp_invalid"
                 )
-            graph["root"]["updatedAt"] = root_updated_at_override
+
+        def snapshot_for_candidate() -> dict[str, Any]:
+            snapshot = transport.snapshot_for_root(
+                token, include_description=True, include_child_comments=True,
+            )
+            if root_updated_at_override is not None:
+                snapshot["root"]["updatedAt"] = root_updated_at_override
+            return snapshot
+
+        graph = snapshot_for_candidate()
         description_plan_revision = (
             graph["root"].get("plan_revision") or plan_revision
         )
@@ -4543,9 +4549,7 @@ def strict_candidate_loader(
             graph, comments,
             generation_selector_plan_revision=description_plan_revision,
             reread=lambda: (
-                transport.snapshot_for_root(
-                    token, include_description=True, include_child_comments=True,
-                ),
+                snapshot_for_candidate(),
                 LinearProjectionAdapter(
                     client, issue_id=token, workstream_id=token,
                     plan_revision=plan_revision, **authority,
