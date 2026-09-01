@@ -2093,6 +2093,28 @@ class GenerationTransport:
                     authenticated_route=self.authority,
                 )
                 event = matching[0]
+                reservation_matches = [
+                    item for item in reduce_generation_reservations(
+                        comments, workstream_id=self.workstream_id,
+                        authenticated_route=self.authority,
+                    )
+                    if item["reservation_id"]
+                    == event["value"]["reservation_id"]
+                    and item["reservation_sha256"]
+                    == event["value"]["reservation_sha256"]
+                ]
+                if len(reservation_matches) > 1:
+                    raise WorkstreamGenerationError(
+                        "generation_historical_reservation_ambiguous"
+                    )
+                if reservation_matches and (
+                    reservation_matches[0].get("schema_version") == 5
+                    and reservation_matches[0].get("operator_contract_sha256")
+                    != self.operator_contract_sha256
+                ):
+                    raise WorkstreamGenerationError(
+                        "generation_historical_operator_contract_mismatch"
+                    )
                 if validate_activation_inputs:
                     carried = event["value"].get("activation_checkpoint")
                     if carried != expected_activation_checkpoint:

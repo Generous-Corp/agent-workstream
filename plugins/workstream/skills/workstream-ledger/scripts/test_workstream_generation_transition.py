@@ -1143,6 +1143,24 @@ class GenerationTransitionTests(unittest.TestCase):
             post_transition.comments, workstream_id=WORKSTREAM,
             authenticated_route=AUTHORITY,
         )), 1)
+        writes_before_mismatch = len(post_transition.mutations)
+        mismatched_post_transport = GenerationTransport(
+            post_transition, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
+            authority=AUTHORITY, candidate_loader=post_stable_loader,
+            legacy_description_plan_revision=OLD,
+            native_root_loader=lambda: post_linear.snapshot_for_root(WORKSTREAM),
+            operator_validator=obsolete_prepare,
+            operator_contract_sha256="0" * 64,
+        )
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_historical_operator_contract_mismatch",
+        ):
+            mismatched_post_transport.activate(
+                target_plan_revision=NEW, created_at=contract["created_at"],
+                retirement=retirement, expected_native_root_sha256=post_native,
+            )
+        self.assertEqual(len(post_transition.mutations), writes_before_mismatch)
         post_transport.candidate_loader = post_stable_loader
         post_transport.operator_validator = obsolete_prepare
         finalized = post_transport.activate(
@@ -1217,6 +1235,27 @@ class GenerationTransitionTests(unittest.TestCase):
                 event["kind"] == "generation_candidate_seal"
                 for event in adapter(cli_client, NEW).state().events
             ), 1)
+            writes_before_mismatch = len(cli_client.mutations)
+            mismatched = deepcopy(contract)
+            mismatched["native_transition"]["target_state"]["name"] = "Different"
+            contract_file.seek(0)
+            contract_file.truncate()
+            json.dump(mismatched, contract_file)
+            contract_file.flush()
+            code, _stdout, error = invoke_cli(cli_stable_loader)
+            self.assertEqual(code, 2)
+            self.assertIn(
+                "generation_historical_operator_contract_mismatch", error,
+            )
+            self.assertEqual(len(cli_client.mutations), writes_before_mismatch)
+            contract_file.seek(0)
+            contract_file.truncate()
+            json.dump(contract, contract_file)
+            contract_file.flush()
+            code, stdout, error = invoke_cli(cli_stable_loader)
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(json.loads(stdout)["activated_plan_revision"], NEW)
+            self.assertEqual(len(cli_client.mutations), writes_before_mismatch)
 
         transport = self.native_fenced_transport()
         for field, value in (
