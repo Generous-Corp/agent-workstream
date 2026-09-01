@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Bootstrap or advance append-only workstream plan-generation authority.
 
-The command never updates a Linear issue.  It reserves the shared material /
-checkpoint boundary, seals and strictly revalidates a candidate, then changes
-authority with one final deterministic comment append.  A lost response is
-recovered by complete readback; exact historical replay is always zero-write.
+The command never updates a Linear issue. It reserves the shared material /
+checkpoint boundary, seals and strictly revalidates a candidate, prepares an
+inert transition, then changes authority with a separate deterministic
+finalization. A lost response is recovered by complete readback; exact
+historical replay is always zero-write.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import hmac
 import json
 import re
 import sys
+import uuid
 from typing import Any, Callable
 
 from workstream_config import load_linear_api_key, resolve_linear_route
@@ -40,7 +42,7 @@ from workstream_linear_projection import (
 from workstream_plan import plan_payload
 from workstream_resume import (
     DEFAULT_RESUME_MAX_BYTES, add_child_material_history, add_material_history,
-    compact_context,
+    apply_generation_execution_status, compact_context,
     read_relation_targets,
 )
 from workstream_checkpoint import (
@@ -56,6 +58,11 @@ RESERVATION_RE = re.compile(
 HEX64 = re.compile(r"[0-9a-f]{64}")
 EVENT_ID = re.compile(r"wsp_[0-9a-f]{32}")
 RESERVATION_ID = re.compile(r"wsgr_[0-9a-f]{32}")
+FINALIZATION_PREFIX = "<!-- workstream-generation-finalization:v1:"
+FINALIZATION_RE = re.compile(
+    r"<!-- workstream-generation-finalization:v1:([A-Za-z0-9_-]+) -->"
+)
+FINALIZATION_ID = re.compile(r"wsgf_[0-9a-f]{32}")
 
 
 class WorkstreamGenerationError(LinearTransportError):
@@ -243,11 +250,13 @@ def _validate_reservation(value: dict[str, Any]) -> None:
         "candidate_resume_sha256", "retirement", "created_at",
     }
     schema_version = value.get("schema_version")
-    if schema_version == 3:
+    if schema_version in {3, 4}:
         fields.add("native_root_sha256")
+    if schema_version == 4:
+        fields.update({"activation_checkpoint", "remote_head"})
     if (
         set(value) != fields
-        or schema_version not in {2, 3}
+        or schema_version not in {2, 3, 4}
         or not RESERVATION_ID.fullmatch(str(value.get("reservation_id", "")))
         or value.get("mode") not in {"bootstrap", "activate"}
         or not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", str(value.get("workstream_id", "")))
@@ -279,8 +288,22 @@ def _validate_reservation(value: dict[str, Any]) -> None:
         )
         or not isinstance(value.get("created_at"), str) or not value["created_at"]
         or (
-            schema_version == 3
+            schema_version in {3, 4}
             and not HEX64.fullmatch(str(value.get("native_root_sha256", "")))
+        )
+        or (
+            schema_version == 4
+            and (
+                (value.get("activation_checkpoint") is not None
+                 and not isinstance(value.get("activation_checkpoint"), dict))
+                or (value.get("remote_head") is not None
+                    and not re.fullmatch(
+                        r"[0-9a-f]{40}(?:[0-9a-f]{24})?",
+                        str(value.get("remote_head", "")),
+                    ))
+                or ((value.get("activation_checkpoint") is None)
+                    != (value.get("remote_head") is None))
+            )
         )
     ):
         raise WorkstreamGenerationError("invalid_generation_reservation")
@@ -290,6 +313,19 @@ def _validate_reservation(value: dict[str, Any]) -> None:
     _validate_retirement(
         value["retirement"], value["from_plan_revision"], value["activation_epoch"],
     )
+    if schema_version == 4 and value["activation_checkpoint"] is not None:
+        try:
+            validate_checkpoint(value["activation_checkpoint"])
+        except (TypeError, ValueError) as error:
+            raise WorkstreamGenerationError(
+                "invalid_generation_reservation"
+            ) from error
+        if (
+            value["activation_checkpoint"]["workstream_id"] != value["workstream_id"]
+            or value["activation_checkpoint"]["plan_revision"]
+            != value["to_plan_revision"]
+        ):
+            raise WorkstreamGenerationError("invalid_generation_reservation")
     unsigned = {key: deepcopy(item) for key, item in value.items()
                 if key != "reservation_id"}
     if value["reservation_id"] != "wsgr_" + _digest(unsigned)[:32]:
@@ -299,6 +335,153 @@ def _validate_reservation(value: dict[str, Any]) -> None:
 def encode_generation_reservation(value: dict[str, Any]) -> str:
     _validate_reservation(value)
     return _envelope(RESERVATION_PREFIX, "reservation", value)
+
+
+def _validate_finalization(value: dict[str, Any]) -> None:
+    fields = {
+        "schema_version", "finalization_id", "workstream_id", "authority",
+        "reservation_id", "reservation_sha256", "transition_event_id",
+        "transition_sha256", "native_root_sha256", "source",
+        "execution_status", "created_at",
+    }
+    if (
+        not isinstance(value, dict) or set(value) != fields
+        or value.get("schema_version") != 1
+        or not FINALIZATION_ID.fullmatch(str(value.get("finalization_id", "")))
+        or not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", str(value.get("workstream_id", "")))
+        or not isinstance(value.get("authority"), dict)
+        or set(value["authority"]) != {
+            "workspace_id", "team_id", "project_id", "root_issue_id",
+        }
+        or not all(isinstance(item, str) and item for item in value["authority"].values())
+        or not RESERVATION_ID.fullmatch(str(value.get("reservation_id", "")))
+        or not EVENT_ID.fullmatch(str(value.get("transition_event_id", "")))
+        or not all(HEX64.fullmatch(str(value.get(field, ""))) for field in (
+            "reservation_sha256", "transition_sha256", "native_root_sha256",
+        ))
+        or not isinstance(value.get("source"), dict)
+        or set(value["source"]) != {"identity", "sha256"}
+        or not isinstance(value["source"].get("identity"), str)
+        or not value["source"]["identity"]
+        or not HEX64.fullmatch(str(value["source"].get("sha256", "")))
+        or value.get("execution_status") != {
+            "authority": "generation_local",
+            "name": "In Progress",
+            "type": "started",
+        }
+        or not isinstance(value.get("created_at"), str) or not value["created_at"]
+    ):
+        raise WorkstreamGenerationError("invalid_generation_finalization")
+    unsigned = {key: deepcopy(item) for key, item in value.items()
+                if key != "finalization_id"}
+    if value["finalization_id"] != "wsgf_" + _digest(unsigned)[:32]:
+        raise WorkstreamGenerationError("invalid_generation_finalization")
+
+
+def encode_generation_finalization(value: dict[str, Any]) -> str:
+    _validate_finalization(value)
+    return _envelope(FINALIZATION_PREFIX, "finalization", value)
+
+
+def generation_finalization_slot_id(value: dict[str, Any]) -> str:
+    _validate_finalization(value)
+    digest = hashlib.sha256(_canonical(value)).hexdigest()
+    return str(uuid.UUID(hex=digest[:32], version=4))
+
+
+def reduce_generation_finalizations(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    authenticated_route: dict[str, str] | None,
+) -> list[dict[str, Any]]:
+    from workstream_linear_projection import (
+        _decode_projection, PROJECTION_PREFIX, PROJECTION_RE,
+    )
+    transitions: dict[str, dict[str, Any]] = {}
+    for comment in comments:
+        body = comment.get("body") or ""
+        if not isinstance(body, str) or PROJECTION_PREFIX not in body:
+            continue
+        encoded = PROJECTION_RE.findall(body)
+        if len(encoded) != 1 or body.count(PROJECTION_PREFIX) != 1:
+            raise WorkstreamGenerationError("malformed_projection_marker")
+        event = _decode_projection(encoded[0])
+        if event["kind"] == "generation_transition":
+            transitions[event["event_id"]] = event
+    result: list[dict[str, Any]] = []
+    observed: set[str] = set()
+    for comment in comments:
+        body = comment.get("body") or ""
+        if not isinstance(body, str):
+            raise WorkstreamGenerationError("malformed_generation_finalization")
+        if FINALIZATION_PREFIX not in body:
+            continue
+        value = _decode_envelope(
+            body, prefix=FINALIZATION_PREFIX, pattern=FINALIZATION_RE,
+            payload_name="finalization",
+        )
+        _validate_finalization(value)
+        transition = transitions.get(value["transition_event_id"])
+        if (
+            value["workstream_id"] != workstream_id
+            or (authenticated_route is not None
+                and value["authority"] != authenticated_route)
+            or transition is None
+            or transition["workstream_id"] != workstream_id
+            or transition["authority"] != value["authority"]
+            or transition["value"].get("schema_version") != 4
+            or transition["value"]["reservation_id"] != value["reservation_id"]
+            or transition["value"]["reservation_sha256"] != value["reservation_sha256"]
+            or transition["value"]["native_root_sha256"] != value["native_root_sha256"]
+            or transition["value"]["source"] != value["source"]
+            or _digest(transition) != value["transition_sha256"]
+            or comment.get("id") != generation_finalization_slot_id(value)
+        ):
+            raise WorkstreamGenerationError("generation_finalization_binding_mismatch")
+        if value["finalization_id"] in observed:
+            raise WorkstreamGenerationError("duplicate_generation_finalization")
+        observed.add(value["finalization_id"])
+        result.append({**value, "remote_id": comment["id"]})
+    return sorted(result, key=lambda item: item["finalization_id"])
+
+
+def finalized_generation_transition_ids(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    authenticated_route: dict[str, str] | None,
+) -> set[str]:
+    return {
+        item["transition_event_id"] for item in reduce_generation_finalizations(
+            comments, workstream_id=workstream_id,
+            authenticated_route=authenticated_route,
+        )
+    }
+
+
+def selected_generation_execution_status(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    transition_event_id: str | None,
+    authenticated_route: dict[str, str] | None,
+) -> dict[str, str] | None:
+    """Return the append-only status selected with a schema-v4 generation.
+
+    Native Linear status is a mutable display cache and cannot be atomically
+    changed with an append-only generation transition.  The finalization is
+    therefore the generation-local execution authority.  A terminal native
+    status observed after preparation cannot make the newly activated plan
+    appear Done; resume authoritatively prefers this status while retaining the
+    native observation for reconciliation and closure review.
+    """
+    if transition_event_id is None:
+        return None
+    matches = [
+        item for item in reduce_generation_finalizations(
+            comments, workstream_id=workstream_id,
+            authenticated_route=authenticated_route,
+        )
+        if item["transition_event_id"] == transition_event_id
+    ]
+    if len(matches) > 1:
+        raise WorkstreamGenerationError("duplicate_generation_finalization")
+    return deepcopy(matches[0]["execution_status"]) if matches else None
 
 
 def reduce_generation_reservations(
@@ -543,6 +726,13 @@ def pending_generation_reservations(
         authenticated_route=authenticated_route,
     )
     aborted = _generation_abort_ids(comments, reservations)
+    finalized_tokens = {
+        f"{item['reservation_id']}:{item['reservation_sha256']}"
+        for item in reduce_generation_finalizations(
+            comments, workstream_id=workstream_id,
+            authenticated_route=authenticated_route,
+        )
+    }
     completed: set[str] = set()
     for plan_revision in {
         item["from_plan_revision"] for item in reservations
@@ -554,10 +744,21 @@ def pending_generation_reservations(
         )
         for event in state.events:
             if event["kind"] in {"generation_genesis", "generation_transition"}:
-                completed.add(
+                token = (
                     f"{event['value']['reservation_id']}:"
                     f"{event['value']['reservation_sha256']}"
                 )
+                reservation = next((
+                    item for item in reservations
+                    if f"{item['reservation_id']}:{item['reservation_sha256']}" == token
+                ), None)
+                if (
+                    reservation is not None
+                    and (reservation.get("schema_version") != 4
+                         or reservation.get("mode") == "bootstrap"
+                         or token in finalized_tokens)
+                ):
+                    completed.add(token)
     return [item for item in reservations if (
         f"{item['reservation_id']}:{item['reservation_sha256']}" not in completed
         and f"{item['reservation_id']}:{item['reservation_sha256']}" not in aborted
@@ -593,7 +794,17 @@ def generation_controls(comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         event = _decode_projection(matches[0])
         if event["kind"] in {"generation_genesis", "generation_transition"}:
             result.append(event)
-    return result
+    finalized = finalized_generation_transition_ids(
+        comments, workstream_id=(
+            result[0]["workstream_id"] if result else "GEN-0"
+        ), authenticated_route=None,
+    ) if result else set()
+    return [
+        event for event in result
+        if event["kind"] != "generation_transition"
+        or event["value"].get("schema_version") != 4
+        or event["event_id"] in finalized
+    ]
 
 
 def selected_activation_checkpoint(
@@ -742,6 +953,7 @@ def assert_generation_write_authority(
 
 CandidateLoader = Callable[[str], dict[str, Any]]
 NativeRootLoader = Callable[[], dict[str, Any]]
+SourceLoader = Callable[[], dict[str, str]]
 
 
 def native_root_activation_proof(
@@ -798,6 +1010,7 @@ class GenerationTransport:
         authority: dict[str, str], candidate_loader: CandidateLoader,
         legacy_description_plan_revision: str | None = None,
         native_root_loader: NativeRootLoader | None = None,
+        source_loader: SourceLoader | None = None,
     ):
         self.client = client
         self.issue_id = issue_id
@@ -806,6 +1019,7 @@ class GenerationTransport:
         self.candidate_loader = candidate_loader
         self.legacy_description_plan_revision = legacy_description_plan_revision
         self.native_root_loader = native_root_loader
+        self.source_loader = source_loader
         self._capability_checked = False
 
     def _native_root_proof(
@@ -826,6 +1040,31 @@ class GenerationTransport:
                 f"expected {proof['sha256']} from preview"
             )
         return proof
+
+    def _assert_source_current(
+        self, expected: dict[str, str] | None,
+    ) -> dict[str, str] | None:
+        if self.source_loader is None:
+            return None
+        observed = self.source_loader()
+        if (
+            not isinstance(observed, dict)
+            or set(observed) < {"identity", "sha256"}
+            or not isinstance(observed["identity"], str)
+            or not observed["identity"]
+            or not HEX64.fullmatch(str(observed["sha256"]))
+        ):
+            raise WorkstreamGenerationError(
+                "generation_canonical_source_readback_invalid"
+            )
+        normalized = {
+            "identity": observed["identity"], "sha256": observed["sha256"],
+        }
+        if expected is not None and normalized != expected:
+            raise WorkstreamGenerationError(
+                "generation_canonical_source_changed_during_activation"
+            )
+        return normalized
 
     def _comments(self) -> list[dict[str, Any]]:
         adapter = LinearProjectionAdapter(
@@ -957,6 +1196,8 @@ class GenerationTransport:
         to_plan: str, epoch: int, previous_control: str | None,
         candidate: dict[str, Any], retirement: dict[str, Any], created_at: str,
         native_root_sha256: str | None = None,
+        activation_checkpoint: dict[str, Any] | None = None,
+        remote_head: str | None = None,
     ) -> dict[str, Any]:
         checkpoints = reduce_generation_checkpoint_comments(
             comments, workstream_id=self.workstream_id,
@@ -986,7 +1227,7 @@ class GenerationTransport:
             from_state=from_state, checkpoints=checkpoints,
         )
         unsigned = {
-            "schema_version": (3 if native_root_sha256 is not None else 2),
+            "schema_version": (4 if native_root_sha256 is not None else 2),
             "workstream_id": self.workstream_id,
             "authority": self.authority, "mode": mode,
             "from_plan_revision": from_plan, "to_plan_revision": to_plan,
@@ -1008,6 +1249,8 @@ class GenerationTransport:
                     "generation_native_root_review_proof_mismatch"
                 )
             unsigned["native_root_sha256"] = native_root_sha256
+            unsigned["activation_checkpoint"] = deepcopy(activation_checkpoint)
+            unsigned["remote_head"] = remote_head
         value = {**unsigned, "reservation_id": "wsgr_" + _digest(unsigned)[:32]}
         _validate_reservation(value)
         return value
@@ -1051,6 +1294,74 @@ class GenerationTransport:
         ) if item["reservation_id"] == reservation["reservation_id"]), None)
         if not existing:
             raise WorkstreamGenerationError("generation_reservation_not_observed")
+        return existing
+
+    def _append_finalization(
+        self, *, reservation: dict[str, Any], transition: dict[str, Any],
+        native_root: dict[str, Any], created_at: str,
+    ) -> dict[str, Any]:
+        unsigned = {
+            "schema_version": 1, "workstream_id": self.workstream_id,
+            "authority": self.authority,
+            "reservation_id": reservation["reservation_id"],
+            "reservation_sha256": reservation["reservation_sha256"],
+            "transition_event_id": transition["event_id"],
+            "transition_sha256": _digest(transition),
+            "native_root_sha256": native_root["sha256"],
+            "source": deepcopy(reservation["source"]),
+            "execution_status": {
+                "authority": "generation_local",
+                "name": "In Progress",
+                "type": "started",
+            },
+            "created_at": created_at,
+        }
+        value = {
+            **unsigned, "finalization_id": "wsgf_" + _digest(unsigned)[:32],
+        }
+        _validate_finalization(value)
+        comments = self._comments()
+        existing = next((item for item in reduce_generation_finalizations(
+            comments, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+        ) if item["finalization_id"] == value["finalization_id"]), None)
+        if existing is not None:
+            if {key: existing[key] for key in value} != value:
+                raise WorkstreamGenerationError(
+                    "generation_finalization_replay_mismatch"
+                )
+            return existing
+        slot = generation_finalization_slot_id(value)
+        self._capability()
+        body = encode_generation_finalization(value)
+        try:
+            response = self.client.execute(COMMENT_CREATE_MUTATION, {"input": {
+                "id": slot, "issueId": self.issue_id, "body": body,
+            }})
+        except (LinearTransportError, OSError, TimeoutError):
+            after = self._comments()
+            existing = next((item for item in reduce_generation_finalizations(
+                after, workstream_id=self.workstream_id,
+                authenticated_route=self.authority,
+            ) if item["finalization_id"] == value["finalization_id"]), None)
+            if existing is not None:
+                return existing
+            raise WorkstreamGenerationError(
+                "generation_finalization_slot_lost_reload_required"
+            )
+        created = response.get("commentCreate") or {}
+        if (
+            created.get("success") is not True
+            or (created.get("comment") or {}).get("id") != slot
+        ):
+            raise WorkstreamGenerationError("generation_finalization_unconfirmed")
+        after = self._comments()
+        existing = next((item for item in reduce_generation_finalizations(
+            after, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+        ) if item["finalization_id"] == value["finalization_id"]), None)
+        if existing is None:
+            raise WorkstreamGenerationError("generation_finalization_not_observed")
         return existing
 
     def _matching_reservation(
@@ -1158,7 +1469,9 @@ class GenerationTransport:
                         "activated_plan_revision": event["value"]["to"]["plan_revision"],
                         "bound_graph_frontier_sha256": event["value"]["graph_frontier_sha256"],
                         "bound_candidate_resume_sha256": event["value"]["candidate_resume_sha256"],
-                        "replay": True}
+                        "replay": True,
+                        **({"prepared_schema_version": 4}
+                           if event["value"].get("schema_version") == 4 else {})}
         return None
 
     def abort(
@@ -1182,6 +1495,28 @@ class GenerationTransport:
         ):
             raise WorkstreamGenerationError("invalid_generation_abort")
         reservation = matching[0]
+        prepared_transition_ids = {
+            item["transition_event_id"]
+            for item in reduce_generation_finalizations(
+                comments, workstream_id=self.workstream_id,
+                authenticated_route=self.authority,
+            )
+        }
+        prepared_for_reservation = [
+            event for state in self._states(
+                comments, reservation["from_plan_revision"]
+            )
+            for event in state.events
+            if event["kind"] == "generation_transition"
+            and event["value"].get("schema_version") == 4
+            and event["value"].get("reservation_id") == reservation_id
+            and event["value"].get("reservation_sha256") == reservation_sha256
+            and event["event_id"] not in prepared_transition_ids
+        ]
+        if prepared_for_reservation:
+            raise WorkstreamGenerationError(
+                "generation_abort_after_preparation_replay_required"
+            )
         token = f"{reservation_id}:{reservation_sha256}"
         aborted = _generation_abort_ids(comments, reservations)
         if token in aborted:
@@ -1419,6 +1754,12 @@ class GenerationTransport:
             comments, workstream_id=self.workstream_id,
         )
         target_state = self._states(comments, target_plan_revision)[0]
+        target_source = target_state.snapshot.get("source") or {}
+        target_source = {
+            "identity": target_source.get("identity") or target_source.get("url"),
+            "sha256": target_source.get("sha256"),
+        }
+        self._assert_source_current(target_source)
         self._prepared_activation_checkpoint_id(
             comments, target_plan_revision=target_plan_revision,
             target_state=target_state,
@@ -1522,13 +1863,104 @@ class GenerationTransport:
                 expected_remote_head=remote_head,
             )
             if replay:
+                finalized = finalized_generation_transition_ids(
+                    comments, workstream_id=self.workstream_id,
+                    authenticated_route=self.authority,
+                )
+                if (
+                    replay.get("prepared_schema_version") != 4
+                    or replay["event_id"] in finalized
+                ):
+                    final_native = self._native_root_proof(
+                        expected_native_root_sha256, require_reviewed=True,
+                    )
+                    result = (
+                        {**replay, "native_root_activation_proof": final_native}
+                        if final_native is not None else replay
+                    )
+                    if replay.get("prepared_schema_version") == 4:
+                        finalization = next(
+                            item for item in reduce_generation_finalizations(
+                                comments, workstream_id=self.workstream_id,
+                                authenticated_route=self.authority,
+                            ) if item["transition_event_id"] == replay["event_id"]
+                        )
+                        result.update({
+                            "two_phase_finalization": finalization,
+                            "final_candidate": self.candidate_loader(
+                                target_plan_revision
+                            ),
+                        })
+                    return result
+                transition = next(
+                    event for state in self._states(comments, replay_from)
+                    for event in state.events
+                    if event["event_id"] == replay["event_id"]
+                )
+                reservation = next((
+                    item for item in pending_generation_reservations(
+                        comments, workstream_id=self.workstream_id,
+                        authenticated_route=self.authority,
+                    )
+                    if item["reservation_id"]
+                    == transition["value"]["reservation_id"]
+                    and item["reservation_sha256"]
+                    == transition["value"]["reservation_sha256"]
+                ), None)
+                if reservation is None:
+                    raise WorkstreamGenerationError(
+                        "generation_prepared_reservation_missing"
+                    )
+                if (
+                    reservation.get("source") != transition["value"].get("source")
+                    or reservation.get("retirement") != retirement
+                    or reservation.get("activation_checkpoint")
+                    != activation_checkpoint
+                    or reservation.get("remote_head") != remote_head
+                    or reservation.get("native_root_sha256")
+                    != expected_native_root_sha256
+                ):
+                    raise WorkstreamGenerationError(
+                        "generation_reservation_replay_inputs_mismatch"
+                    )
+                prepared_post = self._candidate(
+                    target_plan_revision, comments,
+                    activation_checkpoint=activation_checkpoint,
+                )
+                if (
+                    prepared_post["receipt"]["graph_frontier_sha256"]
+                    != transition["value"]["graph_frontier_sha256"]
+                    or prepared_post["receipt"]["snapshot_sha256"]
+                    != transition["value"]["candidate_resume_sha256"]
+                ):
+                    raise WorkstreamGenerationError(
+                        "generation_prepared_candidate_changed"
+                    )
                 final_native = self._native_root_proof(
                     expected_native_root_sha256, require_reviewed=True,
                 )
-                return (
-                    {**replay, "native_root_activation_proof": final_native}
-                    if final_native is not None else replay
+                self._assert_source_current(reservation["source"])
+                finalization = self._append_finalization(
+                    reservation=reservation, transition=transition,
+                    native_root=final_native, created_at=created_at,
                 )
+                after = self._comments()
+                self._assert_source_current(reservation["source"])
+                final = select_plan_generation(
+                    after, workstream_id=self.workstream_id,
+                    description_plan_revision=replay_from,
+                    authenticated_route=self.authority,
+                )
+                if final["plan_revision"] != target_plan_revision:
+                    raise WorkstreamGenerationError(
+                        "generation_activation_not_observed"
+                    )
+                return {
+                    **replay,
+                    "native_root_activation_proof": final_native,
+                    "two_phase_finalization": finalization,
+                    "final_candidate": prepared_post["receipt"],
+                }
         selected = select_plan_generation(
             comments, workstream_id=self.workstream_id,
             description_plan_revision=self.legacy_description_plan_revision,
@@ -1546,6 +1978,12 @@ class GenerationTransport:
             comments, from_plan=from_plan, retirement=retirement,
         )
         target_state = self._states(comments, target_plan_revision)[0]
+        target_source = target_state.snapshot.get("source") or {}
+        target_source = {
+            "identity": target_source.get("identity") or target_source.get("url"),
+            "sha256": target_source.get("sha256"),
+        }
+        self._assert_source_current(target_source)
         self._prepared_activation_checkpoint_id(
             comments, target_plan_revision=target_plan_revision,
             target_state=target_state,
@@ -1607,6 +2045,8 @@ class GenerationTransport:
                 native_root_sha256=(
                     native_root["sha256"] if native_root is not None else None
                 ),
+                activation_checkpoint=activation_checkpoint,
+                remote_head=remote_head,
             )
             stored = self._append_reservation(reservation)
         else:
@@ -1618,6 +2058,15 @@ class GenerationTransport:
         ):
             raise WorkstreamGenerationError(
                 "generation_reservation_native_root_proof_mismatch"
+            )
+        if reservation.get("schema_version") == 4 and (
+            reservation.get("activation_checkpoint") != activation_checkpoint
+            or reservation.get("remote_head") != remote_head
+            or reservation.get("source") != target_source
+            or reservation.get("retirement") != retirement
+        ):
+            raise WorkstreamGenerationError(
+                "generation_reservation_replay_inputs_mismatch"
             )
         comments = self._comments()
         self._assert_reservation_live(comments, reservation)
@@ -1713,14 +2162,24 @@ class GenerationTransport:
                 "activation_checkpoint": deepcopy(activation_checkpoint),
                 "activation_checkpoint_sha256": _digest(activation_checkpoint),
             })
+        if native_root is not None:
+            value.update({
+                "schema_version": 4,
+                "activation_checkpoint": deepcopy(activation_checkpoint),
+                "activation_checkpoint_sha256": (
+                    _digest(activation_checkpoint)
+                    if activation_checkpoint is not None else None
+                ),
+                "native_root_sha256": native_root["sha256"],
+            })
         activation = build_projection_event(
             workstream_id=self.workstream_id, kind="generation_transition", key="root",
             value=value, plan_revision=from_plan,
             expected_revision=from_state.revision, created_at=created_at,
             authority=self.authority,
         )
-        # This is the final complete-read fence. Abort uses this same remote CAS
-        # slot, while legacy ledger collision successors remain quarantined.
+        # This is the final complete-read fence before the recoverable
+        # preparation. Legacy ledger collision successors remain quarantined.
         final_comments = self._comments()
         self._assert_reservation_live(final_comments, reservation)
         final_post = self._candidate(
@@ -1738,10 +2197,12 @@ class GenerationTransport:
             or final_to.revision != reservation["to_projection_revision"] + 1
         ):
             raise WorkstreamGenerationError("generation_final_fence_changed")
-        # Authority changes here and only here.  No append follows this call.
-        self._native_root_proof(
+        # Schema-v4 writes a recoverable preparation first. Authority changes
+        # only when its separately authenticated finalization is appended.
+        final_native = self._native_root_proof(
             expected_native_root_sha256, require_reviewed=True,
         )
+        self._assert_source_current(reservation["source"])
         receipt = LinearProjectionAdapter(
             self.client, issue_id=self.issue_id, workstream_id=self.workstream_id,
             plan_revision=from_plan, **self.authority,
@@ -1749,15 +2210,56 @@ class GenerationTransport:
                  allowed_generation_reservation_id=reservation["reservation_id"],
                  allow_retired_generation_control=True)
         after = self._comments()
+        if reservation.get("schema_version") == 4:
+            self._assert_reservation_live(after, reservation)
+            prepared = select_plan_generation(
+                after, workstream_id=self.workstream_id,
+                description_plan_revision=from_plan,
+                authenticated_route=self.authority,
+            )
+            if prepared["plan_revision"] != from_plan:
+                raise WorkstreamGenerationError(
+                    "generation_preparation_became_authoritative"
+                )
+            # Revalidate the complete candidate after preparation and before
+            # finalization; status/source races therefore leave an exact live
+            # reservation and old execution authority.
+            prepared_post = self._candidate(
+                target_plan_revision, after,
+                activation_checkpoint=activation_checkpoint,
+            )
+            if (
+                prepared_post["receipt"]["graph_frontier_sha256"]
+                != reservation["graph_frontier_sha256"]
+                or prepared_post["receipt"]["snapshot_sha256"]
+                != value["candidate_resume_sha256"]
+            ):
+                raise WorkstreamGenerationError(
+                    "generation_prepared_candidate_changed"
+                )
+            final_native = self._native_root_proof(
+                expected_native_root_sha256, require_reviewed=True,
+            )
+            self._assert_source_current(reservation["source"])
+            finalization = self._append_finalization(
+                reservation=reservation, transition=activation,
+                native_root=final_native, created_at=created_at,
+            )
+            after = self._comments()
+            # This cannot make mutable Git refs atomic with Linear, but it does
+            # guarantee the command never reports success if canonical bytes
+            # changed while the finalization write was in flight. Ordinary
+            # resume then detects the active/live digest mismatch and remains
+            # non-executable until a subsequent generation is reviewed.
+            self._assert_source_current(reservation["source"])
+        else:
+            finalization = None
         final = select_plan_generation(
             after, workstream_id=self.workstream_id,
             description_plan_revision=from_plan, authenticated_route=self.authority,
         )
         if final["plan_revision"] != target_plan_revision or final["activation_epoch"] != epoch:
             raise WorkstreamGenerationError("generation_activation_not_observed")
-        post_native = self._native_root_proof(
-            expected_native_root_sha256, require_reviewed=True,
-        )
         return {
             **receipt,
             "activated_plan_revision": target_plan_revision,
@@ -1767,7 +2269,11 @@ class GenerationTransport:
                 "quarantined_legacy_writes"
             ],
             "replay": False,
-            "native_root_activation_proof": post_native,
+            "native_root_activation_proof": final_native,
+            **({
+                "two_phase_finalization": finalization,
+                "final_candidate": final_post["receipt"],
+            } if finalization is not None else {}),
         }
 
 
@@ -1866,6 +2372,13 @@ def strict_candidate_loader(
                 "generation_authority_origin": selected["authority_origin"],
                 "description_plan_revision": description_plan_revision,
             })
+            apply_generation_execution_status(
+                graph["root"], selected_generation_execution_status(
+                    comments, workstream_id=token,
+                    transition_event_id=selected["transition_tip_event_id"],
+                    authenticated_route=authority,
+                ),
+            )
             selected_checkpoints = selected_activation_checkpoints(
                 comments, workstream_id=token,
                 transition_event_id=selected["transition_tip_event_id"],
@@ -1959,6 +2472,7 @@ def strict_candidate_loader(
         for field in (
             "description_plan_revision", "generation_transition_tip_event_id",
             "generation_activation_epoch", "generation_authority_origin",
+            "issue_status", "issue_status_type", "generation_execution_status",
         ):
             graph_root.pop(field, None)
         graph_surface = {
@@ -2159,8 +2673,15 @@ def main() -> int:
             client, issue_id=args.token.upper(), workstream_id=args.token.upper(),
             authority=authority, candidate_loader=loader,
             legacy_description_plan_revision=description_plan_revision,
-            native_root_loader=lambda: linear_transport.snapshot_for_root(
-                args.token.upper()
+            native_root_loader=(
+                (lambda: linear_transport.snapshot_for_root(args.token.upper()))
+                if args.command == "activate" else None
+            ),
+            source_loader=(
+                (lambda: plan_payload(
+                    args.plan_source, args.plan_identity or args.plan_source,
+                )["source"])
+                if args.command == "activate" else None
             ),
         )
         retirement = None
@@ -2194,39 +2715,64 @@ def main() -> int:
                 expected_native_root_sha256=args.expected_native_root_sha256,
             )
         if args.apply:
-            selected, final_candidate = strict_active_generation_receipt(
-                client, token=args.token.upper(), authority=authority,
-                description_plan_revision=description_plan_revision,
-                requested_plan_revision=source["sha256"],
-                requested_loader=loader, max_bytes=args.max_bytes,
-                max_items=args.max_items,
-            )
-            output = {
-                **output,
-                "final_active_plan_revision": selected["plan_revision"],
-                "final_candidate": final_candidate,
-            }
-            if selected["plan_revision"] != output["activated_plan_revision"]:
-                output["post_read_status"] = (
-                    "historical_replay_active_generation_advanced"
+            if output.get("two_phase_finalization") is not None:
+                selected, final_candidate = strict_active_generation_receipt(
+                    client, token=args.token.upper(), authority=authority,
+                    description_plan_revision=description_plan_revision,
+                    requested_plan_revision=source["sha256"],
+                    requested_loader=loader, max_bytes=args.max_bytes,
+                    max_items=args.max_items,
                 )
-            elif (
-                final_candidate["graph_frontier_sha256"]
-                != output["bound_graph_frontier_sha256"]
-                or final_candidate["snapshot_sha256"]
-                != output["bound_candidate_resume_sha256"]
-            ):
-                raise WorkstreamGenerationError(
-                    "authority_changed_with_post_read_drift"
-                )
+                output["final_active_plan_revision"] = selected["plan_revision"]
+                output["final_candidate"] = final_candidate
+                if selected["plan_revision"] != output["activated_plan_revision"]:
+                    output["post_read_status"] = (
+                        "historical_replay_active_generation_advanced"
+                    )
+                elif (
+                    final_candidate["graph_frontier_sha256"]
+                    != output["bound_graph_frontier_sha256"]
+                    or final_candidate["snapshot_sha256"]
+                    != output["bound_candidate_resume_sha256"]
+                ):
+                    raise WorkstreamGenerationError(
+                        "authority_changed_with_post_read_drift"
+                    )
+                else:
+                    output["post_read_status"] = (
+                        "authority_bound_two_phase_finalization_match"
+                    )
+                output["final_native_root"] = output[
+                    "native_root_activation_proof"
+                ]
             else:
-                output["post_read_status"] = "authority_bound_post_read_match"
-            post_native = transport._native_root_proof(
-                getattr(args, "expected_native_root_sha256", None),
-                require_reviewed=(args.command == "activate"),
-            )
-            if post_native is not None:
-                output["final_native_root"] = post_native
+                selected, final_candidate = strict_active_generation_receipt(
+                    client, token=args.token.upper(), authority=authority,
+                    description_plan_revision=description_plan_revision,
+                    requested_plan_revision=source["sha256"],
+                    requested_loader=loader, max_bytes=args.max_bytes,
+                    max_items=args.max_items,
+                )
+                output = {
+                    **output,
+                    "final_active_plan_revision": selected["plan_revision"],
+                    "final_candidate": final_candidate,
+                }
+                if selected["plan_revision"] != output["activated_plan_revision"]:
+                    output["post_read_status"] = (
+                        "historical_replay_active_generation_advanced"
+                    )
+                elif (
+                    final_candidate["graph_frontier_sha256"]
+                    != output["bound_graph_frontier_sha256"]
+                    or final_candidate["snapshot_sha256"]
+                    != output["bound_candidate_resume_sha256"]
+                ):
+                    raise WorkstreamGenerationError(
+                        "authority_changed_with_post_read_drift"
+                    )
+                else:
+                    output["post_read_status"] = "authority_bound_post_read_match"
         json.dump(output, sys.stdout, ensure_ascii=False, sort_keys=True, indent=2)
         sys.stdout.write("\n")
         return 0

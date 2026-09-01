@@ -76,6 +76,24 @@ class ResumeError(ValueError):
     pass
 
 
+def apply_generation_execution_status(
+    root: dict[str, Any], generation_status: dict[str, str] | None,
+) -> None:
+    """Prefer finalized generation-local status while retaining native truth."""
+    if generation_status is None:
+        return
+    if generation_status != {
+        "authority": "generation_local", "name": "In Progress",
+        "type": "started",
+    }:
+        raise ResumeError("invalid_generation_execution_status")
+    root["issue_status"] = root.get("status")
+    root["issue_status_type"] = root.get("status_type")
+    root["status"] = generation_status["name"]
+    root["status_type"] = generation_status["type"]
+    root["generation_execution_status"] = deepcopy(generation_status)
+
+
 def plan_generation_freshness(
     *, token: str, description: str, active_source: dict[str, Any],
     comments: list[dict[str, Any]], authenticated_route: dict[str, str],
@@ -101,12 +119,17 @@ def plan_generation_freshness(
             "keep exactly one locator for the active plan document"
         )
     live_source = plan_payload(canonical, canonical)["source"]
-    from workstream_generation import pending_generation_reservations
+    from workstream_generation import (
+        generation_ledger_frontier_tokens, pending_generation_reservations,
+    )
 
     pending = pending_generation_reservations(
         comments, workstream_id=token,
         authenticated_route=authenticated_route,
     )
+    prepared_tokens = set(generation_ledger_frontier_tokens(
+        comments, workstream_id=token,
+    ))
     if live_source["sha256"] == active_sha256 and not pending:
         return None
     reservations = []
@@ -139,16 +162,50 @@ def plan_generation_freshness(
                 "requirement": "abort only after proving the original writer stopped",
             },
         })
-        if item.get("native_root_sha256") is not None:
+        if item.get("schema_version") == 4:
             reservations[-1]["native_root_sha256"] = item["native_root_sha256"]
-            reservations[-1]["continue"]["command"][-1:-1] = [
+            replay_inputs = {
+                "source": item["source"],
+                "retirement_proof": item["retirement"],
+                "activation_checkpoint": item["activation_checkpoint"],
+                "remote_head": item["remote_head"],
+                "created_at": item["created_at"],
+                "expected_native_root_sha256": item["native_root_sha256"],
+            }
+            reservations[-1]["replay_inputs"] = replay_inputs
+            command = [
+                "workstreamctl", "generation", "activate", token,
+                "--plan-source", item["source"]["identity"],
+                "--plan-identity", item["source"]["identity"],
+                "--retirement-proof", "<write replay_inputs.retirement_proof>",
+                "--created-at", item["created_at"],
                 "--expected-native-root-sha256", item["native_root_sha256"],
             ]
+            if item["activation_checkpoint"] is not None:
+                command.extend([
+                    "--activation-checkpoint",
+                    "<write replay_inputs.activation_checkpoint>",
+                    "--remote-head", item["remote_head"],
+                ])
+            command.append("--apply")
+            reservations[-1]["continue"]["command"] = command
+            reservation_token = (
+                f"generation:{item['reservation_id']}:"
+                f"{item['reservation_sha256']}"
+            )
+            if reservation_token in prepared_tokens:
+                reservations[-1]["abort"] = {
+                    "available": False,
+                    "reason": (
+                        "authority preparation is durable; replay the exact "
+                        "reservation to finalize after restoring its reviewed state"
+                    ),
+                }
         else:
             reservations[-1]["continue"] = {
                 "available": False,
                 "reason": (
-                    "legacy reservation lacks a reviewed native-root proof; "
+                    "legacy v2/v3 reservation lacks complete replay inputs; "
                     "abort it after writer-death review, then preview a new activation"
                 ),
             }
@@ -182,6 +239,53 @@ def plan_generation_freshness(
             ),
         },
     }
+
+
+def bound_plan_generation_pending(
+    value: dict[str, Any], *, max_bytes: int,
+) -> dict[str, Any]:
+    encoded = _default_output_bytes(value)
+    if len(encoded) <= max_bytes:
+        return value
+    reservations = value.get("pending_generation_reservations") or []
+    deferred = {
+        "original_bytes": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "reservation_count": len(reservations),
+        "reservations_sha256": hashlib.sha256(
+            json.dumps(
+                reservations, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+    bounded = {
+        "resume_authority": "plan_generation_pending",
+        "executable": False,
+        "workstream_id": value.get("workstream_id"),
+        "active_plan_sha256": (value.get("active_source") or {}).get("sha256"),
+        "canonical_live_plan_sha256": (
+            value.get("canonical_live_source") or {}
+        ).get("sha256"),
+        "pending_transition": deferred,
+        "remediation": {
+            "reason": (value.get("remediation") or {}).get("reason"),
+            "command": [
+                "workstreamctl", "resume", value.get("workstream_id"),
+                "--max-bytes", str(max(DEFAULT_RESUME_MAX_BYTES, len(encoded) + 1)),
+            ],
+            "command_role": "display_only_hydration",
+            "execution_rule": (
+                "hydrate this exact digest-bound pending surface; then run its "
+                "generation replay or abort remediation before execution"
+            ),
+        },
+    }
+    if len(_default_output_bytes(bounded)) > max_bytes:
+        raise ResumeError(
+            f"resume_context_over_budget:{len(_default_output_bytes(bounded))}>{max_bytes}"
+        )
+    return bounded
 
 
 def _is_terminal(item: dict[str, Any]) -> bool:
@@ -1151,7 +1255,9 @@ def add_material_history(
                     "Review and disposition quarantined v1 projection events"
                 )
         else:
-            result["root"]["issue_status"] = result["root"].get("status")
+            result["root"].setdefault(
+                "issue_status", result["root"].get("status")
+            )
             result["root"]["status"] = lifecycle["status"]
             result["root"]["closure_receipt"] = lifecycle.get("closure_receipt_sha256")
     return result
@@ -2383,6 +2489,9 @@ def compact_context(
         "root_revision": root["revision"],
         "issue_revision": root.get("issue_revision"),
         "status": root.get("status"),
+        "native_issue_status": root.get("issue_status"),
+        "native_issue_status_type": root.get("issue_status_type"),
+        "generation_execution_status": root.get("generation_execution_status"),
         "next_action": root.get("next_action"),
         "blocker": root.get("blocker"),
         "children": children,
@@ -2653,6 +2762,16 @@ def main() -> int:
             live_graph_snapshot["root"]["generation_authority_origin"] = (
                 generation["authority_origin"]
             )
+            from workstream_generation import selected_generation_execution_status
+            generation_status = selected_generation_execution_status(
+                comments, workstream_id=token,
+                transition_event_id=generation["transition_tip_event_id"],
+                authenticated_route=route,
+            )
+            if generation_status is not None:
+                apply_generation_execution_status(
+                    live_graph_snapshot["root"], generation_status,
+                )
             from workstream_linear_projection import (
                 child_mutation_authorizations_from_comments,
             )
@@ -2756,6 +2875,9 @@ def main() -> int:
                             "status_type"
                         ),
                     }
+                    freshness = bound_plan_generation_pending(
+                        freshness, max_bytes=args.max_bytes,
+                    )
                     sys.stdout.write(_default_output_text(freshness))
                     return 0
             else:

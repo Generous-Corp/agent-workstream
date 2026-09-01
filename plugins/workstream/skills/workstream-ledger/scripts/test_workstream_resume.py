@@ -73,12 +73,17 @@ class ResumeTests(unittest.TestCase):
     def test_pending_generation_reservation_surfaces_exact_replay_or_abort(self):
         canonical, immutable = self.generation_sources()
         reservation = {
+            "schema_version": 4,
             "reservation_id": "wsgr_" + "1" * 32,
             "reservation_sha256": "2" * 64,
             "from_plan_revision": "a" * 64,
             "to_plan_revision": "b" * 64,
             "created_at": "2026-08-31T12:00:00Z",
             "native_root_sha256": "3" * 64,
+            "source": {"identity": immutable, "sha256": "b" * 64},
+            "retirement": {"reviewed": True},
+            "activation_checkpoint": None,
+            "remote_head": None,
         }
         with mock.patch.object(MODULE, "plan_payload", return_value={
             "source": {"identity": canonical, "sha256": "b" * 64},
@@ -99,6 +104,64 @@ class ResumeTests(unittest.TestCase):
         self.assertIn("--abort-reservation-id", pending["abort"]["command"])
         self.assertIn("2026-08-31T12:00:00Z", pending["continue"]["command"])
         self.assertIn("--expected-native-root-sha256", pending["continue"]["command"])
+
+    def test_generation_pending_long_source_route_and_root_stay_under_24k(self):
+        canonical, immutable = self.generation_sources()
+        reservation = {
+            "schema_version": 4,
+            "reservation_id": "wsgr_" + "1" * 32,
+            "reservation_sha256": "2" * 64,
+            "from_plan_revision": "a" * 64,
+            "to_plan_revision": "b" * 64,
+            "created_at": "2026-08-31T12:00:00Z",
+            "native_root_sha256": "3" * 64,
+            "source": {
+                "identity": immutable + "?diagnostic=" + "x" * 30000,
+                "sha256": "b" * 64,
+            },
+            "retirement": {"reviewed": "y" * 30000},
+            "activation_checkpoint": None,
+            "remote_head": None,
+        }
+        with mock.patch.object(MODULE, "plan_payload", return_value={
+            "source": {"identity": canonical, "sha256": "b" * 64},
+        }), mock.patch(
+            "workstream_generation.pending_generation_reservations",
+            return_value=[reservation],
+        ):
+            result = MODULE.plan_generation_freshness(
+                token="GEN-14", description=f"Canonical plan: {canonical}",
+                active_source={"identity": immutable, "sha256": "a" * 64},
+                comments=[], authenticated_route={
+                    "workspace_id": "w" * 30000, "team_id": "t" * 30000,
+                    "project_id": "p" * 30000, "root_issue_id": "r" * 30000,
+                },
+            )
+        result["authenticated_route"] = {"diagnostic": "z" * 30000}
+        result["root"] = {"title": "q" * 30000}
+        bounded = MODULE.bound_plan_generation_pending(
+            result, max_bytes=24 * 1024,
+        )
+        encoded = MODULE._default_output_bytes(bounded)
+        self.assertLessEqual(len(encoded), 24 * 1024)
+        self.assertEqual(bounded["active_plan_sha256"], "a" * 64)
+        self.assertEqual(bounded["canonical_live_plan_sha256"], "b" * 64)
+        self.assertEqual(bounded["pending_transition"]["reservation_count"], 1)
+        self.assertEqual(len(bounded["pending_transition"]["sha256"]), 64)
+
+    def test_gen14_terminal_native_cache_yields_to_finalized_generation_status(self):
+        root = {
+            "identifier": "GEN-14", "status": "Done",
+            "status_type": "completed",
+        }
+        MODULE.apply_generation_execution_status(root, {
+            "authority": "generation_local", "name": "In Progress",
+            "type": "started",
+        })
+        self.assertEqual(root["status"], "In Progress")
+        self.assertEqual(root["status_type"], "started")
+        self.assertEqual(root["issue_status"], "Done")
+        self.assertEqual(root["issue_status_type"], "completed")
 
     def test_zero_multiple_or_different_canonical_plan_refuses_without_fetch(self):
         canonical, immutable = self.generation_sources()

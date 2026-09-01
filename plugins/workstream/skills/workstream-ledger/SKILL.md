@@ -298,11 +298,12 @@ python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_generation.py" \
 The checkpoint must cover the exact current root material revision, name the
 target plan revision, remain pending, and pass the standard 24 KiB resume
 budget; custom resume budgets are refused for this form. The target disposition
-may be prepared first, but the checkpoint is inert until the authenticated
-generation transition is appended last. That same transition becomes its
-remote acknowledgement. A crash before the transition leaves the predecessor
-authoritative; exact replay converges without a second checkpoint or control
-event. Only checkpoints carried by the uniquely selected authenticated
+may be prepared first, but the checkpoint remains inert through the
+authenticated transition preparation. A separate deterministic finalization
+selects that transition and becomes its remote acknowledgement. A crash before
+finalization leaves the predecessor authoritative; exact replay converges
+without a second checkpoint, reservation, or transition. Only checkpoints
+carried by the uniquely selected authenticated
 generation chain are reduced. A forged, forked, off-chain, conflicting, or
 duplicate physical copy fails closed.
 Keep the pending checkpoint file until the command returns its successful
@@ -316,10 +317,16 @@ items unless matching `--max-bytes` / `--max-items` values are supplied. The
 strict check validates complete history but emits the normal compact-validated
 resume surface; it does not require a full-history output artifact. It
 binds the actual material, checkpoint, issue-graph, and projection frontiers.
-Mutation order is fixed: reserve the
-shared material/checkpoint boundary, append the target candidate seal, reread
-and strictly validate, then append the predecessor activation last. Competing
-candidates use the same route/root boundary slot. Material and checkpoint
+Mutation order is fixed: reserve the shared material/checkpoint boundary,
+append the target candidate seal, reread and strictly validate, append an inert
+predecessor-side transition preparation, then refetch the candidate, reviewed
+native root, and canonical source before a separate deterministic finalization
+changes authority. That finalization carries generation-local `In Progress`
+status; ordinary resume prefers it over mutable native issue status while
+retaining the native observation for reconciliation and closure. A crash or
+mismatch after preparation leaves the predecessor authoritative and the exact
+reservation replayable. Competing candidates use the same route/root boundary
+slot. Material and checkpoint
 writers cannot pass a pending reservation. Old runtimes which try to route
 around that occupied slot through deterministic collision successors are
 quarantined from both reduced frontiers; upgraded active writers use the
@@ -329,19 +336,25 @@ Quarantined legacy ledger writes remain non-authoritative, but resume and
 generation receipts surface their stable count and digest for diagnosis;
 upgraded active-generation writes are not counted. After activation, the active
 target may evolve normally; its sealed prefix remains the activation proof. The
-CLI performs another authenticated strict
-full-resume read of the actual active generation after authority changes before
-reporting success. A same-generation bound/live graph or candidate digest
-mismatch refuses with `authority_changed_with_post_read_drift`; authority has
-already changed and the command does not claim rollback or cross-resource
-atomicity. An exact historical replay returns the original receipt without
+CLI performs another authenticated strict read of the actual active generation
+after authority changes before reporting success. It also refetches the
+canonical source after finalization, so a mutable-ref change during the write
+is never reported as success and ordinary resume remains non-executable on the
+resulting digest drift. A same-generation bound/live graph or candidate digest
+mismatch refuses with `authority_changed_with_post_read_drift`; the command
+does not claim cross-resource atomicity with Git or mutable Linear issue
+fields. An exact historical replay returns the original receipt without
 writing even after later successors, then validates and reports the current
 active successor rather than forcing the historical target.
 
 The retirement proof is not a boolean. It names the predecessor plan, writer
 epoch, complete provenance and checkpoint event-ID sets, retirement time, and
 its canonical declaration digest. A partial operation remains durably
-recoverable from its exact reservation. If review decides it must not continue,
+recoverable from its exact reservation, which stores source identity/digest,
+retirement declaration, activation checkpoint, remote head, and reviewed
+native-root digest. Once transition preparation exists the reservation is
+replay-only because aborting it would strand prepared authority. Before
+preparation, if review decides it must not continue,
 use the `activate` command's exact `--abort-reservation-id`,
 `--abort-reservation-sha256`, and `--abort-reason` form; abort releases only
 that reservation and never changes generation authority. Abort is a validated,
