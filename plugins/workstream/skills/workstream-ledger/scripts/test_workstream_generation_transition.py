@@ -11,10 +11,13 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import workstream_projection
+import workstream_generation
 
 from workstream_delta import Delta
 from workstream_generation import (
     GenerationTransport, WorkstreamGenerationError, _digest,
+    _gen14_legacy_split_head_prefix,
+    _gen14_recorded_repair_head,
     build_retirement_proof, generation_quarantine_metadata, main, parser,
     prepare_generation_operator_contract,
     validate_activation_operator_contract,
@@ -320,6 +323,168 @@ class ActivationCheckpointLoader(Loader):
 
 
 class GenerationTransitionTests(unittest.TestCase):
+    def test_gen14_legacy_split_producer_accepts_only_captured_prefix(self):
+        from types import SimpleNamespace
+        plan, frontier = "e" * 64, "f" * 64
+        old_disposition_head, old_scope_head = "a" * 40, "b" * 40
+        prefix_time = "2030-01-01T00:00:00Z"
+        scope_value = {
+            "primary_repository": "github.com:id:R_synthetic",
+            "repositories": [{"provider_repository_id": "R_synthetic",
+                              "slug": "github.com/acme/synthetic",
+                              "exact_head": old_scope_head, "aliases": [],
+                              "evidence": [], "identity_updates": [],
+                              "identity_resolution": {
+                                  "provider_repository_id": "R_synthetic",
+                                  "resolved_slug": "github.com/acme/synthetic",
+                                  "observed_at": prefix_time,
+                                  "evidence": [{"authenticated": True,
+                                      "kind": "authenticated_provider_readback",
+                                      "provider_repository_id": "R_synthetic",
+                                      "resolved_slug": "github.com/acme/synthetic"}],
+                              }}],
+            "child_ownership": {}, "linear": deepcopy(AUTHORITY),
+            "namespace": "synthetic",
+        }
+        values = [
+            {"slice_id": key, "owning_child": child,
+             "predecessor_closure_authority": {
+                "input_frontier_sha256": frontier,
+            }} for key, child in (("one", "GEN-1"), ("two", "GEN-2"))
+        ] + [
+            {"agent": "synthetic", "machine": "test", "session_id": "session"},
+            {"identity": "https://example.test/plan", "sha256": plan},
+            {"disposition": "create_successor",
+             "remote_head": old_disposition_head,
+             "recovered_from_checkpoint": None},
+            scope_value,
+        ]
+        identities = [
+            ("evidence_contract", "one"), ("evidence_contract", "two"),
+            ("provenance", "synthetic"), ("source", "root"),
+            ("disposition", "root"), ("scope", "root"),
+        ]
+        events = [build_projection_event(
+            workstream_id="GEN-14", kind=kind, key=key, value=value,
+            plan_revision=plan, expected_revision=index,
+            created_at=prefix_time, authority=AUTHORITY,
+        ) for index, ((kind, key), value) in enumerate(zip(identities, values))]
+        original_digest = workstream_generation.GEN14_LEGACY_SPLIT_PREFIX_SHA256
+        workstream_generation.GEN14_LEGACY_SPLIT_PREFIX_SHA256 = (
+            workstream_projection.canonical_digest(events)
+        )
+        self.addCleanup(
+            setattr, workstream_generation, "GEN14_LEGACY_SPLIT_PREFIX_SHA256",
+            original_digest,
+        )
+        state = SimpleNamespace(revision=6, events=events)
+        fresh_head = "c" * 40
+        self.assertTrue(_gen14_legacy_split_head_prefix(
+            state, workstream_id="GEN-14",
+            target_plan=plan, input_frontier_sha256=frontier,
+            remote_head=fresh_head,
+        ))
+        desired_scope = deepcopy(events[5]["value"])
+        next(
+            repository for repository in desired_scope["repositories"]
+            if repository["provider_repository_id"] == "R_synthetic"
+        )["exact_head"] = fresh_head
+        repair_time = "2026-09-01T10:00:00Z"
+        disposition = build_projection_event(
+            workstream_id="GEN-14", kind="disposition", key="root",
+            value={"disposition": "create_successor",
+                   "remote_head": fresh_head,
+                   "recovered_from_checkpoint": None},
+            plan_revision=events[0]["plan_revision"], expected_revision=6,
+            created_at=repair_time, supersedes_event_id=events[4]["event_id"],
+            authority=events[0]["authority"],
+        )
+        scope = build_projection_event(
+            workstream_id="GEN-14", kind="scope", key="root",
+            value=desired_scope, plan_revision=events[0]["plan_revision"],
+            expected_revision=7, created_at=repair_time,
+            supersedes_event_id=events[5]["event_id"],
+            authority=events[0]["authority"],
+        )
+        for tail in ([disposition], [disposition, scope]):
+            self.assertTrue(_gen14_legacy_split_head_prefix(
+                SimpleNamespace(revision=6 + len(tail), events=[*events, *tail]),
+                workstream_id="GEN-14", target_plan=plan,
+                input_frontier_sha256=frontier, remote_head=fresh_head,
+            ))
+        later_head = "d" * 40
+        later_disposition = build_projection_event(
+            workstream_id="GEN-14", kind="disposition", key="root",
+            value={"disposition": "create_successor", "remote_head": later_head,
+                   "recovered_from_checkpoint": None},
+            plan_revision=plan, expected_revision=8,
+            created_at="2030-01-01T02:00:00Z",
+            supersedes_event_id=disposition["event_id"], authority=AUTHORITY,
+        )
+        later_scope_value = deepcopy(desired_scope)
+        next(item for item in later_scope_value["repositories"]
+             if item["provider_repository_id"] == "R_synthetic"
+             )["exact_head"] = later_head
+        later_scope = build_projection_event(
+            workstream_id="GEN-14", kind="scope", key="root",
+            value=later_scope_value, plan_revision=plan, expected_revision=9,
+            created_at="2030-01-01T02:00:00Z",
+            supersedes_event_id=scope["event_id"], authority=AUTHORITY,
+        )
+        for later_tail in ([later_disposition], [later_disposition, later_scope]):
+            self.assertTrue(_gen14_legacy_split_head_prefix(
+                SimpleNamespace(
+                    revision=8 + len(later_tail),
+                    events=[*events, disposition, scope, *later_tail],
+                ),
+                workstream_id="GEN-14", target_plan=plan,
+                input_frontier_sha256=frontier, remote_head=fresh_head,
+            ))
+        newer_main = "d" * 40
+        self.assertEqual(
+            _gen14_recorded_repair_head(
+                SimpleNamespace(revision=7, events=[*events, disposition]),
+                newer_main, workstream_id="GEN-14", target_plan=plan,
+                input_frontier_sha256=frontier,
+            ),
+            fresh_head,
+        )
+        mutations = {
+            "arbitrary_pair": (5, "event_id", "wsp_" + "f" * 32),
+            "wrong_order": (4, "expected_revision", 5),
+            "superseded": (4, "supersedes_event_id", "wsp_" + "e" * 32),
+            "noncanonical_disposition": (
+                4, "value", {"disposition": "attach", "remote_head": "a" * 40,
+                             "recovered_from_checkpoint": None},
+            ),
+        }
+        for name, (index, field, value) in mutations.items():
+            with self.subTest(name=name):
+                changed = deepcopy(events)
+                changed[index][field] = value
+                self.assertFalse(_gen14_legacy_split_head_prefix(
+                    SimpleNamespace(revision=6, events=changed),
+                    workstream_id="GEN-14",
+                    target_plan=plan, input_frontier_sha256=frontier,
+                    remote_head=fresh_head,
+                ))
+        self.assertEqual(_gen14_recorded_repair_head(
+            SimpleNamespace(revision=7, events=[*events, disposition]),
+            newer_main, workstream_id="GEN-99", target_plan=plan,
+            input_frontier_sha256=frontier,
+        ), newer_main)
+        for workstream_id, candidate_plan, candidate_frontier in (
+            ("GEN-99", plan, frontier),
+            ("GEN-14", "9" * 64, frontier),
+            ("GEN-14", plan, "8" * 64),
+        ):
+            self.assertFalse(_gen14_legacy_split_head_prefix(
+                state, workstream_id=workstream_id,
+                target_plan=candidate_plan,
+                input_frontier_sha256=candidate_frontier,
+                remote_head=fresh_head,
+            ))
+
     def setUp(self):
         self.client = FakeClient()
         project_full(self.client, OLD)
