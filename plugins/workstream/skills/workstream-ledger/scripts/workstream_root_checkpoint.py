@@ -226,6 +226,11 @@ def _prepare(args: argparse.Namespace, client: Any, route: dict[str, str]):
             event_id for event_id in frontier_before
             if event_id != latest_record["event_id"]
         ]
+    elif latest is not None and latest["root_revision"] >= material.revision:
+        # The selected activation already covers this frontier.  Refuse during
+        # preview; persist() would otherwise discover the same non-monotonic
+        # condition only after its second read.
+        raise LinearTransportError("checkpoint_successor_revision_not_monotonic")
     disposition = projection.snapshot.get("disposition") or {}
     disposition_head = disposition.get("remote_head")
     if args.exact_head is not None and disposition_head not in {
@@ -391,7 +396,8 @@ def _partial_apply_error(
 
 def _ordinary_resume(
     token: str, *, args: argparse.Namespace, route: dict[str, str],
-    source: dict[str, str],
+    source: dict[str, str], expected_checkpoint: dict[str, Any] | None = None,
+    expected_remote_id: str | None = None,
 ) -> dict[str, Any]:
     command = [
         sys.executable, str(Path(__file__).with_name("workstream_resume.py")),
@@ -421,15 +427,39 @@ def _ordinary_resume(
         value.get("resume_authority") != "full"
         or value.get("workstream_id") != token
         or value.get("plan_revision") != source["sha256"]
-        or value.get("source") != source
-        or value.get("authenticated_route") != route
         or len(result.stdout.encode()) > 24 * 1024
-        or not isinstance(value.get("dependency_graph"), dict)
-        or value["dependency_graph"].get("route") != route
-        or value["dependency_graph"].get("plan_revision") != source["sha256"]
         or value.get("plan_generation_pending") is not None
     ):
         raise LinearTransportError("checkpoint_ordinary_resume_not_bounded_full")
+    dependency_graph = value.get("dependency_graph")
+    if isinstance(dependency_graph, dict):
+        if (value.get("source") != source
+                or value.get("authenticated_route") != route
+                or dependency_graph.get("route") != route
+                or dependency_graph.get("plan_revision") != source["sha256"]):
+            raise LinearTransportError("checkpoint_ordinary_resume_not_bounded_full")
+    else:
+        schema = value.get("context_schema") or {}
+        frontier = value.get("execution_frontier")
+        checkpoint = frontier.get("checkpoint") if isinstance(frontier, dict) else None
+        if (schema.get("envelope") != "fixed_frontier_authority_v1"
+                or value.get("authenticated_source") != source
+                or value.get("authenticated_route") != route
+                or not isinstance(frontier, dict)
+                or not isinstance(checkpoint, dict)
+                or checkpoint.get("workstream_id") != token
+                or checkpoint.get("plan_revision") != source["sha256"]
+                or not isinstance(checkpoint.get("root_revision"), int)
+                or not isinstance(checkpoint.get("checkpoint_event_id"), str)):
+            raise LinearTransportError("checkpoint_ordinary_resume_not_bounded_full")
+        if expected_checkpoint is not None:
+            expected_ack = expected_checkpoint.get("acknowledgement") or {}
+            compact_ack = checkpoint.get("acknowledgement") or {}
+            if (checkpoint.get("checkpoint_event_id") != expected_checkpoint.get("event_id")
+                    or checkpoint.get("root_revision") != expected_checkpoint.get("root_revision")
+                    or compact_ack.get("remote_id")
+                    != (expected_remote_id or expected_ack.get("remote_id"))):
+                raise LinearTransportError("checkpoint_ordinary_resume_checkpoint_mismatch")
     return value
 
 
@@ -586,7 +616,8 @@ def run(
     try:
         resume = _ordinary_resume(
             preview["workstream_id"], args=args, route=route,
-            source=preview["source"],
+            source=preview["source"], expected_checkpoint=preview["checkpoint"],
+            expected_remote_id=receipt["acknowledgement"]["remote_id"],
         )
     except (LinearTransportError, OSError, TimeoutError) as error:
         raise _partial_apply_error(

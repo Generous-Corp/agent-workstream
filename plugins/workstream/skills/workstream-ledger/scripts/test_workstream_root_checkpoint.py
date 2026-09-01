@@ -555,6 +555,45 @@ class RootCheckpointTests(unittest.TestCase):
                 "GEN-14", args=args, route=route, source=source,
             )
 
+    def test_ordinary_resume_accepts_bound_fixed_frontier_checkpoint(self):
+        route = fixture.AUTHORITY
+        source = {"identity": "/tmp/plan.md", "sha256": "b" * 64}
+        args = checkpoint_cli.parser().parse_args([
+            "GEN-37", "--created-at", "2026-09-01T06:30:00Z", "--agent", "codex",
+            "--provider", "openai", "--session-id", "s", "--machine", "M5",
+            "--worktree-state", "safe", "--before-status", "In Progress",
+            "--after-status", "In Progress", "--next-action", "Continue",
+        ])
+        expected = {"event_id": "cp-1", "root_revision": 58}
+        payload = {
+            "context_schema": {"envelope": "fixed_frontier_authority_v1"},
+            "resume_authority": "full", "workstream_id": "GEN-37",
+            "plan_revision": source["sha256"], "authenticated_source": source,
+            "authenticated_route": route,
+            "execution_frontier": {"checkpoint": {
+                "workstream_id": "GEN-37", "checkpoint_event_id": "cp-1",
+                "root_revision": 58, "plan_revision": source["sha256"],
+                "acknowledgement": {"remote_id": "remote-cp-1"},
+            }},
+        }
+        completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(payload), stderr="")
+        with patch.object(checkpoint_cli.subprocess, "run", return_value=completed):
+            self.assertEqual(
+                checkpoint_cli._ordinary_resume(
+                    "GEN-37", args=args, route=route, source=source,
+                    expected_checkpoint=expected, expected_remote_id="remote-cp-1",
+                ), payload,
+            )
+        payload["execution_frontier"]["checkpoint"]["root_revision"] = 57
+        completed.stdout = json.dumps(payload)
+        with patch.object(checkpoint_cli.subprocess, "run", return_value=completed), self.assertRaisesRegex(
+            Exception, "checkpoint_mismatch",
+        ):
+            checkpoint_cli._ordinary_resume(
+                "GEN-37", args=args, route=route, source=source,
+                expected_checkpoint=expected, expected_remote_id="remote-cp-1",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
