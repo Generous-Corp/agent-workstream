@@ -28,12 +28,21 @@ from workstream_linear import (
     parse_plan_revision, validate_issue_route,
 )
 from workstream_config import load_linear_api_key
+from workstream_child_closure import (
+    canonical_digest, evidence_receipts_sha256, terminal_child_readback,
+    ChildClosureError,
+)
+from workstream_evidence import evidence_errors
 from workstream_linear_events import LinearCommentEventAdapter, reduce_event_comments
 from workstream_linear_projection import (
     dependency_material_frontier_sha256, LinearProjectionAdapter,
     LinearProjectionError, reduce_projection_comments, select_plan_generation,
+    TOMBSTONE,
 )
-from workstream_scope import ScopeError, validate_scope
+from workstream_projection_history import (
+    closure_bound_historical_evidence, ProjectionHistoryError,
+)
+from workstream_scope import repository_key as scope_repository_key, ScopeError, validate_scope
 
 
 ISSUE_TOKEN = re.compile(r"[A-Z][A-Z0-9]*-\d+")
@@ -1122,10 +1131,24 @@ class LinearChildDependencyAdapter:
             expected_ids = set(live_by_id)
         else:
             scope = projection.snapshot.get("scope")
-            target_ids = {
-                issue_id for issue_id, child in live_by_id.items()
-                if parse_plan_revision(child.get("description")) == self.plan_revision
-            }
+            target_ids: set[str] = set()
+            for issue_id, child in live_by_id.items():
+                native_plan_revision = parse_plan_revision(child.get("description"))
+                identity = {
+                    "issue_id": issue_id,
+                    "identifier": str(child.get("identifier", "")).upper(),
+                }
+                if (
+                    native_plan_revision == self.plan_revision
+                    or (
+                        native_plan_revision is None
+                        and self._legacy_terminal_child_is_projected(
+                            child, identity, projection=projection,
+                            generation=generation,
+                        )
+                    )
+                ):
+                    target_ids.add(issue_id)
             if scope is None and not target_ids:
                 # Rolling upgrade: an inactive, not-yet-projected generation
                 # cannot own predecessor children and therefore authenticates
@@ -1175,12 +1198,178 @@ class LinearChildDependencyAdapter:
                 raise ChildDependencyError(
                     f"owned_child_identity_mismatch:{identity['identifier']}"
                 )
-            if parse_plan_revision(child.get("description")) != self.plan_revision:
+            native_plan_revision = parse_plan_revision(child.get("description"))
+            if (
+                native_plan_revision != self.plan_revision
+                and not (
+                    native_plan_revision is None
+                    and self._legacy_terminal_child_is_projected(
+                        child, identity, projection=projection,
+                        generation=generation,
+                    )
+                )
+            ):
                 raise ChildDependencyError(
                     f"owned_child_plan_revision_mismatch:{identity['identifier']}"
                 )
             result[identity["issue_id"]] = identity
         return result
+
+    def _legacy_terminal_child_is_projected(
+        self, child: dict[str, Any], identity: dict[str, str], *, projection: Any,
+        generation: dict[str, Any],
+    ) -> bool:
+        """Authenticate one description-less terminal child during rolling upgrade.
+
+        Native descriptions remain mandatory for active children.  A legacy
+        completed child may instead be bound by the selected generation's
+        append-only closure and evidence heads, but only when those heads match
+        the exact current Linear readback and configured ownership route.
+        """
+        state = child.get("state")
+        if isinstance(state, dict):
+            normalized = {
+                **child,
+                "state_id": state.get("id"),
+                "status": state.get("name") or state.get("type"),
+                "status_type": state.get("type"),
+            }
+        else:
+            normalized = child
+        if str(normalized.get("status_type", "")).lower() != "completed":
+            return False
+        if generation.get("plan_revision") != self.plan_revision:
+            return False
+        snapshot = getattr(projection, "snapshot", None)
+        events = getattr(projection, "events", None)
+        if not isinstance(snapshot, dict) or not isinstance(events, (list, tuple)):
+            return False
+        scope = snapshot.get("scope")
+        closures = snapshot.get("child_closures")
+        if not isinstance(scope, dict) or not isinstance(closures, list):
+            return False
+        try:
+            closure_bound_historical_evidence(
+                list(events), scope, snapshot.get("projection_history"),
+                selected_transition_tip_event_id=generation.get(
+                    "transition_tip_event_id"
+                ),
+            )
+        except ProjectionHistoryError:
+            return False
+        route = scope.get("linear")
+        if not isinstance(route, dict) or any(
+            route.get(field) != self.authority[field]
+            for field in ("workspace_id", "team_id", "project_id", "root_issue_id")
+        ):
+            return False
+        closure_matches = [
+            value for value in closures
+            if isinstance(value, dict)
+            and str(value.get("child_identifier", "")).upper()
+            == identity["identifier"]
+            and value.get("child_issue_id") == identity["issue_id"]
+        ]
+        if len(closure_matches) != 1:
+            return False
+        closure = closure_matches[0]
+        if (
+            closure.get("plan_revision") != self.plan_revision
+            or closure.get("parent_issue_id") != self.authority["root_issue_id"]
+            or any(
+                closure.get(field) != self.authority[field]
+                for field in ("workspace_id", "team_id", "project_id")
+            )
+        ):
+            return False
+        repository_key = closure.get("repository_key")
+        ownership = scope.get("child_ownership")
+        repositories = scope.get("repositories")
+        try:
+            scoped_repositories = (
+                {scope_repository_key(repository) for repository in repositories}
+                if isinstance(repositories, list) else set()
+            )
+        except ScopeError:
+            return False
+        if (
+            not isinstance(repository_key, str) or not repository_key
+            or not isinstance(ownership, dict)
+            or ownership.get(identity["identifier"]) != repository_key
+            or repository_key not in scoped_repositories
+        ):
+            return False
+        try:
+            readback = terminal_child_readback(normalized)
+        except ChildClosureError:
+            return False
+        if (
+            any(closure.get(field) != value for field, value in readback.items())
+            or closure.get("child_readback_sha256") != canonical_digest(readback)
+        ):
+            return False
+
+        active: dict[tuple[str, str], dict[str, Any]] = {}
+        for event in events:
+            if not isinstance(event, dict):
+                return False
+            kind = event.get("kind")
+            key = event.get("key")
+            if not isinstance(kind, str) or not isinstance(key, str):
+                return False
+            identity_key = (kind, key)
+            if event.get("value") == TOMBSTONE:
+                active.pop(identity_key, None)
+            else:
+                active[identity_key] = event
+        closure_event = active.get(("child_closure", identity["identifier"]))
+        if (
+            not isinstance(closure_event, dict)
+            or closure_event.get("plan_revision") != self.plan_revision
+            or closure_event.get("value") != closure
+        ):
+            return False
+        evidence_heads = closure.get("evidence_heads")
+        if not isinstance(evidence_heads, list) or not evidence_heads:
+            return False
+        current_evidence_heads = sorted(
+            [
+                {
+                    "key": key,
+                    "event_id": event.get("event_id"),
+                    "value_sha256": canonical_digest(event.get("value")),
+                }
+                for (kind, key), event in active.items()
+                if kind == "evidence_contract"
+                and isinstance(event.get("value"), dict)
+                and event["value"].get("owning_child") == identity["identifier"]
+            ],
+            key=lambda head: (head["key"], str(head["event_id"])),
+        )
+        if evidence_heads != current_evidence_heads:
+            return False
+        contracts: list[dict[str, Any]] = []
+        for head in evidence_heads:
+            if not isinstance(head, dict):
+                return False
+            event = active.get(("evidence_contract", head.get("key")))
+            value = event.get("value") if isinstance(event, dict) else None
+            if (
+                not isinstance(value, dict)
+                or event.get("event_id") != head.get("event_id")
+                or canonical_digest(value) != head.get("value_sha256")
+                or value.get("owning_child") != identity["identifier"]
+                or value.get("plan_revision") != self.plan_revision
+                or value.get("repository_key") != repository_key
+                or value.get("exact_head") != closure.get("exact_head")
+                or evidence_errors(value)
+            ):
+                return False
+            contracts.append(value)
+        return (
+            evidence_receipts_sha256(contracts)
+            == closure.get("evidence_receipts_sha256")
+        )
 
     def _relation_connection(
         self, identity: dict[str, str], *, inverse: bool,
