@@ -814,15 +814,21 @@ head, receipts, owner, and repository remain immutable. The carry proof is
 persisted on the new evidence event, so the later closure repair and ordinary
 resume can revalidate it against the predecessor history. Missing, ambiguous,
 mutated, unclosed, late, or frontier-drifted evidence refuses before mutation.
-When the reviewed seed also advances the primary repository head, every seed
-must belong to that primary repository and bind the new head. The manifest
-records the exact predecessor/new heads, computed disposition, checkpoint
+When the reviewed seed also advances the primary repository head, a seed owned
+by that primary repository follows the primary transition contract. A seed
+owned by another participating repository is allowed only through the reviewed
+predecessor binding and its recomputed per-contract closure authority, and only
+when its ownership, complete repository record and exact head remain
+byte-for-byte unchanged and its evidence remains bound to that exact owner and
+head. An unbound non-primary seed refuses. The manifest records
+the exact predecessor/new primary heads, computed disposition, checkpoint
 identity, and issue/material/checkpoint frontier. The writer fences that
 frontier before every append and commits in evidence, disposition, scope order,
-with scope last. Existing closed-child evidence may retain an older head only
-when immutable projection order proves the complete evidence set and scope were
-valid when its closure was appended; open or unclosed evidence always remains
-bound to the current head.
+with scope last. Existing closed-child evidence may retain an older primary
+head only when immutable projection order proves the complete evidence set and
+scope were valid when its closure was appended; non-primary evidence remains
+bound to its unchanged repository head, and open or unclosed evidence always
+remains bound to the current head.
 
 An exact replay is a no-op. An incomplete multi-child batch, missing/failed
 receipts, multiple owners or heads,

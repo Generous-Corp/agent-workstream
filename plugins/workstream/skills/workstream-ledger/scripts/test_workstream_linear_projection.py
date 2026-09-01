@@ -1077,8 +1077,23 @@ class ProjectionTests(unittest.TestCase):
             plan_revision=predecessor_plan, **AUTHORITY,
         )
         predecessor_scope = scope()
+        pulp_repository = deepcopy(predecessor_scope["repositories"][0])
+        pulp_repository.update({
+            "slug": "github.com/generous-corp/pulp",
+            "provider_repository_id": "R_pulp",
+            "exact_head": "9" * 40,
+        })
+        pulp_repository["identity_resolution"].update({
+            "provider_repository_id": "R_pulp",
+            "resolved_slug": "github.com/generous-corp/pulp",
+        })
+        pulp_repository["identity_resolution"]["evidence"][0].update({
+            "provider_repository_id": "R_pulp",
+            "resolved_slug": "github.com/generous-corp/pulp",
+        })
+        predecessor_scope["repositories"].append(pulp_repository)
         predecessor_scope["child_ownership"] = {
-            "GEN-70": predecessor_scope["primary_repository"],
+            "GEN-70": "github.com:id:R_pulp",
         }
 
         def append(kind, key, value):
@@ -1103,7 +1118,16 @@ class ProjectionTests(unittest.TestCase):
         contract.update({
             "slice_id": "gen-70-terminal-receipts-v1",
             "owning_child": "GEN-70", "plan_revision": predecessor_plan,
+            "repository": pulp_repository["slug"],
+            "repository_key": "github.com:id:R_pulp",
+            "exact_head": pulp_repository["exact_head"],
         })
+        for layer in contract["layers"].values():
+            for receipt in layer.get("receipts", []):
+                receipt.update({
+                    "repository_key": "github.com:id:R_pulp",
+                    "exact_head": pulp_repository["exact_head"],
+                })
         append("evidence_contract", contract["slice_id"], contract)
         evidence_event = predecessor.state().events[-1]
         readback = terminal_child_readback(child)
@@ -1111,7 +1135,7 @@ class ProjectionTests(unittest.TestCase):
             "schema_version": 2, **readback,
             "plan_revision": predecessor_plan,
             "repository_key": contract["repository_key"],
-            "exact_head": HEAD,
+            "exact_head": contract["exact_head"],
             "evidence_heads": [{
                 "key": evidence_event["key"],
                 "event_id": evidence_event["event_id"],
@@ -1215,6 +1239,310 @@ class ProjectionTests(unittest.TestCase):
             comments=client.comments,
         )
         self.assertEqual(normalized, manifest)
+
+        with mock.patch.object(
+            workstream_projection, "choose_disposition",
+            return_value={
+                "disposition": "create_successor",
+                "recovered_from_checkpoint": None,
+            },
+        ):
+            preview, unresolved = load_material_history_for_projection_reconcile(
+                projection_graph, client.comments, "GEN-37", normalized, target,
+                authenticated_route=AUTHORITY,
+                authenticated_source={
+                    "identity": "https://example.test/new-plan", "sha256": PLAN,
+                },
+                remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        readbacks = {
+            seed["child_identifier"]: seed["expected_child_readback_sha256"]
+            for seed in manifest["terminal_child_evidence_seeds"]
+        }
+        with mock.patch.object(
+            workstream_projection, "projection_disposition_value",
+            return_value={
+                "disposition": "create_successor", "remote_head": HEAD,
+                "recovered_from_checkpoint": None,
+            },
+        ):
+            reconcile_required_projection(
+                target, preview, normalized, remote_head=HEAD,
+                created_at="2026-09-01T07:48:00Z",
+                authenticated_source={
+                    "identity": "https://example.test/new-plan", "sha256": PLAN,
+                },
+                relation_target_resolver=self.relation_target_resolver,
+                terminal_child_fence=lambda child_ids: {
+                    child_id: readbacks[child_id] for child_id in child_ids
+                },
+                projection_input_fence=lambda: manifest[
+                    "terminal_child_evidence_seed_predecessor"
+                ]["input_frontier_sha256"],
+                checkpoint_fence=lambda: None,
+                projection_comments=client.comments,
+                projection_input_snapshot=projection_graph,
+                legacy_unresolved_relation_heads=unresolved,
+            )
+        successor_head = "f" * 40
+        with mock.patch.object(
+            workstream_projection, "projection_disposition_value",
+            return_value={
+                "disposition": "create_successor",
+                "remote_head": successor_head,
+                "recovered_from_checkpoint": None,
+            },
+        ):
+            successor = prepare_generation_operator_contract(
+                comments=deepcopy(client.comments), graph=deepcopy(raw_graph),
+                workstream_id="GEN-37", authority=AUTHORITY,
+                description_plan_revision=predecessor_plan,
+                target_source={
+                    "identity": "https://example.test/new-plan", "sha256": PLAN,
+                },
+                created_at="2026-09-01T07:49:00Z", remote_head=successor_head,
+                started_state={
+                    "id": "started", "name": "In Progress",
+                    "type": "started", "team_id": "team",
+                },
+            )
+        successor_manifest = successor["projection_preview"]["manifest"]
+        self.assertIn(
+            "terminal_child_evidence_seed_head_transition", successor_manifest,
+        )
+        successor_scope = next(
+            item["value"] for item in successor_manifest["projection"]
+            if (item["kind"], item["key"]) == ("scope", "root")
+        )
+        self.assertEqual(
+            next(
+                repository for repository in successor_scope["repositories"]
+                if repository_key(repository) == "github.com:id:R_pulp"
+            ),
+            pulp_repository,
+        )
+        self.assertEqual(
+            successor_scope["child_ownership"],
+            predecessor_scope["child_ownership"],
+        )
+
+        successor_graph = workstream_projection.bind_projection_plan_generation(
+            deepcopy(raw_graph), client.comments, workstream_id="GEN-37",
+            requested_plan_revision=PLAN, authenticated_route=AUTHORITY,
+        )
+        successor_graph = add_live_child_material_history(
+            successor_graph, authenticated_route=AUTHORITY,
+            root_comments=client.comments,
+            proposal_plan_revision=predecessor_plan,
+        )
+        writes_before_negatives = len(client.comments)
+
+        def successor_seed(candidate):
+            return prepare_terminal_child_evidence_seeds(
+                candidate, successor_graph, target.state(),
+                remote_head=successor_head, comments=client.comments,
+            )
+
+        missing_binding = deepcopy(successor_manifest)
+        missing_binding.pop("terminal_child_evidence_seed_predecessor")
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_evidence_seed_nonprimary_predecessor_required:GEN-70",
+        ):
+            successor_seed(missing_binding)
+
+        owner_substitution = deepcopy(successor_manifest)
+        next(
+            item for item in owner_substitution["projection"]
+            if (item["kind"], item["key"]) == ("scope", "root")
+        )["value"]["child_ownership"]["GEN-70"] = (
+            predecessor_scope["primary_repository"]
+        )
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "closure_history_repository_mismatch:GEN-70",
+        ):
+            successor_seed(owner_substitution)
+
+        for field, value in (
+            ("repository_key", predecessor_scope["primary_repository"]),
+            ("exact_head", "8" * 40),
+        ):
+            with self.subTest(contract_substitution=field):
+                changed = deepcopy(successor_manifest)
+                next(
+                    item for item in changed["projection"]
+                    if item["kind"] == "evidence_contract"
+                )["value"][field] = value
+                with self.assertRaisesRegex(
+                    LinearProjectionError,
+                    "terminal_seed_predecessor_contract_mutated:GEN-70",
+                ):
+                    successor_seed(changed)
+
+        closure_digest = deepcopy(successor_manifest)
+        closure_digest["terminal_child_evidence_seed_predecessor"][
+            "evidence_heads"
+        ][0]["closure_value_sha256"] = "0" * 64
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_seed_predecessor_binding_changed_reload_required",
+        ):
+            successor_seed(closure_digest)
+
+        future_secondary = deepcopy(successor_manifest)
+        future_scope = next(
+            item["value"] for item in future_secondary["projection"]
+            if (item["kind"], item["key"]) == ("scope", "root")
+        )
+        next(
+            repository for repository in future_scope["repositories"]
+            if repository_key(repository) == "github.com:id:R_pulp"
+        )["exact_head"] = "6" * 40
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_evidence_seed_scope_head_only_required",
+        ):
+            successor_seed(future_secondary)
+        self.assertEqual(len(client.comments), writes_before_negatives)
+
+        base_comments = deepcopy(client.comments)
+        source = {
+            "identity": "https://example.test/new-plan", "sha256": PLAN,
+        }
+
+        def transition_case():
+            transition_client = FakeProjectionClient()
+            transition_client.comments = deepcopy(base_comments)
+            transition_adapter = LinearProjectionAdapter(
+                transition_client, issue_id="GEN-37", workstream_id="GEN-37",
+                plan_revision=PLAN, **AUTHORITY,
+            )
+            return transition_client, transition_adapter
+
+        def apply_transition(
+            transition_client, transition_adapter, *, interrupt_after=None,
+        ):
+            graph = workstream_projection.bind_projection_plan_generation(
+                deepcopy(raw_graph), transition_client.comments,
+                workstream_id="GEN-37", requested_plan_revision=PLAN,
+                authenticated_route=AUTHORITY,
+            )
+            graph = add_live_child_material_history(
+                graph, authenticated_route=AUTHORITY,
+                root_comments=transition_client.comments,
+                proposal_plan_revision=predecessor_plan,
+            )
+            reviewed = prepare_terminal_child_evidence_seeds(
+                successor_manifest, graph, transition_adapter.state(),
+                remote_head=successor_head,
+                comments=transition_client.comments,
+            )
+            disposition_value = reviewed[
+                "terminal_child_evidence_seed_head_transition"
+            ]["disposition"]
+            with mock.patch.object(
+                workstream_projection, "choose_disposition",
+                return_value={
+                    "disposition": disposition_value["disposition"],
+                    "recovered_from_checkpoint": disposition_value[
+                        "recovered_from_checkpoint"
+                    ],
+                },
+            ):
+                preview, unresolved = load_material_history_for_projection_reconcile(
+                    graph, transition_client.comments, "GEN-37", reviewed,
+                    transition_adapter, authenticated_route=AUTHORITY,
+                    authenticated_source=source, remote_head=successor_head,
+                    relation_target_resolver=self.relation_target_resolver,
+                )
+            original_execute = transition_client.execute
+            append_count = 0
+
+            def interrupted_execute(query, variables):
+                nonlocal append_count
+                response = original_execute(query, variables)
+                if "commentCreate" in query:
+                    append_count += 1
+                    if append_count == interrupt_after:
+                        raise SystemExit("simulated successor caller death")
+                return response
+
+            if interrupt_after is not None:
+                transition_client.execute = interrupted_execute
+            try:
+                with mock.patch.object(
+                    workstream_projection, "projection_disposition_value",
+                    return_value=deepcopy(disposition_value),
+                ):
+                    return reconcile_required_projection(
+                        transition_adapter, preview, reviewed,
+                        remote_head=successor_head,
+                        created_at="2026-09-01T07:50:00Z",
+                        authenticated_source=source,
+                        relation_target_resolver=self.relation_target_resolver,
+                        terminal_child_fence=lambda child_ids: {
+                            child_id: readbacks[child_id]
+                            for child_id in child_ids
+                        },
+                        projection_input_fence=lambda: reviewed[
+                            "terminal_child_evidence_seed_head_transition"
+                        ]["input_frontier_sha256"],
+                        checkpoint_fence=lambda: None,
+                        projection_comments=transition_client.comments,
+                        projection_input_snapshot=graph,
+                        legacy_unresolved_relation_heads=unresolved,
+                    )
+            finally:
+                transition_client.execute = original_execute
+
+        clean_client, clean_adapter = transition_case()
+        clean_result = apply_transition(clean_client, clean_adapter)
+        canonical_write_count = len(clean_result["writes"])
+        self.assertGreater(canonical_write_count, 0)
+        for prefix in range(1, canonical_write_count + 1):
+            with self.subTest(successor_crash_prefix=prefix):
+                crash_client, crash_adapter = transition_case()
+                with self.assertRaisesRegex(
+                    SystemExit, "simulated successor caller death",
+                ):
+                    apply_transition(
+                        crash_client, crash_adapter, interrupt_after=prefix,
+                    )
+                apply_transition(crash_client, crash_adapter)
+                active = workstream_projection._active_heads(
+                    crash_adapter.state()
+                )
+                final_scope = active[("scope", "root")]["value"]
+                self.assertEqual(
+                    final_scope["child_ownership"],
+                    predecessor_scope["child_ownership"],
+                )
+                self.assertEqual(
+                    next(
+                        repository
+                        for repository in final_scope["repositories"]
+                        if repository_key(repository) == "github.com:id:R_pulp"
+                    ),
+                    pulp_repository,
+                )
+                final_contract = active[(
+                    "evidence_contract", "gen-70-terminal-receipts-v1",
+                )]["value"]
+                self.assertEqual(final_contract["exact_head"], "9" * 40)
+                self.assertEqual(
+                    final_contract["predecessor_closure_authority"],
+                    next(
+                        item["value"]["predecessor_closure_authority"]
+                        for item in successor_manifest["projection"]
+                        if item["kind"] == "evidence_contract"
+                    ),
+                )
+                replay_writes = len(crash_client.comments)
+                replay = apply_transition(crash_client, crash_adapter)
+                self.assertEqual(replay["writes"], [])
+                self.assertEqual(len(crash_client.comments), replay_writes)
 
     def install_late_predecessor_projection_append(
         self, client, adapter, *, after_append, suffix,
@@ -4976,8 +5304,8 @@ class ProjectionTests(unittest.TestCase):
         )
         self.assertEqual(primary_after_race["exact_head"], HEAD)
 
-    def test_terminal_seed_head_transition_refuses_secondary_owned_seed(self):
-        _client, adapter, _source, graph, _children, manifest, new_head = (
+    def terminal_seed_nonprimary_owner_head_transition_fixture(self):
+        client, adapter, source, graph, children, manifest, new_head = (
             self.terminal_seed_head_transition_fixture()
         )
         current_scope_event = workstream_projection._active_heads(
@@ -4998,7 +5326,7 @@ class ProjectionTests(unittest.TestCase):
             "resolved_slug": "github.com/generous-corp/secondary",
         })
         current_scope["repositories"].append(secondary)
-        current_scope["child_ownership"]["GEN-72"] = (
+        current_scope["child_ownership"]["GEN-70"] = (
             "github.com:id:R_secondary"
         )
         adapter.append(build_projection_event(
@@ -5019,13 +5347,113 @@ class ProjectionTests(unittest.TestCase):
             item for item in manifest["projection"]
             if (item["kind"], item["key"]) == ("scope", "root")
         )["value"] = desired_scope
+        contract = next(
+            item["value"] for item in manifest["projection"]
+            if item["kind"] == "evidence_contract"
+            and item["value"]["owning_child"] == "GEN-70"
+        )
+        contract.update({
+            "repository": secondary["slug"],
+            "repository_key": "github.com:id:R_secondary",
+            "exact_head": secondary["exact_head"],
+        })
+        for layer in contract["layers"].values():
+            for receipt in layer.get("receipts", []):
+                receipt.update({
+                    "repository_key": "github.com:id:R_secondary",
+                    "exact_head": secondary["exact_head"],
+                })
+        transition = manifest["terminal_child_evidence_seed_head_transition"]
+        transition.update({
+            "from_scope_event_id": adapter.state().events[-1]["event_id"],
+            "from_scope_value_sha256": canonical_digest(current_scope),
+        })
+        return (
+            client, adapter, source, graph, children, manifest, new_head,
+            deepcopy(secondary),
+        )
+
+    def test_terminal_seed_head_transition_refuses_unbound_secondary_owned_seed(self):
+        (
+            client, adapter, _source, graph, _children, manifest, new_head,
+            _secondary,
+        ) = self.terminal_seed_nonprimary_owner_head_transition_fixture()
+        writes = len(client.comments)
         with self.assertRaisesRegex(
             LinearProjectionError,
-            "terminal_child_evidence_seed_nonprimary_owner:GEN-72",
+            "terminal_child_evidence_seed_nonprimary_predecessor_required:"
+            "GEN-70:gen-70-terminal",
         ):
             prepare_terminal_child_evidence_seeds(
                 manifest, graph, adapter.state(), remote_head=new_head,
             )
+        self.assertEqual(len(client.comments), writes)
+
+    def test_terminal_seed_head_transition_secondary_owner_negatives(self):
+        (
+            client, adapter, _source, graph, _children, manifest, new_head,
+            secondary,
+        ) = self.terminal_seed_nonprimary_owner_head_transition_fixture()
+        # A duplicate immutable repository identity in both the reviewed and
+        # desired scope must not be collapsed with first-match semantics.
+        current_scope_event = workstream_projection._active_heads(
+            adapter.state()
+        )[("scope", "root")]
+        duplicate_current = deepcopy(current_scope_event["value"])
+        duplicate_current["repositories"].append(deepcopy(secondary))
+        state = adapter.state()
+        duplicate_events = deepcopy(list(state.events))
+        duplicate_events[-1]["value"] = duplicate_current
+        duplicate_state = SimpleNamespace(
+            revision=state.revision, events=tuple(duplicate_events),
+            snapshot=deepcopy(state.snapshot),
+            remote_ids=deepcopy(getattr(state, "remote_ids", {})),
+        )
+        duplicate = deepcopy(manifest)
+        duplicate.update(projection_review_contract(duplicate_state))
+        duplicate_scope = next(
+            item["value"] for item in duplicate["projection"]
+            if (item["kind"], item["key"]) == ("scope", "root")
+        )
+        duplicate_scope["repositories"].append(deepcopy(secondary))
+        transition = duplicate["terminal_child_evidence_seed_head_transition"]
+        transition.update({
+            "from_scope_event_id": duplicate_events[-1]["event_id"],
+            "from_scope_value_sha256": canonical_digest(duplicate_current),
+        })
+        duplicate_writes = len(client.comments)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_evidence_seed_repository_ambiguous:GEN-70",
+        ):
+            prepare_terminal_child_evidence_seeds(
+                duplicate, graph, duplicate_state, remote_head=new_head,
+            )
+        self.assertEqual(len(client.comments), duplicate_writes)
+
+        (
+            mismatch_client, mismatch_adapter, _source, mismatch_graph,
+            _children, mismatch, mismatch_head, _secondary,
+        ) = self.terminal_seed_nonprimary_owner_head_transition_fixture()
+        mismatch = deepcopy(mismatch)
+        mismatch_writes = len(mismatch_client.comments)
+        contract = next(
+            item["value"] for item in mismatch["projection"]
+            if item["kind"] == "evidence_contract"
+            and item["value"]["owning_child"] == "GEN-70"
+        )
+        contract["repository_key"] = mismatch["projection"][0]["value"][
+            "primary_repository"
+        ]
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_evidence_seed_contract_invalid:GEN-70",
+        ):
+            prepare_terminal_child_evidence_seeds(
+                mismatch, mismatch_graph, mismatch_adapter.state(),
+                remote_head=mismatch_head,
+            )
+        self.assertEqual(len(mismatch_client.comments), mismatch_writes)
 
     def closed_children_then_head_transition_fixture(self):
         client, adapter, source, graph, _children, manifest = (

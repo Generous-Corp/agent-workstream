@@ -849,6 +849,15 @@ def prepare_generation_operator_contract(
             (item["kind"], item["key"]): item["value"]
             for item in normalized_seed["projection"]
         }
+        # The seed consumer attaches the authenticated predecessor closure
+        # authority to carried terminal evidence.  That value is durable target
+        # authority, not a transient seed-only wrapper; retain it in the final
+        # generation projection so later closure/activation preparation cannot
+        # propose stripping the proof it just required.
+        for item in complete_items:
+            identity = (item["kind"], item["key"])
+            if item["kind"] == "evidence_contract" and identity in seed_values:
+                item["value"] = deepcopy(seed_values[identity])
         allowed_seed = (
             set(seed_values)
             | {(item["kind"], item["key"]) for item in complete_items}

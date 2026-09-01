@@ -940,6 +940,7 @@ class GenerationTransitionTests(unittest.TestCase):
         from types import SimpleNamespace
         predecessor_head = "b" * 40
         target_head = "e" * 40
+        secondary_head = "7" * 40
         predecessor = adapter(self.client, OLD).state()
         base = deepcopy(list(predecessor.events))
         scope = next(
@@ -947,14 +948,31 @@ class GenerationTransitionTests(unittest.TestCase):
             if (event["kind"], event["key"]) == ("scope", "root")
         )["value"]
         scope["child_ownership"] = {"GEN-72": "github.com:id:R_repo"}
-        next(
+        primary_repository = next(
             repository for repository in scope["repositories"]
             if repository["provider_repository_id"] == "R_repo"
-        )["exact_head"] = predecessor_head
+        )
+        primary_repository["exact_head"] = predecessor_head
+        secondary_repository = deepcopy(primary_repository)
+        secondary_repository.update({
+            "slug": "github.com/generous-corp/pulp",
+            "provider_repository_id": "R_pulp",
+            "exact_head": secondary_head,
+        })
+        secondary_repository["identity_resolution"].update({
+            "provider_repository_id": "R_pulp",
+            "resolved_slug": "github.com/generous-corp/pulp",
+        })
+        secondary_repository["identity_resolution"]["evidence"][0].update({
+            "provider_repository_id": "R_pulp",
+            "resolved_slug": "github.com/generous-corp/pulp",
+        })
+        scope["repositories"].append(secondary_repository)
+        scope["child_ownership"] = {"GEN-72": "github.com:id:R_pulp"}
         evidence_old = {
             "owning_child": "GEN-72", "plan_revision": OLD,
-            "repository_key": "github.com:id:R_repo",
-            "exact_head": predecessor_head,
+            "repository_key": "github.com:id:R_pulp",
+            "exact_head": secondary_head,
         }
         predecessor_events = [*base, {
             "schema_version": 2, "kind": "evidence_contract", "key": "terminal",
@@ -1029,10 +1047,45 @@ class GenerationTransitionTests(unittest.TestCase):
                 "closure_value_sha256": "8" * 64,
             }],
         }
+        common_authority = {
+            "schema_version": 1,
+            "predecessor_plan_revision": binding["plan_revision"],
+            "predecessor_projection_revision": binding["projection_revision"],
+            "predecessor_projection_events_sha256": binding[
+                "projection_events_sha256"
+            ],
+            "predecessor_projection_frontier_event_id": binding[
+                "projection_frontier_event_id"
+            ],
+            "predecessor_projection_frontier_sha256": binding[
+                "projection_frontier_sha256"
+            ],
+            "projection_history_sha256": binding["projection_history_sha256"],
+            "material_revision": binding["material_revision"],
+            "material_events_sha256": binding["material_events_sha256"],
+            "checkpoint_event_id": binding["checkpoint_event_id"],
+            "checkpoint_events_sha256": binding["checkpoint_events_sha256"],
+            "input_frontier_sha256": binding["input_frontier_sha256"],
+            "predecessor_evidence_event_id": "wsp_" + "7" * 32,
+            "predecessor_evidence_value_sha256": "7" * 64,
+            "predecessor_closure_event_id": "wsp_" + "8" * 32,
+            "predecessor_closure_value_sha256": "8" * 64,
+        }
+        common[3]["value"]["predecessor_closure_authority"] = common_authority
+        real_prepare_seed = workstream_projection.prepare_terminal_child_evidence_seeds
 
         def normalize_seed(manifest, _graph, target, **_kwargs):
-            result = deepcopy(manifest)
             target_contract = workstream_projection.projection_review_contract(target)
+            if len(target.events) == len(common):
+                result = real_prepare_seed(manifest, _graph, target, **_kwargs)
+            else:
+                result = deepcopy(manifest)
+                for item in result["projection"]:
+                    if item["kind"] == "evidence_contract":
+                        item["value"]["predecessor_closure_authority"] = (
+                            deepcopy(common_authority)
+                        )
+                result.update(target_contract)
             desired_scope = next(
                 item["value"] for item in result["projection"]
                 if (item["kind"], item["key"]) == ("scope", "root")
@@ -1076,7 +1129,6 @@ class GenerationTransitionTests(unittest.TestCase):
                         result["expected_projection_revision"],
                         target_contract["expected_projection_revision"],
                     )
-            result.update(target_contract)
             return result
 
         def normalize_repair(manifest, _graph, _target):
@@ -1100,6 +1152,11 @@ class GenerationTransitionTests(unittest.TestCase):
             ), patch(
                 "workstream_generation.terminal_child_readback",
                 return_value=readback,
+            ), patch(
+                "workstream_projection.terminal_child_readback",
+                return_value=readback,
+            ), patch(
+                "workstream_projection.evidence_errors", return_value=[],
             ), patch(
                 "workstream_projection.terminal_child_evidence_seed_predecessor_contract",
                 return_value=(binding, {"terminal": {
@@ -1154,6 +1211,20 @@ class GenerationTransitionTests(unittest.TestCase):
         desired_scope = next(
             item["value"] for item in seed_manifest["projection"]
             if (item["kind"], item["key"]) == ("scope", "root")
+        )
+        self.assertEqual(
+            next(
+                repository for repository in desired_scope["repositories"]
+                if repository["provider_repository_id"] == "R_pulp"
+            ),
+            secondary_repository,
+        )
+        self.assertEqual(
+            next(
+                item["value"] for item in seed_manifest["projection"]
+                if item["kind"] == "evidence_contract"
+            )["exact_head"],
+            secondary_head,
         )
         target_events.append({
             **deepcopy(common[4]), "event_id": "wsp_" + "2" * 32,
