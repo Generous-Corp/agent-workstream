@@ -31,7 +31,7 @@ from workstream_generation import (
     reduce_generation_finalizations, reduce_generation_reservations,
     selected_activation_checkpoints,
     selected_generation_execution_status,
-    strict_candidate_loader,
+    strict_candidate_loader, validate_prepared_generation_transition,
 )
 from workstream_checkpoint import build_checkpoint
 from workstream_linear import LinearGraphQLTransport, LinearTransportError
@@ -1595,10 +1595,14 @@ class GenerationTransitionTests(unittest.TestCase):
                     current, workspace_id="workspace", team_id="team",
                     project_id="project",
                 )
+                selected_loader = candidate_loader or Loader(current)
                 return GenerationTransport(
                     current, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
                     authority=AUTHORITY,
-                    candidate_loader=candidate_loader or Loader(current),
+                    candidate_loader=selected_loader,
+                    prepared_candidate_loader=lambda plan, _event_id: (
+                        selected_loader(plan)
+                    ),
                     legacy_description_plan_revision=OLD,
                     # Match the production CLI's full operator-snapshot query
                     # shape. Durable reopen custody currently binds fields such
@@ -2186,6 +2190,16 @@ class GenerationTransitionTests(unittest.TestCase):
                         current.comments, workstream_id=WORKSTREAM,
                         authenticated_route=AUTHORITY,
                     )[0]
+                    writes = len(current.mutations)
+                    with self.assertRaisesRegex(
+                        WorkstreamGenerationError,
+                        "generation_prepared_transition_ambiguous",
+                    ):
+                        transport._authorized_prepared_transition_event_id(
+                            current.comments,
+                            {**pending, "reservation_sha256": "0" * 64},
+                        )
+                    self.assertEqual(len(current.mutations), writes)
                     with self.assertRaisesRegex(
                         WorkstreamGenerationError,
                         "generation_abort_after_preparation_replay_required",
@@ -2197,7 +2211,228 @@ class GenerationTransitionTests(unittest.TestCase):
                             ],
                             reason="writer stopped", created_at="abort-race",
                         )
-                retry_and_assert(current, expected_sha)
+                    decoded = []
+                    for comment in current.comments:
+                        body = str(comment.get("body") or "")
+                        matches = PROJECTION_RE.findall(body)
+                        if len(matches) == 1:
+                            decoded.append((comment, _decode_projection(matches[0])))
+                    prepared_transition = next(
+                        event for _comment, event in decoded
+                        if event["kind"] == "generation_transition"
+                        and event["value"].get("reservation_id")
+                        == pending["reservation_id"]
+                    )
+                    expected_candidate_resume = prepared_transition[
+                        "value"
+                    ]["candidate_resume_sha256"]
+
+                    frontier_fields = (
+                        "plan_revision", "source_event_id", "source_identity",
+                        "source_sha256", "material_revision",
+                        "checkpoint_event_ids", "checkpoint_events_sha256",
+                        "projection_revision", "projection_frontier_event_id",
+                        "projection_events_sha256",
+                    )
+                    plants = [
+                        (kind, (frontier, field))
+                        for kind in ("generation_candidate_seal",
+                                     "generation_transition")
+                        for frontier in ("from", "to")
+                        for field in frontier_fields
+                    ] + [
+                        (kind, path)
+                        for kind in ("generation_candidate_seal",
+                                     "generation_transition")
+                        for path in (
+                            ("source", "identity"), ("source", "sha256"),
+                            ("graph_frontier_sha256",),
+                            ("candidate_resume_sha256",),
+                            ("retirement",),
+                            ("previous_control_event_id",),
+                            ("activation_epoch",),
+                        )
+                    ] + [
+                        ("generation_transition", path) for path in (
+                            ("candidate_seal_event_id",),
+                            ("candidate_seal_sha256",),
+                            ("native_root_sha256",),
+                        )
+                    ]
+
+                    def altered(value):
+                        if isinstance(value, int):
+                            return value + 1
+                        if isinstance(value, list):
+                            return sorted(set([
+                                *value, "wsp_" + "f" * 32,
+                            ]))
+                        if isinstance(value, str):
+                            if len(value) == 64 and set(value) <= set("0123456789abcdef"):
+                                return ("0" if value[0] != "0" else "1") + value[1:]
+                            if value.startswith("wsp_"):
+                                return "wsp_" + "f" * 32
+                            return value + "#plant"
+                        raise AssertionError(f"unsupported plant value: {value!r}")
+
+                    def plant(kind, path):
+                        candidate = deepcopy(current)
+                        matches = []
+                        for comment in candidate.comments:
+                            encoded = PROJECTION_RE.findall(str(comment.get("body") or ""))
+                            if len(encoded) != 1:
+                                continue
+                            event = _decode_projection(encoded[0])
+                            if (
+                                event["kind"] == kind
+                                and event["value"].get("reservation_id")
+                                == pending["reservation_id"]
+                            ):
+                                matches.append((comment, event))
+                        self.assertEqual(len(matches), 1, (kind, path))
+                        comment, event = matches[0]
+                        value = deepcopy(event["value"])
+                        if path == ("retirement",):
+                            changed = deepcopy(value["retirement"])
+                            changed["retired_at"] += "#plant"
+                            if changed.get("schema_version") == 2:
+                                changed["authenticated_quiescence"][
+                                    "observed_at"
+                                ] = changed["retired_at"]
+                            changed["declaration_sha256"] = _digest({
+                                key: item for key, item in changed.items()
+                                if key != "declaration_sha256"
+                            })
+                            value["retirement"] = changed
+                        else:
+                            target = value
+                            for key in path[:-1]:
+                                target = target[key]
+                            target[path[-1]] = (
+                                "wsp_" + "f" * 32
+                                if path == ("previous_control_event_id",)
+                                and target[path[-1]] is None
+                                else altered(target[path[-1]])
+                            )
+                        if len(path) == 2 and path[0] in {"from", "to"}:
+                            side = value[path[0]]
+                            if path[1] in {
+                                "plan_revision", "source_sha256",
+                            }:
+                                changed_plan = altered(side["plan_revision"])
+                                side["plan_revision"] = changed_plan
+                                side["source_sha256"] = changed_plan
+                                if path[0] == "to":
+                                    value["source"]["sha256"] = changed_plan
+                                else:
+                                    value["retirement"][
+                                        "predecessor_plan_revision"
+                                    ] = changed_plan
+                            if path[1] in {
+                                "checkpoint_event_ids",
+                                "checkpoint_events_sha256",
+                            }:
+                                side["checkpoint_event_ids"] = altered(
+                                    side["checkpoint_event_ids"]
+                                )
+                                side["checkpoint_events_sha256"] = _digest(
+                                    side["checkpoint_event_ids"]
+                                )
+                            if path[1] == "source_identity" and path[0] == "to":
+                                value["source"]["identity"] = side[
+                                    "source_identity"
+                                ]
+                        if path == ("source", "identity"):
+                            value["to"]["source_identity"] = value[
+                                "source"
+                            ]["identity"]
+                        if path == ("source", "sha256"):
+                            value["to"]["plan_revision"] = value[
+                                "source"
+                            ]["sha256"]
+                            value["to"]["source_sha256"] = value[
+                                "source"
+                            ]["sha256"]
+                        if path == ("activation_epoch",):
+                            value["retirement"]["retired_writer_epoch"] = value[
+                                "activation_epoch"
+                            ]
+                        if path != ("retirement",) and (
+                            value["retirement"] != event["value"]["retirement"]
+                        ):
+                            value["retirement"]["declaration_sha256"] = _digest({
+                                key: item for key, item in value[
+                                    "retirement"
+                                ].items() if key != "declaration_sha256"
+                            })
+                        event_plan_revision = event["plan_revision"]
+                        event_expected_revision = event["expected_revision"]
+                        if kind == "generation_candidate_seal":
+                            event_plan_revision = value["to"]["plan_revision"]
+                            event_expected_revision = value["to"][
+                                "projection_revision"
+                            ]
+                        else:
+                            event_plan_revision = value["from"]["plan_revision"]
+                            event_expected_revision = value["from"][
+                                "projection_revision"
+                            ]
+                        rebuilt = build_projection_event(
+                            workstream_id=event["workstream_id"],
+                            kind=event["kind"], key=event["key"], value=value,
+                            plan_revision=event_plan_revision,
+                            expected_revision=event_expected_revision,
+                            created_at=event["created_at"],
+                            supersedes_event_id=event["supersedes_event_id"],
+                            authority=event["authority"],
+                        )
+                        comment["body"] = encode_projection_comment(rebuilt)
+                        return candidate
+
+                    for kind, path in plants:
+                        with self.subTest(prepared_kind=kind, field=".".join(path)):
+                            planted = plant(kind, path)
+                            planted_writes = len(planted.mutations)
+                            with self.assertRaisesRegex(
+                                WorkstreamGenerationError,
+                                "generation_prepared_transition_(?:binding_invalid|ambiguous)",
+                            ):
+                                validate_prepared_generation_transition(
+                                    planted.comments,
+                                    workstream_id=WORKSTREAM,
+                                    authority=AUTHORITY,
+                                    reservation=pending, required=True,
+                                    expected_candidate_resume_sha256=(
+                                        expected_candidate_resume
+                                    ),
+                                )
+                            self.assertEqual(
+                                len(planted.mutations), planted_writes,
+                            )
+                if crash_call == 4:
+                    handle_transport = activation_transport(current)
+                    recovered = handle_transport.continue_reservation(
+                        reservation_id=pending["reservation_id"],
+                        reservation_sha256=pending["reservation_sha256"],
+                    )
+                    replay_writes = len(current.mutations)
+                    replayed = activation_transport(
+                        current,
+                    ).continue_reservation(
+                        reservation_id=pending["reservation_id"],
+                        reservation_sha256=pending["reservation_sha256"],
+                    )
+                    self.assertEqual(
+                        replayed["event_id"], recovered["event_id"],
+                    )
+                    self.assertEqual(len(current.mutations), replay_writes)
+                else:
+                    retry_and_assert(current, expected_sha)
+                finalizations = reduce_generation_finalizations(
+                    current.comments, workstream_id=WORKSTREAM,
+                    authenticated_route=AUTHORITY,
+                )
+                self.assertEqual(len(finalizations), 1)
 
             # A candidate seal is itself a protocol comment and therefore can
             # advance Linear's root updatedAt without changing any semantic

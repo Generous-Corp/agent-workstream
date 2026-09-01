@@ -2172,6 +2172,222 @@ def generation_controls(comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _validate_prepared_generation_transition(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    authority: dict[str, str], reservation: dict[str, Any],
+    required: bool, expected_candidate_resume_sha256: str | None = None,
+) -> dict[str, Any] | None:
+    """Authenticate one inert schema-v4 transition without performing writes.
+
+    The synthetic finalization below is deliberately local.  It asks the
+    ordinary generation selector to validate the exact transition as though it
+    were finalized, so preparation recovery cannot grow a weaker parallel
+    control-chain reducer.
+    """
+    predecessor = reduce_projection_comments(
+        comments, workstream_id=workstream_id,
+        expected_plan_revision=reservation["from_plan_revision"],
+        authenticated_route=authority,
+    )
+    transitions = [
+        event for event in predecessor.events
+        if event.get("kind") == "generation_transition"
+        and event.get("value", {}).get("reservation_id")
+        == reservation["reservation_id"]
+        and event.get("value", {}).get("reservation_sha256")
+        == reservation["reservation_sha256"]
+    ]
+    if not transitions and not required:
+        return None
+    if len(transitions) != 1:
+        raise WorkstreamGenerationError(
+            "generation_prepared_transition_ambiguous"
+        )
+    transition = transitions[0]
+    target = reduce_projection_comments(
+        comments, workstream_id=workstream_id,
+        expected_plan_revision=reservation["to_plan_revision"],
+        authenticated_route=authority,
+    )
+    authorized_activation_event_ids = frozenset(
+        event["event_id"] for event in generation_controls(comments)
+        if event.get("value", {}).get("activation_checkpoint") is not None
+    )
+
+    def frontier(state: Any, plan_revision: str, revision: int) -> dict[str, Any]:
+        result = _generation_frontier(
+            state, comments, plan_revision=plan_revision,
+            projection_revision=revision,
+            material_revision=reservation["material_revision"],
+            authorized_activation_event_ids=authorized_activation_event_ids,
+        )
+        checkpoint = reservation.get("activation_checkpoint")
+        if checkpoint is not None and plan_revision == reservation[
+            "to_plan_revision"
+        ]:
+            result["checkpoint_event_ids"] = sorted(set([
+                *result["checkpoint_event_ids"], checkpoint["event_id"],
+            ]))
+            result["checkpoint_events_sha256"] = _digest(
+                result["checkpoint_event_ids"]
+            )
+        return result
+
+    expected_from = frontier(
+        predecessor, reservation["from_plan_revision"],
+        reservation["from_projection_revision"],
+    )
+    expected_to_before = frontier(
+        target, reservation["to_plan_revision"],
+        reservation["to_projection_revision"],
+    )
+    expected_to = frontier(
+        target, reservation["to_plan_revision"],
+        reservation["to_projection_revision"] + 1,
+    )
+    seal_value = {
+        "schema_version": 2,
+        "reservation_id": reservation["reservation_id"],
+        "reservation_sha256": reservation["reservation_sha256"],
+        "from": expected_from,
+        "to": expected_to_before,
+        "source": deepcopy(reservation["source"]),
+        "graph_frontier_sha256": reservation["graph_frontier_sha256"],
+        "candidate_resume_sha256": reservation["candidate_resume_sha256"],
+        "retirement": deepcopy(reservation["retirement"]),
+        "previous_control_event_id": reservation[
+            "previous_control_event_id"
+        ],
+        "activation_epoch": reservation["activation_epoch"],
+    }
+    expected_seal = build_projection_event(
+        workstream_id=workstream_id, kind="generation_candidate_seal",
+        key=reservation["reservation_id"], value=seal_value,
+        plan_revision=reservation["to_plan_revision"],
+        expected_revision=reservation["to_projection_revision"],
+        created_at=reservation["created_at"], authority=authority,
+    )
+    seals = [
+        event for event in target.events
+        if event.get("kind") == "generation_candidate_seal"
+        and event.get("key") == reservation["reservation_id"]
+    ]
+    if len(seals) != 1 or seals[0] != expected_seal:
+        raise WorkstreamGenerationError(
+            "generation_prepared_transition_binding_invalid:seal"
+        )
+    seal = seals[0]
+    observed_candidate_resume_sha256 = transition.get("value", {}).get(
+        "candidate_resume_sha256"
+    )
+    if (
+        not HEX64.fullmatch(str(observed_candidate_resume_sha256 or ""))
+        or expected_candidate_resume_sha256 is not None
+        and observed_candidate_resume_sha256
+        != expected_candidate_resume_sha256
+    ):
+        raise WorkstreamGenerationError(
+            "generation_prepared_transition_binding_invalid:candidate_resume"
+        )
+    transition_value = {
+        **seal_value,
+        "to": expected_to,
+        # This post-seal digest is verified by the strict candidate reread
+        # before finalization.  All authority needed to permit that reread is
+        # independently bound here.
+        "candidate_resume_sha256": observed_candidate_resume_sha256,
+        "candidate_seal_event_id": seal["event_id"],
+        "candidate_seal_sha256": _digest(seal),
+        "schema_version": 4,
+        "activation_checkpoint": deepcopy(reservation.get(
+            "activation_checkpoint"
+        )),
+        "activation_checkpoint_sha256": (
+            _digest(reservation["activation_checkpoint"])
+            if reservation.get("activation_checkpoint") is not None else None
+        ),
+        "native_root_sha256": reservation["native_root_sha256"],
+    }
+    expected_transition = build_projection_event(
+        workstream_id=workstream_id, kind="generation_transition", key="root",
+        value=transition_value,
+        plan_revision=reservation["from_plan_revision"],
+        expected_revision=reservation["from_projection_revision"],
+        created_at=reservation["created_at"], authority=authority,
+    )
+    if transition != expected_transition:
+        raise WorkstreamGenerationError(
+            "generation_prepared_transition_binding_invalid:transition"
+        )
+
+    # Exercise the ordinary chain/frontier/seal reducer without appending the
+    # finalization that would make this transition authoritative remotely.
+    finalization_unsigned = {
+        "schema_version": 1, "workstream_id": workstream_id,
+        "authority": deepcopy(authority),
+        "reservation_id": reservation["reservation_id"],
+        "reservation_sha256": reservation["reservation_sha256"],
+        "transition_event_id": transition["event_id"],
+        "transition_sha256": _digest(transition),
+        "native_root_sha256": reservation["native_root_sha256"],
+        "source": deepcopy(reservation["source"]),
+        "execution_status": {
+            "authority": "generation_local", "name": "In Progress",
+            "type": "started",
+        },
+        "created_at": reservation["created_at"],
+    }
+    finalization = {
+        **finalization_unsigned,
+        "finalization_id": "wsgf_" + _digest(finalization_unsigned)[:32],
+    }
+    synthetic = {
+        "id": generation_finalization_slot_id(finalization),
+        "body": encode_generation_finalization(finalization),
+    }
+    try:
+        selected = select_plan_generation(
+            [*comments, synthetic], workstream_id=workstream_id,
+            description_plan_revision=reservation["from_plan_revision"],
+            authenticated_route=authority,
+        )
+    except (LinearTransportError, ValueError, TypeError) as error:
+        raise WorkstreamGenerationError(
+            f"generation_prepared_transition_binding_invalid:chain:{error}"
+        ) from error
+    if (
+        selected["plan_revision"] != reservation["to_plan_revision"]
+        or selected["transition_tip_event_id"] != transition["event_id"]
+        or selected["activation_epoch"] != reservation["activation_epoch"]
+    ):
+        raise WorkstreamGenerationError(
+            "generation_prepared_transition_binding_invalid:selection"
+        )
+    return transition
+
+
+def validate_prepared_generation_transition(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    authority: dict[str, str], reservation: dict[str, Any],
+    required: bool, expected_candidate_resume_sha256: str | None = None,
+) -> dict[str, Any] | None:
+    """Fail closed with one protocol error for malformed prepared state."""
+    try:
+        return _validate_prepared_generation_transition(
+            comments, workstream_id=workstream_id, authority=authority,
+            reservation=reservation, required=required,
+            expected_candidate_resume_sha256=(
+                expected_candidate_resume_sha256
+            ),
+        )
+    except WorkstreamGenerationError:
+        raise
+    except (LinearTransportError, ValueError, TypeError, KeyError) as error:
+        raise WorkstreamGenerationError(
+            f"generation_prepared_transition_binding_invalid:{error}"
+        ) from error
+
+
 def selected_activation_checkpoint(
     comments: list[dict[str, Any]], *, workstream_id: str,
     transition_event_id: str | None, target_plan_revision: str,
@@ -2317,6 +2533,7 @@ def assert_generation_write_authority(
 
 
 CandidateLoader = Callable[[str], dict[str, Any]]
+PreparedCandidateLoader = Callable[[str, str], dict[str, Any]]
 NativeRootLoader = Callable[[], dict[str, Any]]
 SourceLoader = Callable[[], dict[str, str]]
 OperatorValidator = Callable[[], dict[str, Any]]
@@ -2393,6 +2610,7 @@ class GenerationTransport:
     def __init__(
         self, client: Any, *, issue_id: str, workstream_id: str,
         authority: dict[str, str], candidate_loader: CandidateLoader,
+        prepared_candidate_loader: PreparedCandidateLoader | None = None,
         legacy_description_plan_revision: str | None = None,
         native_root_loader: NativeRootLoader | None = None,
         source_loader: SourceLoader | None = None,
@@ -2406,6 +2624,7 @@ class GenerationTransport:
         self.workstream_id = workstream_id.upper()
         self.authority = dict(authority)
         self.candidate_loader = candidate_loader
+        self.prepared_candidate_loader = prepared_candidate_loader
         self.legacy_description_plan_revision = legacy_description_plan_revision
         self.native_root_loader = native_root_loader
         self.source_loader = source_loader
@@ -2924,6 +3143,7 @@ class GenerationTransport:
     def _candidate(
         self, plan: str, comments: list[dict[str, Any]], *,
         activation_checkpoint: dict[str, Any] | None = None,
+        authorized_prepared_transition_event_id: str | None = None,
     ) -> dict[str, Any]:
         state = self._states(comments, plan)[0]
         source = state.snapshot.get("source") or {}
@@ -2944,7 +3164,14 @@ class GenerationTransport:
             checkpoint_ids = sorted(set([
                 *checkpoint_ids, activation_checkpoint["event_id"],
             ]))
-        receipt = self.candidate_loader(plan)
+        receipt = (
+            self.prepared_candidate_loader(
+                plan, authorized_prepared_transition_event_id,
+            )
+            if authorized_prepared_transition_event_id is not None
+            and self.prepared_candidate_loader is not None
+            else self.candidate_loader(plan)
+        )
         _validate_candidate_receipt(
             receipt, plan_revision=plan, authority=self.authority, source=source,
             material_revision=material.revision,
@@ -2952,6 +3179,19 @@ class GenerationTransport:
         )
         return {"state": state, "source": source, "receipt": receipt,
                 "material": material, "checkpoint_ids": checkpoint_ids}
+
+    def _authorized_prepared_transition_event_id(
+        self, comments: list[dict[str, Any]],
+        reservation: dict[str, Any],
+    ) -> str:
+        """Return only an exact, normally selectable prepared transition."""
+        transition = validate_prepared_generation_transition(
+            comments, workstream_id=self.workstream_id,
+            authority=self.authority, reservation=reservation,
+            required=True,
+        )
+        assert transition is not None
+        return transition["event_id"]
 
     def _validate_retirement_frontier(
         self, comments: list[dict[str, Any]], *, from_plan: str,
@@ -4073,6 +4313,11 @@ class GenerationTransport:
                 prepared_post = self._candidate(
                     target_plan_revision, comments,
                     activation_checkpoint=activation_checkpoint,
+                    authorized_prepared_transition_event_id=(
+                        self._authorized_prepared_transition_event_id(
+                            comments, reservation,
+                        )
+                    ),
                 )
                 if (
                     prepared_post["receipt"]["graph_frontier_sha256"]
@@ -4083,6 +4328,14 @@ class GenerationTransport:
                     raise WorkstreamGenerationError(
                         "generation_prepared_candidate_changed"
                     )
+                validate_prepared_generation_transition(
+                    comments, workstream_id=self.workstream_id,
+                    authority=self.authority, reservation=reservation,
+                    required=True,
+                    expected_candidate_resume_sha256=prepared_post[
+                        "receipt"
+                    ]["snapshot_sha256"],
+                )
                 final_native = self._post_protocol_native_root_proof(
                     reservation, expected_native_root_sha256,
                 )
@@ -4447,6 +4700,11 @@ class GenerationTransport:
             prepared_post = self._candidate(
                 target_plan_revision, after,
                 activation_checkpoint=activation_checkpoint,
+                authorized_prepared_transition_event_id=(
+                    self._authorized_prepared_transition_event_id(
+                        after, reservation,
+                    )
+                ),
             )
             if (
                 prepared_post["receipt"]["graph_frontier_sha256"]
@@ -4457,6 +4715,14 @@ class GenerationTransport:
                 raise WorkstreamGenerationError(
                     "generation_prepared_candidate_changed"
                 )
+            validate_prepared_generation_transition(
+                after, workstream_id=self.workstream_id,
+                authority=self.authority, reservation=reservation,
+                required=True,
+                expected_candidate_resume_sha256=prepared_post[
+                    "receipt"
+                ]["snapshot_sha256"],
+            )
             final_native = self._post_protocol_native_root_proof(
                 reservation, expected_native_root_sha256,
             )
@@ -4505,7 +4771,15 @@ def strict_candidate_loader(
     activation_remote_head: str | None = None,
     activation_created_at: str | None = None,
     root_updated_at_override: str | None = None,
+    authorized_prepared_transition_event_id: str | None = None,
 ) -> CandidateLoader:
+    if (
+        authorized_prepared_transition_event_id is not None
+        and not EVENT_ID.fullmatch(authorized_prepared_transition_event_id)
+    ):
+        raise WorkstreamGenerationError(
+            "generation_authorized_prepared_transition_event_id_invalid"
+        )
     authenticated_source = plan_payload(
         plan_source, plan_identity or plan_source,
     )["source"]
@@ -4713,6 +4987,9 @@ def strict_candidate_loader(
             joined, token, max_bytes=max_bytes, max_items=max_items,
             require_projection_authority=True, require_dependency_graph=True,
             include_history=False,
+            authorized_prepared_transition_event_id=(
+                authorized_prepared_transition_event_id
+            ),
         )
         if context.get("resume_authority") != "full":
             raise WorkstreamGenerationError("generation_candidate_not_strict_full_authority")
@@ -5416,7 +5693,20 @@ def main() -> int:
                         authenticated_route=authority,
                     )
                 }
-                if (args.reservation_id, args.reservation_sha256) in pending_tokens:
+                reservation_pending = (
+                    args.reservation_id, args.reservation_sha256
+                ) in pending_tokens
+                prepared_transition = (
+                    validate_prepared_generation_transition(
+                        comments, workstream_id=token, authority=authority,
+                        reservation=reservation, required=False,
+                    )
+                    if reservation_pending else None
+                )
+                if (
+                    reservation_pending
+                    and prepared_transition is None
+                ):
                     verified_custody = generation_graph_clock_custody(
                         client, token=token, authority=authority,
                         reservation_id=args.reservation_id,
@@ -5427,11 +5717,11 @@ def main() -> int:
                         apply=False,
                     )
                 else:
-                    # Finalized replay is independently fenced by the exact
-                    # transition/finalization reducers below. The deterministic
-                    # custody envelope remains the historical clock authority;
-                    # rerunning its pre-transition proof would incorrectly
-                    # require the predecessor to still be active.
+                    # Prepared and finalized replay are independently fenced
+                    # by the exact transition/finalization reducers below. The
+                    # deterministic custody envelope remains the historical
+                    # clock authority; rerunning its pre-transition proof would
+                    # incorrectly require the predecessor to still be active.
                     verified_custody = clock_custodies[0]
                 root_updated_at_override = verified_custody[
                     "historical_root_updated_at"
@@ -5445,6 +5735,26 @@ def main() -> int:
                 activation_created_at=reservation["created_at"],
                 root_updated_at_override=root_updated_at_override,
             )
+
+            def prepared_loader(
+                plan_revision: str,
+                authorized_prepared_transition_event_id: str,
+            ) -> dict[str, Any]:
+                return strict_candidate_loader(
+                    client, token=token, authority=authority,
+                    plan_source=reservation["source"]["identity"],
+                    plan_identity=reservation["source"]["identity"],
+                    activation_checkpoint=reservation[
+                        "activation_checkpoint"
+                    ],
+                    activation_remote_head=reservation["remote_head"],
+                    activation_created_at=reservation["created_at"],
+                    root_updated_at_override=root_updated_at_override,
+                    authorized_prepared_transition_event_id=(
+                        authorized_prepared_transition_event_id
+                    ),
+                )(plan_revision)
+
             linear_transport = LinearGraphQLTransport(
                 client, team_id=authority["team_id"],
                 workspace_id=authority["workspace_id"],
@@ -5459,6 +5769,7 @@ def main() -> int:
             transport = GenerationTransport(
                 client, issue_id=token, workstream_id=token,
                 authority=authority, candidate_loader=loader,
+                prepared_candidate_loader=prepared_loader,
                 legacy_description_plan_revision=description_plan_revision,
                 native_root_loader=lambda: _activation_native_root_snapshot(
                     linear_transport, token,
@@ -5630,6 +5941,23 @@ def main() -> int:
             activation_remote_head=activation_protocol_remote_head,
             activation_created_at=args.created_at,
         )
+
+        def prepared_loader(
+            plan_revision: str,
+            authorized_prepared_transition_event_id: str,
+        ) -> dict[str, Any]:
+            return strict_candidate_loader(
+                client, token=args.token.upper(), authority=authority,
+                plan_source=args.plan_source, plan_identity=args.plan_identity,
+                max_bytes=args.max_bytes, max_items=args.max_items,
+                activation_checkpoint=activation_checkpoint,
+                activation_remote_head=activation_protocol_remote_head,
+                activation_created_at=args.created_at,
+                authorized_prepared_transition_event_id=(
+                    authorized_prepared_transition_event_id
+                ),
+            )(plan_revision)
+
         linear_transport = LinearGraphQLTransport(
             client, team_id=authority["team_id"],
             workspace_id=authority["workspace_id"],
@@ -5697,6 +6025,9 @@ def main() -> int:
         transport = GenerationTransport(
             client, issue_id=args.token.upper(), workstream_id=args.token.upper(),
             authority=authority, candidate_loader=loader,
+            prepared_candidate_loader=(
+                prepared_loader if args.command == "activate" else None
+            ),
             legacy_description_plan_revision=description_plan_revision,
             native_root_loader=(
                 (lambda: _activation_native_root_snapshot(
