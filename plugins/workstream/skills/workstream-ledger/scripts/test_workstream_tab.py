@@ -77,10 +77,15 @@ class FakeHerdr:
 
 
 class WorkstreamTabTests(unittest.TestCase):
-    def apply(self, title="Linear", token="GEN-37"):
+    def apply(
+        self, title="Linear", token="GEN-37", *, project_name=None,
+        automatic_title=None,
+    ):
         fake = FakeCmux(title)
         result = tab.apply_title(
-            token, target="surface:7", runner=fake, which=lambda _: "/opt/cmux",
+            token, target="surface:7", project_name=project_name,
+            automatic_title=automatic_title, runner=fake,
+            which=lambda _: "/opt/cmux",
         )
         return fake, result
 
@@ -143,6 +148,13 @@ class WorkstreamTabTests(unittest.TestCase):
                         which=lambda _: "/opt/cmux",
                     )
                 self.assertNotIn("rename-tab", [call[1] for call in fake.calls])
+
+        fake = FakeCmux("Linear · GEN-38")
+        with self.assertRaisesRegex(tab.TabTitleError, "workstream_tab_conflict"):
+            tab.apply_title(
+                "GEN-37", target="surface:7", runner=fake,
+                which=lambda _: "/opt/cmux",
+            )
 
     def test_non_cmux_fallback_is_successful_and_does_not_probe(self):
         called = False
@@ -341,7 +353,7 @@ class WorkstreamTabTests(unittest.TestCase):
         self.assertNotIn(["tab", "rename"], [call[1:3] for call in fake.calls])
 
         conflicting = FakeHerdr("Linear · GEN-38")
-        with self.assertRaisesRegex(tab.TabTitleError, "conflicting_workstream_token"):
+        with self.assertRaisesRegex(tab.TabTitleError, "workstream_tab_conflict"):
             tab.apply_title(
                 "GEN-37", environ=self.herdr_env(), runner=conflicting,
                 which=lambda _: None,
