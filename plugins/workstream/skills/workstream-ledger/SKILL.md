@@ -432,6 +432,10 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.47 accepts description-less legacy terminal children only when
+strict closure, evidence, ownership, exact-head, and native-readback proof
+agree; contradictory or incomplete legacy state remains non-authoritative.
+
 Version 0.4.46 authenticates the active dependency graph during resume and
 makes canonical plan replacement a recoverable two-phase transition. Stale
 plan generations remain bounded and non-executable until exact activation.
