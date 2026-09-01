@@ -542,6 +542,10 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.55 treats one standard Markdown link on the canonical-plan line as
+one logical locator and atomically rewrites both its label and destination,
+while still refusing duplicate labeled lines or unrelated URL repetition.
+
 Version 0.4.54 delays target-disposition derivation until the candidate
 projection is otherwise activation-ready, so an intentionally ambiguous
 predecessor provenance set cannot block a valid terminal-evidence seed preview.

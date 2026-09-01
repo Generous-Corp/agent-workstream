@@ -291,6 +291,104 @@ class RootTransitionTests(unittest.TestCase):
             "WorkstreamRootTransition(" in query for query, _ in current.calls
         ))
 
+    def test_locator_reconcile_preserves_one_markdown_link(self):
+        fake = FakeClient()
+        fake.description = fake.description.replace(
+            "Canonical plan: " + PINNED,
+            f"Canonical plan: [{PINNED}](<{PINNED}>)",
+        )
+        transport = self.locator_transport(fake)
+        preview = transport.preview(
+            operation="reconcile-plan-url", target=ACTIVE_PINNED,
+        )
+        result = transport.apply(
+            operation="reconcile-plan-url", target=ACTIVE_PINNED,
+            expected_snapshot_sha256=preview["expected_snapshot_sha256"],
+            expected_frontier_sha256=preview["expected_frontier_sha256"],
+            expected_intent_sha256=preview["intent_sha256"],
+        )
+        self.assertEqual(result["result"], "applied_or_exact_replay")
+        self.assertIn(
+            f"Canonical plan: [{ACTIVE_PINNED}](<{ACTIVE_PINNED}>)",
+            fake.description,
+        )
+        self.assertNotIn(PINNED, fake.description)
+        writes = sum(
+            "WorkstreamRootTransition(" in query for query, _ in fake.calls
+        )
+        comments = len(fake.comments)
+        replay = transport.apply(
+            operation="reconcile-plan-url", target=ACTIVE_PINNED,
+            expected_snapshot_sha256=preview["expected_snapshot_sha256"],
+            expected_frontier_sha256=preview["expected_frontier_sha256"],
+            expected_intent_sha256=preview["intent_sha256"],
+        )
+        self.assertEqual(replay["result"], "applied_or_exact_replay")
+        self.assertEqual(sum(
+            "WorkstreamRootTransition(" in query for query, _ in fake.calls
+        ), writes)
+        self.assertEqual(len(fake.comments), comments)
+
+        current = FakeClient()
+        current.description = current.description.replace(
+            "Canonical plan: " + PINNED,
+            f"Canonical plan: [{ACTIVE_PINNED}](<{ACTIVE_PINNED}>)",
+        )
+        current_transport = self.locator_transport(current)
+        current_preview = current_transport.preview(
+            operation="reconcile-plan-url", target=ACTIVE_PINNED,
+        )
+        current_comments = deepcopy(current.comments)
+        noop = current_transport.apply(
+            operation="reconcile-plan-url", target=ACTIVE_PINNED,
+            expected_snapshot_sha256=current_preview["expected_snapshot_sha256"],
+            expected_frontier_sha256=current_preview["expected_frontier_sha256"],
+            expected_intent_sha256=current_preview["intent_sha256"],
+        )
+        self.assertEqual(noop["result"], "already_current_noop")
+        self.assertEqual(current.comments, current_comments)
+
+    def test_candidate_plan_transition_preserves_one_markdown_link(self):
+        fake = FakeClient()
+        fake.description = fake.description.replace(
+            "Canonical plan: " + PINNED,
+            f"Canonical plan: [{PINNED}]({PINNED})",
+        )
+        transport = self.transport(fake)
+        preview = transport.preview(operation="plan-url", target=MAIN)
+        result = transport.apply(
+            operation="plan-url", target=MAIN,
+            expected_snapshot_sha256=preview["expected_snapshot_sha256"],
+            expected_frontier_sha256=preview["expected_frontier_sha256"],
+            expected_intent_sha256=preview["intent_sha256"],
+        )
+        self.assertEqual(result["result"], "applied_or_exact_replay")
+        self.assertIn(f"Canonical plan: [{MAIN}]({MAIN})", fake.description)
+        self.assertNotIn(PINNED, fake.description)
+
+    def test_locator_reconcile_refuses_duplicate_labeled_lines(self):
+        fake = FakeClient()
+        fake.description += "\nCanonical plan: " + PINNED
+        with self.assertRaisesRegex(
+            RootTransitionError, "canonical_plan_url_occurrence_ambiguous",
+        ):
+            self.locator_transport(fake).preview(
+                operation="reconcile-plan-url", target=ACTIVE_PINNED,
+            )
+
+    def test_locator_reconcile_refuses_third_same_line_occurrence(self):
+        fake = FakeClient()
+        fake.description = fake.description.replace(
+            "Canonical plan: " + PINNED,
+            f"Canonical plan: [{PINNED}](<{PINNED}>) {PINNED}",
+        )
+        with self.assertRaisesRegex(
+            RootTransitionError, "canonical_plan_url_occurrence_ambiguous",
+        ):
+            self.locator_transport(fake).preview(
+                operation="reconcile-plan-url", target=ACTIVE_PINNED,
+            )
+
     def test_locator_reconcile_refuses_authority_or_target_substitution(self):
         fake = FakeClient()
         with self.assertRaisesRegex(

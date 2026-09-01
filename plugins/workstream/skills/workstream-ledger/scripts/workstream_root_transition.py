@@ -155,6 +155,44 @@ def comment_frontier_sha256(
     return _digest(sorted(values, key=lambda item: str(item["id"])))
 
 
+def canonical_plan_url_spans(
+    description: str, current: str,
+) -> list[tuple[int, int]]:
+    """Locate one logical canonical URL, including its Markdown duplicate."""
+    lines = list(CANONICAL_PLAN_LINE.finditer(description))
+    if len(lines) != 1:
+        raise RootTransitionError(
+            "canonical_plan_url_occurrence_ambiguous:keep exactly one labeled URL"
+        )
+    line = lines[0]
+    matches = [
+        match for match in HTTPS_URL.finditer(line.group(1))
+        if match.group(0) == current
+    ]
+    if len(matches) == 1:
+        pass
+    elif len(matches) == 2 and re.fullmatch(
+        rf"\[{re.escape(current)}\]"
+        rf"\((?:{re.escape(current)}|<{re.escape(current)}>)\)",
+        line.group(1),
+    ):
+        pass
+    else:
+        raise RootTransitionError(
+            "canonical_plan_url_occurrence_ambiguous:keep exactly one labeled URL"
+        )
+    offset = line.start(1)
+    return [(offset + match.start(), offset + match.end()) for match in matches]
+
+
+def replace_spans(
+    value: str, spans: list[tuple[int, int]], replacement: str,
+) -> str:
+    for start, end in reversed(spans):
+        value = value[:start] + replacement + value[end:]
+    return value
+
+
 def replace_canonical_plan_url(description: str, target: str) -> tuple[str, str]:
     current = canonical_plan_url(description)
     if not re.fullmatch(r"https://github\.com/[^/]+/[^/]+/blob/[0-9a-f]{40}/.+", current):
@@ -163,18 +201,8 @@ def replace_canonical_plan_url(description: str, target: str) -> tuple[str, str]
         raise RootTransitionError("target_plan_url_must_be_canonical_github_blob_main")
     if not same_plan_document(current, target):
         raise RootTransitionError("canonical_plan_url_different_document")
-    spans: list[tuple[int, int]] = []
-    for line in CANONICAL_PLAN_LINE.finditer(description):
-        for match in HTTPS_URL.finditer(line.group(1)):
-            if match.group(0) == current:
-                offset = line.start(1)
-                spans.append((offset + match.start(), offset + match.end()))
-    if len(spans) != 1:
-        raise RootTransitionError(
-            "canonical_plan_url_occurrence_ambiguous:keep exactly one labeled URL"
-        )
-    start, end = spans[0]
-    return description[:start] + target + description[end:], current
+    spans = canonical_plan_url_spans(description, current)
+    return replace_spans(description, spans, target), current
 
 
 def reconcile_canonical_plan_url(
@@ -187,18 +215,8 @@ def reconcile_canonical_plan_url(
         )
     if not same_plan_document(current, target):
         raise RootTransitionError("locator_reconcile_different_plan_document")
-    spans: list[tuple[int, int]] = []
-    for line in CANONICAL_PLAN_LINE.finditer(description):
-        for match in HTTPS_URL.finditer(line.group(1)):
-            if match.group(0) == current:
-                offset = line.start(1)
-                spans.append((offset + match.start(), offset + match.end()))
-    if len(spans) != 1:
-        raise RootTransitionError(
-            "canonical_plan_url_occurrence_ambiguous:keep exactly one labeled URL"
-        )
-    start, end = spans[0]
-    return description[:start] + target + description[end:], current
+    spans = canonical_plan_url_spans(description, current)
+    return replace_spans(description, spans, target), current
 
 
 def _reservation_matches_request(
