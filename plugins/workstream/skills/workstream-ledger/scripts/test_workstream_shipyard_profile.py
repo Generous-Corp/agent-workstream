@@ -372,6 +372,40 @@ class ShipyardProfileTests(unittest.TestCase):
                 model="gpt-5.6-sol", reasoning_effort="medium",
             )
 
+            extra = {
+                "issue_id": "20000000-0000-4000-8000-000000000003",
+                "identifier": "GEN-45",
+            }
+            duplicate_identifier = {
+                "issue_id": "20000000-0000-4000-8000-000000000004",
+                "identifier": "GEN-43",
+            }
+            identity_forgeries = {
+                "omitted": deepcopy(context),
+                "extra": deepcopy(context),
+                "same_identifier_different_id": deepcopy(context),
+            }
+            identity_forgeries["omitted"]["dependency_authority"][
+                "owned_children"
+            ] = []
+            identity_forgeries["extra"]["dependency_graph"][
+                "validation_authority"
+            ]["owned_children"] = [blocker, blocked, extra]
+            identity_forgeries["same_identifier_different_id"][
+                "dependency_graph"
+            ]["validation_authority"]["owned_children"] = [
+                blocker, duplicate_identifier, blocked,
+            ]
+            for label, identity_forgery in identity_forgeries.items():
+                with self.subTest(label=label), self.assertRaisesRegex(
+                    MODULE.ShipyardProfileError,
+                    "resume_dependency_graph_invalid",
+                ):
+                    MODULE.build_launch_profile(
+                        identity_forgery, "GEN-37", self.git(root),
+                        model="gpt-5.6-sol", reasoning_effort="medium",
+                    )
+
             forged = deepcopy(context)
             forged["dependency_graph"]["relations"][0]["blocked"] = {
                 "issue_id": "20000000-0000-4000-8000-000000000003",

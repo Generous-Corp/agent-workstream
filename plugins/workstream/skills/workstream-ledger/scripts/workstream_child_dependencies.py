@@ -507,7 +507,11 @@ def validate_dependency_graph_authority(
         [_validate_identity(item, label="owned_child") for item in raw_owned],
         key=lambda item: (item["identifier"], item["issue_id"]),
     )
-    if owned != raw_owned or len({item["issue_id"] for item in owned}) != len(owned):
+    if (
+        owned != raw_owned
+        or len({item["issue_id"] for item in owned}) != len(owned)
+        or len({item["identifier"] for item in owned}) != len(owned)
+    ):
         raise ChildDependencyError("dependency_owned_child_authority_invalid")
     if (
         expected_owned_identifiers is not None
@@ -516,15 +520,29 @@ def validate_dependency_graph_authority(
         raise ChildDependencyError("dependency_owned_child_set_mismatch")
     owned_by_id = {item["issue_id"]: item for item in owned}
     if expected_owned_children is not None:
-        for child in expected_owned_children:
-            identifier = str(child.get("identifier", "")).upper()
-            issue_id = child.get("issue_id", child.get("id"))
-            matches = [item for item in owned if item["identifier"] == identifier]
-            if (
-                len(matches) != 1 or not isinstance(issue_id, str)
-                or matches[0]["issue_id"] != issue_id
-            ):
-                raise ChildDependencyError("dependency_owned_child_identity_mismatch")
+        if (
+            not isinstance(expected_owned_children, list)
+            or any(not isinstance(child, dict) for child in expected_owned_children)
+        ):
+            raise ChildDependencyError("dependency_owned_child_identity_mismatch")
+        expected_input = [
+            _validate_identity({
+                "issue_id": child.get("issue_id", child.get("id")),
+                "identifier": child.get("identifier"),
+            }, label="expected_owned_child")
+            for child in expected_owned_children
+        ]
+        expected = sorted(
+            expected_input,
+            key=lambda item: (item["identifier"], item["issue_id"]),
+        )
+        if (
+            expected_input != expected
+            or len({item["issue_id"] for item in expected}) != len(expected)
+            or len({item["identifier"] for item in expected}) != len(expected)
+            or expected != owned
+        ):
+            raise ChildDependencyError("dependency_owned_child_identity_mismatch")
     for relation in value["relations"]:
         for endpoint in (relation["blocker"], relation["blocked"]):
             if owned_by_id.get(endpoint["issue_id"]) != endpoint:
