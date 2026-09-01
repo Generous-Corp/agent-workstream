@@ -267,6 +267,7 @@ def authorized_dependency_graph(
     material_remote_ids: dict[str, str] | None = None,
     projection_remote_ids: dict[str, str] | None = None,
     comments: list[dict[str, Any]] | None = None,
+    owned_children: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Bind the native graph to the ordered active-generation grants."""
     authority = _validate_authority(authority)
@@ -413,7 +414,7 @@ def authorized_dependency_graph(
     root_digest = root_readback_sha256
     if not re.fullmatch(r"[0-9a-f]{64}", str(root_digest)):
         raise ChildDependencyError("invalid_dependency_root_readback")
-    return {
+    result = {
         "schema_version": 1,
         "authority": "child_dependency_authorization",
         "plan_revision": plan_revision,
@@ -427,6 +428,21 @@ def authorized_dependency_graph(
         "observed_frontier": deepcopy(frontier),
         "root_readback_sha256": root_digest,
     }
+    if (
+        comments is not None and owned_children is not None
+        and (relations or batches)
+    ):
+        identities = sorted(
+            [_validate_identity(item, label="owned_child") for item in owned_children],
+            key=lambda item: (item["identifier"], item["issue_id"]),
+        )
+        if len({item["issue_id"] for item in identities}) != len(identities):
+            raise ChildDependencyError("ambiguous_owned_child_identity")
+        result["validation_authority"] = {
+            "owned_children": identities,
+            "comments": deepcopy(comments),
+        }
+    return result
 
 
 def validate_authorized_dependency_graph_surface(
@@ -441,6 +457,14 @@ def validate_authorized_dependency_graph_surface(
         expected_frontier=expected_frontier,
         expected_root_readback_sha256=expected_root_readback_sha256,
     )
+    proof = value.get("validation_authority")
+    if proof is not None:
+        return validate_dependency_graph_authority(
+            value, authority=authority, plan_revision=plan_revision,
+            expected_frontier=expected_frontier,
+            expected_root_readback_sha256=expected_root_readback_sha256,
+            expected_projection_events=projection_events,
+        )
     relations = value["relations"]
     expected = authorized_dependency_graph(
         DependencyGraph(
@@ -449,6 +473,101 @@ def validate_authorized_dependency_graph_surface(
         authority=authority, plan_revision=plan_revision,
         observed_frontier=value["observed_frontier"],
         root_readback_sha256=value["root_readback_sha256"],
+    )
+    if value != expected:
+        raise ChildDependencyError("dependency_graph_surface_mismatch")
+    return expected
+
+
+def validate_dependency_graph_authority(
+    value: Any, *, authority: dict[str, str], plan_revision: str,
+    expected_frontier: dict[str, Any] | None = None,
+    expected_root_readback_sha256: str | None = None,
+    expected_projection_events: list[dict[str, Any]] | None = None,
+    expected_material_event_ids: list[str] | None = None,
+    expected_owned_identifiers: set[str] | None = None,
+    expected_owned_children: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Re-run canonical reducers from the authority carried by a resume graph."""
+    validate_dependency_graph_summary(
+        value, authority=authority, plan_revision=plan_revision,
+        expected_frontier=expected_frontier,
+        expected_root_readback_sha256=expected_root_readback_sha256,
+    )
+    proof = value.get("validation_authority")
+    if proof is None and not value["relations"] and not value["authorization_batches"]:
+        return deepcopy(value)
+    if not isinstance(proof, dict) or set(proof) != {"owned_children", "comments"}:
+        raise ChildDependencyError("dependency_validation_authority_missing")
+    raw_owned = proof.get("owned_children")
+    comments = proof.get("comments")
+    if not isinstance(raw_owned, list) or not isinstance(comments, list):
+        raise ChildDependencyError("dependency_validation_authority_invalid")
+    owned = sorted(
+        [_validate_identity(item, label="owned_child") for item in raw_owned],
+        key=lambda item: (item["identifier"], item["issue_id"]),
+    )
+    if owned != raw_owned or len({item["issue_id"] for item in owned}) != len(owned):
+        raise ChildDependencyError("dependency_owned_child_authority_invalid")
+    if (
+        expected_owned_identifiers is not None
+        and {item["identifier"] for item in owned} != expected_owned_identifiers
+    ):
+        raise ChildDependencyError("dependency_owned_child_set_mismatch")
+    owned_by_id = {item["issue_id"]: item for item in owned}
+    if expected_owned_children is not None:
+        for child in expected_owned_children:
+            identifier = str(child.get("identifier", "")).upper()
+            issue_id = child.get("issue_id", child.get("id"))
+            matches = [item for item in owned if item["identifier"] == identifier]
+            if (
+                len(matches) != 1 or not isinstance(issue_id, str)
+                or matches[0]["issue_id"] != issue_id
+            ):
+                raise ChildDependencyError("dependency_owned_child_identity_mismatch")
+    for relation in value["relations"]:
+        for endpoint in (relation["blocker"], relation["blocked"]):
+            if owned_by_id.get(endpoint["issue_id"]) != endpoint:
+                raise ChildDependencyError("dependency_endpoint_not_owned")
+    material = reduce_event_comments(
+        comments, workstream_id=authority["root_identifier"],
+    )
+    if (
+        expected_material_event_ids is not None
+        and [event.event_id for event in material.events]
+        != expected_material_event_ids
+    ):
+        raise ChildDependencyError("dependency_material_authority_mismatch")
+    projection = reduce_projection_comments(
+        comments, workstream_id=authority["root_identifier"],
+        expected_plan_revision=plan_revision,
+        authenticated_route={
+            key: authority[key]
+            for key in ("workspace_id", "team_id", "project_id", "root_issue_id")
+        },
+    )
+    if (
+        expected_projection_events is not None
+        and [
+            event for event in projection.events
+            if event.get("kind") == "child_dependency_authorization"
+        ] != [
+            event for event in expected_projection_events
+            if event.get("kind") == "child_dependency_authorization"
+        ]
+    ):
+        raise ChildDependencyError("dependency_projection_authority_mismatch")
+    expected = authorized_dependency_graph(
+        DependencyGraph(
+            tuple(value["relations"]), value["ignored_non_dependency_count"],
+        ),
+        projection.events, authority=authority, plan_revision=plan_revision,
+        observed_frontier=value["observed_frontier"],
+        root_readback_sha256=value["root_readback_sha256"],
+        material_events=material.events,
+        material_remote_ids=material.remote_ids,
+        projection_remote_ids=projection.remote_ids,
+        comments=comments, owned_children=owned,
     )
     if value != expected:
         raise ChildDependencyError("dependency_graph_surface_mismatch")
@@ -467,7 +586,10 @@ def validate_dependency_graph_summary(
         "ignored_non_dependency_count",
         "observed_frontier", "root_readback_sha256",
     }
-    if not isinstance(value, dict) or set(value) != required:
+    if (
+        not isinstance(value, dict)
+        or set(value) not in (required, required | {"validation_authority"})
+    ):
         raise ChildDependencyError("invalid_dependency_graph_surface")
     relations = value.get("relations")
     ignored = value.get("ignored_non_dependency_count")
@@ -661,6 +783,9 @@ def rebind_authenticated_dependency_graph(
         material_remote_ids=material.remote_ids,
         projection_remote_ids=projection.remote_ids,
         comments=comments,
+        owned_children=(base_surface.get("validation_authority") or {}).get(
+            "owned_children", []
+        ),
     )
 
 
@@ -1198,7 +1323,7 @@ class LinearChildDependencyAdapter:
         expected_root_readback_sha256: str | None = None,
     ) -> dict[str, Any]:
         """Read the active child graph and bind every edge to its grant."""
-        frontier, graph, _owned, projection, material, comments, root = (
+        frontier, graph, owned, projection, material, comments, root = (
             self._read_state(None)
         )
         if (
@@ -1226,6 +1351,7 @@ class LinearChildDependencyAdapter:
             material_remote_ids=material.remote_ids,
             projection_remote_ids=projection.remote_ids,
             comments=comments,
+            owned_children=list(owned.values()),
         )
 
     def read_authorized_graph_for_snapshot(
@@ -1323,6 +1449,7 @@ class LinearChildDependencyAdapter:
             material_remote_ids=material.remote_ids,
             projection_remote_ids=projection.remote_ids,
             comments=comments,
+            owned_children=list(owned.values()),
         )
 
     @staticmethod

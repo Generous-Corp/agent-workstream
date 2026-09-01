@@ -24,7 +24,7 @@ from urllib.parse import urlparse
 from workstream_resume import DEFAULT_RESUME_MAX_BYTES, ResumeError, extract_token
 from workstream_scope import ScopeError, canonical_repository
 from workstream_child_dependencies import (
-    ChildDependencyError, validate_dependency_graph_summary,
+    ChildDependencyError, validate_dependency_graph_authority,
 )
 
 
@@ -409,11 +409,35 @@ def _validate_dependency_graph(
         raise ShipyardProfileError("resume_dependency_graph_missing")
     revision = graph.get("revision")
     graph_sha256 = graph.get("sha256")
+    dependency_authority = context.get("dependency_authority")
+    if graph.get("relations") or graph.get("authorization_batches"):
+        if (
+            not isinstance(dependency_authority, dict)
+            or set(dependency_authority) != {
+                "owned_children", "authorization_events", "material_event_ids",
+            }
+        ):
+            raise ShipyardProfileError("resume_dependency_graph_invalid")
+    else:
+        dependency_authority = dependency_authority or {
+            "owned_children": [], "authorization_events": [],
+            "material_event_ids": [],
+        }
     try:
-        validate_dependency_graph_summary(
+        validate_dependency_graph_authority(
             graph,
             authority={**route, "root_identifier": context.get("workstream_id")},
             plan_revision=plan_revision,
+            expected_projection_events=dependency_authority[
+                "authorization_events"
+            ],
+            expected_material_event_ids=dependency_authority[
+                "material_event_ids"
+            ],
+            expected_owned_identifiers=set(
+                (context.get("scope") or {}).get("child_ownership", {})
+            ),
+            expected_owned_children=dependency_authority["owned_children"],
             expected_frontier={
                 "material_revision": material_revision,
                 "projection_revision": context.get("projection_revision"),

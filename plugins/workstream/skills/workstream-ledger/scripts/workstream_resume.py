@@ -2357,6 +2357,25 @@ def compact_context(
         "scope": clean["scope"] if include_history else _compact_scope(clean["scope"]),
         "relations": clean["relations"],
         "dependency_graph": clean["dependency_graph"],
+        "dependency_authority": ({
+            "owned_children": sorted([
+                {"issue_id": child["id"], "identifier": child["identifier"]}
+                for child in clean["children"]
+            ], key=lambda item: (item["identifier"], item["issue_id"])),
+            "authorization_events": [
+                deepcopy(event) for event in clean["projection_events"]
+                if event.get("kind") == "child_dependency_authorization"
+            ],
+            "material_event_ids": [
+                event["event_id"] for event in clean["material_events"]
+            ],
+        } if (
+            clean["dependency_graph"] is not None
+            and (
+                clean["dependency_graph"].get("relations")
+                or clean["dependency_graph"].get("authorization_batches")
+            )
+        ) else None),
         "evidence_contracts": (
             clean["evidence_contracts"] if include_history
             else _compact_evidence_contracts(
