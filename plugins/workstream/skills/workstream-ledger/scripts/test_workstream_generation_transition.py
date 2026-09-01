@@ -72,6 +72,7 @@ class FakeClient:
         self.graph_nonce = "initial"
         self.graph_status = "In Progress"
         self.graph_status_type = "started"
+        self.graph_state_id = "state"
         self.children: list[dict] = []
         self.before_issue_create = None
 
@@ -84,7 +85,7 @@ class FakeClient:
             "project": {"id": "project"},
             "team": {"id": "team", "organization": {"id": "workspace"}},
             "assignee": None,
-            "state": {"id": "state", "name": self.graph_status,
+            "state": {"id": self.graph_state_id, "name": self.graph_status,
                       "type": self.graph_status_type},
         }
 
@@ -997,6 +998,7 @@ class GenerationTransitionTests(unittest.TestCase):
             legacy_description_plan_revision=OLD,
             native_root_loader=lambda: race_linear.snapshot_for_root(WORKSTREAM),
             operator_validator=validate_race_operator,
+            operator_contract_sha256=_digest(contract),
         )
         race_preview = race_transport.preview_activate(
             target_plan_revision=NEW, created_at=contract["created_at"],
@@ -1013,9 +1015,208 @@ class GenerationTransitionTests(unittest.TestCase):
                 ),
             )
         self.assertFalse(any(
-            "generation_candidate_seal" in item.get("body", "")
-            for item in race.comments
+            event["kind"] == "generation_candidate_seal"
+            for event in adapter(race, NEW).state().events
         ))
+
+        crash = deepcopy(self.client)
+        crash_linear = LinearGraphQLTransport(
+            crash, workspace_id="workspace", team_id="team", project_id="project",
+        )
+        stable_loader = Loader(crash)
+        loader_calls = {"count": 0}
+
+        def crash_after_seal(plan):
+            loader_calls["count"] += 1
+            result = stable_loader(plan)
+            if loader_calls["count"] == 2:
+                raise WorkstreamGenerationError("simulated_operator_crash_after_seal")
+            return result
+
+        def validate_crash_operator():
+            graph = crash_linear.snapshot_for_root(
+                WORKSTREAM, include_description=True, include_child_comments=True,
+            )
+            observed = prepare_generation_operator_contract(
+                comments=deepcopy(crash.comments), graph=graph,
+                workstream_id=WORKSTREAM, authority=AUTHORITY,
+                description_plan_revision=OLD,
+                target_source={
+                    "identity": f"https://example.test/{NEW}", "sha256": NEW,
+                }, created_at=contract["created_at"],
+                remote_head=contract["remote_head"], started_state=STARTED_STATE,
+            )
+            self.assertEqual(observed, contract)
+            return {"retirement_proof": observed["retirement_proof"]}
+
+        crash_transport = GenerationTransport(
+            crash, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
+            authority=AUTHORITY, candidate_loader=crash_after_seal,
+            legacy_description_plan_revision=OLD,
+            native_root_loader=lambda: crash_linear.snapshot_for_root(WORKSTREAM),
+            operator_validator=validate_crash_operator,
+            operator_contract_sha256=_digest(contract),
+        )
+        crash_native = native_root_activation_proof(
+            crash_linear.snapshot_for_root(WORKSTREAM),
+            workstream_id=WORKSTREAM, issue_id=WORKSTREAM, authority=AUTHORITY,
+        )["sha256"]
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError, "operator_crash_after_seal",
+        ):
+            crash_transport.activate(
+                target_plan_revision=NEW, created_at=contract["created_at"],
+                retirement=retirement,
+                expected_native_root_sha256=crash_native,
+            )
+        seals_after_crash = sum(
+            event["kind"] == "generation_candidate_seal"
+            for event in adapter(crash, NEW).state().events
+        )
+        self.assertEqual(seals_after_crash, 1)
+        crash_transport.candidate_loader = stable_loader
+
+        def obsolete_prepare():
+            raise WorkstreamGenerationError("fresh_prepare_must_not_gate_pending_seal")
+
+        crash_transport.operator_validator = obsolete_prepare
+        recovered = crash_transport.activate(
+            target_plan_revision=NEW, created_at=contract["created_at"],
+            retirement=retirement, expected_native_root_sha256=crash_native,
+        )
+        self.assertEqual(recovered["activated_plan_revision"], NEW)
+        self.assertEqual(sum(
+            event["kind"] == "generation_candidate_seal"
+            for event in adapter(crash, NEW).state().events
+        ), 1)
+
+        post_transition = deepcopy(self.client)
+        post_linear = LinearGraphQLTransport(
+            post_transition, workspace_id="workspace", team_id="team",
+            project_id="project",
+        )
+        post_stable_loader = Loader(post_transition)
+        post_calls = {"count": 0}
+
+        def crash_before_finalization(plan):
+            post_calls["count"] += 1
+            result = post_stable_loader(plan)
+            if post_calls["count"] == 4:
+                raise WorkstreamGenerationError("simulated_post_transition_crash")
+            return result
+
+        def validate_post_operator():
+            graph = post_linear.snapshot_for_root(
+                WORKSTREAM, include_description=True, include_child_comments=True,
+            )
+            observed = prepare_generation_operator_contract(
+                comments=deepcopy(post_transition.comments), graph=graph,
+                workstream_id=WORKSTREAM, authority=AUTHORITY,
+                description_plan_revision=OLD,
+                target_source={
+                    "identity": f"https://example.test/{NEW}", "sha256": NEW,
+                }, created_at=contract["created_at"],
+                remote_head=contract["remote_head"], started_state=STARTED_STATE,
+            )
+            return {"retirement_proof": observed["retirement_proof"]}
+
+        post_transport = GenerationTransport(
+            post_transition, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
+            authority=AUTHORITY, candidate_loader=crash_before_finalization,
+            legacy_description_plan_revision=OLD,
+            native_root_loader=lambda: post_linear.snapshot_for_root(WORKSTREAM),
+            operator_validator=validate_post_operator,
+            operator_contract_sha256=_digest(contract),
+        )
+        post_native = native_root_activation_proof(
+            post_linear.snapshot_for_root(WORKSTREAM),
+            workstream_id=WORKSTREAM, issue_id=WORKSTREAM, authority=AUTHORITY,
+        )["sha256"]
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError, "post_transition_crash",
+        ):
+            post_transport.activate(
+                target_plan_revision=NEW, created_at=contract["created_at"],
+                retirement=retirement, expected_native_root_sha256=post_native,
+            )
+        self.assertEqual(len(pending_generation_reservations(
+            post_transition.comments, workstream_id=WORKSTREAM,
+            authenticated_route=AUTHORITY,
+        )), 1)
+        post_transport.candidate_loader = post_stable_loader
+        post_transport.operator_validator = obsolete_prepare
+        finalized = post_transport.activate(
+            target_plan_revision=NEW, created_at=contract["created_at"],
+            retirement=retirement, expected_native_root_sha256=post_native,
+        )
+        self.assertEqual(finalized["activated_plan_revision"], NEW)
+        self.assertFalse(pending_generation_reservations(
+            post_transition.comments, workstream_id=WORKSTREAM,
+            authenticated_route=AUTHORITY,
+        ))
+
+        cli_client = deepcopy(self.client)
+        cli_client.graph_state_id = STARTED_STATE["id"]
+        cli_linear = LinearGraphQLTransport(
+            cli_client, workspace_id="workspace", team_id="team", project_id="project",
+        )
+        cli_stable_loader = Loader(cli_client)
+        cli_calls = {"count": 0}
+
+        def cli_crash_after_seal(plan):
+            cli_calls["count"] += 1
+            result = cli_stable_loader(plan)
+            if cli_calls["count"] == 2:
+                raise WorkstreamGenerationError("simulated_cli_crash_after_seal")
+            return result
+
+        cli_native = native_root_activation_proof(
+            cli_linear.snapshot_for_root(WORKSTREAM),
+            workstream_id=WORKSTREAM, issue_id=WORKSTREAM, authority=AUTHORITY,
+        )["sha256"]
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as contract_file:
+            json.dump(contract, contract_file)
+            contract_file.flush()
+            argv = [
+                "workstream_generation.py", "activate", WORKSTREAM,
+                "--plan-source", "plan", "--plan-identity", "plan",
+                "--operator-contract", contract_file.name,
+                "--created-at", contract["created_at"], "--apply",
+                "--expected-native-root-sha256", cli_native,
+            ]
+
+            def invoke_cli(loader):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with patch.object(sys, "argv", argv), patch(
+                    "workstream_generation._route_and_client",
+                    return_value=(cli_client, AUTHORITY),
+                ), patch("workstream_generation.plan_payload", return_value={
+                    "source": {
+                        "identity": f"https://example.test/{NEW}", "sha256": NEW,
+                    },
+                }), patch(
+                    "workstream_generation.strict_candidate_loader",
+                    return_value=loader,
+                ), patch.object(sys, "stdout", stdout), patch.object(
+                    sys, "stderr", stderr,
+                ):
+                    return main(), stdout.getvalue(), stderr.getvalue()
+
+            code, _stdout, error = invoke_cli(cli_crash_after_seal)
+            self.assertEqual(code, 2)
+            self.assertIn("simulated_cli_crash_after_seal", error)
+            seals = sum(
+                event["kind"] == "generation_candidate_seal"
+                for event in adapter(cli_client, NEW).state().events
+            )
+            self.assertEqual(seals, 1)
+            code, stdout, error = invoke_cli(cli_stable_loader)
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(json.loads(stdout)["activated_plan_revision"], NEW)
+            self.assertEqual(sum(
+                event["kind"] == "generation_candidate_seal"
+                for event in adapter(cli_client, NEW).state().events
+            ), 1)
 
         transport = self.native_fenced_transport()
         for field, value in (

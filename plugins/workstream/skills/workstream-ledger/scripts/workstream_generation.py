@@ -783,13 +783,15 @@ def _validate_reservation(value: dict[str, Any]) -> None:
         "candidate_resume_sha256", "retirement", "created_at",
     }
     schema_version = value.get("schema_version")
-    if schema_version in {3, 4}:
+    if schema_version in {3, 4, 5}:
         fields.add("native_root_sha256")
-    if schema_version == 4:
+    if schema_version in {4, 5}:
         fields.update({"activation_checkpoint", "remote_head"})
+    if schema_version == 5:
+        fields.add("operator_contract_sha256")
     if (
         set(value) != fields
-        or schema_version not in {2, 3, 4}
+        or schema_version not in {2, 3, 4, 5}
         or not RESERVATION_ID.fullmatch(str(value.get("reservation_id", "")))
         or value.get("mode") not in {"bootstrap", "activate"}
         or not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", str(value.get("workstream_id", "")))
@@ -821,11 +823,11 @@ def _validate_reservation(value: dict[str, Any]) -> None:
         )
         or not isinstance(value.get("created_at"), str) or not value["created_at"]
         or (
-            schema_version in {3, 4}
+            schema_version in {3, 4, 5}
             and not HEX64.fullmatch(str(value.get("native_root_sha256", "")))
         )
         or (
-            schema_version == 4
+            schema_version in {4, 5}
             and (
                 (value.get("activation_checkpoint") is not None
                  and not isinstance(value.get("activation_checkpoint"), dict))
@@ -838,6 +840,10 @@ def _validate_reservation(value: dict[str, Any]) -> None:
                     != (value.get("remote_head") is None))
             )
         )
+        or (
+            schema_version == 5
+            and not HEX64.fullmatch(str(value.get("operator_contract_sha256", "")))
+        )
     ):
         raise WorkstreamGenerationError("invalid_generation_reservation")
     previous = value["previous_control_event_id"]
@@ -846,7 +852,7 @@ def _validate_reservation(value: dict[str, Any]) -> None:
     _validate_retirement(
         value["retirement"], value["from_plan_revision"], value["activation_epoch"],
     )
-    if schema_version == 4 and value["activation_checkpoint"] is not None:
+    if schema_version in {4, 5} and value["activation_checkpoint"] is not None:
         try:
             validate_checkpoint(value["activation_checkpoint"])
         except (TypeError, ValueError) as error:
@@ -1287,7 +1293,7 @@ def pending_generation_reservations(
                 ), None)
                 if (
                     reservation is not None
-                    and (reservation.get("schema_version") != 4
+                    and (reservation.get("schema_version") not in {4, 5}
                          or reservation.get("mode") == "bootstrap"
                          or token in finalized_tokens)
                 ):
@@ -1546,6 +1552,7 @@ class GenerationTransport:
         native_root_loader: NativeRootLoader | None = None,
         source_loader: SourceLoader | None = None,
         operator_validator: OperatorValidator | None = None,
+        operator_contract_sha256: str | None = None,
     ):
         self.client = client
         self.issue_id = issue_id
@@ -1556,6 +1563,11 @@ class GenerationTransport:
         self.native_root_loader = native_root_loader
         self.source_loader = source_loader
         self.operator_validator = operator_validator
+        if operator_contract_sha256 is not None and not HEX64.fullmatch(
+            operator_contract_sha256
+        ):
+            raise WorkstreamGenerationError("generation_operator_contract_digest_invalid")
+        self.operator_contract_sha256 = operator_contract_sha256
         self._capability_checked = False
 
     def _validate_operator(self, retirement: dict[str, Any]) -> None:
@@ -1569,6 +1581,68 @@ class GenerationTransport:
             raise WorkstreamGenerationError(
                 "generation_operator_contract_live_state_drift"
             )
+
+    def _pending_operator_replay(
+        self, comments: list[dict[str, Any]], *, target_plan_revision: str,
+        retirement: dict[str, Any], created_at: str,
+    ) -> bool:
+        """Recognize only a seal reserved by this exact reviewed contract."""
+        if self.operator_contract_sha256 is None:
+            return False
+        selected = select_plan_generation(
+            comments, workstream_id=self.workstream_id,
+            description_plan_revision=self.legacy_description_plan_revision,
+            authenticated_route=self.authority,
+        )
+        from_plan = selected["plan_revision"]
+        if from_plan == target_plan_revision:
+            return False
+        epoch = (
+            selected["activation_epoch"]
+            if selected["activation_epoch"] is not None else -1
+        ) + 1
+        reservation = self._matching_reservation(
+            comments, mode="activate", from_plan=from_plan,
+            to_plan=target_plan_revision, epoch=epoch,
+            previous_control=selected["transition_tip_event_id"],
+            retirement=retirement, created_at=created_at,
+        )
+        if reservation is None:
+            return False
+        if (
+            reservation.get("schema_version") != 5
+            or reservation.get("operator_contract_sha256")
+            != self.operator_contract_sha256
+        ):
+            raise WorkstreamGenerationError(
+                "generation_pending_operator_contract_mismatch"
+            )
+        target_state = self._states(comments, target_plan_revision)[0]
+        seals = [
+            event for event in target_state.events
+            if event["kind"] == "generation_candidate_seal"
+            and event["key"] == reservation["reservation_id"]
+        ]
+        if not seals:
+            return False
+        if len(seals) != 1:
+            raise WorkstreamGenerationError("generation_pending_candidate_seal_ambiguous")
+        value = seals[0]["value"]
+        if (
+            value.get("reservation_sha256") != reservation["reservation_sha256"]
+            or value.get("retirement") != retirement
+            or value.get("source") != reservation["source"]
+            or value.get("previous_control_event_id")
+            != reservation["previous_control_event_id"]
+            or value.get("activation_epoch") != reservation["activation_epoch"]
+            or (value.get("from") or {}).get("plan_revision") != from_plan
+            or (value.get("to") or {}).get("plan_revision")
+            != target_plan_revision
+        ):
+            raise WorkstreamGenerationError(
+                "generation_pending_candidate_seal_mismatch"
+            )
+        return True
 
     def _native_root_proof(
         self, expected_sha256: str | None, *, require_reviewed: bool,
@@ -1784,6 +1858,7 @@ class GenerationTransport:
         native_root_sha256: str | None = None,
         activation_checkpoint: dict[str, Any] | None = None,
         remote_head: str | None = None,
+        operator_contract_sha256: str | None = None,
     ) -> dict[str, Any]:
         checkpoints = reduce_generation_checkpoint_comments(
             comments, workstream_id=self.workstream_id,
@@ -1813,7 +1888,10 @@ class GenerationTransport:
             from_state=from_state, checkpoints=checkpoints,
         )
         unsigned = {
-            "schema_version": (4 if native_root_sha256 is not None else 2),
+            "schema_version": (
+                5 if operator_contract_sha256 is not None
+                else (4 if native_root_sha256 is not None else 2)
+            ),
             "workstream_id": self.workstream_id,
             "authority": self.authority, "mode": mode,
             "from_plan_revision": from_plan, "to_plan_revision": to_plan,
@@ -1837,6 +1915,8 @@ class GenerationTransport:
             unsigned["native_root_sha256"] = native_root_sha256
             unsigned["activation_checkpoint"] = deepcopy(activation_checkpoint)
             unsigned["remote_head"] = remote_head
+        if operator_contract_sha256 is not None:
+            unsigned["operator_contract_sha256"] = operator_contract_sha256
         value = {**unsigned, "reservation_id": "wsgr_" + _digest(unsigned)[:32]}
         _validate_reservation(value)
         return value
@@ -2320,7 +2400,11 @@ class GenerationTransport:
             )
             if replay:
                 return replay
-        self._validate_operator(retirement)
+        if not self._pending_operator_replay(
+            comments, target_plan_revision=target_plan_revision,
+            retirement=retirement, created_at=created_at,
+        ):
+            self._validate_operator(retirement)
         selected = select_plan_generation(
             comments, workstream_id=self.workstream_id,
             description_plan_revision=self.legacy_description_plan_revision,
@@ -2548,7 +2632,11 @@ class GenerationTransport:
                     "two_phase_finalization": finalization,
                     "final_candidate": prepared_post["receipt"],
                 }
-        self._validate_operator(retirement)
+        if not self._pending_operator_replay(
+            comments, target_plan_revision=target_plan_revision,
+            retirement=retirement, created_at=created_at,
+        ):
+            self._validate_operator(retirement)
         selected = select_plan_generation(
             comments, workstream_id=self.workstream_id,
             description_plan_revision=self.legacy_description_plan_revision,
@@ -2635,6 +2723,7 @@ class GenerationTransport:
                 ),
                 activation_checkpoint=activation_checkpoint,
                 remote_head=remote_head,
+                operator_contract_sha256=self.operator_contract_sha256,
             )
             stored = self._append_reservation(reservation)
         else:
@@ -2647,7 +2736,7 @@ class GenerationTransport:
             raise WorkstreamGenerationError(
                 "generation_reservation_native_root_proof_mismatch"
             )
-        if reservation.get("schema_version") == 4 and (
+        if reservation.get("schema_version") in {4, 5} and (
             reservation.get("activation_checkpoint") != activation_checkpoint
             or reservation.get("remote_head") != remote_head
             or reservation.get("source") != target_source
@@ -2658,7 +2747,11 @@ class GenerationTransport:
             )
         comments = self._comments()
         self._assert_reservation_live(comments, reservation)
-        self._validate_operator(retirement)
+        if not self._pending_operator_replay(
+            comments, target_plan_revision=target_plan_revision,
+            retirement=retirement, created_at=created_at,
+        ):
+            self._validate_operator(retirement)
         from_state, to_state = self._states(comments, from_plan, target_plan_revision)
         selected_before_seal = select_plan_generation(
             comments, workstream_id=self.workstream_id,
@@ -2799,7 +2892,7 @@ class GenerationTransport:
                  allowed_generation_reservation_id=reservation["reservation_id"],
                  allow_retired_generation_control=True)
         after = self._comments()
-        if reservation.get("schema_version") == 4:
+        if reservation.get("schema_version") in {4, 5}:
             self._assert_reservation_live(after, reservation)
             prepared = select_plan_generation(
                 after, workstream_id=self.workstream_id,
@@ -3456,6 +3549,10 @@ def main() -> int:
                 if args.command == "activate" else None
             ),
             operator_validator=activation_operator_validator,
+            operator_contract_sha256=(
+                _digest(operator_contract)
+                if isinstance(operator_contract, dict) else None
+            ),
         )
         retirement = None
         if args.command == "activate":
