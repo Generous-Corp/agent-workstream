@@ -530,6 +530,10 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.51 aligns generation and projection terminal-seed frontiers and
+authenticates legacy dependency grants whose immutable schema predates the
+material-frontier digest, without weakening current writers.
+
 Version 0.4.50 keeps root checkpoint recovery safe when Linear advances the
 root timestamp for the operator's own comment: fresh previews bind that exact
 timestamp, while postwrite proof normalizes it only after a confirmed own
