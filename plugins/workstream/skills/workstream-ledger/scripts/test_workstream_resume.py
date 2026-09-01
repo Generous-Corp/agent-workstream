@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from workstream_checkpoint import build_checkpoint
+from workstream_generation import build_retirement_proof
 from workstream_delta import Delta
 from workstream_linear_checkpoints import encode_checkpoint_comment
 from workstream_linear_events import encode_event_comment
@@ -104,6 +105,82 @@ class ResumeTests(unittest.TestCase):
         self.assertIn("--abort-reservation-id", pending["abort"]["command"])
         self.assertIn("2026-08-31T12:00:00Z", pending["continue"]["command"])
         self.assertIn("--expected-native-root-sha256", pending["continue"]["command"])
+
+    def test_non_null_generation_replay_is_exact_and_legacy_is_abort_only(self):
+        canonical, immutable = self.generation_sources()
+        checkpoint = build_checkpoint(
+            workstream_id="GEN-14", boundary_id="generation-replay",
+            root_revision=7, plan_revision="b" * 64,
+            before_status="Done", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai",
+                "session_id": "resume-session", "machine": "M3",
+                "worktree": {
+                    "state": "safe", "path": "/Volumes/Workshop/Code/wt",
+                    "branch": "resume", "head": "4" * 40,
+                },
+            },
+            exact_head="4" * 40, evidence=[], blocker=None,
+            next_action="Finalize the reviewed generation.",
+        )
+        retirement = build_retirement_proof(
+            predecessor_plan_revision="a" * 64,
+            retired_at="2026-08-31T12:00:00Z", retired_writer_epoch=0,
+            provenance_event_ids=["wsp_" + "5" * 32],
+            checkpoint_event_ids=["wscp_" + "6" * 32],
+        )
+        reservation = {
+            "schema_version": 4,
+            "reservation_id": "wsgr_" + "1" * 32,
+            "reservation_sha256": "2" * 64,
+            "from_plan_revision": "a" * 64,
+            "to_plan_revision": "b" * 64,
+            "created_at": "2026-08-31T12:00:00Z",
+            "native_root_sha256": "3" * 64,
+            "source": {"identity": immutable, "sha256": "b" * 64},
+            "retirement": retirement,
+            "activation_checkpoint": checkpoint,
+            "remote_head": "4" * 40,
+        }
+
+        def surface(items):
+            with mock.patch.object(MODULE, "plan_payload", return_value={
+                "source": {"identity": canonical, "sha256": "b" * 64},
+            }), mock.patch(
+                "workstream_generation.pending_generation_reservations",
+                return_value=items,
+            ):
+                return MODULE.plan_generation_freshness(
+                    token="GEN-14", description=f"Canonical plan: {canonical}",
+                    active_source={"identity": immutable, "sha256": "a" * 64},
+                    comments=[], authenticated_route={
+                        "workspace_id": "workspace", "team_id": "team",
+                        "project_id": "project", "root_issue_id": "root",
+                    },
+                )
+
+        pending = surface([reservation])["pending_generation_reservations"][0]
+        self.assertEqual(pending["replay_inputs"], {
+            "source": reservation["source"],
+            "retirement_proof": retirement,
+            "activation_checkpoint": checkpoint,
+            "remote_head": "4" * 40,
+            "created_at": reservation["created_at"],
+            "expected_native_root_sha256": "3" * 64,
+        })
+        self.assertFalse(any("<" in token for token in pending["continue"]["command"]))
+        self.assertIn("4" * 40, pending["continue"]["command"])
+        self.assertEqual(
+            [item["content"] for item in pending["continue"]["materialize_files"]],
+            [retirement, checkpoint],
+        )
+        for legacy_version in (2, 3):
+            legacy = dict(reservation)
+            legacy["schema_version"] = legacy_version
+            observed = surface([legacy])["pending_generation_reservations"][0]
+            self.assertFalse(observed["continue"]["available"])
+            self.assertIn("abort", observed["continue"]["reason"])
+            self.assertIn("--abort-reservation-id", observed["abort"]["command"])
 
     def test_generation_pending_long_source_route_and_root_stay_under_24k(self):
         canonical, immutable = self.generation_sources()
@@ -2117,6 +2194,221 @@ class ResumeTests(unittest.TestCase):
                 graph, comments_payload, "GEN-37", authenticated_route=route,
                 authenticated_source=authenticated_source,
             )
+
+    def test_gen14_ordinary_resume_drift_activation_and_full_recovery(self):
+        import test_workstream_generation_transition as generation_fixture
+        from workstream_generation import (
+            GenerationTransport, native_root_activation_proof,
+            strict_candidate_loader,
+        )
+        from workstream_linear import LinearGraphQLTransport
+        from workstream_linear_projection import (
+            LinearProjectionAdapter, reduce_projection_comments,
+        )
+
+        token = "GEN-14"
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project",
+            "root_issue_id": "33333333-3333-4333-8333-333333333333",
+        }
+        canonical = "https://github.com/acme/plans/blob/main/PLAN.md"
+        old_identity = (
+            "https://github.com/acme/plans/blob/" + "1" * 40 + "/PLAN.md"
+        )
+        new_identity = (
+            "https://github.com/acme/plans/blob/" + "2" * 40 + "/PLAN.md"
+        )
+        old_plan = tempfile.NamedTemporaryFile("w+", suffix=".md")
+        new_plan = tempfile.NamedTemporaryFile("w+", suffix=".md")
+        self.addCleanup(old_plan.close)
+        self.addCleanup(new_plan.close)
+        old_plan.write("# GEN-14 original plan\n")
+        old_plan.flush()
+        new_plan.write("# GEN-14 revised plan\n")
+        new_plan.flush()
+        old_digest = hashlib.sha256(Path(old_plan.name).read_bytes()).hexdigest()
+        new_digest = hashlib.sha256(Path(new_plan.name).read_bytes()).hexdigest()
+
+        with mock.patch.object(generation_fixture, "WORKSTREAM", token), \
+             mock.patch.object(generation_fixture, "AUTHORITY", route):
+            client = generation_fixture.FakeClient()
+            client.description = (
+                f"Plan revision: {old_digest}\nCanonical plan: {canonical}\n"
+                "Next action: Review the revised plan."
+            )
+            client.graph_status = "Done"
+            client.graph_status_type = "completed"
+            generation_fixture.project_full(
+                client, old_digest, identity=old_identity,
+            )
+            generation_fixture.project_full(
+                client, new_digest, identity=new_identity,
+            )
+            initial_comment_count = len(client.comments)
+
+            def source_payload(location, identity=None):
+                if location == canonical:
+                    return {"source": {
+                        "identity": canonical, "sha256": new_digest,
+                        "bytes": len(Path(new_plan.name).read_bytes()),
+                    }}
+                if location == old_plan.name:
+                    return {"source": {
+                        "identity": identity or old_identity,
+                        "sha256": old_digest,
+                        "bytes": len(Path(old_plan.name).read_bytes()),
+                    }}
+                if location == new_plan.name or location == new_identity:
+                    return {"source": {
+                        "identity": identity or new_identity,
+                        "sha256": new_digest,
+                        "bytes": len(Path(new_plan.name).read_bytes()),
+                    }}
+                raise AssertionError(f"unexpected plan source: {location}")
+
+            def ordinary_resume(plan_path, identity):
+                output = io.StringIO()
+                comments_adapter = mock.Mock()
+                comments_adapter.comments.return_value = copy.deepcopy(
+                    client.comments
+                )
+                with mock.patch.object(
+                    MODULE, "resolve_linear_route", return_value=(None, None),
+                ), mock.patch.object(
+                    MODULE, "resolve_authenticated_issue_route", return_value=route,
+                ), mock.patch.object(
+                    MODULE, "HttpGraphQLClient", return_value=client,
+                ), mock.patch.object(
+                    MODULE, "LinearCommentEventAdapter",
+                    return_value=comments_adapter,
+                ), mock.patch.object(
+                    MODULE, "load_linear_api_key", return_value="secret",
+                ), mock.patch.object(
+                    MODULE, "plan_payload", side_effect=source_payload,
+                ), mock.patch.object(
+                    MODULE.sys, "argv", [
+                        "workstream_resume.py", token,
+                        "--plan-source", plan_path,
+                        "--plan-identity", identity,
+                    ],
+                ), mock.patch.object(MODULE.sys, "stdout", output):
+                    self.assertEqual(MODULE.main(), 0)
+                return json.loads(output.getvalue())
+
+            pending = ordinary_resume(old_plan.name, old_identity)
+            self.assertEqual(
+                pending["resume_authority"], "plan_generation_pending",
+            )
+            self.assertFalse(pending["executable"])
+            self.assertEqual(pending["active_source"]["sha256"], old_digest)
+            self.assertEqual(
+                pending["canonical_live_source"]["sha256"], new_digest,
+            )
+            self.assertLessEqual(
+                len(MODULE._default_output_bytes(pending)), 24 * 1024,
+            )
+            self.assertEqual(client.graph_status, "Done")
+
+            client.graph_status = "In Progress"
+            client.graph_status_type = "started"
+            linear = LinearGraphQLTransport(
+                client, workspace_id="workspace", team_id="team",
+                project_id="project",
+            )
+            loader = strict_candidate_loader(
+                client, token=token, authority=route,
+                plan_source=new_plan.name, plan_identity=new_identity,
+            )
+            generation = GenerationTransport(
+                client, issue_id=token, workstream_id=token,
+                authority=route, candidate_loader=loader,
+                legacy_description_plan_revision=old_digest,
+                native_root_loader=lambda: linear.snapshot_for_root(token),
+                source_loader=lambda: {
+                    "identity": new_identity, "sha256": new_digest,
+                },
+            )
+            old_state = LinearProjectionAdapter(
+                client, issue_id=token, workstream_id=token,
+                plan_revision=old_digest, **route,
+            ).state()
+            retirement = build_retirement_proof(
+                predecessor_plan_revision=old_digest,
+                retired_at="2026-08-31T12:00:00Z", retired_writer_epoch=0,
+                provenance_event_ids=[
+                    event["event_id"] for event in old_state.events
+                    if event["kind"] == "provenance"
+                ],
+                checkpoint_event_ids=[],
+            )
+            preview = generation.preview_activate(
+                target_plan_revision=new_digest,
+                created_at="2026-08-31T12:00:00Z",
+                retirement=retirement,
+            )
+            proof = preview["native_root_activation_proof"]
+            expected_proof = native_root_activation_proof(
+                linear.snapshot_for_root(token), workstream_id=token,
+                issue_id=token, authority=route,
+            )
+            self.assertEqual(proof, expected_proof)
+            activated = generation.activate(
+                target_plan_revision=new_digest,
+                created_at="2026-08-31T12:00:00Z",
+                retirement=retirement,
+                expected_native_root_sha256=proof["sha256"],
+            )
+            writes_after_activation = len(client.comments)
+            replay = generation.activate(
+                target_plan_revision=new_digest,
+                created_at="2026-08-31T12:00:00Z",
+                retirement=retirement,
+                expected_native_root_sha256=proof["sha256"],
+            )
+            self.assertTrue(replay["replay"])
+            self.assertEqual(len(client.comments), writes_after_activation)
+            self.assertEqual(
+                activated["two_phase_finalization"]["execution_status"]["name"],
+                "In Progress",
+            )
+
+            client.graph_status = "Done"
+            client.graph_status_type = "completed"
+            first = ordinary_resume(new_plan.name, new_identity)
+            second = ordinary_resume(new_plan.name, new_identity)
+            self.assertEqual(first, second)
+            self.assertEqual(first["resume_authority"], "full")
+            self.assertEqual(first["workstream_id"], token)
+            self.assertEqual(first["plan_revision"], new_digest)
+            self.assertEqual(first["source"], {
+                "identity": new_identity, "sha256": new_digest,
+            })
+            self.assertEqual(first["status"], "In Progress")
+            self.assertEqual(first["native_issue_status"], "Done")
+            self.assertEqual(first["authenticated_route"], route)
+            self.assertEqual(len(client.comments), writes_after_activation)
+            self.assertEqual(client.root_issue()["id"], route["root_issue_id"])
+            self.assertEqual(
+                client.root_issue()["project"]["id"], route["project_id"],
+            )
+            self.assertEqual(client.children, [])
+            source_events = []
+            for digest in (old_digest, new_digest):
+                state = reduce_projection_comments(
+                    client.comments, workstream_id=token,
+                    expected_plan_revision=digest,
+                    authenticated_route=route,
+                )
+                source_events.extend(
+                    event for event in state.events if event["kind"] == "source"
+                )
+            self.assertEqual(len(source_events), 2)
+            self.assertEqual(
+                {event["value"]["sha256"] for event in source_events},
+                {old_digest, new_digest},
+            )
+            self.assertGreater(writes_after_activation, initial_comment_count)
 
     def test_relation_target_readback_reconstructs_exact_lifecycle_digest(self):
         graph = self.snapshot()

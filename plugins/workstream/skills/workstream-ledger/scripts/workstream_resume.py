@@ -173,22 +173,47 @@ def plan_generation_freshness(
                 "expected_native_root_sha256": item["native_root_sha256"],
             }
             reservations[-1]["replay_inputs"] = replay_inputs
+            replay_stem = f"workstream-generation-{item['reservation_id']}"
+            retirement_path = replay_stem + "-retirement.json"
             command = [
                 "workstreamctl", "generation", "activate", token,
                 "--plan-source", item["source"]["identity"],
                 "--plan-identity", item["source"]["identity"],
-                "--retirement-proof", "<write replay_inputs.retirement_proof>",
+                "--retirement-proof", retirement_path,
                 "--created-at", item["created_at"],
                 "--expected-native-root-sha256", item["native_root_sha256"],
             ]
+            materialize_files = [{
+                "path": retirement_path,
+                "content": item["retirement"],
+                "sha256": hashlib.sha256(json.dumps(
+                    item["retirement"], ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")).hexdigest(),
+            }]
             if item["activation_checkpoint"] is not None:
+                checkpoint_path = replay_stem + "-checkpoint.json"
                 command.extend([
-                    "--activation-checkpoint",
-                    "<write replay_inputs.activation_checkpoint>",
+                    "--activation-checkpoint", checkpoint_path,
                     "--remote-head", item["remote_head"],
                 ])
+                materialize_files.append({
+                    "path": checkpoint_path,
+                    "content": item["activation_checkpoint"],
+                    "sha256": hashlib.sha256(json.dumps(
+                        item["activation_checkpoint"], ensure_ascii=False,
+                        sort_keys=True, separators=(",", ":"),
+                    ).encode("utf-8")).hexdigest(),
+                })
             command.append("--apply")
             reservations[-1]["continue"]["command"] = command
+            reservations[-1]["continue"]["materialize_files"] = (
+                materialize_files
+            )
+            reservations[-1]["continue"]["requirement"] = (
+                "write each exact content value to its named path, verify its "
+                "sha256, then execute this exact argv"
+            )
             reservation_token = (
                 f"generation:{item['reservation_id']}:"
                 f"{item['reservation_sha256']}"
