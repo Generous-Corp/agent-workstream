@@ -97,12 +97,22 @@ class PlanIntakeTests(unittest.TestCase):
         self.assertEqual(init[0][0:4], ["git", "init", "--bare", "--quiet"])
         self.assertEqual(Path(isolated).name, "repository.git")
         self.assertEqual(fetch[0], [
-            "git", "-C", isolated, "fetch", "--quiet", "--no-tags",
-            "--depth=1", "git@github.com:Generous-Corp/pulp-planning.git", commit,
+            "git", "-C", isolated,
+            "-c", "protocol.version=2",
+            "-c", "remote.origin.url=git@github.com:Generous-Corp/pulp-planning.git",
+            "-c", "remote.origin.promisor=true",
+            "-c", "remote.origin.partialclonefilter=blob:none",
+            "fetch", "--quiet", "--no-tags", "--depth=1",
+            "--filter=blob:none", "origin", commit,
         ])
         self.assertEqual(show[0], [
-            "git", "-C", isolated, "show", "--no-ext-diff", "--no-textconv",
-            f"{commit}:plans/continuity.md",
+            "git", "-C", isolated,
+            "-c", "protocol.version=2",
+            "-c", "remote.origin.url=git@github.com:Generous-Corp/pulp-planning.git",
+            "-c", "remote.origin.promisor=true",
+            "-c", "remote.origin.partialclonefilter=blob:none",
+            "show", "--no-ext-diff", "--no-textconv",
+            "FETCH_HEAD:plans/continuity.md",
         ])
         self.assertFalse(Path(isolated).parent.exists())
         for arguments, environment, _timeout in calls:
@@ -136,11 +146,21 @@ class PlanIntakeTests(unittest.TestCase):
         self.assertEqual(raw, b"# Current private plan\n")
         self.assertEqual(identity, source)
         self.assertEqual(calls[1], [
-            "git", "-C", isolated, "fetch", "--quiet", "--no-tags",
-            "--depth=1", "git@github.com:acme/plans.git", "refs/heads/main",
+            "git", "-C", isolated,
+            "-c", "protocol.version=2",
+            "-c", "remote.origin.url=git@github.com:acme/plans.git",
+            "-c", "remote.origin.promisor=true",
+            "-c", "remote.origin.partialclonefilter=blob:none",
+            "fetch", "--quiet", "--no-tags", "--depth=1",
+            "--filter=blob:none", "origin", "refs/heads/main",
         ])
         self.assertEqual(calls[2], [
-            "git", "-C", isolated, "show", "--no-ext-diff", "--no-textconv",
+            "git", "-C", isolated,
+            "-c", "protocol.version=2",
+            "-c", "remote.origin.url=git@github.com:acme/plans.git",
+            "-c", "remote.origin.promisor=true",
+            "-c", "remote.origin.partialclonefilter=blob:none",
+            "show", "--no-ext-diff", "--no-textconv",
             "FETCH_HEAD:PLAN.md",
         ])
 
