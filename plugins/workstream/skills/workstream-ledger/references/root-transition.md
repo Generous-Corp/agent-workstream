@@ -19,12 +19,14 @@ Preview reopening the exact terminal root to a reviewed Linear `started` state:
 workstreamctl root-transition reopen GEN-123 --state-id <linear-state-uuid>
 ```
 
-Review `intent`, `authenticated_route`, `expected_snapshot_sha256`, and
-`expected_frontier_sha256`, then repeat the identical command with:
+Review `intent`, `authenticated_route`, `expected_snapshot_sha256`,
+`expected_frontier_sha256`, and `intent_sha256`, then repeat the identical
+command with:
 
 ```sh
 --expected-snapshot-sha256 <preview-value> \
---expected-frontier-sha256 <preview-value> --apply
+--expected-frontier-sha256 <preview-value> \
+--expected-intent-sha256 <preview-value> --apply
 ```
 
 Apply reauthenticates the workspace, team, project, immutable root, and target
@@ -40,3 +42,13 @@ clients following this protocol, but cannot make the native write atomic
 against unrelated writers. A contradictory post-read therefore fails closed
 and requires human reconciliation; the command never silently retries or rolls
 back mutable issue data.
+
+Only the uninterrupted process that receives and verifies a newly created
+reservation may call `issueUpdate`. An identical concurrent caller, an unknown
+create outcome, or a restart that finds the root still in its pre-state refuses
+as pending without a native write. Recovery is deliberate: inspect the pending
+reservation, run a fresh preview whose frontier includes it, review the new
+three digests, and apply that new intent. If the original native update already
+landed, the old exact apply validates the target and returns a zero-write replay.
+Reservation deletion, duplication, or body replacement at either the immediate
+prewrite or final postread boundary refuses.

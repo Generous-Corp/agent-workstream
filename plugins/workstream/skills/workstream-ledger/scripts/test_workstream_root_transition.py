@@ -7,6 +7,7 @@ import unittest
 from workstream_root_transition import (
     RootTransitionError, RootTransitionTransport,
 )
+from workstream_linear import LinearTransportError
 
 
 TOKEN = "GEN-14"
@@ -32,6 +33,8 @@ class FakeClient:
             "id": "ordinary", "body": "preserved", "createdAt": "t0", "updatedAt": "t0",
         }]
         self.calls: list[tuple[str, dict]] = []
+        self.after_issue_update = None
+        self.before_comment_create = None
 
     def root(self):
         return {
@@ -67,13 +70,17 @@ class FakeClient:
             return {"__type": {"inputFields": [{"name": "id"}]}}
         if "WorkstreamDeltaCommentCreate" in query:
             value = variables["input"]
+            if self.before_comment_create is not None:
+                callback, self.before_comment_create = self.before_comment_create, None
+                callback(value)
             existing = next((item for item in self.comments if item["id"] == value["id"]), None)
-            if existing is None:
-                existing = {
-                    "id": value["id"], "body": value["body"],
-                    "createdAt": "reservation", "updatedAt": "reservation",
-                }
-                self.comments.append(existing)
+            if existing is not None:
+                raise LinearTransportError("comment id collision")
+            existing = {
+                "id": value["id"], "body": value["body"],
+                "createdAt": "reservation", "updatedAt": "reservation",
+            }
+            self.comments.append(existing)
             return {"commentCreate": {"success": True, "comment": deepcopy(existing)}}
         if "WorkstreamRootTransitionState" in query:
             return {
@@ -90,6 +97,8 @@ class FakeClient:
             if "stateId" in update:
                 self.state = {"id": update["stateId"], "name": "In Progress", "type": "started"}
             self.updated_at = "after"
+            if self.after_issue_update is not None:
+                self.after_issue_update()
             return {"issueUpdate": {"success": True, "issue": self.root()}}
         raise AssertionError(query)
 
@@ -109,6 +118,7 @@ class RootTransitionTests(unittest.TestCase):
             operation="plan-url", target=MAIN,
             expected_snapshot_sha256=preview["expected_snapshot_sha256"],
             expected_frontier_sha256=preview["expected_frontier_sha256"],
+            expected_intent_sha256=preview["intent_sha256"],
         )
         self.assertTrue(result["apply"])
         self.assertEqual(fake.description, original.replace(PINNED, MAIN))
@@ -124,6 +134,7 @@ class RootTransitionTests(unittest.TestCase):
             "operation": "plan-url", "target": MAIN,
             "expected_snapshot_sha256": preview["expected_snapshot_sha256"],
             "expected_frontier_sha256": preview["expected_frontier_sha256"],
+            "expected_intent_sha256": preview["intent_sha256"],
         }
         transport.apply(**args)
         writes = sum("WorkstreamRootTransition(" in query for query, _ in fake.calls)
@@ -171,6 +182,7 @@ class RootTransitionTests(unittest.TestCase):
                     operation="plan-url", target=MAIN,
                     expected_snapshot_sha256=preview["expected_snapshot_sha256"],
                     expected_frontier_sha256=preview["expected_frontier_sha256"],
+                    expected_intent_sha256=preview["intent_sha256"],
                 )
             self.assertFalse(any("WorkstreamRootTransition(" in query for query, _ in fake.calls))
 
@@ -182,6 +194,7 @@ class RootTransitionTests(unittest.TestCase):
             operation="reopen", target=STARTED_STATE,
             expected_snapshot_sha256=preview["expected_snapshot_sha256"],
             expected_frontier_sha256=preview["expected_frontier_sha256"],
+            expected_intent_sha256=preview["intent_sha256"],
         )
         self.assertEqual(result["final_root"]["state"], {
             "id": STARTED_STATE, "name": "In Progress", "type": "started",
@@ -191,6 +204,7 @@ class RootTransitionTests(unittest.TestCase):
             operation="reopen", target=STARTED_STATE,
             expected_snapshot_sha256=preview["expected_snapshot_sha256"],
             expected_frontier_sha256=preview["expected_frontier_sha256"],
+            expected_intent_sha256=preview["intent_sha256"],
         )
         self.assertEqual(sum("WorkstreamRootTransition(" in query for query, _ in fake.calls), writes)
 
@@ -212,8 +226,134 @@ class RootTransitionTests(unittest.TestCase):
                 operation="plan-url", target=MAIN,
                 expected_snapshot_sha256=preview["expected_snapshot_sha256"],
                 expected_frontier_sha256=preview["expected_frontier_sha256"],
+                expected_intent_sha256=preview["intent_sha256"],
             )
         self.assertFalse(any("WorkstreamRootTransition(" in query for query, _ in fake.calls))
+
+    def test_operation_and_target_substitution_refuse_before_reservation(self):
+        fake = FakeClient()
+        transport = self.transport(fake)
+        preview = transport.preview(operation="plan-url", target=MAIN)
+        for operation, target in (
+            ("reopen", STARTED_STATE),
+            ("plan-url", "https://github.com/EXAMPLE/private-plans/blob/main/plan.md"),
+        ):
+            with self.subTest(operation=operation), self.assertRaisesRegex(
+                RootTransitionError, "intent_mismatch"
+            ):
+                transport.apply(
+                    operation=operation, target=target,
+                    expected_snapshot_sha256=preview["expected_snapshot_sha256"],
+                    expected_frontier_sha256=preview["expected_frontier_sha256"],
+                    expected_intent_sha256=preview["intent_sha256"],
+                )
+        self.assertFalse(any("CommentCreate" in query for query, _ in fake.calls))
+        self.assertFalse(any("WorkstreamRootTransition(" in query for query, _ in fake.calls))
+
+    def test_crash_after_create_leaves_explicit_pending_and_no_automatic_owner(self):
+        fake = FakeClient()
+        preview = self.transport(fake).preview(operation="plan-url", target=MAIN)
+        args = {
+            "operation": "plan-url", "target": MAIN,
+            "expected_snapshot_sha256": preview["expected_snapshot_sha256"],
+            "expected_frontier_sha256": preview["expected_frontier_sha256"],
+            "expected_intent_sha256": preview["intent_sha256"],
+        }
+
+        def crash():
+            raise RuntimeError("process died")
+
+        with self.assertRaisesRegex(RuntimeError, "process died"):
+            RootTransitionTransport(
+                fake, token=TOKEN, authority=AUTHORITY,
+                after_reservation_created=crash,
+            ).apply(**args)
+        with self.assertRaisesRegex(
+            RootTransitionError, "reservation_pending_review_new_preview_required"
+        ):
+            self.transport(fake).apply(**args)
+        self.assertFalse(any("WorkstreamRootTransition(" in query for query, _ in fake.calls))
+
+    def test_two_client_create_race_allows_only_proven_creator_to_update(self):
+        fake = FakeClient()
+        transport = self.transport(fake)
+        preview = transport.preview(operation="plan-url", target=MAIN)
+        args = {
+            "operation": "plan-url", "target": MAIN,
+            "expected_snapshot_sha256": preview["expected_snapshot_sha256"],
+            "expected_frontier_sha256": preview["expected_frontier_sha256"],
+            "expected_intent_sha256": preview["intent_sha256"],
+        }
+
+        def competing_create(value):
+            fake.comments.append({
+                "id": value["id"], "body": value["body"],
+                "createdAt": "winner", "updatedAt": "winner",
+            })
+
+        fake.before_comment_create = competing_create
+        with self.assertRaisesRegex(
+            RootTransitionError, "reservation_not_owned_by_this_process"
+        ):
+            transport.apply(**args)
+        self.assertFalse(any("WorkstreamRootTransition(" in query for query, _ in fake.calls))
+
+    def test_reservation_deletion_or_replacement_refuses_at_prewrite(self):
+        for mode in ("delete", "replace"):
+            fake = FakeClient()
+            preview = self.transport(fake).preview(operation="plan-url", target=MAIN)
+
+            def corrupt():
+                reservation = next(
+                    item for item in fake.comments
+                    if item["id"] == preview["reservation_slot_id"]
+                )
+                if mode == "delete":
+                    fake.comments.remove(reservation)
+                else:
+                    reservation["body"] = "replaced"
+
+            transport = RootTransitionTransport(
+                fake, token=TOKEN, authority=AUTHORITY,
+                after_reservation_created=corrupt,
+            )
+            with self.subTest(mode=mode), self.assertRaisesRegex(
+                RootTransitionError, "reservation_changed_or_missing"
+            ):
+                transport.apply(
+                    operation="plan-url", target=MAIN,
+                    expected_snapshot_sha256=preview["expected_snapshot_sha256"],
+                    expected_frontier_sha256=preview["expected_frontier_sha256"],
+                    expected_intent_sha256=preview["intent_sha256"],
+                )
+            self.assertFalse(any("WorkstreamRootTransition(" in query for query, _ in fake.calls))
+
+    def test_reservation_deletion_or_replacement_refuses_at_postread(self):
+        for mode in ("delete", "replace"):
+            fake = FakeClient()
+            preview = self.transport(fake).preview(operation="plan-url", target=MAIN)
+
+            def corrupt():
+                reservation = next(
+                    item for item in fake.comments
+                    if item["id"] == preview["reservation_slot_id"]
+                )
+                if mode == "delete":
+                    fake.comments.remove(reservation)
+                else:
+                    reservation["body"] = "replaced"
+
+            fake.after_issue_update = corrupt
+            with self.subTest(mode=mode), self.assertRaisesRegex(
+                RootTransitionError, "reservation_changed_or_missing"
+            ):
+                self.transport(fake).apply(
+                    operation="plan-url", target=MAIN,
+                    expected_snapshot_sha256=preview["expected_snapshot_sha256"],
+                    expected_frontier_sha256=preview["expected_frontier_sha256"],
+                    expected_intent_sha256=preview["intent_sha256"],
+                )
+            self.assertTrue(any("WorkstreamRootTransition(" in query for query, _ in fake.calls))
 
 
 if __name__ == "__main__":

@@ -216,10 +216,12 @@ supported, separately fenced front door. Preview `workstreamctl root-transition
 plan-url GEN-123 --to <same-document-blob/main-URL>` to replace one pinned
 canonical locator without changing other description text, or preview
 `workstreamctl root-transition reopen GEN-123 --state-id <started-state-UUID>`
-to reopen the same terminal root. Apply requires the previewed snapshot and
-comment-frontier digests. Linear has no conditional `issueUpdate`; the command
+to reopen the same terminal root. Apply requires the previewed snapshot,
+comment-frontier, and operation/target intent digests. Linear has no conditional `issueUpdate`; the command
 uses a deterministic append-only reservation plus immediate pre/post readback
-and explicitly does not claim cross-writer atomicity. Full instructions are in
+and explicitly does not claim cross-writer atomicity. An interrupted pre-update
+reservation requires a fresh reviewed preview; a new process never inherits
+write ownership merely by finding it. Full instructions are in
 the workstream-ledger skill's `references/root-transition.md`.
 
 After a PR lands, `workstreamctl reconcile --help` exposes the explicit GitHub,

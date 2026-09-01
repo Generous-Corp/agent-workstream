@@ -421,7 +421,11 @@ These mutations do not change append-only generation authority. Linear has no
 conditional `issueUpdate`, so the supported transport does not call the native
 write atomic: it first wins one deterministic append-only reservation for the
 reviewed snapshot, then performs immediate prewrite and postwrite readback.
-Exact replay is a no-op; drift or a competing reservation refuses. This is the
+Apply also requires the previewed intent digest, which binds the operation and
+target. Exact replay after the native update is a no-op; drift or a competing
+reservation refuses. A crash after reservation creation but before the native
+update leaves an explicit pending intent: another process cannot claim its
+ownership and must obtain a newly reviewed preview/frontier. This is the
 strongest supported fence, not protection against an unrelated writer changing
 the native issue in the interval between final prewrite readback and update.
 

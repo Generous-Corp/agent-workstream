@@ -18,7 +18,7 @@ import re
 import sys
 import uuid
 from copy import deepcopy
-from typing import Any
+from typing import Any, Callable
 
 from workstream_config import load_linear_api_key, resolve_linear_route
 from workstream_linear import (
@@ -165,6 +165,20 @@ def replace_canonical_plan_url(description: str, target: str) -> tuple[str, str]
     return description[:start] + target + description[end:], current
 
 
+def _reservation_matches_request(
+    reservation: dict[str, Any], *, operation: str, target: str,
+) -> bool:
+    if operation == "plan-url":
+        return (
+            reservation.get("after") == {"canonical_plan_url": target}
+            and isinstance((reservation.get("update") or {}).get("description"), str)
+            and canonical_plan_url(reservation["update"]["description"]) == target
+        )
+    if operation == "reopen":
+        return reservation.get("update") == {"stateId": target}
+    return False
+
+
 def _validate_authority(
     snapshot: dict[str, Any], token: str, authority: dict[str, str],
 ) -> None:
@@ -182,10 +196,14 @@ def _validate_authority(
 
 
 class RootTransitionTransport:
-    def __init__(self, client: Any, *, token: str, authority: dict[str, str]):
+    def __init__(
+        self, client: Any, *, token: str, authority: dict[str, str],
+        after_reservation_created: Callable[[], None] | None = None,
+    ):
         self.client = client
         self.token = token.upper()
         self.authority = deepcopy(authority)
+        self.after_reservation_created = after_reservation_created
         self.graph = LinearGraphQLTransport(
             client, team_id=authority["team_id"],
             workspace_id=authority["workspace_id"],
@@ -230,9 +248,17 @@ class RootTransitionTransport:
             "team_id": (state.get("team") or {}).get("id"),
         }
 
+    @staticmethod
+    def _assert_reservation(
+        comments: list[dict[str, Any]], *, slot: str, body: str,
+    ) -> None:
+        matches = [item for item in comments if item.get("id") == slot]
+        if len(matches) != 1 or matches[0].get("body") != body:
+            raise RootTransitionError("root_transition_reservation_changed_or_missing")
+
     def _reserve(
         self, reservation: dict[str, Any], slot: str,
-    ) -> None:
+    ) -> tuple[str, str]:
         capability = self.client.execute(COMMENT_CREATE_CAPABILITY_QUERY, {})
         fields = {
             item.get("name") for item in
@@ -242,14 +268,25 @@ class RootTransitionTransport:
             raise RootTransitionError("root_transition_comment_id_capability_unavailable")
         body = _encode(reservation)
         try:
-            self.client.execute(COMMENT_CREATE_MUTATION, {
+            response = self.client.execute(COMMENT_CREATE_MUTATION, {
                 "input": {"id": slot, "issueId": self.authority["root_issue_id"], "body": body},
             })
-        except LinearTransportError:
-            pass
-        matches = [item for item in self.comments.comments() if item.get("id") == slot]
-        if len(matches) != 1 or matches[0].get("body") != body:
+        except (LinearTransportError, OSError):
+            observed = self.comments.comments()
+            matches = [item for item in observed if item.get("id") == slot]
+            if len(matches) == 1 and matches[0].get("body") == body:
+                return "existing_or_unknown", body
             raise RootTransitionError("root_transition_reservation_slot_conflict")
+        created = response.get("commentCreate")
+        returned = (created or {}).get("comment") if isinstance(created, dict) else None
+        if (
+            not isinstance(created, dict) or created.get("success") is not True
+            or not isinstance(returned, dict) or returned.get("id") != slot
+            or returned.get("body") != body
+        ):
+            raise RootTransitionError("root_transition_reservation_create_unproven")
+        self._assert_reservation(self.comments.comments(), slot=slot, body=body)
+        return "created", body
 
     def preview(self, *, operation: str, target: str) -> dict[str, Any]:
         snapshot, comments = self._read()
@@ -298,8 +335,13 @@ class RootTransitionTransport:
     def apply(
         self, *, operation: str, target: str,
         expected_snapshot_sha256: str, expected_frontier_sha256: str,
+        expected_intent_sha256: str,
     ) -> dict[str, Any]:
-        if not HEX64.fullmatch(expected_snapshot_sha256) or not HEX64.fullmatch(expected_frontier_sha256):
+        if (
+            not HEX64.fullmatch(expected_snapshot_sha256)
+            or not HEX64.fullmatch(expected_frontier_sha256)
+            or not HEX64.fullmatch(expected_intent_sha256)
+        ):
             raise RootTransitionError("root_transition_expected_fence_invalid")
         snapshot, comments = self._read()
         reviewed_state = self._started_state(target) if operation == "reopen" else None
@@ -308,12 +350,40 @@ class RootTransitionTransport:
         # Rebuild the original reviewed intent only while the original snapshot is present.
         replayed = snapshot_sha256(snapshot) != expected_snapshot_sha256
         if not replayed:
+            if reserved:
+                if len(reserved) != 1:
+                    raise RootTransitionError("root_transition_reservation_slot_conflict")
+                existing = _decode(str(reserved[0].get("body") or ""))
+                if (
+                    not isinstance(existing, dict)
+                    or existing.get("intent_sha256") != expected_intent_sha256
+                    or existing.get("operation") != operation
+                    or existing.get("authority") != self.authority
+                    or not _reservation_matches_request(
+                        existing, operation=operation, target=target,
+                    )
+                ):
+                    raise RootTransitionError("root_transition_reservation_slot_conflict")
+                raise RootTransitionError(
+                    "root_transition_reservation_pending_review_new_preview_required"
+                )
             preview = self.preview(operation=operation, target=target)
             if preview["expected_frontier_sha256"] != expected_frontier_sha256:
                 raise RootTransitionError("root_transition_frontier_drift")
+            if preview["intent_sha256"] != expected_intent_sha256:
+                raise RootTransitionError("root_transition_intent_mismatch")
             reservation = {**preview["intent"], "intent_sha256": preview["intent_sha256"]}
-            self._reserve(reservation, slot)
+            reservation_result, reservation_body = self._reserve(reservation, slot)
+            if reservation_result != "created":
+                raise RootTransitionError(
+                    "root_transition_reservation_not_owned_by_this_process"
+                )
+            if self.after_reservation_created is not None:
+                self.after_reservation_created()
             immediate, immediate_comments = self._read()
+            self._assert_reservation(
+                immediate_comments, slot=slot, body=reservation_body,
+            )
             if (
                 snapshot_sha256(immediate) != expected_snapshot_sha256
                 or comment_frontier_sha256(immediate_comments, exclude_id=slot)
@@ -337,6 +407,10 @@ class RootTransitionTransport:
                 or reservation.get("expected_snapshot_sha256") != expected_snapshot_sha256
                 or reservation.get("expected_frontier_sha256") != expected_frontier_sha256
                 or reservation.get("authority") != self.authority
+                or reservation.get("intent_sha256") != expected_intent_sha256
+                or not _reservation_matches_request(
+                    reservation, operation=operation, target=target,
+                )
             ):
                 raise RootTransitionError("root_transition_replay_intent_mismatch")
             unsigned = {key: deepcopy(value) for key, value in reservation.items()
@@ -359,6 +433,8 @@ class RootTransitionTransport:
             ):
                 raise RootTransitionError("root_transition_replay_intent_mismatch")
         final, final_comments = self._read()
+        reservation_body = _encode(reservation)
+        self._assert_reservation(final_comments, slot=slot, body=reservation_body)
         final_root = final["root"]
         if _preserved_root(final, operation) != reservation.get("preserved_root"):
             raise RootTransitionError("root_transition_postwrite_unrelated_root_drift")
@@ -414,6 +490,7 @@ def parser() -> argparse.ArgumentParser:
     for command in (plan, reopen):
         command.add_argument("--expected-snapshot-sha256")
         command.add_argument("--expected-frontier-sha256")
+        command.add_argument("--expected-intent-sha256")
         command.add_argument("--apply", action="store_true")
     return value
 
@@ -440,12 +517,17 @@ def main() -> int:
         operation = args.command
         target = args.to if operation == "plan-url" else args.state_id
         if args.apply:
-            if not args.expected_snapshot_sha256 or not args.expected_frontier_sha256:
+            if (
+                not args.expected_snapshot_sha256
+                or not args.expected_frontier_sha256
+                or not args.expected_intent_sha256
+            ):
                 raise RootTransitionError("root_transition_apply_requires_reviewed_fences")
             output = transport.apply(
                 operation=operation, target=target,
                 expected_snapshot_sha256=args.expected_snapshot_sha256,
                 expected_frontier_sha256=args.expected_frontier_sha256,
+                expected_intent_sha256=args.expected_intent_sha256,
             )
         else:
             output = transport.preview(operation=operation, target=target)
