@@ -601,6 +601,9 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         "expected_projection_quarantine_sha256",
     }
     repairs_allowed = required | {"terminal_child_repairs"}
+    gen14_bridge_repairs_allowed = repairs_allowed | {
+        "terminal_child_repair_gen14_frontier_bridge"
+    }
     seeds_allowed = required | {"terminal_child_evidence_seeds"}
     predecessor_seeds_allowed = seeds_allowed | {
         "terminal_child_evidence_seed_predecessor"
@@ -617,6 +620,7 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
     source_transition_allowed = required | {"terminal_child_source_transition"}
     if not isinstance(manifest, dict) or frozenset(manifest) not in {
         frozenset(required), frozenset(repairs_allowed),
+        frozenset(gen14_bridge_repairs_allowed),
         frozenset(seeds_allowed), frozenset(predecessor_seeds_allowed),
         frozenset(seed_transition_allowed),
         frozenset(predecessor_seed_transition_allowed),
@@ -1070,6 +1074,42 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             seen_issues.add(child["child_issue_id"])
         if pending != sorted(pending, key=lambda child: child["child_identifier"].upper()):
             raise LinearProjectionError("terminal_child_source_transition_not_canonical")
+    bridge = manifest.get("terminal_child_repair_gen14_frontier_bridge")
+    if bridge is not None:
+        if (
+            not isinstance(bridge, dict)
+            or set(bridge) != {
+                "prefix_sha256", "stored_input_frontier_sha256",
+                "recomputed_input_frontier_sha256", "source_event_id",
+                "source_value_sha256", "created_at", "child_identifiers",
+            }
+            or bridge["prefix_sha256"] != GEN14_SPLIT_PREFIX_SHA256
+            or bridge["stored_input_frontier_sha256"]
+            != GEN14_SPLIT_STORED_FRONTIER_SHA256
+            or bridge["recomputed_input_frontier_sha256"]
+            != GEN14_SPLIT_RECOMPUTED_FRONTIER_SHA256
+            or not isinstance(bridge["source_event_id"], str)
+            or not bridge["source_event_id"]
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(bridge["source_value_sha256"]),
+            )
+            or not isinstance(bridge["created_at"], str)
+            or not bridge["created_at"]
+            or not isinstance(bridge["child_identifiers"], list)
+            or not 1 <= len(bridge["child_identifiers"]) <= 2
+            or bridge["child_identifiers"] != sorted(
+                bridge["child_identifiers"]
+            )
+            or len(set(bridge["child_identifiers"]))
+            != len(bridge["child_identifiers"])
+            or any(
+                not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", str(child_id))
+                for child_id in bridge["child_identifiers"]
+            )
+        ):
+            raise LinearProjectionError(
+                "invalid_terminal_child_repair_gen14_frontier_bridge"
+            )
     return _desired_items(manifest), retirements
 
 
@@ -1888,6 +1928,90 @@ def _gen14_completed_split_migration(state: Any) -> bool:
     return list(state.events[6:8]) == expected
 
 
+def _gen14_completed_split_stable_source_prefix(state: Any) -> bool:
+    """Recognize exact D6/S7 plus at most its reviewed source-only event."""
+    if len(state.events) not in {8, 9}:
+        return False
+    base = SimpleNamespace(
+        revision=8, events=tuple(state.events[:8]),
+        snapshot=deepcopy(state.snapshot),
+    )
+    if not _gen14_completed_split_migration(base):
+        return False
+    if len(state.events) == 8:
+        return True
+    prefix_source = state.events[3]
+    source = state.events[8]
+    value = source.get("value", {})
+    return (
+        isinstance(value, dict)
+        and value.get("sha256") == prefix_source.get("value", {}).get("sha256")
+        and _valid_reviewed_source_transition(
+            str(prefix_source.get("value", {}).get("identity", "")),
+            str(value.get("identity", "")),
+        )
+        and source == build_projection_event(
+            workstream_id="GEN-14", kind="source", key="root", value=value,
+            plan_revision=prefix_source["plan_revision"], expected_revision=8,
+            created_at=source.get("created_at", ""),
+            supersedes_event_id=prefix_source["event_id"],
+            authority=prefix_source["authority"],
+        )
+    )
+
+
+def _gen14_stable_repair_descendant(
+    state: Any, desired: list[dict[str, Any]], bridge: dict[str, Any],
+) -> bool:
+    """Accept only the exact sorted closure prefix after reviewed source."""
+    if len(state.events) < 9 or not _gen14_completed_split_stable_source_prefix(
+        SimpleNamespace(
+            revision=9, events=tuple(state.events[:9]),
+            snapshot=deepcopy(state.snapshot),
+        )
+    ):
+        return False
+    source = state.events[8]
+    desired_sources = [
+        item for item in desired
+        if (item.get("kind"), item.get("key")) == ("source", "root")
+    ]
+    if (
+        source["event_id"] != bridge.get("source_event_id")
+        or canonical_digest(source["value"])
+        != bridge.get("source_value_sha256")
+        or len(desired_sources) != 1
+        or desired_sources[0].get("value") != source.get("value")
+    ):
+        return False
+    closures = sorted(
+        [item for item in desired if item.get("kind") == "child_closure"],
+        key=lambda item: item.get("key", ""),
+    )
+    closure_ids = [item.get("key") for item in closures]
+    if (
+        not 1 <= len(closures) <= 2
+        or closure_ids != bridge.get("child_identifiers")
+        or len(set(closure_ids)) != len(closure_ids)
+        or any(
+            not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", str(child_id or ""))
+            for child_id in closure_ids
+        )
+    ):
+        return False
+    expected = [
+        build_projection_event(
+            workstream_id="GEN-14", kind="child_closure", key=item["key"],
+            value=item["value"], plan_revision=state.events[0]["plan_revision"],
+            expected_revision=9 + index, created_at=bridge["created_at"],
+            authority=state.events[0]["authority"],
+        )
+        for index, item in enumerate(closures)
+    ]
+    tail = list(state.events[9:])
+    return len(tail) <= len(expected) and tail == expected[:len(tail)]
+
+
 def _gen14_frontier_only_evidence_normalization(
     current: dict[str, Any], desired: dict[str, Any], *, enabled: bool,
 ) -> bool:
@@ -2135,8 +2259,30 @@ def prepare_terminal_child_evidence_seeds(
                 "input_frontier_sha256"
             ],
         }
+        ordinary_transition = result.get(
+            "terminal_child_evidence_seed_head_transition"
+        )
+        retain_stable_completed_split_evidence = (
+            legacy_split is None
+            and ordinary_transition is None
+            and _gen14_completed_split_stable_source_prefix(state)
+        )
         for item in desired if legacy_split is None else []:
             if item["kind"] != "evidence_contract":
+                continue
+            if retain_stable_completed_split_evidence:
+                current = active.get((item["kind"], item["key"]))
+                if current is None:
+                    raise LinearProjectionError(
+                        "gen14_completed_split_evidence_missing"
+                    )
+                # The content-addressed prefix already authenticated these
+                # evidence values. D6/S7 advances target history, so a freshly
+                # derived predecessor-authority envelope is not the stored
+                # value and must not be written as an evidence replacement.
+                # This no-transition path is the stable repaired-head case;
+                # changed-head normalization retains its existing contract.
+                item["value"] = deepcopy(current["value"])
                 continue
             reviewed = predecessor_authorities[item["key"]]
             item["value"]["predecessor_closure_authority"] = {
@@ -2152,9 +2298,6 @@ def prepare_terminal_child_evidence_seeds(
                     "closure_value_sha256"
                 ],
             }
-        ordinary_transition = result.get(
-            "terminal_child_evidence_seed_head_transition"
-        )
         completed_split_normalization = False
         if legacy_split is None and ordinary_transition is not None:
             replay_desired = [*deepcopy(desired), {
@@ -2643,6 +2786,23 @@ def prepare_terminal_child_repairs(
     if result.get("retirements"):
         raise LinearProjectionError("terminal_child_repair_forbids_retirements")
     active = _active_heads(state)
+    bridge = result.get("terminal_child_repair_gen14_frontier_bridge")
+    if bridge is not None:
+        carried_frontiers = {
+            event["value"].get("predecessor_closure_authority", {}).get(
+                "input_frontier_sha256"
+            )
+            for (kind, _key), event in active.items()
+            if kind == "evidence_contract"
+        }
+        if (
+            carried_frontiers != {
+                bridge["stored_input_frontier_sha256"]
+            }
+        ):
+            raise LinearProjectionError(
+                "terminal_child_repair_gen14_frontier_bridge_mismatch"
+            )
     scope_event = active.get(("scope", "root"))
     if scope_event is None:
         raise LinearProjectionError("terminal_child_repair_scope_missing")
@@ -2825,6 +2985,12 @@ def prepare_terminal_child_repairs(
             )
         ],
     ]
+    if bridge is not None and not _gen14_stable_repair_descendant(
+        state, desired, bridge,
+    ):
+        raise LinearProjectionError(
+            "terminal_child_repair_gen14_frontier_bridge_mismatch"
+        )
 
     current_contract = projection_review_contract(state)
     if current_contract != original_contract:
@@ -3515,6 +3681,25 @@ def reconcile_required_projection(
             _validate_gen14_legacy_split_repair_prefix(
                 manifest, initial, scope_item["value"],
             )
+    repair_frontier_bridge = manifest.get(
+        "terminal_child_repair_gen14_frontier_bridge"
+    )
+    if repair_frontier_bridge is not None:
+        # The bridge is an exception for the live input frontier only. Rebuild
+        # every closure from the fenced child snapshot and carried evidence so
+        # an already-active caller-supplied value cannot evade the ordinary
+        # changed-closure check merely by matching the manifest.
+        authoritative_repair = prepare_terminal_child_repairs(
+            manifest, snapshot, initial,
+        )
+        authoritative_desired, _ = _reviewed_manifest(authoritative_repair)
+        submitted_desired = [
+            item for item in desired if item["kind"] != "disposition"
+        ]
+        if submitted_desired != authoritative_desired:
+            raise LinearProjectionError(
+                "terminal_child_repair_gen14_frontier_bridge_mismatch"
+            )
     active_heads = _active_heads(initial)
     _require_repairs_for_changed_child_closures(
         desired, active_heads, manifest.get("terminal_child_repairs") or [],
@@ -3578,6 +3763,22 @@ def reconcile_required_projection(
     repair_predecessor_frontier = next(
         iter(repair_predecessor_frontiers), None,
     )
+    if repair_frontier_bridge is not None and (
+        adapter.workstream_id != "GEN-14"
+        or adapter.plan_revision != initial.events[0].get("plan_revision")
+        or adapter.authority != initial.events[0].get("authority")
+        or created_at != repair_frontier_bridge["created_at"]
+        or sorted(repaired_child_ids)
+        != repair_frontier_bridge["child_identifiers"]
+        or repair_predecessor_frontier
+        != repair_frontier_bridge["stored_input_frontier_sha256"]
+        or not _gen14_stable_repair_descendant(
+            initial, desired, repair_frontier_bridge,
+        )
+    ):
+        raise LinearProjectionError(
+            "terminal_child_repair_gen14_frontier_bridge_mismatch"
+        )
     repair_predecessor_projection_bindings = {
         canonical_digest(
             _predecessor_binding_from_carried_authority(
@@ -3938,6 +4139,10 @@ def reconcile_required_projection(
         transition_frontier = (
             seed_head_transition or seed_predecessor or {}
         ).get("input_frontier_sha256") or repair_predecessor_frontier
+        if repair_frontier_bridge is not None:
+            transition_frontier = repair_frontier_bridge[
+                "recomputed_input_frontier_sha256"
+            ]
         if (
             transition_frontier is not None
             and expected_projection_input_frontier is not None

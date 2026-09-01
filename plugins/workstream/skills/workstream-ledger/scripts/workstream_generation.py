@@ -366,7 +366,8 @@ def prepare_generation_operator_contract(
     computed; an unclassified key is a protocol error.
     """
     from workstream_projection import (
-        _active_heads, _contract_from_heads, _reviewed_manifest,
+        _active_heads, _contract_from_heads,
+        _gen14_stable_repair_descendant, _reviewed_manifest,
         _value_digest, prepare_terminal_child_evidence_seeds,
         prepare_terminal_child_repairs,
         prepare_terminal_child_source_transition, projection_review_contract,
@@ -1084,6 +1085,37 @@ def prepare_generation_operator_contract(
             normalized_repair = prepare_terminal_child_repairs(
                 repair_manifest, graph, target,
             )
+            source_head = target_heads.get(("source", "root"))
+            bridge = {
+                "prefix_sha256": GEN14_LEGACY_SPLIT_PREFIX_SHA256,
+                "stored_input_frontier_sha256": (
+                    GEN14_LEGACY_SPLIT_STORED_FRONTIER_SHA256
+                ),
+                "recomputed_input_frontier_sha256": (
+                    GEN14_LEGACY_SPLIT_RECOMPUTED_FRONTIER_SHA256
+                ),
+                "source_event_id": (
+                    source_head.get("event_id", "")
+                    if isinstance(source_head, dict) else ""
+                ),
+                "source_value_sha256": (
+                    canonical_digest(source_head.get("value"))
+                    if isinstance(source_head, dict) else ""
+                ),
+                "created_at": created_at,
+                "child_identifiers": sorted(
+                    repair["child_identifier"].upper() for repair in repairs
+                ),
+            }
+            if _gen14_stable_repair_descendant(
+                target, normalized_repair["projection"], bridge,
+            ):
+                repair_manifest[
+                    "terminal_child_repair_gen14_frontier_bridge"
+                ] = bridge
+                normalized_repair = prepare_terminal_child_repairs(
+                    repair_manifest, graph, target,
+                )
             repair_values = {
                 (item["kind"], item["key"]): item["value"]
                 for item in normalized_repair["projection"]

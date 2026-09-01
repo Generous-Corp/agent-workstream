@@ -4917,6 +4917,259 @@ class ProjectionTests(unittest.TestCase):
             }],
         )
 
+        # Live-shaped stable-head seam: D6/S7 are both durable at the exact
+        # requested head. Fresh prepare must retain the authenticated prefix
+        # evidence values instead of proposing a predecessor-authority rewrite.
+        stable_client, stable_adapter = adapter_with_tail([
+            disposition, repair_scope_event,
+        ])
+        self.assertTrue(
+            workstream_projection._gen14_completed_split_stable_source_prefix(
+                stable_adapter.state()
+            )
+        )
+        stable_operator = prepared_operator_contract(
+            stable_adapter, new_head, "2030-01-01T03:00:00Z",
+        )
+        self.assertEqual(
+            stable_operator["projection_preview"]["phase"],
+            "terminal_source_transition",
+        )
+        stable_before = stable_adapter.state().revision
+        stable_source_result = apply_operator_contract(
+            stable_adapter, stable_operator,
+        )
+        self.assertEqual(len(stable_source_result["writes"]), 1)
+        self.assertEqual(
+            [(event["kind"], event["key"])
+             for event in stable_adapter.state().events[stable_before:]],
+            [("source", "root")],
+        )
+        stable_closure = prepared_operator_contract(
+            stable_adapter, new_head, "2030-01-01T03:00:00Z",
+        )
+        self.assertEqual(
+            stable_closure["projection_preview"]["phase"],
+            "terminal_closure_repair",
+        )
+        stable_bridge = stable_closure["projection_preview"]["manifest"][
+            "terminal_child_repair_gen14_frontier_bridge"
+        ]
+        stable_source_event = stable_adapter.state().events[8]
+        self.assertEqual(stable_bridge, {
+            "prefix_sha256": canonical_digest(events),
+            "stored_input_frontier_sha256": stored_frontier,
+            "recomputed_input_frontier_sha256": frontier,
+            "source_event_id": stable_source_event["event_id"],
+            "source_value_sha256": canonical_digest(
+                stable_source_event["value"]
+            ),
+            "created_at": "2030-01-01T03:00:00Z",
+            "child_identifiers": sorted(readbacks),
+        })
+        forged_bridge = deepcopy(stable_closure["projection_preview"]["manifest"])
+        forged_bridge["terminal_child_repair_gen14_frontier_bridge"][
+            "recomputed_input_frontier_sha256"
+        ] = "9" * 64
+        comments_before_bridge_refusal = len(stable_client.comments)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "invalid_terminal_child_repair_gen14_frontier_bridge",
+        ):
+            prepare_terminal_child_repairs(
+                forged_bridge, snapshot, stable_adapter.state(),
+            )
+        self.assertEqual(
+            len(stable_client.comments), comments_before_bridge_refusal,
+        )
+
+        closure_items = sorted(
+            [
+                item for item in stable_closure["projection_preview"][
+                    "manifest"
+                ]["projection"]
+                if item["kind"] == "child_closure"
+            ],
+            key=lambda item: item["key"],
+        )
+        canonical_closure_events = [
+            build_projection_event(
+                workstream_id="GEN-14", kind="child_closure",
+                key=item["key"], value=item["value"], plan_revision=plan,
+                expected_revision=9 + index,
+                created_at=stable_bridge["created_at"], authority=AUTHORITY,
+            )
+            for index, item in enumerate(closure_items)
+        ]
+
+        class DirectStateAdapter:
+            def __init__(self, state, *, workstream_id="GEN-14"):
+                self._state = state
+                self.workstream_id = workstream_id
+                self.plan_revision = plan
+                self.authority = deepcopy(AUTHORITY)
+                self.workspace_id = AUTHORITY["workspace_id"]
+                self.team_id = AUTHORITY["team_id"]
+                self.project_id = AUTHORITY["project_id"]
+                self.root_issue_id = AUTHORITY["root_issue_id"]
+                self.append_calls = 0
+
+            def state(self):
+                return self._state
+
+            def append(self, *_args, **_kwargs):
+                self.append_calls += 1
+                raise AssertionError("bridge refusal must precede append")
+
+        def assert_direct_bridge_refusal(
+            tail, *, workstream_id="GEN-14",
+            error="terminal_child_repair_gen14_frontier_bridge_mismatch",
+            bridge_updates=None, source_override=None,
+            closure_value_updates=None,
+        ):
+            forged_state = SimpleNamespace(
+                revision=9 + len(tail),
+                events=tuple([
+                    *stable_adapter.state().events[:9], *tail,
+                ]),
+                snapshot=deepcopy(stable_adapter.state().snapshot),
+            )
+            direct_adapter = DirectStateAdapter(
+                forged_state, workstream_id=workstream_id,
+            )
+            forged_manifest = deepcopy(
+                stable_closure["projection_preview"]["manifest"]
+            )
+            forged_manifest.update(projection_review_contract(forged_state))
+            forged_manifest[
+                "terminal_child_repair_gen14_frontier_bridge"
+            ].update(bridge_updates or {})
+            if source_override is not None:
+                next(
+                    item for item in forged_manifest["projection"]
+                    if (item["kind"], item["key"]) == ("source", "root")
+                )["value"] = deepcopy(source_override)
+            for item in forged_manifest["projection"]:
+                if (
+                    item["kind"] == "child_closure"
+                    and item["key"] in (closure_value_updates or {})
+                ):
+                    item["value"] = deepcopy(
+                        closure_value_updates[item["key"]]
+                    )
+            with self.assertRaisesRegex(LinearProjectionError, error):
+                reconcile_required_projection(
+                    direct_adapter, snapshot, forged_manifest,
+                    remote_head=new_head,
+                    created_at=stable_bridge["created_at"],
+                    authenticated_source=source_override or source,
+                    terminal_child_fence=lambda child_ids: {
+                        child_id: readbacks[child_id]
+                        for child_id in child_ids
+                    },
+                    projection_input_fence=lambda: frontier,
+                    checkpoint_fence=lambda: None,
+                    projection_input_snapshot=snapshot,
+                    expected_projection_input_frontier=frontier,
+                )
+            self.assertEqual(direct_adapter.append_calls, 0)
+
+        assert_direct_bridge_refusal([], workstream_id="GEN-15")
+        assert_direct_bridge_refusal(
+            [], bridge_updates={"source_event_id": "forged-source-event"},
+        )
+        assert_direct_bridge_refusal(
+            [], bridge_updates={"created_at": "2030-01-01T03:00:01Z"},
+        )
+        assert_direct_bridge_refusal(
+            [], error="terminal_child_repair_source_changed",
+            source_override={
+                "identity": "https://github.com/Generous-Corp/forged/blob/"
+                f"{plan}/PLAN.md",
+                "sha256": plan,
+            },
+        )
+        assert_direct_bridge_refusal(list(reversed(canonical_closure_events)))
+        forged_existing_value = deepcopy(closure_items[0]["value"])
+        forged_existing_value["child_readback_sha256"] = "a" * 64
+        forged_existing_closure = build_projection_event(
+            workstream_id="GEN-14", kind="child_closure",
+            key=closure_items[0]["key"], value=forged_existing_value,
+            plan_revision=plan, expected_revision=9,
+            created_at=stable_bridge["created_at"], authority=AUTHORITY,
+        )
+        assert_direct_bridge_refusal(
+            [forged_existing_closure],
+            error=(
+                "terminal_child_repair_closure_conflict|"
+                "terminal_child_repair_gen14_frontier_bridge_mismatch"
+            ),
+            closure_value_updates={
+                closure_items[0]["key"]: forged_existing_value,
+            },
+        )
+        no_op_scope = build_projection_event(
+            workstream_id="GEN-14", kind="scope", key="root",
+            value=deepcopy(stable_adapter.state().events[7]["value"]),
+            plan_revision=plan, expected_revision=9,
+            created_at=stable_bridge["created_at"],
+            supersedes_event_id=stable_adapter.state().events[7]["event_id"],
+            authority=AUTHORITY,
+        )
+        assert_direct_bridge_refusal([no_op_scope])
+        duplicate_closure = build_projection_event(
+            workstream_id="GEN-14", kind="child_closure",
+            key=closure_items[0]["key"], value=closure_items[0]["value"],
+            plan_revision=plan, expected_revision=10,
+            created_at=stable_bridge["created_at"],
+            supersedes_event_id=canonical_closure_events[0]["event_id"],
+            authority=AUTHORITY,
+        )
+        assert_direct_bridge_refusal([
+            canonical_closure_events[0], duplicate_closure,
+        ])
+        overlong_closure = build_projection_event(
+            workstream_id="GEN-14", kind="child_closure",
+            key=closure_items[0]["key"],
+            value=closure_items[0]["value"], plan_revision=plan,
+            expected_revision=11, created_at=stable_bridge["created_at"],
+            supersedes_event_id=canonical_closure_events[0]["event_id"],
+            authority=AUTHORITY,
+        )
+        assert_direct_bridge_refusal([
+            *canonical_closure_events, overlong_closure,
+        ])
+
+        stable_closure_before = stable_adapter.state().revision
+        apply_operator_contract(stable_adapter, stable_closure)
+        self.assertEqual(
+            [event["kind"] for event in stable_adapter.state().events[
+                stable_closure_before:
+            ]],
+            ["child_closure", "child_closure"],
+        )
+        stable_continued = prepared_operator_contract(
+            stable_adapter, new_head, "2030-01-01T03:00:00Z",
+        )
+        if stable_continued["projection_preview"]["phase"] != "activation_ready":
+            self.assertEqual(
+                stable_continued["projection_preview"]["phase"],
+                "complete_projection",
+            )
+            apply_operator_contract(stable_adapter, stable_continued)
+            stable_continued = prepared_operator_contract(
+                stable_adapter, new_head, "2030-01-01T03:00:00Z",
+            )
+        self.assertEqual(
+            stable_continued["projection_preview"]["phase"],
+            "activation_ready",
+        )
+        self.assertFalse(any(
+            event["kind"] in {"evidence_contract", "disposition", "scope"}
+            for event in stable_adapter.state().events[stable_before:]
+        ))
+        self.assertGreater(len(stable_client.comments), 0)
+
         interrupted_client, interrupted_adapter = adapter_with_tail([disposition])
         newer_requested_head = "d" * 40
         interrupted_operator = prepared_operator_contract(
