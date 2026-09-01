@@ -400,6 +400,11 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.45 keeps authenticated resume within the default 24 KiB contract by
+deferring only digest-bound verbose detail after full-history validation. Exact
+authority fields and executable next actions remain available, while an
+explicit audit command recovers the complete authenticated context.
+
 Version 0.4.44 makes child-dependency apply select and validate the same active
 generation as full resume. Historical children remain preserved, while stale,
 ambiguous, incomplete, or incorrectly owned dependency graphs refuse before
