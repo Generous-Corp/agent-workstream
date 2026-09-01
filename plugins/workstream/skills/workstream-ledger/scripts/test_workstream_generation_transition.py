@@ -3788,6 +3788,7 @@ class GenerationTransitionTests(unittest.TestCase):
                 "--operator-contract", proof_file.name,
                 "--activation-checkpoint", checkpoint_file.name,
                 "--remote-head", "e" * 40,
+                "--expected-native-root-sha256", "f" * 64,
                 "--max-items", "101", "--created-at", "now", "--apply",
             ]
             stderr = io.StringIO()
@@ -3815,7 +3816,8 @@ class GenerationTransitionTests(unittest.TestCase):
             stdout, stderr = io.StringIO(), io.StringIO()
             def authorize(contract, **kwargs):
                 return {
-                    "authorization": {}, "retirement_proof": contract,
+                    "authorization": {},
+                    "retirement_proof": contract["retirement_proof"],
                     "remote_head": kwargs.get("remote_head") or "e" * 40,
                 }
             with patch.object(sys, "argv", ["workstream_generation.py", *argv]), \
@@ -3828,6 +3830,12 @@ class GenerationTransitionTests(unittest.TestCase):
                     sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
                 code = main()
             return code, stdout.getvalue(), stderr.getvalue(), compact
+
+        def reviewed_operator_contract(retirement):
+            # Live contract validation is patched at this CLI composition
+            # boundary, but the production command still consumes the v2
+            # envelope and extracts its nested retirement proof.
+            return {"retirement_proof": retirement}
 
         bootstrap_plan, bootstrap_digest = plan_file("# Bootstrap plan\n")
         self.addCleanup(bootstrap_plan.close)
@@ -3873,7 +3881,7 @@ class GenerationTransitionTests(unittest.TestCase):
             checkpoint_event_ids=[],
         )
         with tempfile.NamedTemporaryFile("w", suffix=".json") as proof:
-            json.dump(retirement, proof)
+            json.dump(reviewed_operator_contract(retirement), proof)
             proof.flush()
             code, raw, error, compact = invoke(activate_client, [
                 "activate", WORKSTREAM, "--plan-source", new_plan.name,
@@ -3925,7 +3933,7 @@ class GenerationTransitionTests(unittest.TestCase):
         )
         with tempfile.NamedTemporaryFile("w", suffix=".json") as proof, \
                 tempfile.NamedTemporaryFile("w", suffix=".json") as checkpoint_file:
-            json.dump(checkpoint_retirement, proof)
+            json.dump(reviewed_operator_contract(checkpoint_retirement), proof)
             proof.flush()
             json.dump(activation_checkpoint, checkpoint_file)
             checkpoint_file.flush()
@@ -3976,7 +3984,7 @@ class GenerationTransitionTests(unittest.TestCase):
             checkpoint_event_ids=[],
         )
         with tempfile.NamedTemporaryFile("w", suffix=".json") as proof:
-            json.dump(later_retirement, proof)
+            json.dump(reviewed_operator_contract(later_retirement), proof)
             proof.flush()
             code, _raw, error, _compact = invoke(activate_client, [
                 "activate", WORKSTREAM, "--plan-source", later_plan.name,
@@ -3988,7 +3996,7 @@ class GenerationTransitionTests(unittest.TestCase):
             ])
         self.assertEqual((code, error), (0, ""))
         with tempfile.NamedTemporaryFile("w", suffix=".json") as proof:
-            json.dump(retirement, proof)
+            json.dump(reviewed_operator_contract(retirement), proof)
             proof.flush()
             code, raw, error, _compact = invoke(activate_client, [
                 "activate", WORKSTREAM, "--plan-source", new_plan.name,
@@ -4028,7 +4036,7 @@ class GenerationTransitionTests(unittest.TestCase):
             checkpoint_event_ids=[],
         )
         with tempfile.NamedTemporaryFile("w", suffix=".json") as proof:
-            json.dump(drift_retirement, proof)
+            json.dump(reviewed_operator_contract(drift_retirement), proof)
             proof.flush()
             code, _raw, error, _compact = invoke(drift_client, [
                 "activate", WORKSTREAM, "--plan-source", new_plan.name,

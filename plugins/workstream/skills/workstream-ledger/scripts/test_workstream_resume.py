@@ -2511,6 +2511,14 @@ class ResumeTests(unittest.TestCase):
                     generation_cli_module, "_route_and_client",
                     return_value=(client, route),
                 ), mock.patch.object(
+                    generation_cli_module,
+                    "validate_activation_operator_contract",
+                    side_effect=lambda contract, **_kwargs: {
+                        "authorization": {},
+                        "retirement_proof": contract["retirement_proof"],
+                        "remote_head": contract["remote_head"],
+                    },
+                ), mock.patch.object(
                     generation_cli_module.sys, "argv",
                     ["workstream_generation.py", *arguments],
                 ), mock.patch.object(
@@ -2551,15 +2559,18 @@ class ResumeTests(unittest.TestCase):
                 ],
                 checkpoint_event_ids=[],
             )
-            retirement_file = tempfile.NamedTemporaryFile("w+", suffix=".json")
-            self.addCleanup(retirement_file.close)
-            json.dump(retirement, retirement_file)
-            retirement_file.flush()
+            operator_contract = {
+                "retirement_proof": retirement, "remote_head": None,
+            }
+            operator_file = tempfile.NamedTemporaryFile("w+", suffix=".json")
+            self.addCleanup(operator_file.close)
+            json.dump(operator_contract, operator_file)
+            operator_file.flush()
             base_generation_args = [
                 "activate", token,
                 "--plan-source", new_plan.name,
                 "--plan-identity", new_identity,
-                "--retirement-proof", retirement_file.name,
+                "--operator-contract", operator_file.name,
                 "--created-at", "2026-08-31T12:00:00Z",
             ]
             preview = generation_cli(base_generation_args)
