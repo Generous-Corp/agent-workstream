@@ -1252,6 +1252,15 @@ uncheckpointed, dirty, mismatched, or unlineaged authority. It emits no prompt
 or secret. Owner-only profile publication currently requires macOS. See [the
 exact bridge and digest contract](references/shipyard-launch-profile.md).
 
+For tracked work, a bare `shipyard ship --pr` is validation only and is not a
+workstream handoff. Submit through `shipyard pr --workstream-id <handle>
+--context-url <exact recovered context URL>` whenever that path is available.
+If the exact PR/head already exists, repair only that same object with
+`shipyard runner steward-handoff --repo <owner/repo> --pr <number> --head
+<exact head> --workstream-id <handle> --context-url <exact recovered context
+URL>`; review its dry run, then apply. Never create a replacement PR, queue
+item, Linear issue, or project merely to add correlation metadata.
+
 ## Abrupt termination
 
 Native transcript resume is useful but not cross-machine task authority. The

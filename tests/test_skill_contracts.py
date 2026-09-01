@@ -181,6 +181,18 @@ class SkillContractTests(unittest.TestCase):
                     flat,
                 )
 
+    def test_tracked_shipyard_delivery_cannot_drop_workstream_correlation(self):
+        ledger = self.skill()
+        bridge = (
+            Path(__file__).parents[1]
+            / "plugins/workstream/skills/workstream-ledger/references/"
+              "shipyard-launch-profile.md"
+        ).read_text()
+        self.assertIn("a bare `shipyard ship --pr` is validation only", ledger)
+        self.assertIn("shipyard pr --workstream-id", ledger)
+        self.assertIn("shipyard runner steward-handoff", ledger)
+        self.assertIn("Do not substitute bare `shipyard ship --pr`", bridge)
+
     def test_resume_entry_is_small_and_owns_fresh_handle_trigger(self):
         resume = self.resume_skill()
         ledger = self.skill()
