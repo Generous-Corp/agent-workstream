@@ -82,6 +82,10 @@ layers.
 
 ## Exact-version updates
 
+The exact-version updater requires Python 3.11 or newer. It checks this at
+process startup and refuses with a remediation message before taking its lock,
+creating state, or invoking either client when the interpreter is too old.
+
 For one host, update both integrations and emit an immutable verification
 receipt with:
 
