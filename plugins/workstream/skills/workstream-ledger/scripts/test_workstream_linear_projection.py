@@ -3552,6 +3552,260 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(replay_result["writes"], [])
         self.assertEqual(len(client.comments), comments_before)
 
+    def test_predecessor_seed_rebinds_only_primary_then_repairs_children(self):
+        (
+            client, adapter, source, graph, children, manifest, binding,
+        ) = self.mixed_head_plan_generation_fixture()
+        desired_scope = next(
+            item["value"] for item in manifest["projection"]
+            if (item["kind"], item["key"]) == ("scope", "root")
+        )
+        secondary = deepcopy(desired_scope["repositories"][0])
+        secondary.update({
+            "provider_repository_id": "shipyard-id",
+            "slug": "github.com/acme/shipyard",
+            "exact_head": "d513461fed3571a18f748aa9dd939d5c431ee957",
+            "identity_resolution": {
+                "provider_repository_id": "shipyard-id",
+                "resolved_slug": "github.com/acme/shipyard",
+                "observed_at": "2026-09-01T09:00:00Z",
+                "evidence": [{
+                    "kind": "authenticated_provider_readback",
+                    "authenticated": True,
+                    "provider_repository_id": "shipyard-id",
+                    "resolved_slug": "github.com/acme/shipyard",
+                }],
+            },
+        })
+        desired_scope["repositories"].append(secondary)
+        desired_contracts = {
+            item["key"]: item["value"] for item in manifest["projection"]
+            if item["kind"] == "evidence_contract"
+        }
+        binding, _authorities = (
+            terminal_child_evidence_seed_predecessor_contract(
+                graph, adapter.state(), client.comments,
+                workstream_id="GEN-37", predecessor_plan_revision="b" * 64,
+                desired_scope=desired_scope,
+                seeds=manifest["terminal_child_evidence_seeds"],
+                desired_contracts=desired_contracts,
+            )
+        )
+        manifest["terminal_child_evidence_seed_predecessor"] = binding
+        seeded = prepare_terminal_child_evidence_seeds(
+            manifest, graph, adapter.state(), remote_head=HEAD,
+            comments=client.comments,
+        )
+        predecessor_head = "2" * 40
+        stale_projection = deepcopy(seeded["projection"])
+        stale_scope = next(
+            item["value"] for item in stale_projection
+            if (item["kind"], item["key"]) == ("scope", "root")
+        )
+        stale_primary = next(
+            repository for repository in stale_scope["repositories"]
+            if repository_key(repository) == stale_scope["primary_repository"]
+        )
+        self.assertEqual(stale_primary["exact_head"], HEAD)
+        stale_primary["exact_head"] = predecessor_head
+        for index, item in enumerate(stale_projection):
+            adapter.append(build_projection_event(
+                workstream_id="GEN-37", kind=item["kind"], key=item["key"],
+                value=item["value"], plan_revision=PLAN,
+                expected_revision=adapter.state().revision,
+                created_at=f"2026-09-01T09:{index:02d}:00Z",
+                authority=AUTHORITY,
+            ))
+        adapter.append(build_projection_event(
+            workstream_id="GEN-37", kind="disposition", key="root",
+            value={
+                "disposition": "attach", "remote_head": HEAD,
+                "recovered_from_checkpoint": None,
+            },
+            plan_revision=PLAN, expected_revision=adapter.state().revision,
+            created_at="2026-09-01T09:20:00Z", authority=AUTHORITY,
+        ))
+
+        active = workstream_projection._active_heads(adapter.state())
+        stale_scope_event = active[("scope", "root")]
+        desired_scope = next(
+            item["value"] for item in seeded["projection"]
+            if (item["kind"], item["key"]) == ("scope", "root")
+        )
+        secondary_before = {
+            repository_key(repository): repository["exact_head"]
+            for repository in stale_scope_event["value"]["repositories"]
+            if repository_key(repository)
+            != stale_scope_event["value"]["primary_repository"]
+        }
+        evidence_before = {
+            key: (event["event_id"], deepcopy(event["value"]))
+            for (kind, key), event in active.items()
+            if kind == "evidence_contract"
+        }
+        transition = {
+            "repository_key": desired_scope["primary_repository"],
+            "from_exact_head": predecessor_head,
+            "to_exact_head": HEAD,
+            "from_scope_event_id": stale_scope_event["event_id"],
+            "from_scope_value_sha256": canonical_digest(
+                stale_scope_event["value"]
+            ),
+            "disposition": {
+                "disposition": "attach", "remote_head": HEAD,
+                "recovered_from_checkpoint": None,
+            },
+            "input_frontier_sha256": binding["input_frontier_sha256"],
+        }
+        combined = {
+            **reviewed_manifest(adapter, deepcopy(seeded["projection"])),
+            "terminal_child_evidence_seeds": deepcopy(
+                manifest["terminal_child_evidence_seeds"]
+            ),
+            "terminal_child_evidence_seed_predecessor": deepcopy(binding),
+            "terminal_child_evidence_seed_head_transition": transition,
+        }
+        mismatched = deepcopy(combined)
+        mismatched["terminal_child_evidence_seed_head_transition"][
+            "input_frontier_sha256"
+        ] = "f" * 64
+        before_comments = len(client.comments)
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_evidence_seed_input_frontier_mismatch",
+        ):
+            prepare_terminal_child_evidence_seeds(
+                mismatched, graph, adapter.state(), remote_head=HEAD,
+                comments=client.comments,
+            )
+        self.assertEqual(len(client.comments), before_comments)
+
+        prepared = prepare_terminal_child_evidence_seeds(
+            combined, graph, adapter.state(), remote_head=HEAD,
+            comments=client.comments,
+        )
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", prepared, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=source,
+            remote_head=HEAD,
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        readbacks = {
+            seed["child_identifier"]: seed["expected_child_readback_sha256"]
+            for seed in prepared["terminal_child_evidence_seeds"]
+        }
+        seed_revision = adapter.state().revision
+        seed_result = reconcile_required_projection(
+            adapter, preview, prepared, remote_head=HEAD,
+            created_at="2026-09-01T09:21:00Z",
+            authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda child_ids: {
+                child_id: readbacks[child_id] for child_id in child_ids
+            },
+            projection_input_fence=lambda: binding["input_frontier_sha256"],
+            checkpoint_fence=lambda: None,
+            projection_comments=client.comments,
+            projection_input_snapshot=graph,
+            legacy_unresolved_relation_heads=unresolved,
+        )
+        self.assertFalse(seed_result["resume_authority_verified"])
+        self.assertEqual(
+            [
+                (event["kind"], event["key"])
+                for event in adapter.state().events[seed_revision:]
+            ],
+            [("scope", "root")],
+        )
+
+        active = workstream_projection._active_heads(adapter.state())
+        current_scope = active[("scope", "root")]["value"]
+        current_primary = next(
+            repository for repository in current_scope["repositories"]
+            if repository_key(repository) == current_scope["primary_repository"]
+        )
+        self.assertEqual(current_primary["exact_head"], HEAD)
+        self.assertEqual({
+            repository_key(repository): repository["exact_head"]
+            for repository in current_scope["repositories"]
+            if repository_key(repository) != current_scope["primary_repository"]
+        }, secondary_before)
+        self.assertEqual({
+            key: (event["event_id"], event["value"])
+            for (kind, key), event in active.items()
+            if kind == "evidence_contract"
+        }, evidence_before)
+
+        repairs = []
+        for child in children:
+            evidence_event = next(
+                event for (kind, _key), event in active.items()
+                if kind == "evidence_contract"
+                and event["value"]["owning_child"] == child["identifier"]
+            )
+            repairs.append({
+                "child_identifier": child["identifier"],
+                "child_issue_id": child["id"],
+                "expected_child_readback_sha256": readbacks[
+                    child["identifier"]
+                ],
+                "expected_assignee_id": child["assignee"]["id"],
+                "approved_evidence_heads": [{
+                    "key": evidence_event["key"],
+                    "event_id": evidence_event["event_id"],
+                    "value_sha256": canonical_digest(evidence_event["value"]),
+                }],
+            })
+        repair_projection = [
+            {"kind": kind, "key": key, "value": deepcopy(event["value"])}
+            for (kind, key), event in sorted(active.items())
+            if kind != "disposition"
+        ]
+        repair_manifest = {
+            **reviewed_manifest(adapter, repair_projection),
+            "terminal_child_repairs": repairs,
+        }
+        prepared_repair = prepare_terminal_child_repairs(
+            repair_manifest, graph, adapter.state(),
+        )
+        repair_preview, repair_unresolved = (
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37", prepared_repair, adapter,
+                authenticated_route=AUTHORITY, authenticated_source=source,
+                remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        )
+        repair_result = reconcile_required_projection(
+            adapter, repair_preview, prepared_repair, remote_head=HEAD,
+            created_at="2026-09-01T09:22:00Z",
+            authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda child_ids: {
+                child_id: readbacks[child_id] for child_id in child_ids
+            },
+            projection_input_fence=lambda: binding["input_frontier_sha256"],
+            checkpoint_fence=lambda: None,
+            legacy_unresolved_relation_heads=repair_unresolved,
+        )
+        self.assertTrue(repair_result["resume_authority_verified"])
+        final_active = workstream_projection._active_heads(adapter.state())
+        self.assertEqual(
+            {key for kind, key in final_active if kind == "child_closure"},
+            {child["identifier"] for child in children},
+        )
+        self.assertEqual({
+            key: (event["event_id"], event["value"])
+            for (kind, key), event in final_active.items()
+            if kind == "evidence_contract"
+        }, evidence_before)
+        final_scope = final_active[("scope", "root")]["value"]
+        self.assertEqual({
+            repository_key(repository): repository["exact_head"]
+            for repository in final_scope["repositories"]
+            if repository_key(repository) != final_scope["primary_repository"]
+        }, secondary_before)
+
     def test_terminal_repair_consumer_refuses_primary_head_mismatch(self):
         client, adapter, source, graph, _children, manifest = (
             self.multi_terminal_repair_fixture(evidence_active=True)

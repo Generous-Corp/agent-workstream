@@ -882,6 +882,15 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             raise LinearProjectionError(
                 "invalid_terminal_child_evidence_seed_head_transition"
             )
+    if (
+        predecessor is not None
+        and seed_head_transition is not None
+        and predecessor["input_frontier_sha256"]
+        != seed_head_transition["input_frontier_sha256"]
+    ):
+        raise LinearProjectionError(
+            "terminal_child_evidence_seed_input_frontier_mismatch"
+        )
     transition = manifest.get("terminal_child_source_transition")
     if transition is not None:
         if not isinstance(transition, dict) or set(transition) != {
