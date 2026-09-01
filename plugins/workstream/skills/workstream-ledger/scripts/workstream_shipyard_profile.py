@@ -23,6 +23,9 @@ from urllib.parse import urlparse
 
 from workstream_resume import DEFAULT_RESUME_MAX_BYTES, ResumeError, extract_token
 from workstream_scope import ScopeError, canonical_repository
+from workstream_child_dependencies import (
+    ChildDependencyError, validate_dependency_graph_authority,
+)
 
 
 RESUME_MAX_BYTES = DEFAULT_RESUME_MAX_BYTES
@@ -397,6 +400,58 @@ def _validate_scope(context: dict[str, Any], git: GitIdentity) -> None:
         raise ShipyardProfileError("resume_scope_head_mismatch")
 
 
+def _validate_dependency_graph(
+    context: dict[str, Any], route: dict[str, Any], plan_revision: str,
+    material_revision: int,
+) -> tuple[int, str, str]:
+    graph = context.get("dependency_graph")
+    if not isinstance(graph, dict):
+        raise ShipyardProfileError("resume_dependency_graph_missing")
+    revision = graph.get("revision")
+    graph_sha256 = graph.get("sha256")
+    dependency_authority = context.get("dependency_authority")
+    if graph.get("relations") or graph.get("authorization_batches"):
+        if (
+            not isinstance(dependency_authority, dict)
+            or set(dependency_authority) != {
+                "owned_children", "authorization_events", "material_event_ids",
+            }
+        ):
+            raise ShipyardProfileError("resume_dependency_graph_invalid")
+    else:
+        dependency_authority = dependency_authority or {
+            "owned_children": [], "authorization_events": [],
+            "material_event_ids": [],
+        }
+    try:
+        validate_dependency_graph_authority(
+            graph,
+            authority={**route, "root_identifier": context.get("workstream_id")},
+            plan_revision=plan_revision,
+            expected_projection_events=dependency_authority[
+                "authorization_events"
+            ],
+            expected_material_event_ids=dependency_authority[
+                "material_event_ids"
+            ],
+            expected_owned_identifiers=set(
+                (context.get("scope") or {}).get("child_ownership", {})
+            ),
+            expected_owned_children=dependency_authority["owned_children"],
+            expected_frontier={
+                "material_revision": material_revision,
+                "projection_revision": context.get("projection_revision"),
+                "graph_revision": revision,
+                "graph_sha256": graph_sha256,
+            },
+        )
+    except (ChildDependencyError, KeyError, TypeError) as error:
+        raise ShipyardProfileError("resume_dependency_graph_invalid")
+    return revision, graph_sha256, _authority_digest(
+        "agent-workstream-dependency-graph-v1", graph,
+    )
+
+
 def _validate_current_resume(
     context: dict[str, Any], token: str, git: GitIdentity,
 ) -> tuple[dict[str, Any], str, str, int, str]:
@@ -444,7 +499,7 @@ def _validate_current_resume(
     availability = context.get("surface_availability")
     required_surfaces = {
         "scope", "relations", "choice_events", "evidence_contracts",
-        "material_events", "latest_checkpoint",
+        "material_events", "dependency_graph", "latest_checkpoint",
     }
     if (
         not isinstance(availability, dict)
@@ -463,6 +518,7 @@ def _validate_current_resume(
     obligations = context.get("uncheckpointed_material_obligations")
     if not isinstance(obligations, list) or obligations:
         raise ShipyardProfileError("resume_has_uncheckpointed_obligations")
+    _validate_dependency_graph(context, route, plan_revision, material_revision)
 
     recovery = context.get("checkpoint_recovery")
     checkpoint = context.get("latest_checkpoint")
@@ -594,6 +650,12 @@ def build_launch_profile(
     checkpoint, provider, session_id, generation, checkpoint_digest = (
         _validate_current_resume(context, normalized, git)
     )
+    dependency_graph_revision, dependency_graph_sha256, dependency_graph_digest = (
+        _validate_dependency_graph(
+            context, context["authenticated_route"], context["plan_revision"],
+            context["material_event_revision"],
+        )
+    )
     if provider == "claude" and reasoning_effort == "ultra":
         raise ShipyardProfileError("claude_ultra_effort_unsupported")
 
@@ -621,6 +683,7 @@ def build_launch_profile(
         "checkpoint_generation": generation,
         "checkpoint_digest": checkpoint_digest,
         "resume_context_digest": resume_digest,
+        "dependency_graph_digest": dependency_graph_digest,
         "repository": git.repository,
         "head_sha": git.head,
     }
@@ -664,6 +727,9 @@ def build_launch_profile(
             "issue_revision": context["issue_revision"],
             "projection_revision": context["projection_revision"],
             "material_event_revision": context["material_event_revision"],
+            "dependency_graph_revision": dependency_graph_revision,
+            "dependency_graph_sha256": dependency_graph_sha256,
+            "dependency_graph_digest": dependency_graph_digest,
             "checkpoint_id": checkpoint["checkpoint_event_id"],
             "checkpoint_generation": generation,
             "checkpoint_digest": checkpoint_digest,

@@ -14,6 +14,12 @@ import unittest
 from unittest import mock
 
 import workstream_shipyard_profile as MODULE
+from workstream_child_dependencies import (
+    dependency_relation_id, dependency_material_frontier_sha256,
+)
+from workstream_linear_projection import (
+    build_projection_event, encode_projection_comment, projection_slot_id,
+)
 
 
 HEAD = "1" * 40
@@ -101,6 +107,30 @@ class ShipyardProfileTests(unittest.TestCase):
                 }],
             },
             "relations": [],
+            "dependency_graph": {
+                "schema_version": 1,
+                "authority": "child_dependency_authorization",
+                "plan_revision": PLAN,
+                "route": {
+                    "workspace_id": "workspace",
+                    "team_id": "team",
+                    "project_id": "project",
+                    "root_issue_id": "33333333-3333-4333-8333-333333333333",
+                },
+                "revision": 0,
+                "sha256": hashlib.sha256(b"[]").hexdigest(),
+                "authorization_batches": [],
+                "relations": [],
+                "native_readback": "relations_and_inverseRelations",
+                "ignored_non_dependency_count": 0,
+                "observed_frontier": {
+                    "material_revision": 3,
+                    "projection_revision": 4,
+                    "graph_revision": 0,
+                    "graph_sha256": hashlib.sha256(b"[]").hexdigest(),
+                },
+                "root_readback_sha256": "6" * 64,
+            },
             "evidence_contracts": [],
             "surface_availability": {
                 "scope": "available",
@@ -108,6 +138,7 @@ class ShipyardProfileTests(unittest.TestCase):
                 "choice_events": "available",
                 "evidence_contracts": "available",
                 "material_events": "available",
+                "dependency_graph": "available",
                 "latest_checkpoint": "available",
             },
             "provenance": [{"kind": "plan", "sha256": PLAN}],
@@ -171,6 +202,14 @@ class ShipyardProfileTests(unittest.TestCase):
         ])
         self.assertEqual(profile["checkpoint"]["generation"], 2)
         self.assertEqual(
+            profile["continuation_bootstrap"]["dependency_graph_sha256"],
+            hashlib.sha256(b"[]").hexdigest(),
+        )
+        self.assertRegex(
+            profile["continuation_bootstrap"]["dependency_graph_digest"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertEqual(
             profile["continuation_bootstrap"]["expected_resume_context_digest"],
             MODULE._resume_context_digest(context),
         )
@@ -204,6 +243,242 @@ class ShipyardProfileTests(unittest.TestCase):
                 model="gpt-5.6-sol", reasoning_effort="medium",
             )
             self.assertEqual(first, second)
+
+    def test_launch_profile_rejects_missing_null_or_tampered_dependency_graph(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for mutation in ("missing", "null", "body"):
+                with self.subTest(mutation=mutation):
+                    context = self.context(root)
+                    if mutation == "missing":
+                        context.pop("dependency_graph")
+                    elif mutation == "null":
+                        context["dependency_graph"] = None
+                    else:
+                        context["dependency_graph"]["sha256"] = "f" * 64
+                    with self.assertRaisesRegex(
+                        MODULE.ShipyardProfileError,
+                        "resume_dependency_graph_(missing|invalid)",
+                    ):
+                        MODULE.build_launch_profile(
+                            context, "GEN-37", self.git(root),
+                            model="gpt-5.6-sol", reasoning_effort="medium",
+                        )
+
+    def test_launch_profile_rejects_semantically_forged_dependency_authority(self):
+        def digest(value):
+            return hashlib.sha256(json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            context = self.context(root)
+            authority = {
+                **context["authenticated_route"], "root_identifier": "GEN-37",
+            }
+            blocker = {
+                "issue_id": "20000000-0000-4000-8000-000000000001",
+                "identifier": "GEN-43",
+            }
+            blocked = {
+                "issue_id": "20000000-0000-4000-8000-000000000002",
+                "identifier": "GEN-44",
+            }
+            repository_key = "github.com:id:R_agent_workstream"
+            context["scope"]["child_ownership"] = {
+                "GEN-43": repository_key, "GEN-44": repository_key,
+            }
+            context["children"] = [
+                {"id": blocker["issue_id"], "identifier": blocker["identifier"]},
+                {"id": blocked["issue_id"], "identifier": blocked["identifier"]},
+            ]
+            relation = {
+                "id": dependency_relation_id(
+                    authority=authority, blocker=blocker, blocked=blocked,
+                ),
+                "type": "blocks", "blocker": blocker, "blocked": blocked,
+                "inverse_type": "blocked_by",
+            }
+            before = {
+                "material_revision": 0, "projection_revision": 0,
+                "graph_revision": 0, "graph_sha256": digest([]),
+            }
+            batch_id = "wsdb_" + digest([
+                "workstream-child-dependency-native-batch-v1", authority,
+                PLAN, before, [relation],
+            ])[:32]
+            route = context["authenticated_route"]
+            event = build_projection_event(
+                workstream_id="GEN-37", kind="child_dependency_authorization",
+                key=batch_id, plan_revision=PLAN, expected_revision=0,
+                created_at="2026-08-31T00:00:00Z", authority=route,
+                value={
+                    "root_issue_id": route["root_issue_id"], "route": route,
+                    "plan_revision": PLAN, "batch_id": batch_id,
+                    "relation_ids": [relation["id"]],
+                    "relations_sha256": digest([relation]),
+                    "expected_material_revision": 0,
+                    "expected_material_frontier_sha256": (
+                        dependency_material_frontier_sha256([], {}, [], revision=0)
+                    ),
+                    "expected_projection_revision": 0,
+                    "expected_graph_revision": 0,
+                    "expected_graph_sha256": digest([]),
+                    "initial_state": "owned_children_validated",
+                },
+            )
+            comment = {
+                "id": projection_slot_id("GEN-37", PLAN, 0, route),
+                "body": encode_projection_comment(event),
+                "createdAt": "2026-08-31T00:00:00Z",
+                "updatedAt": "2026-08-31T00:00:00Z",
+            }
+            context["material_event_revision"] = 0
+            context["root_revision"] = 0
+            context["latest_checkpoint"]["root_revision"] = 0
+            context["projection_revision"] = 1
+            context["dependency_graph"].update({
+                "revision": 1, "sha256": digest([relation]),
+                "relations": [relation],
+                "authorization_batches": [{
+                    "batch_id": batch_id, "event_id": event["event_id"],
+                    "relation_ids": [relation["id"]],
+                    "relations_sha256": digest([relation]),
+                    "expected_material_revision": 0,
+                    "expected_material_frontier_sha256": (
+                        dependency_material_frontier_sha256([], {}, [], revision=0)
+                    ),
+                    "expected_projection_revision": 0,
+                    "expected_graph_revision": 0,
+                    "expected_graph_sha256": digest([]),
+                }],
+                "validation_authority": {
+                    "owned_children": [blocker, blocked],
+                    "comments": [comment],
+                },
+            })
+            context["dependency_graph"]["observed_frontier"].update({
+                "material_revision": 0, "projection_revision": 1,
+                "graph_revision": 1, "graph_sha256": digest([relation]),
+            })
+            context["dependency_authority"] = {
+                "owned_children": [blocker, blocked],
+                "authorization_events": [event],
+                "material_event_ids": [],
+            }
+            MODULE.build_launch_profile(
+                context, "GEN-37", self.git(root),
+                model="gpt-5.6-sol", reasoning_effort="medium",
+            )
+
+            extra = {
+                "issue_id": "20000000-0000-4000-8000-000000000003",
+                "identifier": "GEN-45",
+            }
+            duplicate_identifier = {
+                "issue_id": "20000000-0000-4000-8000-000000000004",
+                "identifier": "GEN-43",
+            }
+            identity_forgeries = {
+                "omitted": deepcopy(context),
+                "extra": deepcopy(context),
+                "same_identifier_different_id": deepcopy(context),
+            }
+            identity_forgeries["omitted"]["dependency_authority"][
+                "owned_children"
+            ] = []
+            identity_forgeries["extra"]["dependency_graph"][
+                "validation_authority"
+            ]["owned_children"] = [blocker, blocked, extra]
+            identity_forgeries["same_identifier_different_id"][
+                "dependency_graph"
+            ]["validation_authority"]["owned_children"] = [
+                blocker, duplicate_identifier, blocked,
+            ]
+            for label, identity_forgery in identity_forgeries.items():
+                with self.subTest(label=label), self.assertRaisesRegex(
+                    MODULE.ShipyardProfileError,
+                    "resume_dependency_graph_invalid",
+                ):
+                    MODULE.build_launch_profile(
+                        identity_forgery, "GEN-37", self.git(root),
+                        model="gpt-5.6-sol", reasoning_effort="medium",
+                    )
+
+            forged = deepcopy(context)
+            forged["dependency_graph"]["relations"][0]["blocked"] = {
+                "issue_id": "20000000-0000-4000-8000-000000000003",
+                "identifier": "GEN-45",
+            }
+            changed = forged["dependency_graph"]["relations"][0]
+            changed["id"] = dependency_relation_id(
+                authority=authority, blocker=blocker, blocked=changed["blocked"],
+            )
+            forged_batch_id = "wsdb_" + digest([
+                "workstream-child-dependency-native-batch-v1", authority,
+                PLAN, before, [changed],
+            ])[:32]
+            forged_event = build_projection_event(
+                workstream_id="GEN-37", kind="child_dependency_authorization",
+                key=forged_batch_id, plan_revision=PLAN, expected_revision=0,
+                created_at="2026-08-31T00:00:00Z", authority=route,
+                value={
+                    **event["value"], "batch_id": forged_batch_id,
+                    "relation_ids": [changed["id"]],
+                    "relations_sha256": digest([changed]),
+                },
+            )
+            forged["dependency_graph"]["sha256"] = digest([changed])
+            forged["dependency_graph"]["observed_frontier"][
+                "graph_sha256"
+            ] = digest([changed])
+            forged["dependency_graph"]["authorization_batches"][0].update({
+                "batch_id": forged_batch_id,
+                "event_id": forged_event["event_id"],
+                "relation_ids": [changed["id"]],
+                "relations_sha256": digest([changed]),
+            })
+            forged["dependency_graph"]["validation_authority"]["comments"] = [{
+                **comment,
+                "id": projection_slot_id("GEN-37", PLAN, 0, route),
+                "body": encode_projection_comment(forged_event),
+            }]
+            forged["dependency_graph"]["validation_authority"][
+                "owned_children"
+            ] = [blocker, changed["blocked"]]
+            with self.assertRaisesRegex(
+                MODULE.ShipyardProfileError, "resume_dependency_graph_invalid",
+            ):
+                MODULE.build_launch_profile(
+                    forged, "GEN-37", self.git(root),
+                    model="gpt-5.6-sol", reasoning_effort="medium",
+                )
+
+            stale_receipt = deepcopy(context)
+            stale_event = build_projection_event(
+                workstream_id="GEN-37", kind="child_dependency_authorization",
+                key=batch_id, plan_revision=PLAN, expected_revision=0,
+                created_at="2026-08-31T00:00:01Z", authority=route,
+                value=deepcopy(event["value"]),
+            )
+            stale_receipt["dependency_graph"]["authorization_batches"][0][
+                "event_id"
+            ] = stale_event["event_id"]
+            stale_receipt["dependency_graph"]["validation_authority"][
+                "comments"
+            ] = [{
+                **comment, "body": encode_projection_comment(stale_event),
+                "createdAt": "2026-08-31T00:00:01Z",
+                "updatedAt": "2026-08-31T00:00:01Z",
+            }]
+            with self.assertRaisesRegex(
+                MODULE.ShipyardProfileError, "resume_dependency_graph_invalid",
+            ):
+                MODULE.build_launch_profile(
+                    stale_receipt, "GEN-37", self.git(root),
+                    model="gpt-5.6-sol", reasoning_effort="medium",
+                )
 
     def test_digest_bound_resume_envelope_requires_exact_hydration(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -46,6 +46,10 @@ from workstream_child_closure import (
     canonical_digest, evidence_receipts_sha256, terminal_child_readback,
     CHILD_READBACK_FIELDS, ChildClosureError,
 )
+from workstream_child_dependencies import (
+    ChildDependencyError, LinearChildDependencyAdapter,
+    rebind_authenticated_dependency_graph,
+)
 from workstream_projection_history import (
     carried_predecessor_evidence_authority,
     closure_bound_historical_evidence, ProjectionHistoryError,
@@ -446,6 +450,10 @@ def projection_input_frontier_sha256(
 ) -> str:
     """Bind a reviewed transition to its issue/material/checkpoint frontier."""
     graph = deepcopy(snapshot)
+    # Native dependency authority is independently authenticated and rebound
+    # to this projection frontier.  It must not retroactively change legacy
+    # projection-input bindings created before the graph surface existed.
+    graph.pop("dependency_graph", None)
     root = graph.get("root")
     if isinstance(root, dict):
         root.pop("description", None)
@@ -1125,6 +1133,9 @@ def _with_validation_only_seed_closures(
     ))
     candidate["child_closures"] = closures
     candidate["projection_revision"] = len(events)
+    dependency_graph = candidate.get("dependency_graph")
+    if isinstance(dependency_graph, dict):
+        dependency_graph["observed_frontier"]["projection_revision"] = len(events)
     return candidate
 
 
@@ -2623,7 +2634,7 @@ def load_material_history_for_projection_reconcile(
                     candidate_active.pop(identity, None)
                 else:
                     candidate_active[identity] = event
-            return add_material_history(
+            candidate = add_material_history(
                 snapshot, candidate_comments, token,
                 authenticated_route=authenticated_route,
                 authenticated_source=authenticated_source,
@@ -2632,6 +2643,13 @@ def load_material_history_for_projection_reconcile(
                     authority_sensitive_changes or bool(unresolved)
                 ),
             )
+            if snapshot.get("dependency_graph") is not None:
+                candidate["dependency_graph"] = rebind_authenticated_dependency_graph(
+                    candidate, candidate_comments, snapshot["dependency_graph"],
+                    authority={**authenticated_route, "root_identifier": token},
+                    plan_revision=adapter.plan_revision,
+                )
+            return candidate
 
         seeds = manifest.get("terminal_child_evidence_seeds") or []
         seed_scope_transition = bool(seeds) and (
@@ -2671,6 +2689,7 @@ def load_material_history_for_projection_reconcile(
         compact_context(
             validation_candidate, token, max_bytes=max_bytes,
             max_items=max_items, require_projection_authority=True,
+            require_dependency_graph=False,
             expected_missing_terminal_closures=expected_missing,
         )
         return candidate, frozenset(unresolved)
@@ -3474,9 +3493,22 @@ def main() -> int:
         )
         description = graph["root"].get("description")
         description_fence = canonical_source_diagnostic_fence(description)
+        generation_selector_plan_revision = graph["root"].get("plan_revision")
+
+        def dependency_reread(comment_source: Any) -> tuple[
+            dict[str, Any], list[dict[str, Any]],
+        ]:
+            reread_graph = transport.snapshot_for_root(
+                token, include_description=True, include_child_comments=True,
+            )
+            validate_canonical_source_readback(
+                reread_graph["root"].get("description"), description_fence,
+            )
+            return reread_graph, comment_source.comments()
+
         generation_binding = projection_generation_source_binding(
             comments, workstream_id=token,
-            description_plan_revision=graph["root"].get("plan_revision"),
+            description_plan_revision=generation_selector_plan_revision,
             requested_plan_revision=plan_revision,
             authenticated_route=route,
         )
@@ -3494,6 +3526,17 @@ def main() -> int:
             )["plan_revision"],
         )
         projection_state = adapter.state()
+        dependency_adapter = LinearChildDependencyAdapter(
+            client, workspace_id=route["workspace_id"],
+            team_id=route["team_id"], project_id=route["project_id"],
+            root_issue_id=route["root_issue_id"], root_identifier=token,
+            plan_revision=plan_revision,
+        )
+        graph["dependency_graph"] = dependency_adapter.read_authorized_graph_for_snapshot(
+            graph, comments,
+            generation_selector_plan_revision=generation_selector_plan_revision,
+            reread=lambda: dependency_reread(comment_adapter),
+        )
         # A seed batch may have committed a canonical prefix before the client
         # died or lost its response. Normalize the reviewed contract through
         # the seed prefix validator before generic inactive-source sync compares
@@ -3532,10 +3575,11 @@ def main() -> int:
         manifest = prepare_terminal_child_repairs(
             manifest, graph, projection_state,
         )
-        graph = deepcopy(graph)
-        graph["root"].pop("description", None)
+        projection_input_graph = deepcopy(graph)
+        projection_input_graph.pop("dependency_graph", None)
+        projection_input_graph["root"].pop("description", None)
         expected_projection_input_frontier = (
-            projection_input_frontier_sha256(graph, comments)
+            projection_input_frontier_sha256(projection_input_graph, comments)
         )
         seed_head_transition = manifest.get(
             "terminal_child_evidence_seed_head_transition"
@@ -3644,7 +3688,7 @@ def main() -> int:
             projection_input_fence=projection_input_fence,
             checkpoint_fence=checkpoint_fence,
             projection_comments=comments,
-            projection_input_snapshot=graph,
+            projection_input_snapshot=projection_input_graph,
             expected_projection_input_frontier=(
                 expected_projection_input_frontier
             ),
@@ -3663,6 +3707,11 @@ def main() -> int:
         )
         validate_canonical_source_readback(
             graph_after["root"].get("description"), description_fence,
+        )
+        dependency_graph_after = dependency_adapter.read_authorized_graph_for_snapshot(
+            graph_after, comments_after,
+            generation_selector_plan_revision=generation_selector_plan_revision,
+            reread=lambda: dependency_reread(final_comments),
         )
         final_generation_binding = projection_generation_source_binding(
             comments_after, workstream_id=token,
@@ -3684,10 +3733,14 @@ def main() -> int:
                 }
             )["plan_revision"],
         )
-        graph_after = deepcopy(graph_after)
-        graph_after["root"].pop("description", None)
+        graph_after["dependency_graph"] = dependency_graph_after
+        final_projection_input_graph = deepcopy(graph_after)
+        final_projection_input_graph.pop("dependency_graph", None)
+        final_projection_input_graph["root"].pop("description", None)
         if (
-            projection_input_frontier_sha256(graph_after, comments_after)
+            projection_input_frontier_sha256(
+                final_projection_input_graph, comments_after,
+            )
             != expected_projection_input_frontier
         ):
             raise LinearProjectionError(
@@ -3718,6 +3771,7 @@ def main() -> int:
             context = compact_context(
                 verified, token, max_bytes=args.max_bytes,
                 max_items=args.max_items, require_projection_authority=True,
+                require_dependency_graph=True,
                 expected_missing_terminal_closures=expected_pending,
             )
             # The bounded resume gate may return a fixed-schema authority
@@ -3770,6 +3824,7 @@ def main() -> int:
                 validation_snapshot, token, max_bytes=args.max_bytes,
                 max_items=args.max_items,
                 require_projection_authority=True,
+                require_dependency_graph=True,
             )
             choose_disposition(validation_snapshot, remote_head=args.remote_head)
             result["pending_terminal_closure"] = sorted(expected_pending)
@@ -3786,6 +3841,7 @@ def main() -> int:
                 verified, token, max_bytes=args.max_bytes,
                 max_items=args.max_items,
                 require_projection_authority=True,
+                require_dependency_graph=True,
             )
             choose_disposition(verified, remote_head=args.remote_head)
             result["source_sync"] = {
@@ -3799,7 +3855,8 @@ def main() -> int:
         json.dump(result, sys.stdout, sort_keys=True, indent=2)
         sys.stdout.write("\n")
         return 0
-    except (OSError, json.JSONDecodeError, LinearProjectionError, LinearTransportError, ResumeError,
+    except (OSError, json.JSONDecodeError, ChildDependencyError,
+            LinearProjectionError, LinearTransportError, ResumeError,
             SuccessorError, ValueError) as error:
         print(f"workstream projection refused: {error}", file=sys.stderr)
         return 2

@@ -89,10 +89,12 @@ root material/projection frontier plus the child dependency graph, reserves a
 deterministic append-only `child_dependency_authorization` projection slot,
 then projects that immutable authority into a native `blocks` cache relation
 with one deterministic client-supplied UUIDv4. The authorization is ordered
-after the exact pre-grant material/projection/graph state; the graph frontier
-includes a canonical SHA-256 so a same-count edge replacement cannot pass as
-unchanged. Root comments observed beyond the reviewed material frontier must
-have a strictly later server creation time than the grant. Projection CAS
+after the exact pre-grant material/projection/graph state. Its material
+frontier digest binds every ordered event ID, remote comment ID, and exact
+comment body, while the graph frontier includes a canonical SHA-256 so a
+same-count edit or edge replacement cannot pass as unchanged. Root comments
+observed beyond the reviewed material frontier must have a strictly later
+server creation time than the grant. Projection CAS
 orders later projection events after it. Events ordered after the grant do not
 retroactively invalidate it: contradictions or scope changes require an
 append-only superseding event and reconciliation of the derived native cache.
@@ -717,7 +719,20 @@ the authority used to choose attach versus successor after live remote-head
 verification. The recorded disposition is always the explicit `attach` or
 `create_successor` result and must reconcile with that checkpoint and live head;
 an ambiguous placeholder is not executable. An empty surface is reported as
-empty rather than fabricated.
+empty rather than fabricated. Ordinary full-authority resume also emits
+`dependency_graph` separately from the root's projected `relations`. Every
+dependency edge is reduced from both native `relations` and
+`inverseRelations` readback over the exact active-plan children, then bound to
+the ordered active-generation `child_dependency_authorization` grants. The
+authenticated graph read must match the same native root digest and exact
+material/projection frontier as the resume snapshot. Grant receipts bind the
+remote comment order: material events beyond a grant's reviewed frontier must
+have a strictly later server creation time. A relation may have only one active
+grant; replacement requires an explicit validated supersession/reconciliation
+protocol. Contradictory, duplicate, ambiguous, unauthorized, stale-frontier,
+cross-generation, or misordered evidence refuses resume. Full authority always
+requires this authenticated surface, including an explicit empty graph; a
+missing or null graph is never full authority.
 When no local config is available, authenticated token-only bootstrap resolves
 the root's exact workspace/team/project route before the fenced read.
 
