@@ -2431,6 +2431,7 @@ class ResumeTests(unittest.TestCase):
         new_plan.flush()
         old_digest = hashlib.sha256(Path(old_plan.name).read_bytes()).hexdigest()
         new_digest = hashlib.sha256(Path(new_plan.name).read_bytes()).hexdigest()
+        canonical_live_digest = [new_digest]
 
         with mock.patch.object(generation_fixture, "WORKSTREAM", token), \
              mock.patch.object(generation_fixture, "AUTHORITY", route):
@@ -2461,7 +2462,8 @@ class ResumeTests(unittest.TestCase):
             def source_payload(location, identity=None):
                 if location == canonical:
                     return {"source": {
-                        "identity": canonical, "sha256": new_digest,
+                        "identity": canonical,
+                        "sha256": canonical_live_digest[0],
                         "bytes": len(Path(new_plan.name).read_bytes()),
                     }}
                 if location == old_plan.name:
@@ -2616,6 +2618,35 @@ class ResumeTests(unittest.TestCase):
                 {old_digest, new_digest},
             )
             self.assertGreater(writes_after_activation, initial_comment_count)
+
+            post_finalization_digest = "f" * 64
+            canonical_live_digest[0] = post_finalization_digest
+            drift_after_finalization = ordinary_resume(
+                new_plan.name, new_identity,
+            )
+            self.assertEqual(
+                drift_after_finalization["resume_authority"],
+                "plan_generation_pending",
+            )
+            self.assertFalse(drift_after_finalization["executable"])
+            self.assertEqual(
+                drift_after_finalization["root"]["native_status_observed"],
+                "Done",
+            )
+            self.assertEqual(
+                drift_after_finalization["root"][
+                    "native_status_type_observed"
+                ],
+                "completed",
+            )
+            self.assertEqual(
+                drift_after_finalization["active_source"]["sha256"],
+                new_digest,
+            )
+            self.assertEqual(
+                drift_after_finalization["canonical_live_source"]["sha256"],
+                post_finalization_digest,
+            )
 
     def test_relation_target_readback_reconstructs_exact_lifecycle_digest(self):
         graph = self.snapshot()

@@ -38,7 +38,8 @@ from workstream_linear_events import (
     reduce_event_comments,
 )
 from workstream_linear_projection import (
-    _inspect_unsealed_identity_history, inspect_unsealed_identity_history,
+    _inspect_unsealed_identity_history, bind_active_plan_generation,
+    inspect_unsealed_identity_history,
     LinearProjectionError,
     reduce_projection_comments, select_plan_generation, TOMBSTONE,
     validate_projection_event,
@@ -2874,29 +2875,10 @@ def main() -> int:
                 description_plan_revision=live_graph_snapshot["root"]["plan_revision"],
                 authenticated_route=route,
             )
-            live_graph_snapshot["root"]["plan_revision"] = generation["plan_revision"]
-            live_graph_snapshot["root"]["description_plan_revision"] = generation[
-                "description_plan_revision"
-            ]
-            live_graph_snapshot["root"]["generation_transition_tip_event_id"] = (
-                generation["transition_tip_event_id"]
+            live_graph_snapshot = bind_active_plan_generation(
+                live_graph_snapshot, comments, workstream_id=token,
+                selected=generation, authenticated_route=route,
             )
-            live_graph_snapshot["root"]["generation_activation_epoch"] = (
-                generation["activation_epoch"]
-            )
-            live_graph_snapshot["root"]["generation_authority_origin"] = (
-                generation["authority_origin"]
-            )
-            from workstream_generation import selected_generation_execution_status
-            generation_status = selected_generation_execution_status(
-                comments, workstream_id=token,
-                transition_event_id=generation["transition_tip_event_id"],
-                authenticated_route=route,
-            )
-            if generation_status is not None:
-                apply_generation_execution_status(
-                    live_graph_snapshot["root"], generation_status,
-                )
             from workstream_linear_projection import (
                 child_mutation_authorizations_from_comments,
             )
@@ -2994,10 +2976,12 @@ def main() -> int:
                             live_graph_snapshot["root"].get("project") or {}
                         ).get("id"),
                         "native_status_observed": live_graph_snapshot["root"].get(
-                            "status"
+                            "issue_status",
+                            live_graph_snapshot["root"].get("status"),
                         ),
                         "native_status_type_observed": live_graph_snapshot["root"].get(
-                            "status_type"
+                            "issue_status_type",
+                            live_graph_snapshot["root"].get("status_type"),
                         ),
                     }
                     freshness = bound_plan_generation_pending(

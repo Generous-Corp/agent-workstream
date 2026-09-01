@@ -2827,6 +2827,44 @@ def select_plan_generation(
     }
 
 
+def bind_active_plan_generation(
+    graph: dict[str, Any], comments: list[dict[str, Any]], *,
+    workstream_id: str, selected: dict[str, Any],
+    authenticated_route: dict[str, str],
+) -> dict[str, Any]:
+    """Apply one selected generation's plan and execution authority to a graph."""
+    result = deepcopy(graph)
+    root = result.get("root")
+    if not isinstance(root, dict):
+        raise LinearProjectionError("generation_root_missing")
+    description_revision = root.get("plan_revision")
+    root["description_plan_revision"] = description_revision
+    root["plan_revision"] = selected["plan_revision"]
+    root["generation_transition_tip_event_id"] = selected[
+        "transition_tip_event_id"
+    ]
+    root["generation_activation_epoch"] = selected["activation_epoch"]
+    root["generation_authority_origin"] = selected["authority_origin"]
+    from workstream_generation import selected_generation_execution_status
+    generation_status = selected_generation_execution_status(
+        comments, workstream_id=workstream_id,
+        transition_event_id=selected["transition_tip_event_id"],
+        authenticated_route=authenticated_route,
+    )
+    if generation_status is not None:
+        if generation_status != {
+            "authority": "generation_local", "name": "In Progress",
+            "type": "started",
+        }:
+            raise LinearProjectionError("invalid_generation_execution_status")
+        root["issue_status"] = root.get("status")
+        root["issue_status_type"] = root.get("status_type")
+        root["status"] = generation_status["name"]
+        root["status_type"] = generation_status["type"]
+        root["generation_execution_status"] = deepcopy(generation_status)
+    return result
+
+
 def _inspect_unsealed_identity_history(
     comments: list[dict[str, Any]], *, workstream_id: str,
     expected_plan_revision: str, authenticated_route: dict[str, str],

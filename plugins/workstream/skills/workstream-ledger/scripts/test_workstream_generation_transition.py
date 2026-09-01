@@ -3114,19 +3114,38 @@ class GenerationTransitionTests(unittest.TestCase):
         self.assertEqual((parsed.command, parsed.abort_reason), ("activate", "reviewed"))
 
     def test_projection_cli_binding_treats_description_as_diagnostic(self):
-        graph = {"root": {"plan_revision": OLD, "identifier": WORKSTREAM}}
+        graph = {"root": {
+            "plan_revision": OLD, "identifier": WORKSTREAM,
+            "status": "Done", "status_type": "completed",
+        }}
         candidate = bind_projection_plan_generation(
             graph, self.client.comments, workstream_id=WORKSTREAM,
             requested_plan_revision=NEW, authenticated_route=AUTHORITY,
         )
         self.assertEqual(candidate["root"]["plan_revision"], NEW)
         self.assertEqual(candidate["root"]["description_plan_revision"], OLD)
-        self.activate()
+        project_full(self.client, NEW)
+        transport = self.native_and_source_fenced_transport({
+            "identity": f"https://example.test/{NEW}", "sha256": NEW,
+        })
+        proof = transport.preview_activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+        )["native_root_activation_proof"]
+        transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=self.retirement(),
+            expected_native_root_sha256=proof["sha256"],
+        )
         active = bind_projection_plan_generation(
             graph, self.client.comments, workstream_id=WORKSTREAM,
             requested_plan_revision=NEW, authenticated_route=AUTHORITY,
         )
         self.assertEqual(active["root"]["plan_revision"], NEW)
+        self.assertEqual(active["root"]["status"], "In Progress")
+        self.assertEqual(active["root"]["status_type"], "started")
+        self.assertEqual(active["root"]["issue_status"], "Done")
+        self.assertEqual(active["root"]["issue_status_type"], "completed")
         with self.assertRaisesRegex(LinearProjectionError, "plan_retired"):
             bind_projection_plan_generation(
                 graph, self.client.comments, workstream_id=WORKSTREAM,

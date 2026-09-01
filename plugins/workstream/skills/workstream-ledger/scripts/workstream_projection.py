@@ -26,7 +26,8 @@ from workstream_linear_checkpoints import (
     LinearCheckpointError, reduce_checkpoint_comments,
 )
 from workstream_linear_projection import (
-    build_projection_event, encode_projection_comment, LinearProjectionAdapter,
+    bind_active_plan_generation, build_projection_event, encode_projection_comment,
+    LinearProjectionAdapter,
     LinearProjectionError, projection_slot_id, reduce_projection_comments,
     select_plan_generation, TOMBSTONE,
 )
@@ -92,15 +93,21 @@ def bind_projection_plan_generation(
     result["root"]["description_plan_revision"] = description_revision
     result["root"]["plan_revision"] = requested_plan_revision
     if selected is not None:
-        result["root"]["generation_transition_tip_event_id"] = selected[
-            "transition_tip_event_id"
-        ]
-        result["root"]["generation_activation_epoch"] = selected[
-            "activation_epoch"
-        ]
-        result["root"]["generation_authority_origin"] = selected[
-            "authority_origin"
-        ]
+        if requested_plan_revision == selected["plan_revision"]:
+            result = bind_active_plan_generation(
+                graph, comments, workstream_id=workstream_id,
+                selected=selected, authenticated_route=authenticated_route,
+            )
+        else:
+            result["root"]["generation_transition_tip_event_id"] = selected[
+                "transition_tip_event_id"
+            ]
+            result["root"]["generation_activation_epoch"] = selected[
+                "activation_epoch"
+            ]
+            result["root"]["generation_authority_origin"] = selected[
+                "authority_origin"
+            ]
     return result
 
 

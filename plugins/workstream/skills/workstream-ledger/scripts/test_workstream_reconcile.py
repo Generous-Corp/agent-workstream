@@ -143,6 +143,63 @@ class Response:
 
 
 class ReconcileTests(unittest.TestCase):
+    def test_reconcile_selects_finalized_generation_and_execution_status(self):
+        from test_workstream_generation_transition import (
+            AUTHORITY as GENERATION_AUTHORITY,
+            GenerationTransitionTests, NEW, WORKSTREAM,
+        )
+        from workstream_linear import LinearGraphQLTransport
+
+        generation = GenerationTransitionTests()
+        generation.setUp()
+        from test_workstream_generation_transition import project_full
+        project_full(generation.client, NEW)
+        generation_transport = generation.native_and_source_fenced_transport({
+            "identity": f"https://example.test/{NEW}", "sha256": NEW,
+        })
+        proof = generation_transport.preview_activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=generation.retirement(),
+        )["native_root_activation_proof"]
+        generation_transport.activate(
+            target_plan_revision=NEW, created_at="now",
+            retirement=generation.retirement(),
+            expected_native_root_sha256=proof["sha256"],
+        )
+        generation.client.graph_status = "Done"
+        generation.client.graph_status_type = "completed"
+        transport = LinearGraphQLTransport(
+            generation.client, workspace_id="workspace", team_id="team",
+            project_id="project",
+        )
+        raw = transport.snapshot_for_root(
+            WORKSTREAM, include_description=True, include_child_comments=True,
+        )
+        comments = deepcopy(generation.client.comments)
+        dependency_adapter = LinearChildDependencyAdapter(
+            generation.client, workspace_id="workspace", team_id="team",
+            project_id="project",
+            root_issue_id=GENERATION_AUTHORITY["root_issue_id"],
+            root_identifier=WORKSTREAM, plan_revision=NEW,
+        )
+
+        reconciled = authenticated_reconcile_snapshot(
+            raw, comments, WORKSTREAM,
+            authenticated_route=GENERATION_AUTHORITY,
+            authenticated_source={
+                "identity": f"https://example.test/{NEW}", "sha256": NEW,
+            },
+            dependency_adapter=dependency_adapter,
+            reread=lambda: (deepcopy(raw), deepcopy(comments)),
+        )
+
+        self.assertEqual(reconciled["root"]["plan_revision"], NEW)
+        self.assertEqual(reconciled["root"]["status"], "In Progress")
+        self.assertEqual(reconciled["root"]["status_type"], "started")
+        self.assertEqual(reconciled["root"]["issue_status"], "Done")
+        self.assertEqual(reconciled["root"]["issue_status_type"], "completed")
+        self.assertRegex(reconciled["dependency_graph"]["sha256"], r"^[0-9a-f]{64}$")
+
     def adapter(self, client):
         return LinearProjectionAdapter(
             client, issue_id="GEN-37", workstream_id="GEN-37", plan_revision="sha",
