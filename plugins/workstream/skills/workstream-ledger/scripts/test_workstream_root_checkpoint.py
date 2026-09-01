@@ -6,6 +6,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from copy import deepcopy
 from unittest.mock import patch
 
 from workstream_delta import Delta
@@ -99,32 +100,172 @@ class RootCheckpointTests(unittest.TestCase):
                 }
                 # Simulate process death after the checkpoint append and
                 # before the reviewed disposition candidate is written.
+                update_count = 0
+
+                def linear_updates_root_timestamp(_item, observed):
+                    nonlocal update_count
+                    update_count += 1
+                    observed.graph_nonce = f"comment-write-{update_count}"
+
+                client.before_each_create = linear_updates_root_timestamp
                 LinearCheckpointAdapter(
                     client, issue_id=token, workstream_id=token,
                     workspace_id=route["workspace_id"],
                     team_id=route["team_id"], project_id=route["project_id"],
                 ).persist(preview["checkpoint"])
+                checkpoint_only_preview = checkpoint_cli.run(common)
+                self.assertNotEqual(
+                    checkpoint_only_preview["preview_sha256"],
+                    preview["preview_sha256"],
+                )
+                original_persist = LinearCheckpointAdapter.persist
+
+                def no_op_replay_with_unrelated_timestamp_drift(
+                    adapter, event, **kwargs,
+                ):
+                    receipt = original_persist(adapter, event, **kwargs)
+                    client.graph_nonce = "unrelated-no-op-replay-drift"
+                    return receipt
+
+                with patch.object(
+                    LinearCheckpointAdapter, "persist",
+                    new=no_op_replay_with_unrelated_timestamp_drift,
+                ), self.assertRaises(
+                    checkpoint_cli.CheckpointPartialApplyError,
+                ) as raised:
+                    checkpoint_cli.run([
+                        *common, "--apply", "--expected-material-revision", "180",
+                        "--expected-preview-sha256",
+                        checkpoint_only_preview["preview_sha256"],
+                    ])
+                self.assertEqual(
+                    raised.exception.payload["reason"],
+                    "checkpoint_applied_but_native_root_drift",
+                )
+                checkpoint_only_preview = checkpoint_cli.run(common)
+                original_append = checkpoint_cli.LinearProjectionAdapter.append
+
+                def disposition_commits_then_response_is_lost(
+                    projection_adapter, event, **kwargs,
+                ):
+                    original_append(
+                        projection_adapter, event, **kwargs,
+                    )
+                    raise checkpoint_cli.LinearTransportError(
+                        "lost projection response after commit",
+                    )
+
+                writes_before_apply = len(client.mutations)
                 with patch.object(
                     checkpoint_cli, "_ordinary_resume", return_value=resume,
+                ), patch.object(
+                    checkpoint_cli.LinearProjectionAdapter, "append",
+                    new=disposition_commits_then_response_is_lost,
                 ):
                     applied = checkpoint_cli.run([
                         *common, "--apply", "--expected-material-revision", "180",
-                        "--expected-preview-sha256", preview["preview_sha256"],
+                        "--expected-preview-sha256",
+                        checkpoint_only_preview["preview_sha256"],
                     ])
                 self.assertEqual(applied["resume_authority"], "full")
                 self.assertEqual(applied["writes_performed"], 1)
+                self.assertEqual(len(client.mutations), writes_before_apply + 1)
                 self.assertEqual(loader(digest)["resume_authority"], "full")
                 writes = len(client.mutations)
+                replay_preview = checkpoint_cli.run(common)
                 with patch.object(
                     checkpoint_cli, "_ordinary_resume", return_value=resume,
                 ):
                     replay = checkpoint_cli.run([
                         *common, "--apply", "--expected-material-revision", "180",
-                        "--expected-preview-sha256", preview["preview_sha256"],
+                        "--expected-preview-sha256",
+                        replay_preview["preview_sha256"],
                     ])
                 self.assertEqual(replay["resume_authority"], "full")
                 self.assertEqual(replay["writes_performed"], 0)
                 self.assertEqual(len(client.mutations), writes)
+
+    def test_description_and_child_drift_during_own_append_still_refuse(self):
+        token = "GEN-14"
+        route = fixture.AUTHORITY
+
+        class ChildAwareClient(fixture.FakeClient):
+            def execute(self, query, variables):
+                result = super().execute(query, variables)
+                if "query WorkstreamResumeRoot" in query:
+                    result["issue"]["children"]["nodes"] = deepcopy(
+                        self.children,
+                    )
+                return result
+
+        child = {
+            "id": "child-id", "identifier": "GEN-72", "title": "Child",
+            "description": "Next action: Continue.",
+            "url": "https://linear.test/GEN-72", "updatedAt": "child-time",
+            "archivedAt": None,
+            "parent": {"id": route["root_issue_id"], "identifier": token},
+            "project": {"id": route["project_id"]},
+            "team": {
+                "id": route["team_id"],
+                "organization": {"id": route["workspace_id"]},
+            },
+            "assignee": None,
+            "state": {"id": "child-state", "name": "In Progress",
+                      "type": "started"},
+            "comments": {"nodes": [], "pageInfo": {
+                "hasNextPage": False, "endCursor": None,
+            }},
+        }
+        with patch.object(fixture, "WORKSTREAM", token):
+            for drift_kind in ("description", "child"):
+                with self.subTest(drift_kind=drift_kind):
+                    client = ChildAwareClient()
+                    with tempfile.NamedTemporaryFile("w+", suffix=".md") as plan:
+                        text = f"# {drift_kind} drift\n"
+                        plan.write(text)
+                        plan.flush()
+                        digest = hashlib.sha256(text.encode()).hexdigest()
+                        client.description = (
+                            f"Plan revision: {digest}\nNext action: Continue."
+                        )
+                        fixture.project_full(client, digest, identity=plan.name)
+                        common = [
+                            token, "--created-at", "2026-09-01T06:30:00Z",
+                            "--agent", "codex", "--provider", "openai",
+                            "--session-id", "s", "--machine", "M5",
+                            "--worktree-state", "unknown",
+                            "--before-status", "In Progress",
+                            "--after-status", "In Progress",
+                            "--next-action", "Continue",
+                        ]
+                        with patch.object(
+                            checkpoint_cli, "_client_and_route",
+                            return_value=(client, route),
+                        ):
+                            preview = checkpoint_cli.run(common)
+
+                            def drift(item, observed):
+                                if "workstream-checkpoint:v1" not in item["body"]:
+                                    return
+                                if drift_kind == "description":
+                                    observed.description += "\nConcurrent edit."
+                                else:
+                                    observed.children.append(deepcopy(child))
+
+                            client.before_each_create = drift
+                            with self.assertRaises(
+                                checkpoint_cli.CheckpointPartialApplyError,
+                            ) as raised:
+                                checkpoint_cli.run([
+                                    *common, "--apply",
+                                    "--expected-material-revision", "0",
+                                    "--expected-preview-sha256",
+                                    preview["preview_sha256"],
+                                ])
+                        self.assertEqual(
+                            raised.exception.payload["reason"],
+                            "checkpoint_applied_but_native_root_drift",
+                        )
 
     def test_exact_checkpoint_at_wrong_remote_slot_refuses_before_projection(self):
         token = "GEN-14"
