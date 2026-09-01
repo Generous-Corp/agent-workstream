@@ -4931,7 +4931,11 @@ def generation_graph_clock_custody(
     )
     current_candidate = current_loader(reservation["to_plan_revision"])
     historical_candidate = historical_loader(reservation["to_plan_revision"])
-    expected_checkpoint_ids = reservation["checkpoint_event_ids"]
+    # A reservation's checkpoint list is the global serialization frontier;
+    # it deliberately includes predecessor checkpoints.  A strict candidate
+    # receipt is scoped to the target generation, whose exact checkpoint
+    # frontier was already bound by the reservation-backed candidate seal.
+    expected_checkpoint_ids = seal_value["to"]["checkpoint_event_ids"]
     if (
         current_candidate["source"] != reservation["source"]
         or current_candidate["material_revision"] != reservation["material_revision"]
