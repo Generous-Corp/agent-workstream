@@ -41,7 +41,7 @@ from workstream_linear_projection import (
     _canonical, _generation_frontier, build_projection_event,
     encode_projection_comment, LinearProjectionAdapter, PROJECTION_PREFIX,
     PROJECTION_RE, projection_slot_id, reduce_projection_comments,
-    select_plan_generation, _decode_projection,
+    select_plan_generation, decode_projection_receipt,
 )
 from workstream_plan import plan_payload
 from workstream_resume import (
@@ -227,6 +227,7 @@ def prepare_generation_operator_contract(
         _value_digest, prepare_terminal_child_evidence_seeds,
         prepare_terminal_child_repairs, projection_review_contract,
         terminal_child_evidence_seed_predecessor_contract,
+        bind_projection_plan_generation,
     )
 
     if (
@@ -378,6 +379,24 @@ def prepare_generation_operator_contract(
     phase = "complete_projection"
     manifest: dict[str, Any]
     if closure_heads:
+        # Generation prepare and projection preview must bind terminal carry to
+        # the same canonical candidate graph.  The transport snapshot still
+        # names the description-selected predecessor and contains raw child
+        # comment collections; projection preview first binds the requested
+        # generation and reduces those child logs.  Computing the predecessor
+        # binding from the raw snapshot therefore made a deterministic prepare
+        # output impossible for its consumer to accept.
+        if "child_comments" in graph:
+            graph = bind_projection_plan_generation(
+                graph, comments, workstream_id=workstream_id,
+                requested_plan_revision=target_plan,
+                authenticated_route=authority,
+            )
+            graph = add_child_material_history(
+                graph, graph["child_comments"],
+                authenticated_route=authority, root_comments=comments,
+                proposal_plan_revision=predecessor_plan,
+            )
         seed_items = [
             deepcopy(item) for item in complete_items
             if item["kind"] in {"scope", "source", "provenance"}
@@ -948,7 +967,7 @@ def reduce_generation_finalizations(
     authenticated_route: dict[str, str] | None,
 ) -> list[dict[str, Any]]:
     from workstream_linear_projection import (
-        _decode_projection, PROJECTION_PREFIX, PROJECTION_RE,
+        PROJECTION_PREFIX, PROJECTION_RE,
     )
     transitions: dict[str, dict[str, Any]] = {}
     for comment in comments:
@@ -958,7 +977,7 @@ def reduce_generation_finalizations(
         encoded = PROJECTION_RE.findall(body)
         if len(encoded) != 1 or body.count(PROJECTION_PREFIX) != 1:
             raise WorkstreamGenerationError("malformed_projection_marker")
-        event = _decode_projection(encoded[0])
+        event = decode_projection_receipt(comment, encoded[0])
         if event["kind"] == "generation_transition":
             transitions[event["event_id"]] = event
     result: list[dict[str, Any]] = []
@@ -1095,7 +1114,7 @@ def generation_ledger_frontier_tokens(
 ) -> list[str]:
     """Separate upgraded active writers from quarantined legacy successors."""
     from workstream_linear_projection import (
-        _decode_projection, PROJECTION_PREFIX, PROJECTION_RE,
+        PROJECTION_PREFIX, PROJECTION_RE,
     )
 
     tokens: set[str] = set()
@@ -1107,7 +1126,7 @@ def generation_ledger_frontier_tokens(
         if len(matches) != 1 or body.count(PROJECTION_PREFIX) != 1:
             continue
         try:
-            event = _decode_projection(matches[0])
+            event = decode_projection_receipt(comment, matches[0])
         except LinearTransportError:
             continue
         if (
@@ -1140,7 +1159,7 @@ def _generation_abort_ids(
         matches = PROJECTION_RE.findall(body)
         if len(matches) != 1 or body.count(PROJECTION_PREFIX) != 1:
             continue
-        event = _decode_projection(matches[0])
+        event = decode_projection_receipt(comment, matches[0])
         if event["kind"] != "generation_abort":
             continue
         value = event["value"]
@@ -1336,7 +1355,9 @@ def assert_no_pending_generation_reservation(
 
 
 def generation_controls(comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    from workstream_linear_projection import PROJECTION_PREFIX, PROJECTION_RE, _decode_projection
+    from workstream_linear_projection import (
+        PROJECTION_PREFIX, PROJECTION_RE, decode_projection_receipt,
+    )
     result = []
     for comment in comments:
         body = comment.get("body") or ""
@@ -1345,7 +1366,7 @@ def generation_controls(comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         matches = PROJECTION_RE.findall(body)
         if len(matches) != 1 or body.count(PROJECTION_PREFIX) != 1:
             raise WorkstreamGenerationError("malformed_projection_marker")
-        event = _decode_projection(matches[0])
+        event = decode_projection_receipt(comment, matches[0])
         if event["kind"] in {"generation_genesis", "generation_transition"}:
             result.append(event)
     finalized = finalized_generation_transition_ids(
@@ -1382,7 +1403,7 @@ def selected_activation_checkpoint(
         encoded = PROJECTION_RE.findall(body)
         if len(encoded) != 1 or body.count(PROJECTION_PREFIX) != 1:
             raise WorkstreamGenerationError("malformed_projection_marker")
-        event = _decode_projection(encoded[0])
+        event = decode_projection_receipt(comment, encoded[0])
         if event["event_id"] != transition_event_id:
             continue
         remote_id = comment.get("id")

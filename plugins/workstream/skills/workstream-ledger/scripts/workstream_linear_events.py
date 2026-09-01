@@ -934,14 +934,18 @@ def apply_material_semantic_repairs(
         )
     try:
         from workstream_linear_projection import (
-            PROJECTION_RE, _decode_projection,
+            PROJECTION_RE, decode_projection_receipt,
         )
         source_matches = PROJECTION_RE.findall(source_body or "")
         seal_matches = PROJECTION_RE.findall(seal_body or "")
         if len(source_matches) != 1 or len(seal_matches) != 1:
             raise ValueError("projection proof marker count")
-        source_event = _decode_projection(source_matches[0])
-        seal_event = _decode_projection(seal_matches[0])
+        source_event = decode_projection_receipt({
+            "id": oracle["source_remote_comment_id"],
+        }, source_matches[0])
+        seal_event = decode_projection_receipt({
+            "id": oracle["projection_seal_remote_comment_id"],
+        }, seal_matches[0])
     except Exception:
         source_event = seal_event = None
     if not isinstance(source_event, dict) or source_event.get("kind") != "source":

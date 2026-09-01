@@ -29,6 +29,7 @@ from workstream_linear_events import (
 from workstream_generation import (
     _digest as generation_digest, build_retirement_proof, GenerationTransport,
     generation_quarantine_metadata, reduce_generation_checkpoint_comments,
+    prepare_generation_operator_contract,
 )
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
@@ -1054,6 +1055,156 @@ class ProjectionTests(unittest.TestCase):
             "terminal_child_evidence_seed_predecessor": binding,
         }
         return client, current, source, graph, children, manifest, binding
+
+    def test_generation_prepare_manifest_matches_projection_seed_preview_at_revision_11(self):
+        """A transport graph must have one producer/consumer frontier."""
+        predecessor_plan = "b" * 64
+        child = {
+            "id": "70000000-0000-4000-8000-000000000070",
+            "identifier": "GEN-70", "title": "terminal GEN-70",
+            "parent": {"id": ROOT_UUID, "identifier": "GEN-37"},
+            "team": {"id": "team", "organization": {"id": "workspace"}},
+            "project": {"id": "project"}, "assignee": {"id": "owner-70"},
+            "state_id": "done-70", "status": "Done",
+            "status_type": "completed",
+        }
+        client = FakeProjectionClient()
+        predecessor = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=predecessor_plan, **AUTHORITY,
+        )
+        predecessor_scope = scope()
+        predecessor_scope["child_ownership"] = {
+            "GEN-70": predecessor_scope["primary_repository"],
+        }
+
+        def append(kind, key, value):
+            return predecessor.append(build_projection_event(
+                workstream_id="GEN-37", kind=kind, key=key, value=value,
+                plan_revision=predecessor_plan,
+                expected_revision=predecessor.state().revision,
+                created_at=f"2026-09-01T07:{predecessor.state().revision:02d}:00Z",
+                authority=AUTHORITY,
+            ))
+
+        append("scope", "root", predecessor_scope)
+        append("source", "root", {
+            "identity": "https://example.test/previous-plan",
+            "sha256": predecessor_plan,
+        })
+        append("provenance", "previous", {
+            "agent": "codex", "machine": "M3", "session_id": "previous",
+            "worktree": {"state": "safe", "head": HEAD},
+        })
+        contract = evidence_contract()
+        contract.update({
+            "slice_id": "gen-70-terminal-receipts-v1",
+            "owning_child": "GEN-70", "plan_revision": predecessor_plan,
+        })
+        append("evidence_contract", contract["slice_id"], contract)
+        evidence_event = predecessor.state().events[-1]
+        readback = terminal_child_readback(child)
+        append("child_closure", "GEN-70", {
+            "schema_version": 2, **readback,
+            "plan_revision": predecessor_plan,
+            "repository_key": contract["repository_key"],
+            "exact_head": HEAD,
+            "evidence_heads": [{
+                "key": evidence_event["key"],
+                "event_id": evidence_event["event_id"],
+                "value_sha256": canonical_digest(evidence_event["value"]),
+            }],
+            "evidence_receipts_sha256": evidence_receipts_sha256([contract]),
+            "child_readback_sha256": canonical_digest(readback),
+        })
+        for index in range(6):
+            append("provenance", f"revision-11-{index}", {
+                "agent": "codex", "machine": "M3",
+                "session_id": f"revision-11-{index}",
+                "worktree": {"state": "safe", "head": HEAD},
+            })
+        self.assertEqual(predecessor.state().revision, 11)
+
+        material = Delta(
+            "generation-boundary", "GEN-37", "requirement", "agent",
+            {"text": "Carry terminal children into the next plan."}, 0,
+            "2026-09-01T07:20:00Z",
+        )
+        checkpoint = build_checkpoint(
+            workstream_id="GEN-37", boundary_id="generation-boundary",
+            root_revision=1, plan_revision=predecessor_plan,
+            before_status="In Progress", after_status="In Progress",
+            execution={
+                "agent": "codex", "provider": "openai",
+                "session_id": "previous", "machine": "M3",
+                "worktree": {
+                    "state": "safe", "path": "/worktree",
+                    "branch": "previous", "head": HEAD,
+                },
+            },
+            exact_head=HEAD, evidence=[], blocker=None,
+            next_action="Carry terminal children into the next plan.",
+        )
+        client.comments.extend([
+            {"id": "material-generation-boundary",
+             "body": encode_event_comment(material)},
+            {"id": "checkpoint-generation-boundary",
+             "body": encode_checkpoint_comment(checkpoint)},
+        ])
+        raw_graph = {
+            "root": {
+                "id": ROOT_UUID, "identifier": "GEN-37",
+                "url": "https://linear.test/GEN-37",
+                "plan_revision": predecessor_plan, "revision": 1,
+                "status": "In Progress", "status_type": "started",
+                "next_action": "Carry terminal children into the next plan.",
+            },
+            "children": [child], "child_comments": {},
+        }
+        prepared = prepare_generation_operator_contract(
+            comments=deepcopy(client.comments), graph=deepcopy(raw_graph),
+            workstream_id="GEN-37", authority=AUTHORITY,
+            description_plan_revision=predecessor_plan,
+            target_source={
+                "identity": "https://example.test/new-plan", "sha256": PLAN,
+            },
+            created_at="2026-09-01T07:47:35Z", remote_head=HEAD,
+            started_state={
+                "id": "started", "name": "In Progress", "type": "started",
+                "team_id": "team",
+            },
+        )
+        manifest = prepared["projection_preview"]["manifest"]
+        self.assertEqual(prepared["projection_preview"]["phase"],
+                         "terminal_evidence_seed")
+        self.assertEqual(
+            manifest["terminal_child_evidence_seed_predecessor"]
+            ["projection_revision"],
+            11,
+        )
+        self.assertIsNotNone(
+            manifest["terminal_child_evidence_seed_predecessor"]
+            ["checkpoint_event_id"],
+        )
+
+        projection_graph = workstream_projection.bind_projection_plan_generation(
+            deepcopy(raw_graph), client.comments, workstream_id="GEN-37",
+            requested_plan_revision=PLAN, authenticated_route=AUTHORITY,
+        )
+        projection_graph = add_live_child_material_history(
+            projection_graph, authenticated_route=AUTHORITY,
+            root_comments=client.comments,
+            proposal_plan_revision=predecessor_plan,
+        )
+        target = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **AUTHORITY,
+        )
+        normalized = prepare_terminal_child_evidence_seeds(
+            manifest, projection_graph, target.state(), remote_head=HEAD,
+            comments=client.comments,
+        )
+        self.assertEqual(normalized, manifest)
 
     def install_late_predecessor_projection_append(
         self, client, adapter, *, after_append, suffix,
