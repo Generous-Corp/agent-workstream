@@ -459,6 +459,28 @@ pending row or advance its revision by last-writer-wins. Both `apply` and
 lossless append-only event log. `apply_with_rebase` reloads the live revision
 and retries a stable event ID after `RevisionConflict`.
 
+#### Transient tracking outage
+
+A Linear availability failure must not stop an already-authorized owner from
+doing independently authorized work. The runtime may use
+`scripts/workstream_degraded_execution.py` only when the same process and
+current turn still hold an opaque, unexpired grant issued immediately after a
+live authenticated full resume. There is intentionally no CLI or serialized
+cache that can mint or transfer this grant. A fresh session, copied grant,
+expired grant, auth/permission failure, semantic refusal, or ambiguous
+post-write timeout fails closed.
+
+This narrow `degraded_continuation` authority permits provider/local
+implementation and an immutable exact-head Shipyard handoff or landing. It
+does not permit Linear writes, scope expansion, source/root/generation or
+ownership transitions, attach/successor selection, semantic closure, or
+Linear resume/handoff certification. Record discovered material deltas in the
+durable local outbox. Before remote replay or certification, obtain a fresh
+authenticated full resume, verify every bound route/source/generation/frontier,
+owner, repository, worktree, Shipyard, and snapshot field, then reconcile the
+stable event IDs idempotently. Reconciliation, not outage duration, restores
+normal authority.
+
 `scripts/workstream_linear_events.py` is the dependency-free authenticated
 Linear `MutationAdapter`. It stores one immutable material delta per issue
 comment using Linear's documented `commentCreate` API, paginates the complete
