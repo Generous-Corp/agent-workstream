@@ -3523,6 +3523,10 @@ class ProjectionTests(unittest.TestCase):
         client, adapter, source, graph, _children, manifest, new_head = (
             self.terminal_seed_head_transition_fixture()
         )
+        self.assertNotIn(
+            "created_at",
+            manifest["terminal_child_evidence_seed_head_transition"],
+        )
         prepared = prepare_terminal_child_evidence_seeds(
             manifest, graph, adapter.state(), remote_head=new_head,
         )
@@ -4621,6 +4625,12 @@ class ProjectionTests(unittest.TestCase):
         self.assertIn(
             "terminal_child_evidence_seed_head_transition",
             later_preview["manifest"],
+        )
+        self.assertEqual(
+            later_preview["manifest"][
+                "terminal_child_evidence_seed_head_transition"
+            ]["created_at"],
+            later_created_at,
         )
         self.assertNotIn(
             "terminal_child_evidence_seed_legacy_split_head_repair",

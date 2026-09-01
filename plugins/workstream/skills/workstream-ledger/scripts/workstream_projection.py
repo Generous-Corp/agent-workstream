@@ -889,16 +889,19 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         disposition = seed_head_transition.get("disposition") if isinstance(
             seed_head_transition, dict
         ) else None
+        head_transition_fields = {
+            "repository_key", "from_exact_head", "to_exact_head",
+            "from_scope_event_id", "from_scope_value_sha256",
+            "from_disposition_event_id", "from_disposition_value_sha256",
+            "disposition", "input_frontier_sha256",
+        }
         if (
             not seeds
             or not isinstance(seed_head_transition, dict)
-            or set(seed_head_transition) != {
-                "repository_key", "from_exact_head", "to_exact_head",
-                "from_scope_event_id", "from_scope_value_sha256",
-                "from_disposition_event_id",
-                "from_disposition_value_sha256",
-                "disposition", "input_frontier_sha256", "created_at",
-            }
+            or set(seed_head_transition) not in (
+                head_transition_fields,
+                head_transition_fields | {"created_at"},
+            )
             or not isinstance(seed_head_transition.get("repository_key"), str)
             or not seed_head_transition["repository_key"]
             or not re.fullmatch(
@@ -931,8 +934,13 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
                 r"[0-9a-f]{64}",
                 str(seed_head_transition.get("input_frontier_sha256", "")),
             )
-            or not isinstance(seed_head_transition.get("created_at"), str)
-            or not seed_head_transition["created_at"]
+            or (
+                "created_at" in seed_head_transition
+                and (
+                    not isinstance(seed_head_transition["created_at"], str)
+                    or not seed_head_transition["created_at"]
+                )
+            )
             or not isinstance(disposition, dict)
             or set(disposition) != {
                 "disposition", "remote_head", "recovered_from_checkpoint",
@@ -1837,9 +1845,13 @@ def _gen14_completed_normalization_replay(
     created_at: str,
 ) -> bool:
     """Accept only the deterministic ordinary tail following exact D6/S7."""
+    ordinary_transition = manifest.get(
+        "terminal_child_evidence_seed_head_transition"
+    )
     if (
         len(state.events) < 8
-        or manifest.get("terminal_child_evidence_seed_head_transition") is None
+        or not isinstance(ordinary_transition, dict)
+        or ordinary_transition.get("created_at") != created_at
         or manifest.get("terminal_child_evidence_seed_legacy_split_head_repair")
         is not None
     ):
@@ -2082,11 +2094,16 @@ def prepare_terminal_child_evidence_seeds(
                 "kind": "disposition", "key": "root",
                 "value": deepcopy(ordinary_transition["disposition"]),
             }]
+            ordinary_created_at = ordinary_transition.get("created_at")
             completed_split_normalization = (
-                _gen14_completed_split_migration(state)
-                or _gen14_completed_normalization_replay(
-                    state, result, replay_desired,
-                    created_at=ordinary_transition["created_at"],
+                isinstance(ordinary_created_at, str)
+                and bool(ordinary_created_at)
+                and (
+                    _gen14_completed_split_migration(state)
+                    or _gen14_completed_normalization_replay(
+                        state, result, replay_desired,
+                        created_at=ordinary_created_at,
+                    )
                 )
             )
     bootstrap = bootstrap or _terminal_seed_bootstrap_prefix(
@@ -3422,7 +3439,12 @@ def reconcile_required_projection(
     )
     completed_split_normalization = (
         legacy_split is None
-        and manifest.get("terminal_child_evidence_seed_head_transition") is not None
+        and isinstance(
+            manifest.get("terminal_child_evidence_seed_head_transition"), dict,
+        )
+        and manifest["terminal_child_evidence_seed_head_transition"].get(
+            "created_at"
+        ) == created_at
         and (
             _gen14_completed_split_migration(initial)
             or _gen14_completed_normalization_replay(

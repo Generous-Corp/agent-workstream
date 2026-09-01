@@ -733,6 +733,49 @@ class RootTransitionTransport:
         reserved = [item for item in comments if item.get("id") == slot]
         # Rebuild the original reviewed intent only while the original snapshot is present.
         replayed = snapshot_sha256(snapshot) != expected_snapshot_sha256
+        if replayed and len(reserved) == 1:
+            reservation_body = str(reserved[0].get("body") or "")
+            pending = _decode(reservation_body)
+            if isinstance(pending, dict):
+                unsigned = {
+                    key: deepcopy(value) for key, value in pending.items()
+                    if key != "intent_sha256"
+                }
+                receipt = self._reservation_receipt(
+                    comments, slot=slot, body=reservation_body,
+                )
+                root = snapshot.get("root") or {}
+                update = pending.get("update") or {}
+                target_applied = (
+                    root.get("description") == update.get("description")
+                    if operation in {"plan-url", "reconcile-plan-url"}
+                    else (root.get("state") or {}).get("id") == target
+                )
+                reservation_only = (
+                    pending.get("operation") == operation
+                    and pending.get("expected_snapshot_sha256")
+                    == expected_snapshot_sha256
+                    and pending.get("expected_frontier_sha256")
+                    == expected_frontier_sha256
+                    and pending.get("authority") == self.authority
+                    and pending.get("intent_sha256") == expected_intent_sha256
+                    and pending.get("intent_sha256") == _digest(unsigned)
+                    and pending.get("operator_authorization")
+                    == current_authorization
+                    and _reservation_matches_request(
+                        pending, operation=operation, target=target,
+                    )
+                    and root.get("updatedAt") == receipt["updatedAt"]
+                    and _preserved_root(snapshot, operation)
+                    == pending.get("preserved_root")
+                    and comment_frontier_sha256(comments, exclude_id=slot)
+                    == expected_frontier_sha256
+                    and not target_applied
+                )
+                if reservation_only:
+                    raise RootTransitionError(
+                        "root_transition_reservation_pending_review_new_preview_required"
+                    )
         if (
             operation == "reconcile-plan-url"
             and not replayed

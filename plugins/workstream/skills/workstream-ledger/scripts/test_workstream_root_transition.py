@@ -873,6 +873,14 @@ class RootTransitionTests(unittest.TestCase):
                 operator_authorization=OPERATOR_AUTHORIZATION,
                 after_reservation_created=crash,
             ).apply(**args)
+        reservation = next(
+            item for item in fake.comments
+            if item["id"] == preview["reservation_slot_id"]
+        )
+        self.assertNotEqual(
+            reservation["createdAt"], reservation["updatedAt"],
+        )
+        self.assertEqual(fake.updated_at, reservation["updatedAt"])
         with self.assertRaisesRegex(
             RootTransitionError, "reservation_pending_review_new_preview_required"
         ):
