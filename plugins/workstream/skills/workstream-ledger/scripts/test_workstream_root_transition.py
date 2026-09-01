@@ -5,10 +5,12 @@ from copy import deepcopy
 import io
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from workstream_root_transition import (
     RootTransitionError, RootTransitionTransport, main as root_main,
+    validate_active_locator_authorization,
 )
 from workstream_linear import LinearTransportError
 
@@ -21,6 +23,9 @@ AUTHORITY = {
 }
 PINNED = "https://github.com/example/private-plans/blob/" + "a" * 40 + "/plan.md"
 MAIN = "https://github.com/example/private-plans/blob/main/plan.md"
+ACTIVE_PINNED = (
+    "https://github.com/example/private-plans/blob/" + "b" * 40 + "/plan.md"
+)
 STARTED_STATE = "44444444-4444-4444-8444-444444444444"
 OPERATOR_AUTHORIZATION = {
     "schema_version": 1, "contract_sha256": "1" * 64,
@@ -37,6 +42,25 @@ OPERATOR_AUTHORIZATION = {
         },
     },
     "retirement_sha256": "2" * 64, "frontiers_sha256": "3" * 64,
+}
+LOCATOR_AUTHORIZATION = {
+    "schema_version": 1,
+    "authorization_kind": "active_generation_plan_locator",
+    "source": {"identity": ACTIVE_PINNED, "sha256": "f" * 64},
+    "generation": {
+        "plan_revision": "f" * 64,
+        "description_plan_revision": "f" * 64,
+        "transition_tip_event_id": "wsp_" + "1" * 32,
+        "activation_epoch": 1,
+        "authority_origin": "generation_transition",
+    },
+    "projection": {
+        "revision": 4,
+        "frontier_event_id": "wsp_" + "2" * 32,
+        "events_sha256": "3" * 64,
+        "source_event_id": "wsp_" + "4" * 32,
+        "source_value_sha256": "5" * 64,
+    },
 }
 
 
@@ -131,23 +155,269 @@ class FakeClient:
 class RootTransitionTests(unittest.TestCase):
 
     def test_apply_missing_fences_refuses_before_auth_or_network(self):
-        argv = [
-            "workstream_root_transition.py", "plan-url", TOKEN,
-            "--to", MAIN, "--operator-contract", "review.json",
-            "--plan-source", "PLAN.md", "--apply",
-        ]
-        stderr = io.StringIO()
-        with mock.patch.object(sys, "argv", argv), mock.patch(
-            "workstream_root_transition.resolve_linear_route",
-            side_effect=AssertionError("invalid local CLI reached auth/network"),
-        ), mock.patch.object(sys, "stderr", stderr):
-            self.assertEqual(root_main(), 2)
-        self.assertIn("root_transition_expected_fence_invalid", stderr.getvalue())
+        for argv in (
+            [
+                "workstream_root_transition.py", "plan-url", TOKEN,
+                "--to", MAIN, "--operator-contract", "review.json",
+                "--plan-source", "PLAN.md", "--apply",
+            ],
+            [
+                "workstream_root_transition.py", "reconcile-plan-url", TOKEN,
+                "--to", ACTIVE_PINNED, "--apply",
+            ],
+        ):
+            stderr = io.StringIO()
+            with self.subTest(command=argv[1]), mock.patch.object(
+                sys, "argv", argv,
+            ), mock.patch(
+                "workstream_root_transition.resolve_linear_route",
+                side_effect=AssertionError("invalid local CLI reached auth/network"),
+            ), mock.patch.object(sys, "stderr", stderr):
+                self.assertEqual(root_main(), 2)
+            self.assertIn(
+                "root_transition_expected_fence_invalid", stderr.getvalue(),
+            )
+
     def transport(self, fake):
         return RootTransitionTransport(
             fake, token=TOKEN, authority=AUTHORITY,
             operator_authorization=OPERATOR_AUTHORIZATION,
         )
+
+    def locator_transport(self, fake):
+        return RootTransitionTransport(
+            fake, token=TOKEN, authority=AUTHORITY,
+            operator_authorization=LOCATOR_AUTHORIZATION,
+        )
+
+    def test_locator_cli_normalizes_authenticated_plan_payload_source(self):
+        argv = [
+            "workstream_root_transition.py", "reconcile-plan-url", TOKEN,
+            "--to", ACTIVE_PINNED,
+        ]
+        transport = mock.Mock()
+        transport.preview.return_value = {"apply": False}
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            sys, "stdout", stdout,
+        ), mock.patch(
+            "workstream_root_transition.resolve_linear_route",
+            return_value=({
+                key: AUTHORITY[key]
+                for key in ("workspace_id", "team_id", "project_id")
+            }, {}),
+        ), mock.patch(
+            "workstream_root_transition.load_linear_api_key", return_value="key",
+        ), mock.patch(
+            "workstream_root_transition.HttpGraphQLClient",
+        ) as client_type, mock.patch(
+            "workstream_root_transition.bootstrap_linear_route",
+            return_value=AUTHORITY,
+        ), mock.patch(
+            "workstream_root_transition.plan_payload",
+            return_value={"source": {
+                "identity": ACTIVE_PINNED, "sha256": "f" * 64, "bytes": 42,
+            }},
+        ), mock.patch(
+            "workstream_root_transition.RootTransitionTransport",
+            return_value=transport,
+        ) as transport_type, mock.patch(
+            "workstream_root_transition.validate_active_locator_authorization",
+            return_value=LOCATOR_AUTHORIZATION,
+        ) as validate:
+            self.assertEqual(root_main(), 0)
+            validator = transport_type.call_args.kwargs["operator_validator"]
+            self.assertEqual(validator({"root": {}}, []), LOCATOR_AUTHORIZATION)
+        validate.assert_called_once_with(
+            source={"identity": ACTIVE_PINNED, "sha256": "f" * 64},
+            token=TOKEN, authority=AUTHORITY, comments=[], graph={"root": {}},
+        )
+        transport.preview.assert_called_once_with(
+            operation="reconcile-plan-url", target=ACTIVE_PINNED,
+        )
+        self.assertTrue(client_type.called)
+
+    def test_locator_reconcile_apply_replay_and_fresh_noop(self):
+        fake = FakeClient()
+        original_root = fake.root()
+        original_comments = deepcopy(fake.comments)
+        transport = self.locator_transport(fake)
+        preview = transport.preview(
+            operation="reconcile-plan-url", target=ACTIVE_PINNED,
+        )
+        self.assertFalse(preview["apply"])
+        result = transport.apply(
+            operation="reconcile-plan-url", target=ACTIVE_PINNED,
+            expected_snapshot_sha256=preview["expected_snapshot_sha256"],
+            expected_frontier_sha256=preview["expected_frontier_sha256"],
+            expected_intent_sha256=preview["intent_sha256"],
+        )
+        self.assertEqual(result["result"], "applied_or_exact_replay")
+        self.assertEqual(fake.description, original_root["description"].replace(
+            PINNED, ACTIVE_PINNED,
+        ))
+        self.assertEqual(len(fake.comments), len(original_comments) + 1)
+        writes = sum(
+            "WorkstreamRootTransition(" in query for query, _ in fake.calls
+        )
+        replay = transport.apply(
+            operation="reconcile-plan-url", target=ACTIVE_PINNED,
+            expected_snapshot_sha256=preview["expected_snapshot_sha256"],
+            expected_frontier_sha256=preview["expected_frontier_sha256"],
+            expected_intent_sha256=preview["intent_sha256"],
+        )
+        self.assertEqual(replay["result"], "applied_or_exact_replay")
+        self.assertEqual(sum(
+            "WorkstreamRootTransition(" in query for query, _ in fake.calls
+        ), writes)
+        self.assertEqual(len(fake.comments), len(original_comments) + 1)
+
+        current = FakeClient()
+        current.description = current.description.replace(PINNED, ACTIVE_PINNED)
+        current_transport = self.locator_transport(current)
+        current_preview = current_transport.preview(
+            operation="reconcile-plan-url", target=ACTIVE_PINNED,
+        )
+        comments_before = deepcopy(current.comments)
+        noop = current_transport.apply(
+            operation="reconcile-plan-url", target=ACTIVE_PINNED,
+            expected_snapshot_sha256=current_preview["expected_snapshot_sha256"],
+            expected_frontier_sha256=current_preview["expected_frontier_sha256"],
+            expected_intent_sha256=current_preview["intent_sha256"],
+        )
+        self.assertEqual(noop["result"], "already_current_noop")
+        self.assertEqual(current.comments, comments_before)
+        self.assertFalse(any(
+            "WorkstreamRootTransition(" in query for query, _ in current.calls
+        ))
+
+    def test_locator_reconcile_refuses_authority_or_target_substitution(self):
+        fake = FakeClient()
+        with self.assertRaisesRegex(
+            RootTransitionError, "locator_authorization_required",
+        ):
+            self.transport(fake).preview(
+                operation="reconcile-plan-url", target=ACTIVE_PINNED,
+            )
+        with self.assertRaisesRegex(
+            RootTransitionError, "candidate_authorization_required",
+        ):
+            self.locator_transport(fake).preview(
+                operation="plan-url", target=ACTIVE_PINNED,
+            )
+        other = (
+            "https://github.com/example/private-plans/blob/"
+            + "c" * 40 + "/other.md"
+        )
+        with self.assertRaisesRegex(
+            RootTransitionError, "target_not_active_source|different_plan_document",
+        ):
+            self.locator_transport(fake).preview(
+                operation="reconcile-plan-url", target=other,
+            )
+        for description, error in (
+            ("No canonical plan", "canonical_plan_source_missing"),
+            (f"Canonical plan: {PINNED} {ACTIVE_PINNED}",
+             "canonical_plan_source_ambiguous"),
+        ):
+            malformed = FakeClient()
+            malformed.description = description
+            with self.subTest(error=error), self.assertRaisesRegex(
+                ValueError, error,
+            ):
+                self.locator_transport(malformed).preview(
+                    operation="reconcile-plan-url", target=ACTIVE_PINNED,
+                )
+
+    def test_active_locator_authorization_binds_exact_generation_and_source(self):
+        source = deepcopy(LOCATOR_AUTHORIZATION["source"])
+        selected = deepcopy(LOCATOR_AUTHORIZATION["generation"])
+        source_event = {
+            "kind": "source", "key": "root",
+            "event_id": "wsp_" + "4" * 32,
+            "value": deepcopy(source),
+        }
+        frontier = {
+            "kind": "disposition", "key": "root",
+            "event_id": "wsp_" + "2" * 32, "value": {},
+        }
+        state = SimpleNamespace(
+            revision=2, events=(source_event, frontier),
+            snapshot={"source": deepcopy(source)},
+        )
+        graph = {"root": {"plan_revision": "e" * 64}}
+        with mock.patch(
+            "workstream_root_transition.select_plan_generation",
+            return_value=selected,
+        ), mock.patch(
+            "workstream_root_transition.reduce_projection_comments",
+            return_value=state,
+        ), mock.patch(
+            "workstream_generation.assert_no_pending_generation_reservation",
+        ):
+            result = validate_active_locator_authorization(
+                source=source, token=TOKEN, authority=AUTHORITY,
+                comments=[], graph=graph,
+            )
+        self.assertEqual(result["source"], source)
+        self.assertEqual(result["generation"], selected)
+        self.assertEqual(result["projection"]["revision"], 2)
+        self.assertEqual(
+            result["projection"]["source_event_id"], source_event["event_id"],
+        )
+
+        for changed, error in (
+            ({**selected, "authority_origin": "legacy_description"},
+             "structured_active_generation_required"),
+            ({**selected, "plan_revision": "0" * 64},
+             "target_not_active_source"),
+        ):
+            with self.subTest(error=error), mock.patch(
+                "workstream_root_transition.select_plan_generation",
+                return_value=changed,
+            ), self.assertRaisesRegex(RootTransitionError, error):
+                validate_active_locator_authorization(
+                    source=source, token=TOKEN, authority=AUTHORITY,
+                    comments=[], graph=graph,
+                )
+        mismatched_state = SimpleNamespace(
+            revision=2,
+            events=({**source_event, "value": {
+                "identity": ACTIVE_PINNED, "sha256": "0" * 64,
+            }}, frontier),
+            snapshot={"source": {
+                "identity": ACTIVE_PINNED, "sha256": "0" * 64,
+            }},
+        )
+        with mock.patch(
+            "workstream_root_transition.select_plan_generation",
+            return_value=selected,
+        ), mock.patch(
+            "workstream_root_transition.reduce_projection_comments",
+            return_value=mismatched_state,
+        ), mock.patch(
+            "workstream_generation.assert_no_pending_generation_reservation",
+        ), self.assertRaisesRegex(
+            RootTransitionError, "active_source_mismatch",
+        ):
+            validate_active_locator_authorization(
+                source=source, token=TOKEN, authority=AUTHORITY,
+                comments=[], graph=graph,
+            )
+
+        with mock.patch(
+            "workstream_root_transition.select_plan_generation",
+            return_value=selected,
+        ), mock.patch(
+            "workstream_generation.assert_no_pending_generation_reservation",
+            side_effect=LinearTransportError("generation_boundary_reserved:test"),
+        ), self.assertRaisesRegex(
+            RootTransitionError, "generation_boundary_reserved",
+        ):
+            validate_active_locator_authorization(
+                source=source, token=TOKEN, authority=AUTHORITY,
+                comments=[], graph=graph,
+            )
 
     def test_plan_url_preview_is_zero_write_and_apply_preserves_other_text(self):
         fake = FakeClient()

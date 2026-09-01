@@ -1161,19 +1161,26 @@ class ProjectionTests(unittest.TestCase):
             },
             "children": [child], "child_comments": {},
         }
-        prepared = prepare_generation_operator_contract(
-            comments=deepcopy(client.comments), graph=deepcopy(raw_graph),
-            workstream_id="GEN-37", authority=AUTHORITY,
-            description_plan_revision=predecessor_plan,
-            target_source={
-                "identity": "https://example.test/new-plan", "sha256": PLAN,
-            },
-            created_at="2026-09-01T07:47:35Z", remote_head=HEAD,
-            started_state={
-                "id": "started", "name": "In Progress", "type": "started",
-                "team_id": "team",
-            },
-        )
+        with mock.patch(
+            "workstream_projection.projection_disposition_value",
+            side_effect=AssertionError(
+                "seed preview must not derive an activation disposition"
+            ),
+        ) as disposition_reducer:
+            prepared = prepare_generation_operator_contract(
+                comments=deepcopy(client.comments), graph=deepcopy(raw_graph),
+                workstream_id="GEN-37", authority=AUTHORITY,
+                description_plan_revision=predecessor_plan,
+                target_source={
+                    "identity": "https://example.test/new-plan", "sha256": PLAN,
+                },
+                created_at="2026-09-01T07:47:35Z", remote_head=HEAD,
+                started_state={
+                    "id": "started", "name": "In Progress",
+                    "type": "started", "team_id": "team",
+                },
+            )
+        disposition_reducer.assert_not_called()
         manifest = prepared["projection_preview"]["manifest"]
         self.assertEqual(prepared["projection_preview"]["phase"],
                          "terminal_evidence_seed")
@@ -3457,12 +3464,19 @@ class ProjectionTests(unittest.TestCase):
         from_scope_event = workstream_projection._active_heads(
             adapter.state()
         )[("scope", "root")]
+        from_disposition_event = workstream_projection._active_heads(
+            adapter.state()
+        )[("disposition", "root")]
         manifest["terminal_child_evidence_seed_head_transition"] = {
             "repository_key": desired_scope["primary_repository"],
             "from_exact_head": HEAD, "to_exact_head": new_head,
             "from_scope_event_id": from_scope_event["event_id"],
             "from_scope_value_sha256": canonical_digest(
                 from_scope_event["value"]
+            ),
+            "from_disposition_event_id": from_disposition_event["event_id"],
+            "from_disposition_value_sha256": canonical_digest(
+                from_disposition_event["value"]
             ),
             "disposition": {
                 "disposition": "create_successor", "remote_head": new_head,
@@ -3616,6 +3630,16 @@ class ProjectionTests(unittest.TestCase):
                 created_at=f"2026-09-01T09:{index:02d}:00Z",
                 authority=AUTHORITY,
             ))
+        old_disposition = build_projection_event(
+            workstream_id="GEN-37", kind="disposition", key="root",
+            value={
+                "disposition": "attach", "remote_head": predecessor_head,
+                "recovered_from_checkpoint": None,
+            },
+            plan_revision=PLAN, expected_revision=adapter.state().revision,
+            created_at="2026-09-01T09:19:00Z", authority=AUTHORITY,
+        )
+        adapter.append(old_disposition)
         adapter.append(build_projection_event(
             workstream_id="GEN-37", kind="disposition", key="root",
             value={
@@ -3624,6 +3648,7 @@ class ProjectionTests(unittest.TestCase):
             },
             plan_revision=PLAN, expected_revision=adapter.state().revision,
             created_at="2026-09-01T09:20:00Z", authority=AUTHORITY,
+            supersedes_event_id=old_disposition["event_id"],
         ))
 
         active = workstream_projection._active_heads(adapter.state())
@@ -3643,6 +3668,7 @@ class ProjectionTests(unittest.TestCase):
             for (kind, key), event in active.items()
             if kind == "evidence_contract"
         }
+        history_before = deepcopy(adapter.state().events)
         transition = {
             "repository_key": desired_scope["primary_repository"],
             "from_exact_head": predecessor_head,
@@ -3650,6 +3676,10 @@ class ProjectionTests(unittest.TestCase):
             "from_scope_event_id": stale_scope_event["event_id"],
             "from_scope_value_sha256": canonical_digest(
                 stale_scope_event["value"]
+            ),
+            "from_disposition_event_id": old_disposition["event_id"],
+            "from_disposition_value_sha256": canonical_digest(
+                old_disposition["value"]
             ),
             "disposition": {
                 "disposition": "attach", "remote_head": HEAD,
@@ -3790,6 +3820,9 @@ class ProjectionTests(unittest.TestCase):
         )
         self.assertTrue(repair_result["resume_authority_verified"])
         final_active = workstream_projection._active_heads(adapter.state())
+        self.assertEqual(
+            adapter.state().events[:len(history_before)], history_before,
+        )
         self.assertEqual(
             {key for kind, key in final_active if kind == "child_closure"},
             {child["identifier"] for child in children},
@@ -3978,6 +4011,19 @@ class ProjectionTests(unittest.TestCase):
         ):
             prepare_terminal_child_evidence_seeds(
                 changed_namespace, graph, adapter.state(), remote_head=new_head,
+            )
+
+        wrong_disposition_binding = deepcopy(manifest)
+        wrong_disposition_binding[
+            "terminal_child_evidence_seed_head_transition"
+        ]["from_disposition_value_sha256"] = "0" * 64
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_evidence_seed_reviewed_predecessor_missing",
+        ):
+            prepare_terminal_child_evidence_seeds(
+                wrong_disposition_binding, graph, adapter.state(),
+                remote_head=new_head,
             )
 
         wrong_head = deepcopy(manifest)

@@ -191,7 +191,11 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("a bare `shipyard ship --pr` is validation only", ledger)
         self.assertIn("shipyard pr --workstream-id", ledger)
         self.assertIn("shipyard runner steward-handoff", ledger)
+        self.assertIn("without substituting dummy or no-op gates", ledger)
+        self.assertIn("only then submit one bare `shipyard ship --pr", ledger)
         self.assertIn("Do not substitute bare `shipyard ship --pr`", bridge)
+        self.assertIn("fail without replacing them with", bridge)
+        self.assertIn("steward receipt—not the bare validation command", bridge)
 
     def test_resume_entry_is_small_and_owns_fresh_handle_trigger(self):
         resume = self.resume_skill()
@@ -215,7 +219,7 @@ class SkillContractTests(unittest.TestCase):
         codex = json.loads((plugin / ".codex-plugin/plugin.json").read_text())
         claude = json.loads((plugin / ".claude-plugin/plugin.json").read_text())
         self.assertEqual(codex["version"], claude["version"])
-        self.assertEqual(codex["version"], "0.4.52")
+        self.assertEqual(codex["version"], "0.4.54")
         shim = plugin / "skills/workstream-resume/scripts/workstream_resume.py"
         target = plugin / "skills/workstream-ledger/scripts/workstream_resume.py"
         self.assertTrue(shim.is_file())

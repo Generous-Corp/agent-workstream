@@ -66,12 +66,59 @@ class ResumeTests(unittest.TestCase):
             result = MODULE.plan_generation_freshness(
                 token="GEN-37", description=f"Canonical plan: {canonical}",
                 active_source=active, comments=[], authenticated_route=route,
+                generation={
+                    "plan_revision": "a" * 64,
+                    "description_plan_revision": "a" * 64,
+                    "transition_tip_event_id": "wsp_" + "1" * 32,
+                    "activation_epoch": 1,
+                    "authority_origin": "generation_transition",
+                },
             )
         self.assertEqual(result["resume_authority"], "plan_generation_pending")
         self.assertFalse(result["executable"])
         self.assertEqual(result["active_source"]["sha256"], "a" * 64)
         self.assertEqual(result["canonical_live_source"]["sha256"], "b" * 64)
-        self.assertIn("generation", result["remediation"]["command"])
+        self.assertIsNone(result["remediation"]["command"])
+        self.assertTrue(result["remediation"]["selection_required"])
+        self.assertNotIn(
+            "--retirement-proof", json.dumps(result["remediation"]),
+        )
+        alternatives = {
+            item["kind"]: item for item in result["remediation"]["alternatives"]
+        }
+        self.assertTrue(alternatives["reconcile_regressed_locator"]["available"])
+        self.assertEqual(
+            alternatives["reconcile_regressed_locator"]["command"][:3],
+            ["workstreamctl", "root-transition", "reconcile-plan-url"],
+        )
+        self.assertTrue(alternatives["activate_new_generation"]["available"])
+        with mock.patch.object(MODULE, "plan_payload", return_value={
+            "source": {"identity": canonical, "sha256": "b" * 64},
+        }), mock.patch(
+            "workstream_generation.pending_generation_reservations",
+            return_value=[],
+        ):
+            legacy = MODULE.plan_generation_freshness(
+                token="GEN-37", description=f"Canonical plan: {canonical}",
+                active_source=active, comments=[], authenticated_route=route,
+                generation={
+                    "plan_revision": "a" * 64,
+                    "description_plan_revision": "a" * 64,
+                    "transition_tip_event_id": None,
+                    "activation_epoch": None,
+                    "authority_origin": "legacy_description",
+                },
+            )
+        legacy_alternatives = {
+            item["kind"]: item
+            for item in legacy["remediation"]["alternatives"]
+        }
+        self.assertFalse(
+            legacy_alternatives["reconcile_regressed_locator"]["available"],
+        )
+        self.assertTrue(
+            legacy_alternatives["activate_new_generation"]["available"],
+        )
         self.assertLess(len(json.dumps(result).encode()), 24 * 1024)
 
     def test_pending_generation_reservation_surfaces_exact_replay_or_abort(self):
@@ -104,6 +151,13 @@ class ResumeTests(unittest.TestCase):
                 },
             )
         pending = result["pending_generation_reservations"][0]
+        self.assertIsNone(result["remediation"]["command"])
+        self.assertIn(
+            "pending reservation", result["remediation"]["selection_rule"],
+        )
+        self.assertFalse(any(
+            item["available"] for item in result["remediation"]["alternatives"]
+        ))
         self.assertEqual(pending["reservation_id"], reservation["reservation_id"])
         self.assertIn("--abort-reservation-id", pending["abort"]["command"])
         self.assertIn("2026-08-31T12:00:00Z", pending["continue"]["command"])
@@ -2530,6 +2584,7 @@ class ResumeTests(unittest.TestCase):
     def test_gen14_ordinary_resume_drift_activation_and_full_recovery(self):
         import test_workstream_generation_transition as generation_fixture
         import workstream_generation as generation_cli_module
+        import workstream_root_transition as root_transition_module
         from workstream_linear_projection import (
             LinearProjectionAdapter, reduce_projection_comments,
         )
@@ -2568,6 +2623,14 @@ class ResumeTests(unittest.TestCase):
             def recording_execute(query, variables):
                 if "query WorkstreamDeltaComments" in query:
                     comment_reads.append(copy.deepcopy(variables))
+                if "mutation WorkstreamRootTransition(" in query:
+                    update = copy.deepcopy(variables["input"])
+                    self.assertEqual(set(update), {"description"})
+                    client.description = update["description"]
+                    client.graph_nonce = "locator-reconciled"
+                    return {"issueUpdate": {
+                        "success": True, "issue": client.root_issue(),
+                    }}
                 return original_execute(query, variables)
 
             client.execute = recording_execute
@@ -2639,7 +2702,7 @@ class ResumeTests(unittest.TestCase):
                         "sha256": canonical_live_digest[0],
                         "bytes": len(Path(new_plan.name).read_bytes()),
                     }}
-                if location == old_plan.name:
+                if location == old_plan.name or location == old_identity:
                     return {"source": {
                         "identity": identity or old_identity,
                         "sha256": old_digest,
@@ -2779,6 +2842,101 @@ class ResumeTests(unittest.TestCase):
                 {old_digest, new_digest},
             )
             self.assertGreater(writes_after_activation, initial_comment_count)
+
+            client.description = client.description.replace(canonical, old_identity)
+            locator_pending = ordinary_resume(new_plan.name, new_identity)
+            self.assertEqual(
+                locator_pending["resume_authority"], "plan_generation_pending",
+            )
+            self.assertEqual(
+                locator_pending["active_source"]["sha256"], new_digest,
+            )
+            self.assertEqual(
+                locator_pending["canonical_live_source"]["sha256"], old_digest,
+            )
+            with self.assertRaisesRegex(
+                generation_cli_module.WorkstreamGenerationError,
+                "generation_target_already_active",
+            ):
+                prepare_operator_contract()
+
+            locator_source = {
+                "identity": new_identity, "sha256": new_digest,
+            }
+
+            def locator_validator(snapshot, comments):
+                return root_transition_module.validate_active_locator_authorization(
+                    source=locator_source, token=token, authority=route,
+                    comments=comments, graph=snapshot,
+                )
+
+            locator = root_transition_module.RootTransitionTransport(
+                client, token=token, authority=route,
+                operator_validator=locator_validator,
+            )
+            root_before = copy.deepcopy(client.root_issue())
+            comments_before_locator = copy.deepcopy(client.comments)
+            projections_before = {}
+            for digest in (old_digest, new_digest):
+                projections_before[digest] = tuple(
+                    reduce_projection_comments(
+                        client.comments, workstream_id=token,
+                        expected_plan_revision=digest,
+                        authenticated_route=route,
+                    ).events
+                )
+            locator_preview = locator.preview(
+                operation="reconcile-plan-url", target=new_identity,
+            )
+            locator_result = locator.apply(
+                operation="reconcile-plan-url", target=new_identity,
+                expected_snapshot_sha256=locator_preview[
+                    "expected_snapshot_sha256"
+                ],
+                expected_frontier_sha256=locator_preview[
+                    "expected_frontier_sha256"
+                ],
+                expected_intent_sha256=locator_preview["intent_sha256"],
+            )
+            self.assertEqual(
+                locator_result["result"], "applied_or_exact_replay",
+            )
+            self.assertEqual(
+                client.comments[:len(comments_before_locator)],
+                comments_before_locator,
+            )
+            self.assertEqual(
+                len(client.comments), len(comments_before_locator) + 1,
+            )
+            for digest in (old_digest, new_digest):
+                self.assertEqual(tuple(reduce_projection_comments(
+                    client.comments, workstream_id=token,
+                    expected_plan_revision=digest,
+                    authenticated_route=route,
+                ).events), projections_before[digest])
+            root_after = client.root_issue()
+            for field in ("id", "identifier", "project", "state"):
+                self.assertEqual(root_after[field], root_before[field])
+
+            repaired = ordinary_resume(new_plan.name, new_identity)
+            self.assertEqual(repaired["resume_authority"], "full")
+            comments_after_locator = len(client.comments)
+            locator_replay = locator.apply(
+                operation="reconcile-plan-url", target=new_identity,
+                expected_snapshot_sha256=locator_preview[
+                    "expected_snapshot_sha256"
+                ],
+                expected_frontier_sha256=locator_preview[
+                    "expected_frontier_sha256"
+                ],
+                expected_intent_sha256=locator_preview["intent_sha256"],
+            )
+            self.assertEqual(
+                locator_replay["result"], "applied_or_exact_replay",
+            )
+            self.assertEqual(len(client.comments), comments_after_locator)
+
+            client.description = client.description.replace(new_identity, canonical)
 
             post_finalization_digest = "f" * 64
             canonical_live_digest[0] = post_finalization_digest

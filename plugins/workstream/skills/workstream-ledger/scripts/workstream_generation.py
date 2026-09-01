@@ -228,7 +228,7 @@ def prepare_generation_operator_contract(
         _value_digest, prepare_terminal_child_evidence_seeds,
         prepare_terminal_child_repairs, projection_review_contract,
         terminal_child_evidence_seed_predecessor_contract,
-        bind_projection_plan_generation,
+        bind_projection_plan_generation, projection_disposition_value,
     )
 
     if (
@@ -287,12 +287,10 @@ def prepare_generation_operator_contract(
         identity: event for identity, event in _active_heads(target).items()
         if identity[0] not in generation_control_kinds
     }
-    target_disposition = target_heads.get(("disposition", "root"), {}).get(
-        "value", {}
-    )
-    disposition_matches_remote_head = (
-        isinstance(target_disposition, dict)
-        and target_disposition.get("remote_head") == remote_head
+    target_disposition_event = target_heads.get(("disposition", "root"))
+    target_disposition = (
+        target_disposition_event.get("value", {})
+        if target_disposition_event is not None else {}
     )
     required = {("scope", "root"), ("source", "root")}
     missing = sorted(required - set(predecessor_heads))
@@ -398,6 +396,21 @@ def prepare_generation_operator_contract(
                                    "value": deepcopy(event["value"])})
             carried.append({**identity, "mode": "exact_value_copy"})
 
+    def target_disposition_matches(
+        projection: list[dict[str, Any]],
+    ) -> bool:
+        """Derive disposition only once the target projection can activate.
+
+        Earlier phases may intentionally expose multiple predecessor worktree
+        authorities.  They do not need a target disposition yet, and asking
+        the disposition reducer to choose one would turn a valid seed preview
+        into an unrelated ambiguity refusal.
+        """
+        return target_disposition == projection_disposition_value(
+            graph, projection, remote_head=remote_head,
+            workstream_id=workstream_id,
+        )
+
     terminal_stage: dict[str, Any] | None = None
     phase = "complete_projection"
     manifest: dict[str, Any]
@@ -492,6 +505,10 @@ def prepare_generation_operator_contract(
             current_seed_scope is not None
             and current_seed_scope["value"] != scope
         ):
+            desired_seed_disposition = projection_disposition_value(
+                graph, seed_items, remote_head=remote_head,
+                workstream_id=workstream_id,
+            )
             current_scope = current_seed_scope["value"]
             primary_key = scope["primary_repository"]
             current_primary = [
@@ -528,14 +545,34 @@ def prepare_generation_operator_contract(
                 raise WorkstreamGenerationError(
                     "generation_prepare_target_scope_drift"
                 )
+            reviewed_disposition_event = target_disposition_event
+            if target_disposition == desired_seed_disposition:
+                supersedes = (
+                    reviewed_disposition_event or {}
+                ).get("supersedes_event_id")
+                reviewed_disposition_event = next((
+                    event for event in target.events
+                    if event.get("event_id") == supersedes
+                    and (event.get("kind"), event.get("key"))
+                    == ("disposition", "root")
+                ), None)
+            reviewed_disposition = (
+                reviewed_disposition_event.get("value", {})
+                if reviewed_disposition_event is not None else {}
+            )
             if (
-                not isinstance(target_disposition, dict)
-                or set(target_disposition) != {
+                not isinstance(reviewed_disposition, dict)
+                or set(reviewed_disposition) != {
                     "disposition", "remote_head", "recovered_from_checkpoint",
                 }
-                or target_disposition.get("remote_head") != remote_head
-                or target_disposition.get("disposition")
+                or reviewed_disposition.get("remote_head")
+                != current_primary[0]["exact_head"]
+                or reviewed_disposition.get("disposition")
                 not in {"attach", "create_successor"}
+                or not (
+                    target_disposition == reviewed_disposition
+                    or target_disposition == desired_seed_disposition
+                )
             ):
                 raise WorkstreamGenerationError(
                     "generation_prepare_target_disposition_missing_for_head_transition"
@@ -546,7 +583,11 @@ def prepare_generation_operator_contract(
                 "to_exact_head": remote_head,
                 "from_scope_event_id": current_seed_scope["event_id"],
                 "from_scope_value_sha256": canonical_digest(current_scope),
-                "disposition": deepcopy(target_disposition),
+                "from_disposition_event_id": reviewed_disposition_event["event_id"],
+                "from_disposition_value_sha256": canonical_digest(
+                    reviewed_disposition
+                ),
+                "disposition": deepcopy(desired_seed_disposition),
                 "input_frontier_sha256": binding["input_frontier_sha256"],
             }
         normalized_seed = prepare_terminal_child_evidence_seeds(
@@ -674,7 +715,7 @@ def prepare_generation_operator_contract(
                 if all(
                     identity in current_values and current_values[identity] == value
                     for identity, value in desired_values.items()
-                ) and disposition_matches_remote_head:
+                ) and target_disposition_matches(manifest["projection"]):
                     phase = "activation_ready"
     else:
         desired_values = {
@@ -697,7 +738,7 @@ def prepare_generation_operator_contract(
         if all(
             identity in target_heads and target_heads[identity]["value"] == value
             for identity, value in desired_values.items()
-        ) and disposition_matches_remote_head:
+        ) and target_disposition_matches(complete_items):
             phase = "activation_ready"
     _reviewed_manifest(manifest)
 
