@@ -549,6 +549,13 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.57 keeps root-transition reservations from invalidating their own
+prewrite fence when Linear advances the root `updatedAt`, while still comparing
+every material root field and the non-reservation comment frontier. It also
+finishes GEN-14's content-addressed split-prefix migration by requiring the
+exact opaque stored/recomputed frontier pair at both producer and projection
+consumer boundaries; arbitrary frontier drift remains refused.
+
 Version 0.4.56 contains one content-addressed recovery for GEN-14's captured
 0.4.51 split-head inactive seed prefix. It binds both malformed predecessor
 heads and every frontier, writes the authenticated new disposition before the

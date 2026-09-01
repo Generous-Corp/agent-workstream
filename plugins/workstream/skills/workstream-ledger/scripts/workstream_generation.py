@@ -86,6 +86,12 @@ query WorkstreamGenerationPrepareState($teamId: String!, $stateId: String!) {
 GEN14_LEGACY_SPLIT_PREFIX_SHA256 = (
     "180e178d1732b914edce564ba1d6411e229ceaaecd48cbcb5422de2736d56c28"
 )
+GEN14_LEGACY_SPLIT_STORED_FRONTIER_SHA256 = (
+    "e0317b7cda88262a7baf0df28b13c4c27af8a4e171156147f304f62e104cfc23"
+)
+GEN14_LEGACY_SPLIT_RECOMPUTED_FRONTIER_SHA256 = (
+    "7c53170bb0ba8434182809f23f40f893b279f3b88a14face18326fd737b41240"
+)
 
 
 class WorkstreamGenerationError(LinearTransportError):
@@ -125,6 +131,13 @@ def _gen14_split_prefix_context(
         if repository_key(repository) == primary_key
     ]
     disposition = prefix[4].get("value", {})
+    captured_frontier_migration = (
+        frontiers == {GEN14_LEGACY_SPLIT_STORED_FRONTIER_SHA256}
+        and hmac.compare_digest(
+            input_frontier_sha256,
+            GEN14_LEGACY_SPLIT_RECOMPUTED_FRONTIER_SHA256,
+        )
+    )
     if (
         target_plan != plan
         or identities[:4] != [
@@ -135,7 +148,7 @@ def _gen14_split_prefix_context(
         or identities[4:] != [("disposition", "root"), ("scope", "root")]
         or not isinstance(created_at, str) or not created_at
         or len(primary) != 1 or len(frontiers) != 1
-        or input_frontier_sha256 not in frontiers
+        or not captured_frontier_migration
         or disposition != {
             "disposition": "create_successor",
             "remote_head": disposition.get("remote_head"),
@@ -683,6 +696,24 @@ def prepare_generation_operator_contract(
                     )
                 item["value"] = deepcopy(current["value"])
         if legacy_candidate and not legacy_prefix:
+            captured_frontiers = {
+                event.get("value", {}).get(
+                    "predecessor_closure_authority", {}
+                ).get("input_frontier_sha256")
+                for event in target.events[:2]
+            }
+            if captured_frontiers != {
+                GEN14_LEGACY_SPLIT_STORED_FRONTIER_SHA256
+            }:
+                raise WorkstreamGenerationError(
+                    "generation_prepare_legacy_split_head_stored_frontier_changed"
+                )
+            if binding["input_frontier_sha256"] != (
+                GEN14_LEGACY_SPLIT_RECOMPUTED_FRONTIER_SHA256
+            ):
+                raise WorkstreamGenerationError(
+                    "generation_prepare_legacy_split_head_recomputed_frontier_changed"
+                )
             raise WorkstreamGenerationError(
                 "generation_prepare_legacy_split_head_prefix_changed"
             )
@@ -799,6 +830,7 @@ def prepare_generation_operator_contract(
                 ),
                 "disposition": deepcopy(desired_seed_disposition),
                 "input_frontier_sha256": binding["input_frontier_sha256"],
+                "created_at": created_at,
             }
             if legacy_split:
                 transition["from_disposition_exact_head"] = (
