@@ -14,8 +14,11 @@ from workstream_child_dependencies import (
     reduce_dependency_readback, validate_authorized_dependency_graph_surface,
     validate_dependency_graph_summary,
 )
+from workstream_child_closure import (
+    canonical_digest, evidence_receipts_sha256, terminal_child_readback,
+)
 from workstream_delta import Delta, event_id_for
-from workstream_linear import LinearTransportError
+from workstream_linear import LinearTransportError, parse_plan_revision
 from workstream_linear_events import encode_event_comment
 from workstream_linear_projection import (
     build_projection_event, dependency_material_frontier_sha256,
@@ -39,6 +42,18 @@ FRONTIER = {
     "material_revision": 0, "projection_revision": 0, "graph_revision": 0,
     "graph_sha256": hashlib.sha256(b"[]").hexdigest(),
 }
+GEN14_ROOT_ID = "487a7696-95bb-42d1-8be5-1e5f940bf046"
+GEN70 = {
+    "issue_id": "7179dcd2-f38a-421e-baf3-6568c1e6e971",
+    "identifier": "GEN-70",
+}
+GEN72 = {
+    "issue_id": "589e8512-8d1d-4ec1-b2a3-78d4109bd1be",
+    "identifier": "GEN-72",
+}
+SHIPYARD_HEAD = "250e8119dc834769c7ab3a64343fd300ba68428c"
+SHIPYARD_REPOSITORY = "github.com/generous-corp/shipyard"
+SHIPYARD_REPOSITORY_KEY = "github.com:id:R_shipyard"
 
 
 def graph_sha256(relations):
@@ -723,6 +738,308 @@ class ChildDependencyTests(unittest.TestCase):
                 },
                 projection=mock.Mock(),
             )
+
+    @staticmethod
+    def _legacy_terminal_evidence(child_identifier):
+        receipt = lambda kind: {
+            "kind": kind, "passed": True,
+            "repository_key": SHIPYARD_REPOSITORY_KEY,
+            "exact_head": SHIPYARD_HEAD, "proof": f"{kind} passed",
+        }
+        not_applicable = lambda reason: {
+            "status": "not_applicable", "reason": reason,
+        }
+        return {
+            "slice_id": f"{child_identifier.lower()}-terminal",
+            "owning_child": child_identifier,
+            "repository": SHIPYARD_REPOSITORY,
+            "repository_key": SHIPYARD_REPOSITORY_KEY,
+            "plan_revision": PLAN, "exact_head": SHIPYARD_HEAD,
+            "layers": {
+                "architecture": {
+                    "status": "required", "owned_seam": "Shipyard delivery",
+                    "trust_boundary": "Linear closure receipt",
+                    "allowed_side_effects": [],
+                    "receipts": [{**receipt("review"), "status": "accepted"}],
+                },
+                "logic": {"status": "required", "methods": ["unit"],
+                          "receipts": [receipt("test")]},
+                "component": {"status": "required", "uses_fakes": True,
+                              "fake_scope": "external_edge_only",
+                              "receipts": [receipt("test")]},
+                "adapter": {"status": "required", "mode": "contract_fake",
+                            "receipts": [receipt("test")]},
+                "e2e": not_applicable("Recorded physical acceptance"),
+                "visual": not_applicable("No visual output"),
+                "operational": {"status": "required",
+                                "receipts": [receipt("deployment")]},
+                "negative_control": {"status": "required",
+                                     "failure_detected": True,
+                                     "receipts": [receipt("canary")]},
+            },
+        }
+
+    def _gen14_legacy_terminal_fixture(self):
+        authority = {
+            **AUTHORITY, "root_issue_id": GEN14_ROOT_ID,
+            "root_identifier": "GEN-14",
+        }
+        children = [
+            FakeLinear.child(identity, parent_id=GEN14_ROOT_ID, terminal=True)
+            for identity in (GEN70, GEN72)
+        ]
+        for child in children:
+            child["description"] = "Landed evidence preserved; no control lines."
+            state = child.pop("state")
+            child.update({
+                "state_id": state["id"], "status": state["name"],
+                "status_type": state["type"],
+            })
+        route = {
+            key: authority[key]
+            for key in ("workspace_id", "team_id", "project_id", "root_issue_id")
+        }
+        scope = {
+            "namespace": "shipyard-stewardship",
+            "linear": {
+                **route,
+                "route_verification": {
+                    **route, "observed_at": "2026-08-29T00:00:00Z",
+                    "evidence": [{
+                        "kind": "authenticated_linear_readback",
+                        "authenticated": True, **route,
+                    }],
+                },
+            },
+            "primary_repository": SHIPYARD_REPOSITORY_KEY,
+            "child_ownership": {
+                child["identifier"]: SHIPYARD_REPOSITORY_KEY
+                for child in children
+            },
+            "repositories": [{
+                "slug": SHIPYARD_REPOSITORY,
+                "provider_repository_id": "R_shipyard", "aliases": [],
+                "exact_head": SHIPYARD_HEAD,
+                "identity_resolution": {
+                    "provider_repository_id": "R_shipyard",
+                    "resolved_slug": SHIPYARD_REPOSITORY,
+                    "observed_at": "2026-08-29T00:00:00Z",
+                    "evidence": [{
+                        "kind": "authenticated_provider_readback",
+                        "authenticated": True,
+                        "provider_repository_id": "R_shipyard",
+                        "resolved_slug": SHIPYARD_REPOSITORY,
+                    }],
+                },
+                "identity_updates": [], "evidence": [],
+            }],
+        }
+        events = [build_projection_event(
+            workstream_id="GEN-14", kind="scope", key="root", value=scope,
+            plan_revision=PLAN, expected_revision=0,
+            created_at="2026-08-29T00:00:00Z", authority=route,
+        )]
+        closures = []
+        for child in children:
+            contract = self._legacy_terminal_evidence(child["identifier"])
+            evidence = build_projection_event(
+                workstream_id="GEN-14", kind="evidence_contract",
+                key=contract["slice_id"], value=contract,
+                plan_revision=PLAN, expected_revision=len(events),
+                created_at="2026-08-29T00:00:00Z", authority=route,
+            )
+            events.append(evidence)
+            readback = terminal_child_readback(child)
+            closure = {
+                "schema_version": 2, **readback, "plan_revision": PLAN,
+                "repository_key": SHIPYARD_REPOSITORY_KEY,
+                "exact_head": SHIPYARD_HEAD,
+                "evidence_heads": [{
+                    "key": evidence["key"], "event_id": evidence["event_id"],
+                    "value_sha256": canonical_digest(evidence["value"]),
+                }],
+                "evidence_receipts_sha256": evidence_receipts_sha256([contract]),
+                "child_readback_sha256": canonical_digest(readback),
+            }
+            closures.append(closure)
+            events.append(build_projection_event(
+                workstream_id="GEN-14", kind="child_closure",
+                key=child["identifier"], value=closure,
+                plan_revision=PLAN, expected_revision=len(events),
+                created_at="2026-08-29T00:00:01Z", authority=route,
+            ))
+        projection = mock.Mock(
+            snapshot={
+                "scope": scope, "child_closures": closures,
+                "projection_history": [],
+                "evidence_contracts": [
+                    event["value"] for event in events
+                    if event["kind"] == "evidence_contract"
+                ],
+            },
+            events=tuple(events),
+        )
+        adapter = LinearChildDependencyAdapter(
+            FakeLinear(), workspace_id="workspace", team_id="team",
+            project_id="project", root_issue_id=GEN14_ROOT_ID,
+            root_identifier="GEN-14", plan_revision=PLAN,
+        )
+        generation = {
+            "authority_origin": "generation_genesis",
+            "plan_revision": PLAN,
+            "transition_tip_event_id": "wsp_" + "1" * 32,
+            "description_plan_revision": PLAN,
+        }
+        return adapter, children, projection, generation
+
+    def test_gen14_descriptionless_terminal_children_use_exact_closure_evidence(self):
+        adapter, children, projection, generation = (
+            self._gen14_legacy_terminal_fixture()
+        )
+        owned = adapter._authenticated_children(
+            [GEN70, GEN72], children,
+            generation=generation, projection=projection,
+        )
+        self.assertEqual(owned, {
+            GEN70["issue_id"]: GEN70, GEN72["issue_id"]: GEN72,
+        })
+        self.assertTrue(all(
+            parse_plan_revision(child["description"]) is None
+            for child in children
+        ))
+        raw_children = deepcopy(children)
+        for child in raw_children:
+            child["state"] = {
+                "id": child.pop("state_id"), "name": child.pop("status"),
+                "type": child.pop("status_type"),
+            }
+        self.assertEqual(
+            adapter._authenticated_children(
+                [GEN70, GEN72], raw_children,
+                generation=generation, projection=projection,
+            ),
+            owned,
+        )
+
+    def test_gen14_legacy_terminal_child_refuses_incomplete_projection_proof(self):
+        def unbind_scope_head(_children, projection):
+            projection.snapshot["scope"]["repositories"][0]["exact_head"] = "b" * 40
+            scope_event = next(
+                event for event in projection.events if event["kind"] == "scope"
+            )
+            scope_event["value"]["repositories"][0]["exact_head"] = "b" * 40
+
+        mutations = {
+            "missing_closure": lambda children, projection: (
+                projection.snapshot["child_closures"].pop()
+            ),
+            "tampered_closure": lambda children, projection: (
+                projection.snapshot["child_closures"][-1].__setitem__(
+                    "child_readback_sha256", "f" * 64,
+                )
+            ),
+            "stale_closure": lambda children, projection: (
+                children[-1].__setitem__("status", "Completed")
+            ),
+            "missing_evidence": lambda children, projection: setattr(
+                projection, "events", [
+                    event for event in projection.events
+                    if not (
+                        event["kind"] == "evidence_contract"
+                        and event["value"]["owning_child"] == "GEN-72"
+                    )
+                ],
+            ),
+            "scope_head_unbound": unbind_scope_head,
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                adapter, children, projection, generation = (
+                    self._gen14_legacy_terminal_fixture()
+                )
+                mutate(children, projection)
+                with self.assertRaisesRegex(
+                    ChildDependencyError,
+                    r"owned_child_plan_revision_mismatch:GEN-(70|72)",
+                ):
+                    adapter._authenticated_children(
+                        [GEN70, GEN72], children,
+                        generation=generation, projection=projection,
+                    )
+
+    def test_generation_transition_includes_proven_terminal_legacy_children(self):
+        adapter, children, projection, generation = (
+            self._gen14_legacy_terminal_fixture()
+        )
+        generation["authority_origin"] = "generation_transition"
+        expected = {GEN70["issue_id"]: GEN70, GEN72["issue_id"]: GEN72}
+        self.assertEqual(
+            adapter._authenticated_children(
+                [GEN70, GEN72], children,
+                generation=generation, projection=projection,
+            ),
+            expected,
+        )
+        self.assertEqual(
+            adapter._authenticated_children(
+                None, children, generation=generation, projection=projection,
+            ),
+            expected,
+        )
+
+        children[-1]["status_type"] = "unstarted"
+        self.assertEqual(
+            adapter._authenticated_children(
+                None, children, generation=generation, projection=projection,
+            ),
+            {GEN70["issue_id"]: GEN70},
+        )
+
+    def test_null_nonterminal_and_nonnull_mismatch_never_use_legacy_proof(self):
+        cases = {
+            "nonterminal_null": lambda child: child.__setitem__(
+                "status_type", "unstarted",
+            ),
+            "nonnull_mismatch": lambda child: child.__setitem__(
+                "description", "Plan revision: " + "b" * 64,
+            ),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                adapter, children, projection, generation = (
+                    self._gen14_legacy_terminal_fixture()
+                )
+                mutate(children[-1])
+                with self.assertRaisesRegex(
+                    ChildDependencyError,
+                    "owned_child_plan_revision_mismatch:GEN-72",
+                ):
+                    adapter._authenticated_children(
+                        [GEN70, GEN72], children,
+                        generation=generation, projection=projection,
+                    )
+
+    def test_inactive_generation_closure_cannot_own_null_plan_children(self):
+        adapter, children, projection, generation = (
+            self._gen14_legacy_terminal_fixture()
+        )
+        generation.update({
+            "authority_origin": "generation_transition",
+            "plan_revision": "b" * 64,
+        })
+        self.assertEqual(
+            adapter._authenticated_children(
+                None, children, generation=generation, projection=projection,
+            ),
+            {},
+        )
+        children[0]["description"] = f"Plan revision: {PLAN}"
+        self.assertEqual(
+            adapter._authenticated_children(
+                None, children, generation=generation, projection=projection,
+            ),
+            {GEN70["issue_id"]: GEN70},
+        )
 
     def test_nondeterministic_duplicate_and_missing_inverse_are_planted_mutations(self):
         fake = FakeLinear()
