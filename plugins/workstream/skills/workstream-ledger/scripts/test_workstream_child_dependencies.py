@@ -12,6 +12,7 @@ from workstream_child_dependencies import (
     authorized_dependency_graph, ChildDependencyError, DependencyGraph,
     LinearChildDependencyAdapter, dependency_relation_id,
     reduce_dependency_readback, validate_authorized_dependency_graph_surface,
+    validate_dependency_graph_summary,
 )
 from workstream_delta import Delta, event_id_for
 from workstream_linear import LinearTransportError
@@ -355,6 +356,68 @@ class ChildDependencyTests(unittest.TestCase):
                 observed_frontier=surface["observed_frontier"],
                 root_readback_sha256=surface["root_readback_sha256"],
             )
+
+    def test_legacy_no_edge_root_authenticates_canonical_empty_graph(self):
+        fake = FakeLinear()
+        fake.children = []
+
+        surface = self.adapter(fake).read_authorized_graph()
+
+        self.assertEqual(surface["relations"], [])
+        self.assertEqual(surface["authorization_batches"], [])
+        self.assertEqual(surface["revision"], 0)
+        self.assertEqual(surface["sha256"], graph_sha256([]))
+        self.assertEqual(
+            validate_dependency_graph_summary(
+                surface, authority=AUTHORITY, plan_revision=PLAN,
+                expected_frontier=FRONTIER,
+            ),
+            surface,
+        )
+
+    def test_summary_rejects_semantic_forgery_with_recomputed_graph_digests(self):
+        fake = FakeLinear()
+        self.apply(fake)
+        surface = self.adapter(fake).read_authorized_graph()
+
+        forged_endpoint = deepcopy(surface)
+        relation = forged_endpoint["relations"][0]
+        relation["blocked"] = C
+        relation["id"] = dependency_relation_id(
+            authority=AUTHORITY, blocker=relation["blocker"], blocked=C,
+        )
+        forged_endpoint["revision"] = 1
+        forged_endpoint["sha256"] = graph_sha256(forged_endpoint["relations"])
+        forged_endpoint["observed_frontier"].update({
+            "graph_revision": 1,
+            "graph_sha256": forged_endpoint["sha256"],
+        })
+        batch = forged_endpoint["authorization_batches"][0]
+        batch["relation_ids"] = [relation["id"]]
+        batch["relations_sha256"] = graph_sha256([relation])
+
+        mutations = {
+            "endpoint": forged_endpoint,
+            "uncovered": {
+                **deepcopy(surface), "authorization_batches": [],
+            },
+            "malformed_batch": deepcopy(surface),
+            "stale_frontier": deepcopy(surface),
+            "batch_digest": deepcopy(surface),
+        }
+        mutations["malformed_batch"]["authorization_batches"][0]["arbitrary"] = True
+        mutations["stale_frontier"]["authorization_batches"][0][
+            "expected_graph_revision"
+        ] = 1
+        mutations["batch_digest"]["authorization_batches"][0][
+            "relations_sha256"
+        ] = "f" * 64
+        for label, forged in mutations.items():
+            with self.subTest(label=label), self.assertRaises(ChildDependencyError):
+                validate_dependency_graph_summary(
+                    forged, authority=AUTHORITY, plan_revision=PLAN,
+                    expected_frontier=forged["observed_frontier"],
+                )
 
     def test_resume_graph_rejects_stale_material_frontier_and_pregrant_event(self):
         fake = FakeLinear()

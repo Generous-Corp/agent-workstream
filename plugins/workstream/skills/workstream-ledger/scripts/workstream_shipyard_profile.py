@@ -23,6 +23,9 @@ from urllib.parse import urlparse
 
 from workstream_resume import DEFAULT_RESUME_MAX_BYTES, ResumeError, extract_token
 from workstream_scope import ScopeError, canonical_repository
+from workstream_child_dependencies import (
+    ChildDependencyError, validate_dependency_graph_summary,
+)
 
 
 RESUME_MAX_BYTES = DEFAULT_RESUME_MAX_BYTES
@@ -402,81 +405,23 @@ def _validate_dependency_graph(
     material_revision: int,
 ) -> tuple[int, str, str]:
     graph = context.get("dependency_graph")
-    required = {
-        "schema_version", "authority", "plan_revision", "route", "revision",
-        "sha256", "authorization_batches", "relations", "native_readback",
-        "ignored_non_dependency_count", "observed_frontier",
-        "root_readback_sha256",
-    }
-    if not isinstance(graph, dict) or set(graph) != required:
+    if not isinstance(graph, dict):
         raise ShipyardProfileError("resume_dependency_graph_missing")
-    relations = graph.get("relations")
-    frontier = graph.get("observed_frontier")
     revision = graph.get("revision")
     graph_sha256 = graph.get("sha256")
-    expected_route = {
-        key: route[key]
-        for key in ("workspace_id", "team_id", "project_id", "root_issue_id")
-    }
-    if (
-        graph.get("schema_version") != 1
-        or graph.get("authority") != "child_dependency_authorization"
-        or graph.get("plan_revision") != plan_revision
-        or graph.get("route") != expected_route
-        or graph.get("native_readback") != "relations_and_inverseRelations"
-        or not isinstance(relations, list)
-        or not isinstance(graph.get("authorization_batches"), list)
-        or not isinstance(graph.get("ignored_non_dependency_count"), int)
-        or isinstance(graph.get("ignored_non_dependency_count"), bool)
-        or graph["ignored_non_dependency_count"] < 0
-        or not isinstance(revision, int) or isinstance(revision, bool)
-        or revision != len(relations)
-        or not isinstance(graph_sha256, str) or not SHA256.fullmatch(graph_sha256)
-        or hashlib.sha256(_canonical(relations)).hexdigest() != graph_sha256
-        or not isinstance(frontier, dict)
-        or set(frontier) != {
-            "material_revision", "projection_revision", "graph_revision",
-            "graph_sha256",
-        }
-        or frontier.get("material_revision") != material_revision
-        or frontier.get("projection_revision") != context.get("projection_revision")
-        or frontier.get("graph_revision") != revision
-        or frontier.get("graph_sha256") != graph_sha256
-        or not isinstance(graph.get("root_readback_sha256"), str)
-        or not SHA256.fullmatch(graph["root_readback_sha256"])
-    ):
-        raise ShipyardProfileError("resume_dependency_graph_invalid")
-    relation_ids = []
-    directions = set()
-    unordered_pairs = set()
-    for relation in relations:
-        blocker = relation.get("blocker") if isinstance(relation, dict) else None
-        blocked = relation.get("blocked") if isinstance(relation, dict) else None
-        if (
-            not isinstance(relation, dict)
-            or set(relation) != {"id", "type", "blocker", "blocked", "inverse_type"}
-            or relation.get("type") != "blocks"
-            or relation.get("inverse_type") != "blocked_by"
-            or not isinstance(relation.get("id"), str) or not relation["id"]
-            or not isinstance(blocker, dict) or set(blocker) != {"issue_id", "identifier"}
-            or not isinstance(blocked, dict) or set(blocked) != {"issue_id", "identifier"}
-            or not all(
-                isinstance(identity.get(field), str) and identity[field]
-                for identity in (blocker, blocked)
-                for field in ("issue_id", "identifier")
-            )
-            or blocker == blocked
-        ):
-            raise ShipyardProfileError("resume_dependency_graph_invalid")
-        relation_ids.append(relation["id"])
-        direction = (blocker["issue_id"], blocked["issue_id"])
-        directions.add(direction)
-        unordered_pairs.add(frozenset(direction))
-    if (
-        relation_ids != sorted(set(relation_ids))
-        or len(directions) != len(relations)
-        or len(unordered_pairs) != len(relations)
-    ):
+    try:
+        validate_dependency_graph_summary(
+            graph,
+            authority={**route, "root_identifier": context.get("workstream_id")},
+            plan_revision=plan_revision,
+            expected_frontier={
+                "material_revision": material_revision,
+                "projection_revision": context.get("projection_revision"),
+                "graph_revision": revision,
+                "graph_sha256": graph_sha256,
+            },
+        )
+    except (ChildDependencyError, KeyError, TypeError) as error:
         raise ShipyardProfileError("resume_dependency_graph_invalid")
     return revision, graph_sha256, _authority_digest(
         "agent-workstream-dependency-graph-v1", graph,

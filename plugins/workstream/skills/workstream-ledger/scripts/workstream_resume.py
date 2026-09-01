@@ -1067,8 +1067,11 @@ def extract_token(value: str) -> str:
 def validate_snapshot(
     snapshot: dict[str, Any], token: str | None = None, *,
     require_projection_authority: bool = False,
+    require_dependency_graph: bool | None = None,
     expected_missing_terminal_closures: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
+    if require_dependency_graph is None:
+        require_dependency_graph = require_projection_authority
     if expected_missing_terminal_closures and not require_projection_authority:
         raise ResumeError(
             "expected_missing_terminal_closures_requires_projection_authority"
@@ -1469,7 +1472,7 @@ def validate_snapshot(
                     "disposition_checkpoint_stale_reconcile_required"
                 )
     dependency_graph = snapshot.get("dependency_graph")
-    if require_projection_authority and dependency_graph is None:
+    if require_dependency_graph and dependency_graph is None:
         raise ResumeError("authenticated_dependency_graph_missing")
     if dependency_graph is not None:
         if not isinstance(authenticated_route, dict):
@@ -2205,12 +2208,14 @@ def compact_context(
     snapshot: dict[str, Any], token: str, max_bytes: int = DEFAULT_RESUME_MAX_BYTES,
     max_items: int = 100, *, require_projection_authority: bool = False,
     include_history: bool = False,
+    require_dependency_graph: bool | None = None,
     expected_missing_terminal_closures: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     normalized_token = extract_token(token)
     clean = validate_snapshot(
         snapshot, normalized_token,
         require_projection_authority=require_projection_authority,
+        require_dependency_graph=require_dependency_graph,
         expected_missing_terminal_closures=expected_missing_terminal_closures,
     )
     root = clean["root"]
@@ -2718,6 +2723,7 @@ def main() -> int:
         output = compact_context(
             snapshot, token, args.max_bytes, args.max_items,
             require_projection_authority=not args.inspection_only,
+            require_dependency_graph=not args.inspection_only,
             include_history=args.include_history,
         )
     except (

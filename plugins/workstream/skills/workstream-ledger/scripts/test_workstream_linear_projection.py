@@ -11,6 +11,7 @@ import re
 import tempfile
 import unittest
 from unittest import mock
+import uuid
 import zlib
 
 from workstream_checkpoint import build_checkpoint
@@ -36,7 +37,7 @@ from workstream_linear_projection import (
 )
 from workstream_resume import (
     add_child_material_history, add_live_child_material_history,
-    add_material_history, compact_context, ResumeError,
+    add_material_history, compact_context as resume_compact_context, ResumeError,
 )
 from workstream_relation_readback import RelationReadbackError
 import workstream_projection
@@ -61,6 +62,7 @@ from workstream_child_closure import (
     canonical_digest, ChildClosureError, evidence_receipts_sha256,
     terminal_child_readback,
 )
+from workstream_child_dependencies import dependency_root_readback_sha256
 
 
 PLAN = "f38baae4441485b14e5b16ea0255e3a07e42aa94a4fb0e6e04e7aa513693719d"
@@ -81,11 +83,32 @@ AUTHORITY = {
 }
 
 
+def compact_context(*args, **kwargs):
+    """Exercise pre-graph projection fixtures through the legacy constructor."""
+    kwargs.setdefault("require_dependency_graph", False)
+    return resume_compact_context(*args, **kwargs)
+
+
+def mock_child_uuid(identifier):
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"linear.test/{identifier}"))
+
+
+MOCK_CHILD_IDS = {}
+
+
 def live_graph_with_empty_child_comments(graph):
     """Shape a mocked transport response like include_child_comments=True."""
     result = deepcopy(graph)
+    result["root"].setdefault("id", ROOT_UUID)
+    result["root"].setdefault("team", {
+        "id": AUTHORITY["team_id"],
+        "organization": {"id": AUTHORITY["workspace_id"]},
+    })
+    result["root"].setdefault("project", {"id": AUTHORITY["project_id"]})
     for index, child in enumerate(result.get("children", [])):
-        child.setdefault("id", f"mock-child-{index}")
+        child.setdefault("id", mock_child_uuid(child["identifier"]))
+        MOCK_CHILD_IDS[str(child["identifier"]).upper()] = child["id"]
+        child.setdefault("description", f"Plan revision: {result['root']['plan_revision']}")
         child.setdefault("parent", {
             "id": ROOT_UUID, "identifier": "GEN-37",
         })
@@ -195,6 +218,26 @@ class FakeProjectionClient:
 
     def execute(self, query, variables):
         self.calls.append((query, variables))
+        if (
+            "query WorkstreamChildRelations" in query
+            or "query WorkstreamChildInverseRelations" in query
+        ):
+            identifier = variables["issueId"].upper()
+            field = (
+                "inverseRelations"
+                if "query WorkstreamChildInverseRelations" in query
+                else "relations"
+            )
+            return {"issue": {
+                "id": MOCK_CHILD_IDS.get(identifier, mock_child_uuid(identifier)),
+                "identifier": identifier,
+                "parent": {"id": ROOT_UUID, "identifier": "GEN-37"},
+                "team": {"id": "team", "organization": {"id": "workspace"}},
+                "project": {"id": "project"},
+                field: {"nodes": [], "pageInfo": {
+                    "hasNextPage": False, "endCursor": None,
+                }},
+            }}
         if "WorkstreamProjectionCommentCreateCapability" in query:
             return {"__type": {"inputFields": [{"name": "id"}, {"name": "body"}]}}
         if "query WorkstreamDeltaComments" in query:
@@ -1618,6 +1661,26 @@ class ProjectionTests(unittest.TestCase):
             graph, client.comments, "GEN-37", authenticated_route=AUTHORITY,
             authenticated_source=source,
         )
+        empty_sha = hashlib.sha256(b"[]").hexdigest()
+        strict["dependency_graph"] = {
+            "schema_version": 1,
+            "authority": "child_dependency_authorization",
+            "plan_revision": PLAN,
+            "route": deepcopy(AUTHORITY),
+            "revision": 0,
+            "sha256": empty_sha,
+            "authorization_batches": [],
+            "relations": [],
+            "native_readback": "relations_and_inverseRelations",
+            "ignored_non_dependency_count": 0,
+            "observed_frontier": {
+                "material_revision": strict["material_event_revision"],
+                "projection_revision": strict["projection_revision"],
+                "graph_revision": 0,
+                "graph_sha256": empty_sha,
+            },
+            "root_readback_sha256": dependency_root_readback_sha256(strict["root"]),
+        }
         return strict, contracts
 
     def test_gen37_stale_generation_child_history_is_digest_bound_and_actionable(self):
@@ -1818,6 +1881,26 @@ class ProjectionTests(unittest.TestCase):
 
     def test_compact_resume_builds_launch_profile_without_authority_rehydration(self):
         strict, _contracts = self.gen37_production_shaped_fixture()
+        empty_sha = hashlib.sha256(b"[]").hexdigest()
+        strict["dependency_graph"] = {
+            "schema_version": 1,
+            "authority": "child_dependency_authorization",
+            "plan_revision": PLAN,
+            "route": deepcopy(AUTHORITY),
+            "revision": 0,
+            "sha256": empty_sha,
+            "authorization_batches": [],
+            "relations": [],
+            "native_readback": "relations_and_inverseRelations",
+            "ignored_non_dependency_count": 0,
+            "observed_frontier": {
+                "material_revision": strict["material_event_revision"],
+                "projection_revision": strict["projection_revision"],
+                "graph_revision": 0,
+                "graph_sha256": empty_sha,
+            },
+            "root_readback_sha256": dependency_root_readback_sha256(strict["root"]),
+        }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             worktree = strict["latest_checkpoint"]["worktree"]
@@ -1883,8 +1966,10 @@ class ProjectionTests(unittest.TestCase):
             compact_context(
                 stale, "GEN-37", require_projection_authority=True,
             )
+        inspection_snapshot = deepcopy(stale)
+        inspection_snapshot.pop("dependency_graph")
         inspected = compact_context(
-            stale, "GEN-37", require_projection_authority=False,
+            inspection_snapshot, "GEN-37", require_projection_authority=False,
         )
         self.assertEqual(inspected["resume_authority"], "inspection_only")
         self.assertEqual(inspected["disposition"], stale_disposition)
@@ -8762,7 +8847,7 @@ class ProjectionTests(unittest.TestCase):
             return code, stderr.getvalue()
 
         writes_before = len(client.comments)
-        code, error = invoke([grown, grown, grown])
+        code, error = invoke([grown, grown, grown, grown])
         self.assertEqual(code, 2)
         self.assertIn("resume_context_over_budget", error)
         self.assertEqual(len(client.comments), writes_before)
@@ -8770,7 +8855,7 @@ class ProjectionTests(unittest.TestCase):
         # The preflight is stable and within budget, but the child grows before
         # the first append. The exact input frontier must refuse without a write.
         code, error = invoke([
-            graph, graph, graph, graph, grown, grown, grown,
+            graph, graph, graph, graph, graph, grown, grown, grown,
         ])
         self.assertEqual(code, 2)
         self.assertIn(

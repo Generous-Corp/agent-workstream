@@ -217,6 +217,32 @@ def dependency_root_readback_sha256(root: dict[str, Any]) -> str:
     return _sha256(readback)
 
 
+def dependency_comment_readback_sha256(comments: list[dict[str, Any]]) -> str:
+    """Digest exact root comment receipts independent of connection order."""
+    receipts = []
+    seen: set[str] = set()
+    for comment in comments:
+        if not isinstance(comment, dict):
+            raise ChildDependencyError("invalid_dependency_comment_readback")
+        remote_id = comment.get("id")
+        body = comment.get("body")
+        if (
+            not isinstance(remote_id, str) or not remote_id or remote_id in seen
+            or not isinstance(body, str)
+        ):
+            raise ChildDependencyError("invalid_dependency_comment_readback")
+        seen.add(remote_id)
+        receipts.append({
+            "id": remote_id, "body_sha256": hashlib.sha256(
+                body.encode("utf-8")
+            ).hexdigest(),
+            "createdAt": comment.get("createdAt"),
+            "updatedAt": comment.get("updatedAt"),
+        })
+    receipts.sort(key=lambda item: item["id"])
+    return _sha256(receipts)
+
+
 def _remote_comment_time(comment: Any) -> datetime:
     if not isinstance(comment, dict):
         raise ChildDependencyError("dependency_authorization_receipt_missing")
@@ -410,6 +436,31 @@ def validate_authorized_dependency_graph_surface(
     expected_root_readback_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Validate a resume dependency surface against its active grants."""
+    validate_dependency_graph_summary(
+        value, authority=authority, plan_revision=plan_revision,
+        expected_frontier=expected_frontier,
+        expected_root_readback_sha256=expected_root_readback_sha256,
+    )
+    relations = value["relations"]
+    expected = authorized_dependency_graph(
+        DependencyGraph(
+            tuple(relations), value["ignored_non_dependency_count"],
+        ), projection_events,
+        authority=authority, plan_revision=plan_revision,
+        observed_frontier=value["observed_frontier"],
+        root_readback_sha256=value["root_readback_sha256"],
+    )
+    if value != expected:
+        raise ChildDependencyError("dependency_graph_surface_mismatch")
+    return expected
+
+
+def validate_dependency_graph_summary(
+    value: Any, *, authority: dict[str, str], plan_revision: str,
+    expected_frontier: dict[str, Any] | None = None,
+    expected_root_readback_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Validate graph semantics from its canonical grant summaries."""
     required = {
         "schema_version", "authority", "plan_revision", "route", "revision",
         "sha256", "authorization_batches", "relations", "native_readback",
@@ -482,15 +533,135 @@ def validate_authorized_dependency_graph_surface(
     normalized.sort(key=lambda item: item["id"])
     if normalized != relations:
         raise ChildDependencyError("noncanonical_dependency_graph")
-    expected = authorized_dependency_graph(
-        DependencyGraph(tuple(normalized), ignored), projection_events,
-        authority=authority, plan_revision=plan_revision,
-        observed_frontier=value["observed_frontier"],
-        root_readback_sha256=value["root_readback_sha256"],
-    )
-    if value != expected:
+    if (
+        value.get("revision") != len(normalized)
+        or value.get("sha256") != _sha256(normalized)
+        or value["observed_frontier"].get("graph_revision") != len(normalized)
+        or value["observed_frontier"].get("graph_sha256") != _sha256(normalized)
+    ):
         raise ChildDependencyError("dependency_graph_surface_mismatch")
-    return expected
+    native_by_id = {item["id"]: item for item in normalized}
+    modeled: dict[str, dict[str, Any]] = {}
+    seen_batches: set[str] = set()
+    seen_relations: set[str] = set()
+    last_projection_revision = -1
+    batches = value.get("authorization_batches")
+    if not isinstance(batches, list):
+        raise ChildDependencyError("invalid_dependency_graph_surface")
+    batch_fields = {
+        "batch_id", "event_id", "relation_ids", "relations_sha256",
+        "expected_material_revision", "expected_material_frontier_sha256",
+        "expected_projection_revision", "expected_graph_revision",
+        "expected_graph_sha256",
+    }
+    for batch in batches:
+        if not isinstance(batch, dict) or set(batch) != batch_fields:
+            raise ChildDependencyError("invalid_dependency_authorization_batch")
+        batch_id = batch.get("batch_id")
+        relation_ids = batch.get("relation_ids")
+        material_revision = batch.get("expected_material_revision")
+        projection_revision = batch.get("expected_projection_revision")
+        if (
+            not re.fullmatch(r"wsdb_[0-9a-f]{32}", str(batch_id))
+            or batch_id in seen_batches
+            or not re.fullmatch(r"wsp_[0-9a-f]{32}", str(batch.get("event_id")))
+            or not isinstance(relation_ids, list) or not relation_ids
+            or relation_ids != sorted(set(relation_ids))
+            or any(item in seen_relations for item in relation_ids)
+            or not isinstance(material_revision, int)
+            or isinstance(material_revision, bool) or material_revision < 0
+            or material_revision > value["observed_frontier"]["material_revision"]
+            or not isinstance(projection_revision, int)
+            or isinstance(projection_revision, bool)
+            or projection_revision <= last_projection_revision
+            or projection_revision >= value["observed_frontier"]["projection_revision"]
+            or not re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(batch.get("expected_material_frontier_sha256", "")),
+            )
+        ):
+            raise ChildDependencyError("invalid_dependency_authorization_batch")
+        baseline = [modeled[item] for item in sorted(modeled)]
+        if (
+            batch.get("expected_graph_revision") != len(baseline)
+            or batch.get("expected_graph_sha256") != _sha256(baseline)
+        ):
+            raise ChildDependencyError("stale_dependency_authorization_frontier")
+        granted = []
+        for relation_id in relation_ids:
+            relation = native_by_id.get(relation_id)
+            if relation is None:
+                raise ChildDependencyError("authorized_dependency_readback_missing")
+            granted.append(relation)
+        granted.sort(key=lambda item: (
+            item["blocker"]["issue_id"], item["blocked"]["issue_id"],
+        ))
+        if batch.get("relations_sha256") != _sha256(granted):
+            raise ChildDependencyError("dependency_authorization_digest_mismatch")
+        expected_batch_id = "wsdb_" + _sha256([
+            "workstream-child-dependency-native-batch-v1", authority,
+            plan_revision, {
+                "material_revision": batch["expected_material_revision"],
+                "projection_revision": batch["expected_projection_revision"],
+                "graph_revision": batch["expected_graph_revision"],
+                "graph_sha256": batch["expected_graph_sha256"],
+            }, granted,
+        ])[:32]
+        if batch_id != expected_batch_id:
+            raise ChildDependencyError("dependency_authorization_batch_id_mismatch")
+        for relation in granted:
+            modeled[relation["id"]] = relation
+        seen_batches.add(batch_id)
+        seen_relations.update(relation_ids)
+        last_projection_revision = projection_revision
+    if modeled != native_by_id:
+        raise ChildDependencyError("unauthorized_native_dependency")
+    return deepcopy(value)
+
+
+def rebind_authenticated_dependency_graph(
+    snapshot: dict[str, Any], comments: list[dict[str, Any]],
+    base_surface: dict[str, Any], *, authority: dict[str, str],
+    plan_revision: str,
+) -> dict[str, Any]:
+    """Bind one proven native graph to an exact prospective comment frontier."""
+    validate_dependency_graph_summary(
+        base_surface, authority=authority, plan_revision=plan_revision,
+    )
+    root = snapshot.get("root") if isinstance(snapshot, dict) else None
+    root_sha256 = dependency_root_readback_sha256(root)
+    if base_surface.get("root_readback_sha256") != root_sha256:
+        raise ChildDependencyError("dependency_resume_root_mismatch")
+    material = reduce_event_comments(
+        comments, workstream_id=authority["root_identifier"],
+    )
+    projection = reduce_projection_comments(
+        comments, workstream_id=authority["root_identifier"],
+        expected_plan_revision=plan_revision,
+        authenticated_route={
+            key: authority[key]
+            for key in ("workspace_id", "team_id", "project_id", "root_issue_id")
+        },
+    )
+    graph = DependencyGraph(
+        tuple(deepcopy(base_surface["relations"])),
+        base_surface["ignored_non_dependency_count"],
+    )
+    return authorized_dependency_graph(
+        graph, projection.events, authority=authority,
+        plan_revision=plan_revision,
+        observed_frontier={
+            "material_revision": material.revision,
+            "projection_revision": projection.revision,
+            "graph_revision": graph.revision,
+            "graph_sha256": _sha256(list(graph.relations)),
+        },
+        root_readback_sha256=root_sha256,
+        material_events=material.events,
+        material_remote_ids=material.remote_ids,
+        projection_remote_ids=projection.remote_ids,
+        comments=comments,
+    )
 
 
 def reduce_dependency_readback(
@@ -808,26 +979,35 @@ class LinearChildDependencyAdapter:
             expected_ids = set(live_by_id)
         else:
             scope = projection.snapshot.get("scope")
-            if not isinstance(scope, dict):
-                raise ChildDependencyError("active_generation_scope_invalid:missing")
-            try:
-                validate_scope(
-                    scope, root_id=self.authority["root_identifier"],
-                    child_ids=live_identifiers,
-                )
-            except ScopeError as error:
-                raise ChildDependencyError(
-                    f"active_generation_scope_invalid:{error}"
-                ) from error
-            if any(
-                scope["linear"].get(field) != self.authority[field]
-                for field in ("workspace_id", "team_id", "project_id", "root_issue_id")
-            ):
-                raise ChildDependencyError("active_generation_scope_route_mismatch")
-            expected_ids = {
+            target_ids = {
                 issue_id for issue_id, child in live_by_id.items()
                 if parse_plan_revision(child.get("description")) == self.plan_revision
             }
+            if scope is None and not target_ids:
+                # Rolling upgrade: an inactive, not-yet-projected generation
+                # cannot own predecessor children and therefore authenticates
+                # the canonical empty graph.
+                expected_ids = set()
+            else:
+                if not isinstance(scope, dict):
+                    raise ChildDependencyError("active_generation_scope_invalid:missing")
+                try:
+                    validate_scope(
+                        scope, root_id=self.authority["root_identifier"],
+                        child_ids=live_identifiers,
+                    )
+                except ScopeError as error:
+                    raise ChildDependencyError(
+                        f"active_generation_scope_invalid:{error}"
+                    ) from error
+                if any(
+                    scope["linear"].get(field) != self.authority[field]
+                    for field in (
+                        "workspace_id", "team_id", "project_id", "root_issue_id",
+                    )
+                ):
+                    raise ChildDependencyError("active_generation_scope_route_mismatch")
+                expected_ids = target_ids
         identities = (
             [live_by_id[issue_id] for issue_id in sorted(expected_ids)]
             if declared is None else declared
@@ -1042,6 +1222,103 @@ class LinearChildDependencyAdapter:
             plan_revision=self.plan_revision,
             observed_frontier=frontier,
             root_readback_sha256=root_sha256,
+            material_events=material.events,
+            material_remote_ids=material.remote_ids,
+            projection_remote_ids=projection.remote_ids,
+            comments=comments,
+        )
+
+    def read_authorized_graph_for_snapshot(
+        self, snapshot: dict[str, Any], comments: list[dict[str, Any]], *,
+        reread: Any, generation_selector_plan_revision: str | None = None,
+    ) -> dict[str, Any]:
+        """Authenticate native relations against one caller-stable resume read."""
+        def reduce_inputs(
+            current_snapshot: dict[str, Any], current_comments: list[dict[str, Any]],
+        ) -> tuple[Any, Any, dict[str, dict[str, str]], dict[str, Any]]:
+            root = current_snapshot.get("root")
+            children = current_snapshot.get("children")
+            if not isinstance(root, dict) or not isinstance(children, list):
+                raise ChildDependencyError("invalid_dependency_issue_graph")
+            if root.get("id") != self.authority["root_issue_id"]:
+                raise ChildDependencyError("dependency_root_identity_mismatch")
+            validate_issue_route(
+                root, workspace_id=self.authority["workspace_id"],
+                team_id=self.authority["team_id"],
+                project_id=self.authority["project_id"],
+            )
+            description_plan_revision = (
+                generation_selector_plan_revision
+                if generation_selector_plan_revision is not None
+                else parse_plan_revision(root.get("description"))
+            )
+            selected = select_plan_generation(
+                current_comments,
+                workstream_id=self.authority["root_identifier"],
+                description_plan_revision=description_plan_revision,
+                authenticated_route={
+                    key: self.authority[key] for key in (
+                        "workspace_id", "team_id", "project_id", "root_issue_id",
+                    )
+                },
+            )
+            projection = reduce_projection_comments(
+                current_comments,
+                workstream_id=self.authority["root_identifier"],
+                expected_plan_revision=self.plan_revision,
+                authenticated_route={
+                    key: self.authority[key] for key in (
+                        "workspace_id", "team_id", "project_id", "root_issue_id",
+                    )
+                },
+            )
+            generation = selected
+            if selected["plan_revision"] != self.plan_revision:
+                generation = {
+                    **selected, "authority_origin": "generation_transition",
+                }
+            owned = self._authenticated_children(
+                None, children, generation=generation, projection=projection,
+            )
+            material = reduce_event_comments(
+                current_comments,
+                workstream_id=self.authority["root_identifier"],
+            )
+            return material, projection, owned, root
+
+        material, projection, owned, root = reduce_inputs(snapshot, comments)
+        graph = reduce_dependency_readback(
+            self._relations(owned), authority=self.authority,
+            owned_children=owned,
+        )
+        final_snapshot, final_comments = reread()
+        final_material, final_projection, final_owned, final_root = reduce_inputs(
+            final_snapshot, final_comments,
+        )
+        final_graph = reduce_dependency_readback(
+            self._relations(final_owned), authority=self.authority,
+            owned_children=final_owned,
+        )
+        if (
+            dependency_root_readback_sha256(root)
+            != dependency_root_readback_sha256(final_root)
+            or dependency_comment_readback_sha256(comments)
+            != dependency_comment_readback_sha256(final_comments)
+            or material.events != final_material.events
+            or projection.events != final_projection.events
+            or owned != final_owned or graph != final_graph
+        ):
+            raise ChildDependencyError("dependency_graph_frontier_changed_during_read")
+        return authorized_dependency_graph(
+            graph, projection.events, authority=self.authority,
+            plan_revision=self.plan_revision,
+            observed_frontier={
+                "material_revision": material.revision,
+                "projection_revision": projection.revision,
+                "graph_revision": graph.revision,
+                "graph_sha256": _sha256(list(graph.relations)),
+            },
+            root_readback_sha256=dependency_root_readback_sha256(root),
             material_events=material.events,
             material_remote_ids=material.remote_ids,
             projection_remote_ids=projection.remote_ids,

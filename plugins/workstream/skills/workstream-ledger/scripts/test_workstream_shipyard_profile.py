@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 import workstream_shipyard_profile as MODULE
+from workstream_child_dependencies import dependency_relation_id
 
 
 HEAD = "1" * 40
@@ -258,6 +259,88 @@ class ShipyardProfileTests(unittest.TestCase):
                             context, "GEN-37", self.git(root),
                             model="gpt-5.6-sol", reasoning_effort="medium",
                         )
+
+    def test_launch_profile_rejects_semantically_forged_dependency_authority(self):
+        def digest(value):
+            return hashlib.sha256(json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            context = self.context(root)
+            authority = {
+                **context["authenticated_route"], "root_identifier": "GEN-37",
+            }
+            blocker = {
+                "issue_id": "20000000-0000-4000-8000-000000000001",
+                "identifier": "GEN-43",
+            }
+            blocked = {
+                "issue_id": "20000000-0000-4000-8000-000000000002",
+                "identifier": "GEN-44",
+            }
+            relation = {
+                "id": dependency_relation_id(
+                    authority=authority, blocker=blocker, blocked=blocked,
+                ),
+                "type": "blocks", "blocker": blocker, "blocked": blocked,
+                "inverse_type": "blocked_by",
+            }
+            before = {
+                "material_revision": 3, "projection_revision": 0,
+                "graph_revision": 0, "graph_sha256": digest([]),
+            }
+            batch_id = "wsdb_" + digest([
+                "workstream-child-dependency-native-batch-v1", authority,
+                PLAN, before, [relation],
+            ])[:32]
+            context["dependency_graph"].update({
+                "revision": 1, "sha256": digest([relation]),
+                "relations": [relation],
+                "authorization_batches": [{
+                    "batch_id": batch_id, "event_id": "wsp_" + "1" * 32,
+                    "relation_ids": [relation["id"]],
+                    "relations_sha256": digest([relation]),
+                    "expected_material_revision": 3,
+                    "expected_material_frontier_sha256": "2" * 64,
+                    "expected_projection_revision": 0,
+                    "expected_graph_revision": 0,
+                    "expected_graph_sha256": digest([]),
+                }],
+            })
+            context["dependency_graph"]["observed_frontier"].update({
+                "graph_revision": 1, "graph_sha256": digest([relation]),
+            })
+            MODULE.build_launch_profile(
+                context, "GEN-37", self.git(root),
+                model="gpt-5.6-sol", reasoning_effort="medium",
+            )
+
+            forged = deepcopy(context)
+            forged["dependency_graph"]["relations"][0]["blocked"] = {
+                "issue_id": "20000000-0000-4000-8000-000000000003",
+                "identifier": "GEN-45",
+            }
+            changed = forged["dependency_graph"]["relations"][0]
+            changed["id"] = dependency_relation_id(
+                authority=authority, blocker=blocker, blocked=changed["blocked"],
+            )
+            forged["dependency_graph"]["sha256"] = digest([changed])
+            forged["dependency_graph"]["observed_frontier"][
+                "graph_sha256"
+            ] = digest([changed])
+            forged["dependency_graph"]["authorization_batches"][0].update({
+                "relation_ids": [changed["id"]],
+                "relations_sha256": digest([changed]),
+            })
+            with self.assertRaisesRegex(
+                MODULE.ShipyardProfileError, "resume_dependency_graph_invalid",
+            ):
+                MODULE.build_launch_profile(
+                    forged, "GEN-37", self.git(root),
+                    model="gpt-5.6-sol", reasoning_effort="medium",
+                )
 
     def test_digest_bound_resume_envelope_requires_exact_hydration(self):
         with tempfile.TemporaryDirectory() as directory:
