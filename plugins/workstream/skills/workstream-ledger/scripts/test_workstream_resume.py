@@ -473,6 +473,107 @@ class ResumeTests(unittest.TestCase):
         }
         return snapshot
 
+    def test_closure_receipt_body_is_audit_only_but_done_binding_is_bounded(self):
+        base = self.snapshot()
+        base["children"] = []
+        snapshot = self.full_authority_snapshot(base)
+        route = snapshot["authenticated_route"]
+        plan = snapshot["root"]["plan_revision"]
+        snapshot_sha256 = MODULE.closure_snapshot_digest(snapshot)
+        closure_input_sha256 = "c" * 64
+        github = {
+            "repository": "generous-corp/agent-workstream",
+            "provider_repository_id": "R_agent_workstream", "pr_number": 73,
+            "pr_head": "b" * 40, "merged": True, "merge_sha": "d" * 40,
+        }
+        shipyard_body = {
+            "schema_version": 1,
+            "repository": github["repository"],
+            "repository_key": "github.com:id:R_agent_workstream",
+            "pr_number": 73, "head": "b" * 40,
+            "disposition": "merged", "receipt_id": "shipyard-73",
+        }
+        shipyard = {**shipyard_body, "receipt_sha256": hashlib.sha256(json.dumps(
+            shipyard_body, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()}
+        review = {
+            "schema_version": 1, "workstream_id": "GEN-37",
+            "snapshot_sha256": snapshot_sha256,
+            "closure_input_sha256": closure_input_sha256,
+            "repository_key": "github.com:id:R_agent_workstream",
+            "exact_head": "b" * 40, "verdict": "pass",
+            "reviewer_agent": "claude", "reviewer_session_id": "reviewer",
+            "implementer_session_id": "session",
+            "reviewed_at": "2026-09-01T00:00:00Z",
+            "review_artifact_identity": "audit-secret-" + ("x" * 4096),
+            "review_artifact_sha256": "e" * 64,
+            "trust_boundary": "shared_linear_credential",
+            "procedural_independence": True,
+        }
+        receipt = {
+            "criteria_checked": ["all accepted gates"],
+            "children_checked": [],
+            "evidence_categories_checked": [
+                "decisions", "followups", "prs", "landing_receipts",
+                "tests", "artifacts",
+            ],
+            "excluded": [], "deterministic_checks_passed": True,
+            "semantic_review_invoked": True, "semantic_review_passed": True,
+            "resume_token": "GEN-37", "context_url": "https://linear/GEN-37",
+            "plan_revision": plan, "root_revision": snapshot["root"]["revision"],
+            "final_disposition": "Done", "snapshot_sha256": snapshot_sha256,
+            "closure_input_sha256": closure_input_sha256,
+            "independent_review": review, "github": github,
+            "shipyard_receipt_sha256": shipyard["receipt_sha256"],
+        }
+        receipt_event = build_projection_event(
+            workstream_id="GEN-37", kind="closure_receipt", key=snapshot_sha256,
+            value=receipt, plan_revision=plan,
+            expected_revision=len(snapshot["projection_events"]),
+            created_at="2026-09-01T00:01:00Z", authority=route,
+        )
+        receipt_sha256 = hashlib.sha256(json.dumps(
+            receipt, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        lifecycle = {
+            "status": "Done", "github": github, "shipyard_receipt": shipyard,
+            "closure_input_sha256": closure_input_sha256,
+            "snapshot_sha256": snapshot_sha256, "independent_review": review,
+            "closure_receipt_sha256": receipt_sha256,
+            "closure_receipt_event_id": receipt_event["event_id"],
+        }
+        lifecycle_event = build_projection_event(
+            workstream_id="GEN-37", kind="lifecycle", key="root",
+            value=lifecycle, plan_revision=plan,
+            expected_revision=len(snapshot["projection_events"]) + 1,
+            created_at="2026-09-01T00:02:00Z", authority=route,
+        )
+        snapshot["projection_events"].extend([receipt_event, lifecycle_event])
+        snapshot["projection_revision"] += 2
+        snapshot["closure_receipts"] = [receipt]
+        snapshot["lifecycle"] = lifecycle
+        snapshot["root"].update({
+            "issue_status": snapshot["root"]["status"], "status": "Done",
+            "closure_receipt": receipt_sha256,
+        })
+        snapshot["dependency_graph"]["observed_frontier"][
+            "projection_revision"
+        ] = snapshot["projection_revision"]
+
+        ordinary = MODULE.compact_context(
+            snapshot, "GEN-37", require_projection_authority=True,
+        )
+        self.assertEqual(ordinary["closure_receipt"], {
+            "event_id": receipt_event["event_id"],
+            "sha256": receipt_sha256, "snapshot_sha256": snapshot_sha256,
+        })
+        self.assertNotIn("audit-secret-", json.dumps(ordinary))
+        audit = MODULE.compact_context(
+            snapshot, "GEN-37", require_projection_authority=True,
+            include_history=True, max_bytes=2**20, max_items=1000,
+        )
+        self.assertEqual(audit["closure_receipts"], [receipt])
+
     def test_repair_graph_frontier_binds_native_status_and_state_identity(self):
         snapshot = self.snapshot()
         snapshot["root"].update({

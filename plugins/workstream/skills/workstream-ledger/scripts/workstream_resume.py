@@ -344,6 +344,7 @@ def closure_snapshot_digest(snapshot: dict[str, Any]) -> str:
     material = deepcopy(snapshot)
     material.pop("lifecycle", None)
     material.pop("closure_reviews", None)
+    material.pop("closure_receipts", None)
     material.pop("lifecycle_recovery", None)
     root = material.get("root")
     if isinstance(root, dict):
@@ -359,7 +360,9 @@ def closure_snapshot_digest(snapshot: dict[str, Any]) -> str:
     if isinstance(events, list):
         material["projection_events"] = [
             event for event in events
-            if event.get("kind") not in {"closure_review", "lifecycle"}
+            if event.get("kind") not in {
+                "closure_review", "closure_receipt", "lifecycle",
+            }
         ]
         material["projection_revision"] = len(material["projection_events"])
         recovery = material.get("projection_recovery")
@@ -1685,17 +1688,72 @@ def validate_snapshot(
             and projection_unresolved_quarantine
         ):
             raise ResumeError("projection_current_view_mismatch:lifecycle_root")
+        if (
+            isinstance(lifecycle, dict)
+            and lifecycle.get("status") == "Done"
+            and lifecycle.get("closure_receipt_event_id") is not None
+        ):
+            receipt_events = [
+                event for event in active.values()
+                if event["kind"] == "closure_receipt"
+                and event["event_id"] == lifecycle["closure_receipt_event_id"]
+            ]
+            if len(receipt_events) != 1:
+                raise ResumeError(
+                    "lifecycle_closure_receipt_missing_or_ambiguous"
+                )
+            receipt_event = receipt_events[0]
+            lifecycle_event = active.get(("lifecycle", "root"))
+            if (
+                lifecycle_event is None
+                or projection_events.index(receipt_event)
+                >= projection_events.index(lifecycle_event)
+            ):
+                raise ResumeError("lifecycle_closure_receipt_order_invalid")
+            receipt_value = receipt_event["value"]
+            if (
+                receipt_value.get("snapshot_sha256")
+                != lifecycle.get("snapshot_sha256")
+                or receipt_value.get("closure_input_sha256")
+                != lifecycle.get("closure_input_sha256")
+                or receipt_value.get("independent_review")
+                != lifecycle.get("independent_review")
+                or (
+                    "github" in lifecycle
+                    and (
+                        receipt_value.get("github") != lifecycle["github"]
+                        or receipt_value.get("shipyard_receipt_sha256")
+                        != lifecycle["shipyard_receipt"]["receipt_sha256"]
+                    )
+                )
+                or (
+                    "repositories" in lifecycle
+                    and (
+                        receipt_value.get("repositories")
+                        != lifecycle["repositories"]
+                        or receipt_value.get("repository_truth_sha256")
+                        != lifecycle["repository_truth_sha256"]
+                    )
+                )
+                or hashlib.sha256(json.dumps(
+                    receipt_value, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()).hexdigest()
+                != lifecycle.get("closure_receipt_sha256")
+            ):
+                raise ResumeError("lifecycle_closure_receipt_binding_mismatch")
         for kind, field in (("relation", "relations"), ("choice", "choice_events"),
                             ("evidence_contract", "evidence_contracts"),
                             ("child_closure", "child_closures"),
                             ("provenance", "provenance"),
-                            ("closure_review", "closure_reviews")):
+                            ("closure_review", "closure_reviews"),
+                            ("closure_receipt", "closure_receipts")):
             values = [event["value"] for (event_kind, _), event in active.items()
                       if event_kind == kind]
             values.sort(key=lambda value: json.dumps(
                 value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             ))
-            if values != snapshot.get(field):
+            if values != snapshot.get(field, []):
                 raise ResumeError(f"projection_current_view_mismatch:{field}")
         if require_projection_authority:
             disposition = snapshot.get("disposition")
@@ -1980,6 +2038,8 @@ def validate_snapshot(
             "quarantine_disposition": quarantine_disposition,
             "projection_revision": projection_revision,
             "projection_recovery": projection_recovery,
+            "lifecycle": snapshot.get("lifecycle"),
+            "closure_receipts": snapshot.get("closure_receipts", []),
             "lifecycle_recovery": lifecycle_recovery,
             "authenticated_route": authenticated_route,
             "dependency_graph": dependency_graph,
@@ -2652,6 +2712,16 @@ def compact_context(
         "uncheckpointed_material_obligations": material_obligations,
         "source": clean.get("source"),
         "disposition": clean.get("disposition"),
+        "closure_receipt": (
+            {
+                "event_id": clean["lifecycle"].get("closure_receipt_event_id"),
+                "sha256": clean["lifecycle"].get("closure_receipt_sha256"),
+                "snapshot_sha256": clean["lifecycle"].get("snapshot_sha256"),
+            }
+            if isinstance(clean.get("lifecycle"), dict)
+            and clean["lifecycle"].get("status") == "Done"
+            else None
+        ),
         "projection_revision": clean["projection_revision"],
         "projection_recovery": clean["projection_recovery"],
         "lifecycle_recovery": clean["lifecycle_recovery"],
@@ -2681,6 +2751,7 @@ def compact_context(
         context["projection_unresolved_quarantine"] = clean[
             "projection_unresolved_quarantine"
         ]
+        context["closure_receipts"] = clean.get("closure_receipts", [])
     context = _without_raw_transcripts(context)
     item_count = child_material_item_count + _checkpoint_item_count(
         context["latest_checkpoint"]

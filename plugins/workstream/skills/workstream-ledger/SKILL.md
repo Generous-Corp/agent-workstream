@@ -819,8 +819,14 @@ fresh-session review receipt bound to the exact snapshot, closure input,
 repository-qualified head set, and aggregate landing truth. The receipt names and digests the durable review
 artifact and declares procedural independence under a shared Linear credential;
 it does not claim cryptographic agent identity.
-Resume derives lifecycle status and the closure receipt digest from that durable
-projection rather than mutable issue prose.
+Reconcile appends the immutable closure receipt body before the `Done`
+lifecycle and binds that lifecycle to the receipt's exact projection event ID
+and SHA-256. A response lost after either append replays without a duplicate;
+a conflicting, ambiguous, or altered receipt refuses. Ordinary resume exposes
+only the bounded event ID, digest, and snapshot digest, while full-history
+audit returns the validated receipt body. Resume derives lifecycle status and
+that receipt binding from the durable projection rather than mutable issue
+prose.
 
 ### Fresh-session resume
 
