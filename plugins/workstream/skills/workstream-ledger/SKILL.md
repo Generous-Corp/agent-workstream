@@ -469,25 +469,21 @@ and retries a stable event ID after `RevisionConflict`.
 
 #### Transient tracking outage
 
-A Linear availability failure must not stop an already-authorized owner from
-doing independently authorized work. The runtime may use
-`scripts/workstream_degraded_execution.py` only when the same process and
-current turn still hold an opaque, unexpired grant issued immediately after a
-live authenticated full resume. There is intentionally no CLI or serialized
-cache that can mint or transfer this grant. A fresh session, copied grant,
-expired grant, auth/permission failure, semantic refusal, or ambiguous
-post-write timeout fails closed.
+A narrow Linear transport failure must not stop an already-authorized warm
+provider session from doing independently authorized work. Apply the
+`workstream-resume` warm-session predicate: the same provider session and
+workstream must retain its prior live `full` result plus exact route, source, generation,
+frontiers, owner/session, worktree, repository head, and Shipyard run. This is
+agent workflow policy, not a daemon-enforced or transferable grant.
 
-This narrow `degraded_continuation` authority permits provider/local
-implementation and an immutable exact-head Shipyard handoff or landing. It
-does not permit Linear writes, scope expansion, source/root/generation or
-ownership transitions, attach/successor selection, semantic closure, or
-Linear resume/handoff certification. Record discovered material deltas in the
-durable local outbox. Before remote replay or certification, obtain a fresh
-authenticated full resume, verify every bound route/source/generation/frontier,
-owner, repository, worktree, Shipyard, and snapshot field, then reconcile the
-stable event IDs idempotently. Reconciliation, not outage duration, restores
-normal authority.
+That session may continue provider/local implementation and independently
+fenced exact-head Shipyard handoff or landing. Buffer every material discovery
+through this journal; do not attempt a Linear write while transport is
+unavailable. Before any Linear mutation, scope/ownership/root/generation
+transition, attach/successor selection, new-session handoff, semantic closure,
+or resume/handoff certification, obtain a fresh authenticated full resume and
+reconcile stable event IDs idempotently. Fresh/cold sessions and auth,
+semantic, generation, budget, or ambiguous post-write refusals fail closed.
 
 `scripts/workstream_linear_events.py` is the dependency-free authenticated
 Linear `MutationAdapter`. It stores one immutable material delta per issue

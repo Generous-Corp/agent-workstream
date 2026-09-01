@@ -158,12 +158,13 @@ Those are secondary repository-local CLI examples; installation does not add
 
 If Linear has a narrow transient availability failure, a current active owner
 may continue local/provider implementation and independently fenced exact-head
-Shipyard handoff or landing. This requires a same-process, current-turn opaque
-grant from a live full resume; it is never reusable recovery authority. New
-sessions and ambiguous post-write failures still stop. Material tracking
-deltas remain in the local outbox, while Linear mutations, lifecycle changes,
-closure, and resume/handoff certification wait for fresh full-resume
-reconciliation. See the skill's **Transient tracking outage** contract.
+Shipyard handoff or landing when the same warm provider session retains its
+prior full authority and every exact execution binding. This is agent workflow
+policy, not a daemon-enforced grant or reusable cache. New sessions and auth,
+semantic, generation, budget, or ambiguous post-write failures still stop.
+Material tracking deltas remain in the local outbox, while Linear mutations,
+lifecycle changes, closure, and resume/handoff certification wait for fresh
+full-resume reconciliation. See **Transient tracking outage** in the skill.
 
 `shipyard-profile` derives provider and session from the latest acknowledged
 checkpoint, performs a fresh authenticated full-authority resume, validates the
