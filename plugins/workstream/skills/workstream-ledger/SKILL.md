@@ -407,6 +407,24 @@ reviewed replacement can reserve and activate from the revision advanced by
 that abort. The generation
 transport uses `commentCreate` only and never calls `issueUpdate`.
 
+When a reviewed generation transition needs either of the two mutable native
+root changes that generation deliberately does not own, use the separate
+`workstreamctl root-transition` surface. `plan-url` changes exactly one labeled
+same-document pinned GitHub blob URL to its reviewed `blob/main` locator while
+preserving every other description byte. `reopen` changes the same exact
+terminal root to one authenticated Linear `started` state. Both commands are
+zero-write previews unless `--apply` is supplied, and apply requires the
+previewed root-snapshot and complete comment-frontier digests. See
+[`references/root-transition.md`](references/root-transition.md).
+
+These mutations do not change append-only generation authority. Linear has no
+conditional `issueUpdate`, so the supported transport does not call the native
+write atomic: it first wins one deterministic append-only reservation for the
+reviewed snapshot, then performs immediate prewrite and postwrite readback.
+Exact replay is a no-op; drift or a competing reservation refuses. This is the
+strongest supported fence, not protection against an unrelated writer changing
+the native issue in the interval between final prewrite readback and update.
+
 After intake returns the canonical root token, invoke
 `scripts/workstream_tab.py GEN-123`. In cmux or Herdr it preserves the existing
 tab title and appends exactly one token; the same token is a no-op and a

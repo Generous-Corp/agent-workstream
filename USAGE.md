@@ -211,6 +211,17 @@ and therefore requires `--inspection-only`; only a live authenticated Linear
 read can produce full-authority output. The command writes only reviewed
 changes and verifies a complete live readback.
 
+Before a reviewed generation activation, two native root mutations have a
+supported, separately fenced front door. Preview `workstreamctl root-transition
+plan-url GEN-123 --to <same-document-blob/main-URL>` to replace one pinned
+canonical locator without changing other description text, or preview
+`workstreamctl root-transition reopen GEN-123 --state-id <started-state-UUID>`
+to reopen the same terminal root. Apply requires the previewed snapshot and
+comment-frontier digests. Linear has no conditional `issueUpdate`; the command
+uses a deterministic append-only reservation plus immediate pre/post readback
+and explicitly does not claim cross-writer atomicity. Full instructions are in
+the workstream-ledger skill's `references/root-transition.md`.
+
 After a PR lands, `workstreamctl reconcile --help` exposes the explicit GitHub,
 Shipyard fixed-argv, plan, and closure-input arguments. The command records
 `Landed — acceptance review required` from exact live truth. Supplying a

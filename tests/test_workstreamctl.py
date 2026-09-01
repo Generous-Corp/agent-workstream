@@ -119,6 +119,15 @@ class WorkstreamCtlTests(unittest.TestCase):
             [MODULE.sys.executable, str(script), "activate", "GEN-37", "--help"],
         )
 
+    def test_root_transition_dispatches_supported_native_mutation_command(self):
+        with mock.patch.object(MODULE.os, "execv") as execute:
+            MODULE.main(["root-transition", "reopen", "GEN-14", "--help"])
+        script = MODULE.SCRIPTS / "workstream_root_transition.py"
+        execute.assert_called_once_with(
+            MODULE.sys.executable,
+            [MODULE.sys.executable, str(script), "reopen", "GEN-14", "--help"],
+        )
+
     def test_material_repair_dispatches_reviewed_dry_run_command(self):
         with mock.patch.object(MODULE.os, "execv") as execute:
             MODULE.main([
