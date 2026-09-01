@@ -400,6 +400,9 @@ class MaterialRepairCliTests(unittest.TestCase):
                 "identity": f"https://example.test/{generation_tests.NEW}",
                 "sha256": generation_tests.NEW,
             }
+            successor.description += (
+                f"\nCanonical plan: {successor_source['identity']}"
+            )
             successor_plan = {
                 "graph_review_required": True,
                 "source": {**successor_source, "bytes": 10},
