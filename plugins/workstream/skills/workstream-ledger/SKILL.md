@@ -790,6 +790,21 @@ passes the canonical phase-specific prefix validators; the content-addressed
 GEN-14 split lineage completes its strict normalization tail first. It returns
 partial authority until evidence seeding and closure.
 
+When that exact GEN-14 D6/S7 repair already ends at the requested head, fresh
+prepare retains the content-addressed evidence values: it performs no evidence,
+disposition, or scope replacement before the source-only phase. Its closure
+manifest carries the exact stored-to-recomputed input-frontier bridge. The
+stored frontier continues to bind predecessor history while the recomputed
+frontier fences the live closure input; this bridge is valid only for the exact
+D6/S7, reviewed source-only, and canonical closure-repair descendant. It binds
+the exact source event/value, phase timestamp, and sorted one-or-two child set;
+replay permits only the corresponding zero-, one-, or two-closure prefix with
+canonical envelopes and never a scope event, duplicate, or reversed closure.
+The irreversible reconciler revalidates that lineage and the carried stored
+frontier before substituting the recomputed live-input fence, and rederives
+every already-present closure from the fenced child snapshot and evidence
+rather than trusting equality between an active closure and the manifest.
+
 ### Terminal-child projection repair
 
 After a material child transition to Linear's `completed` state, run the
