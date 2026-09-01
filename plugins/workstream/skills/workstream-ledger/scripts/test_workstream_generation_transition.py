@@ -1438,6 +1438,24 @@ class GenerationTransitionTests(unittest.TestCase):
             client.graph_status = "Done"
             client.graph_status_type = "completed"
             project_full(client, OLD)
+            predecessor_checkpoint = build_checkpoint(
+                workstream_id=WORKSTREAM,
+                boundary_id="schema6-predecessor-custody",
+                root_revision=0, plan_revision=OLD,
+                before_status="Done", after_status="Done",
+                execution={
+                    "agent": "codex", "provider": "openai",
+                    "session_id": "predecessor", "machine": "M5",
+                    "worktree": {"state": "unknown"},
+                },
+                exact_head=None, evidence=[], blocker=None,
+                next_action="Activate the successor generation.",
+            )
+            LinearCheckpointAdapter(
+                client, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
+                workspace_id="workspace", team_id="team",
+                project_id="project",
+            ).persist(predecessor_checkpoint)
             source = {
                 "identity": f"https://example.test/{NEW}", "sha256": NEW,
             }
@@ -2232,6 +2250,17 @@ class GenerationTransitionTests(unittest.TestCase):
                 clock_client.comments, workstream_id=WORKSTREAM,
                 authenticated_route=AUTHORITY,
             )[0]
+            self.assertEqual(
+                clock_reservation["checkpoint_event_ids"],
+                [predecessor_checkpoint["event_id"]],
+            )
+            clock_seal = next(
+                event for event in adapter(clock_client, NEW).state().events
+                if event["kind"] == "generation_candidate_seal"
+            )
+            self.assertEqual(
+                clock_seal["value"]["to"]["checkpoint_event_ids"], [],
+            )
             self.assertEqual(sum(
                 event["kind"] == "generation_candidate_seal"
                 for event in adapter(clock_client, NEW).state().events
@@ -2264,6 +2293,31 @@ class GenerationTransitionTests(unittest.TestCase):
                 )
                 self.assertFalse(preview["apply"])
                 self.assertEqual(len(clock_client.mutations), writes)
+
+                class TargetCheckpointDriftLoader(ClockLoader):
+                    def __call__(self, plan):
+                        receipt = super().__call__(plan)
+                        receipt["checkpoint_event_ids"] = [
+                            "wsc_" + "f" * 32
+                        ]
+                        return receipt
+
+                with patch(
+                    "workstream_generation.strict_candidate_loader",
+                    side_effect=lambda *_args, **kwargs:
+                    TargetCheckpointDriftLoader(
+                        clock_client,
+                        kwargs.get("root_updated_at_override"),
+                    ),
+                ), self.assertRaisesRegex(
+                    WorkstreamGenerationError,
+                    "generation_graph_clock_custody_strict_candidate_mismatch",
+                ):
+                    generation_graph_clock_custody(
+                        **custody_args, apply=False,
+                    )
+                self.assertEqual(len(clock_client.mutations), writes)
+
                 with self.assertRaisesRegex(
                     WorkstreamGenerationError,
                     "generation_graph_clock_custody_(strict_candidate|native_root)_mismatch",
