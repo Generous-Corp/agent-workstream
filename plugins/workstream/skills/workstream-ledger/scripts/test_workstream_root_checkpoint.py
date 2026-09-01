@@ -10,6 +10,9 @@ from unittest.mock import patch
 
 from workstream_delta import Delta
 from workstream_linear_events import LinearCommentEventAdapter
+from workstream_linear_checkpoints import (
+    encode_checkpoint_comment, LinearCheckpointAdapter,
+)
 from workstream_generation import strict_candidate_loader
 from workstream_resume import ResumeError
 from workstream_root_transition import RootTransitionError
@@ -89,6 +92,13 @@ class RootCheckpointTests(unittest.TestCase):
                         },
                     },
                 }
+                # Simulate process death after the checkpoint append and
+                # before the reviewed disposition candidate is written.
+                LinearCheckpointAdapter(
+                    client, issue_id=token, workstream_id=token,
+                    workspace_id=route["workspace_id"],
+                    team_id=route["team_id"], project_id=route["project_id"],
+                ).persist(preview["checkpoint"])
                 with patch.object(
                     checkpoint_cli, "_ordinary_resume", return_value=resume,
                 ):
@@ -97,7 +107,7 @@ class RootCheckpointTests(unittest.TestCase):
                         "--expected-preview-sha256", preview["preview_sha256"],
                     ])
                 self.assertEqual(applied["resume_authority"], "full")
-                self.assertEqual(applied["writes_performed"], 2)
+                self.assertEqual(applied["writes_performed"], 1)
                 self.assertEqual(loader(digest)["resume_authority"], "full")
                 writes = len(client.mutations)
                 with patch.object(
@@ -110,6 +120,110 @@ class RootCheckpointTests(unittest.TestCase):
                 self.assertEqual(replay["resume_authority"], "full")
                 self.assertEqual(replay["writes_performed"], 0)
                 self.assertEqual(len(client.mutations), writes)
+
+    def test_exact_checkpoint_at_wrong_remote_slot_refuses_before_projection(self):
+        token = "GEN-14"
+        route = fixture.AUTHORITY
+        with patch.object(fixture, "WORKSTREAM", token):
+            client = fixture.FakeClient()
+            with tempfile.NamedTemporaryFile("w+", suffix=".md") as plan:
+                text = "# wrong slot\n"
+                plan.write(text)
+                plan.flush()
+                digest = hashlib.sha256(text.encode()).hexdigest()
+                client.description = (
+                    f"Plan revision: {digest}\nNext action: Continue."
+                )
+                fixture.project_full(client, digest, identity=plan.name)
+                common = [
+                    token, "--created-at", "2026-09-01T06:30:00Z",
+                    "--agent", "codex", "--provider", "openai",
+                    "--session-id", "s", "--machine", "M5",
+                    "--worktree-state", "unknown",
+                    "--before-status", "In Progress",
+                    "--after-status", "In Progress", "--next-action", "Continue",
+                ]
+                with patch.object(
+                    checkpoint_cli, "_client_and_route",
+                    return_value=(client, route),
+                ):
+                    preview = checkpoint_cli.run(common)
+                    client.comments.append({
+                        "id": "wrong-remote-slot",
+                        "body": encode_checkpoint_comment(preview["checkpoint"]),
+                        "createdAt": "now", "updatedAt": "now",
+                    })
+                    with self.assertRaises(
+                        checkpoint_cli.CheckpointPartialApplyError,
+                    ) as raised:
+                        checkpoint_cli.run([
+                            *common, "--apply",
+                            "--expected-material-revision", "0",
+                            "--expected-preview-sha256", preview["preview_sha256"],
+                        ])
+                self.assertEqual(
+                    raised.exception.payload["reason"],
+                    "checkpoint_receipt_remote_slot_mismatch",
+                )
+                self.assertEqual(
+                    raised.exception.payload["checkpoint"]["receipt"]
+                    ["acknowledgement"]["remote_id"],
+                    "wrong-remote-slot",
+                )
+
+    def test_native_state_id_drift_during_checkpoint_is_applied_but_not_success(self):
+        token = "GEN-14"
+        route = fixture.AUTHORITY
+        with patch.object(fixture, "WORKSTREAM", token):
+            client = fixture.FakeClient()
+            with tempfile.NamedTemporaryFile("w+", suffix=".md") as plan:
+                text = "# state drift\n"
+                plan.write(text)
+                plan.flush()
+                digest = hashlib.sha256(text.encode()).hexdigest()
+                client.description = (
+                    f"Plan revision: {digest}\nNext action: Continue."
+                )
+                fixture.project_full(client, digest, identity=plan.name)
+                common = [
+                    token, "--created-at", "2026-09-01T06:30:00Z",
+                    "--agent", "codex", "--provider", "openai",
+                    "--session-id", "s", "--machine", "M5",
+                    "--worktree-state", "unknown",
+                    "--before-status", "In Progress",
+                    "--after-status", "In Progress", "--next-action", "Continue",
+                ]
+                with patch.object(
+                    checkpoint_cli, "_client_and_route",
+                    return_value=(client, route),
+                ):
+                    preview = checkpoint_cli.run(common)
+
+                    def drift(item, observed):
+                        if "workstream-checkpoint:v1" in item["body"]:
+                            observed.graph_state_id = "changed-state-id"
+
+                    client.before_each_create = drift
+                    with self.assertRaises(
+                        checkpoint_cli.CheckpointPartialApplyError,
+                    ) as raised:
+                        checkpoint_cli.run([
+                            *common, "--apply",
+                            "--expected-material-revision", "0",
+                            "--expected-preview-sha256", preview["preview_sha256"],
+                        ])
+                payload = raised.exception.payload
+                self.assertEqual(
+                    payload["reason"],
+                    "checkpoint_applied_but_native_root_drift",
+                )
+                self.assertEqual(
+                    payload["checkpoint"]["receipt"]["event_id"],
+                    preview["checkpoint"]["event_id"],
+                )
+                self.assertEqual(
+                    payload["replay_guidance"].split()[0], "Rerun",
+                )
 
     def test_apply_requires_reviewed_fences_before_live_access(self):
         with self.assertRaisesRegex(
@@ -163,9 +277,24 @@ class RootCheckpointTests(unittest.TestCase):
                     ])
 
     def test_ordinary_resume_oracle_uses_production_command_and_budget_contract(self):
+        route = fixture.AUTHORITY
+        source = {"identity": "/tmp/plan.md", "sha256": "a" * 64}
+        args = checkpoint_cli.parser().parse_args([
+            "GEN-14", "--config", "/tmp/workstream.json",
+            "--created-at", "2026-09-01T06:30:00Z",
+            "--agent", "codex", "--provider", "openai",
+            "--session-id", "s", "--machine", "M5",
+            "--worktree-state", "unknown",
+            "--before-status", "In Progress",
+            "--after-status", "In Progress", "--next-action", "Continue",
+        ])
         payload = {
-            "resume_authority": "full", "executable": True,
-            "dependency_graph": {},
+            "resume_authority": "full", "workstream_id": "GEN-14",
+            "plan_revision": source["sha256"], "source": source,
+            "authenticated_route": route,
+            "dependency_graph": {
+                "route": route, "plan_revision": source["sha256"],
+            },
         }
         completed = subprocess.CompletedProcess(
             [], 0, stdout=json.dumps(payload), stderr="",
@@ -174,22 +303,38 @@ class RootCheckpointTests(unittest.TestCase):
             checkpoint_cli.subprocess, "run", return_value=completed,
         ) as invoked:
             self.assertEqual(
-                checkpoint_cli._ordinary_resume("GEN-14"), payload,
+                checkpoint_cli._ordinary_resume(
+                    "GEN-14", args=args, route=route, source=source,
+                ),
+                payload,
             )
         command = invoked.call_args.args[0]
-        self.assertEqual(command[-1], "GEN-14")
-        self.assertTrue(command[-2].endswith("workstream_resume.py"))
+        self.assertEqual(command[2], "GEN-14")
+        self.assertTrue(command[1].endswith("workstream_resume.py"))
+        for flag, expected in (
+            ("--config", "/tmp/workstream.json"),
+            ("--linear-workspace-id", route["workspace_id"]),
+            ("--linear-team-id", route["team_id"]),
+            ("--linear-project-id", route["project_id"]),
+            ("--linear-endpoint", args.linear_endpoint),
+            ("--plan-source", source["identity"]),
+            ("--plan-identity", source["identity"]),
+            ("--max-bytes", str(24 * 1024)), ("--max-items", "100"),
+        ):
+            self.assertEqual(command[command.index(flag) + 1], expected)
         self.assertEqual(invoked.call_args.kwargs["timeout"], 60)
 
         completed.stdout = json.dumps({
-            "resume_authority": "full", "executable": True,
+            **payload, "dependency_graph": None,
         })
         with patch.object(
             checkpoint_cli.subprocess, "run", return_value=completed,
         ), self.assertRaisesRegex(
             Exception, "ordinary_resume_not_bounded_full",
         ):
-            checkpoint_cli._ordinary_resume("GEN-14")
+            checkpoint_cli._ordinary_resume(
+                "GEN-14", args=args, route=route, source=source,
+            )
 
 
 if __name__ == "__main__":

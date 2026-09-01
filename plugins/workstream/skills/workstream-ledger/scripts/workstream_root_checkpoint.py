@@ -30,6 +30,14 @@ from workstream_linear_projection import (
 from workstream_root_transition import _validate_authority
 
 
+class CheckpointPartialApplyError(LinearTransportError):
+    """A checkpoint may be durable; expose exact replay authority."""
+
+    def __init__(self, payload: dict[str, Any]):
+        self.payload = payload
+        super().__init__(str(payload["reason"]))
+
+
 def _canonical(value: Any) -> bytes:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -192,12 +200,14 @@ def _prepare(args: argparse.Namespace, client: Any, route: dict[str, str]):
         )
 
     checkpoint = build(predecessor)
+    checkpoint_replay = False
     frontier_before = sorted(item["event_id"] for item in state.checkpoints)
     if latest_record and latest_record["boundary_id"] == boundary_id:
         replay = build(latest_record.get("predecessor_event_id"))
         if replay["event_id"] != latest_record["event_id"]:
             raise LinearTransportError("checkpoint_boundary_id_conflict")
         checkpoint = replay
+        checkpoint_replay = True
         frontier_before = [
             event_id for event_id in frontier_before
             if event_id != latest_record["event_id"]
@@ -239,13 +249,13 @@ def _prepare(args: argparse.Namespace, client: Any, route: dict[str, str]):
         )
     )
     checkpoint_ids = sorted(item["event_id"] for item in state.checkpoints)
-    if projection_replay:
+    if checkpoint_replay:
         checkpoint_ids = [
             event_id for event_id in checkpoint_ids
             if event_id != checkpoint["event_id"]
         ]
     serialization_comments = comments
-    if projection_replay:
+    if checkpoint_replay:
         checkpoint_remote_id = state.remote_ids.get(checkpoint["event_id"])
         serialization_comments = [
             comment for comment in comments
@@ -293,23 +303,63 @@ def _root_surface(client: Any, route: dict[str, str], token: str) -> dict[str, A
     graph = LinearGraphQLTransport(
         client, workspace_id=route["workspace_id"], team_id=route["team_id"],
         project_id=route["project_id"],
-    ).snapshot_for_root(token, include_description=True)
+    ).snapshot_for_root(
+        token, include_description=True, include_child_comments=True,
+    )
     _validate_authority(graph, token, route)
-    root = graph["root"]
     return {
-        "id": root.get("id"), "identifier": root.get("identifier"),
-        "parent": root.get("parent"), "archivedAt": root.get("archivedAt"),
-        "status": root.get("status"), "status_type": root.get("status_type"),
-        "description_plan_revision": root.get("plan_revision"),
+        "graph": graph, "graph_sha256": _digest(graph),
     }
 
 
-def _ordinary_resume(token: str) -> dict[str, Any]:
+def _partial_apply_error(
+    reason: str, preview: dict[str, Any], *,
+    checkpoint_receipt: dict[str, Any] | None = None,
+    projection_receipt: dict[str, Any] | None = None,
+) -> CheckpointPartialApplyError:
+    checkpoint = preview["checkpoint"]
+    candidate = preview["projection_candidate"]
+    return CheckpointPartialApplyError({
+        "schema_version": 1,
+        "status": "applied_or_unknown_replay_required",
+        "reason": reason,
+        "workstream_id": preview["workstream_id"],
+        "reviewed_preview_sha256": preview["preview_sha256"],
+        "checkpoint": {
+            "event_id": checkpoint["event_id"],
+            "expected_remote_id": preview["deterministic_slot_id"],
+            "receipt": checkpoint_receipt,
+        },
+        "projection": {
+            "event_id": candidate["event_id"],
+            "expected_revision": candidate["expected_revision"],
+            "receipt": projection_receipt,
+        },
+        "replay_guidance": (
+            "Rerun the exact apply with the same material revision, preview "
+            "digest, timestamp, execution inputs, and authenticated route/source."
+        ),
+    })
+
+
+def _ordinary_resume(
+    token: str, *, args: argparse.Namespace, route: dict[str, str],
+    source: dict[str, str],
+) -> dict[str, Any]:
+    command = [
+        sys.executable, str(Path(__file__).with_name("workstream_resume.py")),
+        token, "--linear-workspace-id", route["workspace_id"],
+        "--linear-team-id", route["team_id"],
+        "--linear-project-id", route["project_id"],
+        "--linear-endpoint", args.linear_endpoint,
+        "--plan-source", source["identity"],
+        "--plan-identity", source["identity"],
+        "--max-bytes", str(24 * 1024), "--max-items", "100",
+    ]
+    if args.config:
+        command.extend(["--config", args.config])
     result = subprocess.run(
-        [
-            sys.executable, str(Path(__file__).with_name("workstream_resume.py")),
-            token,
-        ],
+        command,
         check=False, capture_output=True, text=True, timeout=60,
     )
     if result.returncode != 0:
@@ -322,9 +372,15 @@ def _ordinary_resume(token: str) -> dict[str, Any]:
         raise LinearTransportError("checkpoint_ordinary_resume_invalid_json") from error
     if (
         value.get("resume_authority") != "full"
-        or value.get("executable") is not True
+        or value.get("workstream_id") != token
+        or value.get("plan_revision") != source["sha256"]
+        or value.get("source") != source
+        or value.get("authenticated_route") != route
         or len(result.stdout.encode()) > 24 * 1024
-        or value.get("dependency_graph") is None
+        or not isinstance(value.get("dependency_graph"), dict)
+        or value["dependency_graph"].get("route") != route
+        or value["dependency_graph"].get("plan_revision") != source["sha256"]
+        or value.get("plan_generation_pending") is not None
     ):
         raise LinearTransportError("checkpoint_ordinary_resume_not_bounded_full")
     return value
@@ -354,10 +410,7 @@ def run(
     if fenced != preview:
         raise LinearTransportError("checkpoint_preview_stale_reload_required")
     native_before = _root_surface(client, route, preview["workstream_id"])
-    if native_before != {
-        **preview["root_state"], "parent": None, "archivedAt": None,
-        "description_plan_revision": preview["description_plan_revision"],
-    }:
+    if native_before["graph_sha256"] != preview["graph_sha256"]:
         raise LinearTransportError("checkpoint_native_root_prewrite_drift")
     before_persist = adapter._state()
     already_persisted = any(
@@ -382,9 +435,25 @@ def run(
                 if item["event_id"] == preview["checkpoint"]["event_id"]
             )
         except (LinearTransportError, OSError, StopIteration, TimeoutError):
-            raise LinearTransportError(
-                "checkpoint_apply_unknown_replay_required"
+            raise _partial_apply_error(
+                "checkpoint_apply_unknown_replay_required", preview,
             ) from error
+    if (
+        (receipt.get("acknowledgement") or {}).get("remote_id")
+        != preview["deterministic_slot_id"]
+    ):
+        raise _partial_apply_error(
+            "checkpoint_receipt_remote_slot_mismatch", preview,
+            checkpoint_receipt=receipt,
+        )
+    if _root_surface(
+        client, route, preview["workstream_id"],
+    ) != native_before:
+        raise _partial_apply_error(
+            "checkpoint_applied_but_native_root_drift", preview,
+            checkpoint_receipt=receipt,
+        )
+    projection_receipt = None
     if not projection_replay:
         projection_adapter = LinearProjectionAdapter(
             client, issue_id=preview["workstream_id"],
@@ -392,7 +461,7 @@ def run(
             plan_revision=preview["source"]["sha256"], **route,
         )
         try:
-            projection_adapter.append(
+            projection_receipt = projection_adapter.append(
                 preview["projection_candidate"],
                 expected_material_revision=preview["material_revision"],
             )
@@ -405,18 +474,31 @@ def run(
                 ):
                     raise StopIteration
             except (LinearTransportError, OSError, StopIteration, TimeoutError):
-                raise LinearTransportError(
-                    "checkpoint_projection_apply_unknown_replay_required"
+                raise _partial_apply_error(
+                    "checkpoint_projection_apply_unknown_replay_required",
+                    preview, checkpoint_receipt=receipt,
                 ) from error
+    else:
+        projection_receipt = {
+            "event_id": preview["projection_candidate"]["event_id"],
+            "disposition": "existing",
+        }
     if _root_surface(client, route, preview["workstream_id"]) != native_before:
-        raise LinearTransportError(
-            "checkpoint_postwrite_native_root_drift_reconcile_required"
+        raise _partial_apply_error(
+            "checkpoint_postwrite_native_root_drift_reconcile_required",
+            preview, checkpoint_receipt=receipt,
+            projection_receipt=projection_receipt,
         )
     try:
-        resume = _ordinary_resume(preview["workstream_id"])
+        resume = _ordinary_resume(
+            preview["workstream_id"], args=args, route=route,
+            source=preview["source"],
+        )
     except (LinearTransportError, OSError, TimeoutError) as error:
-        raise LinearTransportError(
-            "checkpoint_applied_but_ordinary_resume_refused"
+        raise _partial_apply_error(
+            "checkpoint_applied_but_ordinary_resume_refused", preview,
+            checkpoint_receipt=receipt,
+            projection_receipt=projection_receipt,
         ) from error
     latest_checkpoint = resume.get("latest_checkpoint") or {}
     if (
@@ -426,8 +508,10 @@ def run(
         or (latest_checkpoint.get("acknowledgement") or {}).get("remote_id")
         != receipt["acknowledgement"]["remote_id"]
     ):
-        raise LinearTransportError(
-            "checkpoint_applied_but_ordinary_resume_receipt_mismatch"
+        raise _partial_apply_error(
+            "checkpoint_applied_but_ordinary_resume_receipt_mismatch", preview,
+            checkpoint_receipt=receipt,
+            projection_receipt=projection_receipt,
         )
     return {
         **preview, "apply": True,
@@ -441,6 +525,10 @@ def run(
 def main(argv: list[str] | None = None) -> int:
     try:
         result = run(sys.argv[1:] if argv is None else argv)
+    except CheckpointPartialApplyError as error:
+        json.dump(error.payload, sys.stderr, ensure_ascii=False, sort_keys=True)
+        sys.stderr.write("\n")
+        return 3
     except (
         CheckpointError, LinearTransportError, OSError, TimeoutError, ValueError,
     ) as error:
