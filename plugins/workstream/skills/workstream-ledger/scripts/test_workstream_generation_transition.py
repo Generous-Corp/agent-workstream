@@ -941,6 +941,20 @@ class GenerationTransitionTests(unittest.TestCase):
         predecessor_head = "b" * 40
         target_head = "e" * 40
         secondary_head = "7" * 40
+        old_source = {
+            "identity": (
+                "https://github.com/acme/plans/blob/"
+                + "1" * 40 + "/plan.md"
+            ),
+            "sha256": NEW,
+        }
+        target_source = {
+            "identity": (
+                "https://github.com/acme/plans/blob/"
+                + "2" * 40 + "/plan.md"
+            ),
+            "sha256": NEW,
+        }
         predecessor = adapter(self.client, OLD).state()
         base = deepcopy(list(predecessor.events))
         scope = next(
@@ -996,7 +1010,7 @@ class GenerationTransitionTests(unittest.TestCase):
              "event_id": "wsp_" + "a" * 32},
             {**deepcopy(predecessor_events[1]), "plan_revision": NEW,
              "event_id": "wsp_" + "b" * 32,
-             "value": {"identity": f"https://example.test/{NEW}", "sha256": NEW}},
+             "value": old_source},
             {**deepcopy(predecessor_events[2]), "plan_revision": NEW,
              "event_id": "wsp_" + "c" * 32},
             {"schema_version": 2, "kind": "evidence_contract", "key": "terminal",
@@ -1174,23 +1188,46 @@ class GenerationTransitionTests(unittest.TestCase):
             ):
                 return prepare_generation_operator_contract(
                     comments=deepcopy(self.client.comments),
-                    graph={"root": {}, "children": [{"identifier": "GEN-72"}]},
+                    graph={
+                        "root": {},
+                        "children": [{
+                            "identifier": "GEN-72",
+                            "status_type": "completed",
+                        }],
+                    },
                     workstream_id=WORKSTREAM, authority=AUTHORITY,
                     description_plan_revision=OLD,
-                    target_source={
-                        "identity": f"https://example.test/{NEW}", "sha256": NEW,
-                    },
+                    target_source=target_source,
                     created_at="2026-08-31T23:00:00Z",
                     remote_head=target_head,
                     started_state=STARTED_STATE,
                 )
 
+        noncanonical_source_candidate = [*target_events, {
+            **deepcopy(common[2]),
+            "kind": "provenance", "key": "unreviewed",
+            "event_id": "wsp_" + "9" * 32,
+            "expected_revision": len(target_events),
+            "value": {
+                "agent": "forged", "machine": "forged",
+                "session_id": "forged",
+            },
+        }]
+        comments_before_refusal = len(self.client.comments)
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_prepare_noncanonical_target_prefix",
+        ):
+            run(noncanonical_source_candidate)
+        self.assertEqual(len(self.client.comments), comments_before_refusal)
+
+        without_disposition = target_events[:4]
         with self.assertRaisesRegex(
             WorkstreamGenerationError,
             "generation_prepare_target_disposition_missing_for_head_transition",
         ):
-            run(target_events[:-1])
-        unbound_progress = [*target_events, {
+            run(without_disposition)
+        unbound_progress = [*without_disposition, {
             **deepcopy(common[4]), "event_id": "wsp_" + "4" * 32,
             "value": {
                 "disposition": "attach", "remote_head": target_head,
@@ -1238,6 +1275,47 @@ class GenerationTransitionTests(unittest.TestCase):
         target_events.append({
             **deepcopy(common[0]), "event_id": "wsp_" + "3" * 32,
             "value": desired_scope,
+        })
+
+        source_repair = run(target_events)
+        self.assertEqual(
+            source_repair["projection_preview"]["phase"],
+            "terminal_source_transition",
+        )
+        self.assertEqual(
+            source_repair["projection_preview"]["invocation"]["source"],
+            target_source,
+        )
+        self.assertEqual(
+            source_repair["projection_preview"]["manifest"]
+            ["terminal_child_source_transition"],
+            {
+                "from_identity": old_source["identity"],
+                "to_identity": target_source["identity"],
+                "sha256": NEW,
+                "created_at": "2026-08-31T23:00:00Z",
+                "expected_revision": len(target_events),
+                "from_event_id": next(
+                    event["event_id"] for event in reversed(target_events)
+                    if event["kind"] == "source"
+                ),
+                "from_value_sha256": (
+                    workstream_projection.canonical_digest(old_source)
+                ),
+                "pending_children": [{
+                    "child_identifier": "GEN-72",
+                    "child_issue_id": "child-72",
+                    "expected_child_readback_sha256": (
+                        workstream_projection.canonical_digest(readback)
+                    ),
+                    "expected_assignee_id": "agent",
+                }],
+            },
+        )
+        target_events.append({
+            **deepcopy(common[1]), "event_id": "wsp_" + "6" * 32,
+            "value": target_source,
+            "supersedes_event_id": common[1]["event_id"],
         })
 
         repair = run(target_events)

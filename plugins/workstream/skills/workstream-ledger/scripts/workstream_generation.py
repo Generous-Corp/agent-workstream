@@ -368,7 +368,9 @@ def prepare_generation_operator_contract(
     from workstream_projection import (
         _active_heads, _contract_from_heads, _reviewed_manifest,
         _value_digest, prepare_terminal_child_evidence_seeds,
-        prepare_terminal_child_repairs, projection_review_contract,
+        prepare_terminal_child_repairs,
+        prepare_terminal_child_source_transition, projection_review_contract,
+        LinearProjectionError,
         terminal_child_evidence_seed_predecessor_contract,
         bind_projection_plan_generation, projection_disposition_value,
     )
@@ -557,6 +559,86 @@ def prepare_generation_operator_contract(
     phase = "complete_projection"
     effective_remote_head = remote_head
     manifest: dict[str, Any]
+
+    def finish(
+        reviewed_manifest: dict[str, Any], reviewed_phase: str,
+        reviewed_terminal_stage: dict[str, Any] | None,
+        *, reviewed_remote_head: str = remote_head,
+    ) -> dict[str, Any]:
+        _reviewed_manifest(reviewed_manifest)
+        phase_source = next(
+            item["value"] for item in reviewed_manifest["projection"]
+            if (item["kind"], item["key"]) == ("source", "root")
+        )
+        classified = {
+            (item["kind"], item["key"])
+            for item in [*carried, *staged, *computed]
+        }
+        if classified != set(predecessor_heads):
+            omitted = sorted(set(predecessor_heads) - classified)
+            extra = sorted(classified - set(predecessor_heads))
+            raise WorkstreamGenerationError(
+                "generation_prepare_active_key_classification_incomplete:"
+                f"omitted={omitted}:extra={extra}"
+            )
+        contract = {
+            "schema_version": 1,
+            "workstream_id": workstream_id,
+            "created_at": created_at,
+            "authenticated_route": deepcopy(authority),
+            "source": deepcopy(target_source),
+            "native_transition": {
+                "operation": "reopen",
+                "target_state": deepcopy(started_state),
+            },
+            "remote_head": remote_head,
+            "generation": {
+                "from_plan_revision": predecessor_plan,
+                "target_plan_revision": target_plan,
+                "activation_epoch": epoch,
+                "previous_control_event_id": selected["transition_tip_event_id"],
+            },
+            "frontiers": {
+                "material_revision": material.revision,
+                "predecessor_projection": projection_review_contract(predecessor),
+                "target_projection": projection_review_contract(target),
+                "predecessor_checkpoint_event_ids": checkpoint_ids,
+            },
+            "retirement_proof": retirement,
+            "projection_preview": {
+                "apply": False,
+                "writes_performed": 0,
+                "invocation": {
+                    "remote_head": reviewed_remote_head,
+                    "created_at": reviewed_manifest.get(
+                        "terminal_child_evidence_seed_legacy_split_head_repair",
+                        {},
+                    ).get("created_at", created_at),
+                    "source": deepcopy(phase_source),
+                },
+                "manifest": reviewed_manifest,
+                "active_key_accounting": {
+                    "carried": carried, "staged": staged, "computed": computed,
+                },
+                "terminal_child_stage": reviewed_terminal_stage,
+                "phase": reviewed_phase,
+                "next_gate": {
+                    "terminal_source_transition": (
+                        "review_and_apply_terminal_source_transition"
+                    ),
+                    "terminal_evidence_seed": (
+                        "review_and_apply_terminal_evidence_seed"
+                    ),
+                    "terminal_closure_repair": (
+                        "review_and_apply_terminal_closure_repair"
+                    ),
+                    "complete_projection": "review_and_apply_target_projection",
+                    "activation_ready": "preview_generation_activation",
+                }[reviewed_phase],
+            },
+        }
+        return {**contract, "contract_sha256": _digest(contract)}
+
     if closure_heads:
         # Generation prepare and projection preview must bind terminal carry to
         # the same canonical candidate graph.  The transport snapshot still
@@ -608,6 +690,87 @@ def prepare_generation_operator_contract(
                     key for key, _event in terminal_evidence[child_id]
                 ),
             })
+        current_source = target_heads.get(("source", "root"))
+
+        def source_transition_projection() -> list[dict[str, Any]]:
+            if current_source is None:
+                raise WorkstreamGenerationError(
+                    "generation_prepare_target_source_missing"
+                )
+            projection = [
+                {
+                    "kind": kind, "key": key,
+                    "value": deepcopy(event["value"]),
+                }
+                for (kind, key), event in sorted(target_heads.items())
+                if kind != "disposition"
+            ]
+            source_item = next((
+                item for item in projection
+                if (item["kind"], item["key"]) == ("source", "root")
+            ), None)
+            if source_item is None:
+                raise WorkstreamGenerationError(
+                    "generation_prepare_target_source_missing"
+                )
+            source_item["value"] = deepcopy(target_source)
+            return projection
+
+        def stage_source_transition() -> dict[str, Any]:
+            source_projection = source_transition_projection()
+            source_manifest = {
+                **projection_review_contract(target),
+                "projection": source_projection,
+                "retirements": [],
+                "terminal_child_source_transition": {
+                    "from_identity": current_source["value"].get("identity"),
+                    "to_identity": target_source["identity"],
+                    "sha256": target_plan,
+                    "created_at": created_at,
+                    "expected_revision": target.revision,
+                    "from_event_id": current_source["event_id"],
+                    "from_value_sha256": canonical_digest(
+                        current_source["value"]
+                    ),
+                    "pending_children": [
+                        {
+                            key: deepcopy(value)
+                            for key, value in seed.items()
+                            if key != "evidence_keys"
+                        }
+                        for seed in seeds
+                    ],
+                },
+            }
+            try:
+                source_manifest = prepare_terminal_child_source_transition(
+                    source_manifest, graph, target,
+                )
+            except LinearProjectionError as error:
+                raise WorkstreamGenerationError(str(error)) from error
+            return finish(
+                source_manifest, "terminal_source_transition", {
+                    "state": "terminal_source_transition_required",
+                    "children": [
+                        seed["child_identifier"] for seed in seeds
+                    ],
+                },
+            )
+
+        source_transition_required = (
+            current_source is not None
+            and current_source["value"] != target_source
+        )
+        if source_transition_required:
+            # Validate the current candidate as an accepted generation prefix
+            # before authorizing any durable source-only phase.  Seed validation
+            # must therefore review the currently active same-digest locator;
+            # only the separately fenced source-transition manifest may propose
+            # the authenticated replacement locator.
+            next(
+                item for item in seed_items
+                if (item["kind"], item["key"]) == ("source", "root")
+            )["value"] = deepcopy(current_source["value"])
         desired_contracts = {
             item["key"]: item["value"] for item in seed_items
             if item["kind"] == "evidence_contract"
@@ -977,6 +1140,43 @@ def prepare_generation_operator_contract(
                     for identity, value in desired_values.items()
                 ) and target_disposition_matches(manifest["projection"]):
                     phase = "activation_ready"
+        if source_transition_required and not (
+            legacy_prefix and phase == "terminal_evidence_seed"
+        ):
+            # The phase-specific validators above have now admitted the exact
+            # candidate as a canonical eventual-generation prefix.  The one
+            # content-addressed GEN-14 lineage must finish its strict
+            # evidence/disposition/scope tail before source; every other
+            # admitted prefix may stage the source-only transition now.
+            if phase == "terminal_evidence_seed":
+                phase_allowed = set(seed_values) | {("disposition", "root")}
+            elif phase == "terminal_closure_repair":
+                phase_allowed = (
+                    set(seed_values)
+                    | {
+                        ("child_closure", seed["child_identifier"])
+                        for seed in seeds
+                    }
+                    | {("disposition", "root")}
+                )
+            else:
+                phase_allowed = set(desired_values) | {("disposition", "root")}
+                if any(
+                    identity not in {("source", "root"), ("disposition", "root")}
+                    and target_heads[identity]["value"] != desired_values[identity]
+                    for identity in set(target_heads) & set(desired_values)
+                ):
+                    raise WorkstreamGenerationError(
+                        "generation_prepare_noncanonical_target_prefix"
+                    )
+            if not set(target_heads).issubset(phase_allowed):
+                unexpected = sorted(set(target_heads) - phase_allowed)
+                raise WorkstreamGenerationError(
+                    "generation_prepare_noncanonical_target_prefix:"
+                    + ",".join(f"{kind}:{key}" for kind, key in unexpected)
+                )
+            if target_disposition_matches(source_transition_projection()):
+                return stage_source_transition()
     else:
         desired_values = {
             (item["kind"], item["key"]): item["value"]
@@ -1000,70 +1200,10 @@ def prepare_generation_operator_contract(
             for identity, value in desired_values.items()
         ) and target_disposition_matches(complete_items):
             phase = "activation_ready"
-    _reviewed_manifest(manifest)
-
-    classified = {
-        (item["kind"], item["key"])
-        for item in [*carried, *staged, *computed]
-    }
-    if classified != set(predecessor_heads):
-        omitted = sorted(set(predecessor_heads) - classified)
-        extra = sorted(classified - set(predecessor_heads))
-        raise WorkstreamGenerationError(
-            "generation_prepare_active_key_classification_incomplete:"
-            f"omitted={omitted}:extra={extra}"
-        )
-    contract = {
-        "schema_version": 1,
-        "workstream_id": workstream_id,
-        "created_at": created_at,
-        "authenticated_route": deepcopy(authority),
-        "source": deepcopy(target_source),
-        "native_transition": {
-            "operation": "reopen",
-            "target_state": deepcopy(started_state),
-        },
-        "remote_head": remote_head,
-        "generation": {
-            "from_plan_revision": predecessor_plan,
-            "target_plan_revision": target_plan,
-            "activation_epoch": epoch,
-            "previous_control_event_id": selected["transition_tip_event_id"],
-        },
-        "frontiers": {
-            "material_revision": material.revision,
-            "predecessor_projection": projection_review_contract(predecessor),
-            "target_projection": projection_review_contract(target),
-            "predecessor_checkpoint_event_ids": checkpoint_ids,
-        },
-        "retirement_proof": retirement,
-        "projection_preview": {
-            "apply": False,
-            "writes_performed": 0,
-            "invocation": {
-                "remote_head": effective_remote_head,
-                "created_at": (
-                    manifest.get(
-                        "terminal_child_evidence_seed_legacy_split_head_repair",
-                        {},
-                    ).get("created_at", created_at)
-                ),
-            },
-            "manifest": manifest,
-            "active_key_accounting": {
-                "carried": carried, "staged": staged, "computed": computed,
-            },
-            "terminal_child_stage": terminal_stage,
-            "phase": phase,
-            "next_gate": {
-                "terminal_evidence_seed": "review_and_apply_terminal_evidence_seed",
-                "terminal_closure_repair": "review_and_apply_terminal_closure_repair",
-                "complete_projection": "review_and_apply_target_projection",
-                "activation_ready": "preview_generation_activation",
-            }[phase],
-        },
-    }
-    return {**contract, "contract_sha256": _digest(contract)}
+    return finish(
+        manifest, phase, terminal_stage,
+        reviewed_remote_head=effective_remote_head,
+    )
 
 
 def validate_activation_operator_contract(

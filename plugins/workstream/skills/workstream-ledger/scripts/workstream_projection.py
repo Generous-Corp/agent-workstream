@@ -1024,14 +1024,24 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
     transition = manifest.get("terminal_child_source_transition")
     if transition is not None:
         if not isinstance(transition, dict) or set(transition) != {
-            "from_identity", "to_identity", "sha256", "pending_children",
+            "from_identity", "to_identity", "sha256", "created_at",
+            "expected_revision", "from_event_id", "from_value_sha256",
+            "pending_children",
         }:
             raise LinearProjectionError("invalid_terminal_child_source_transition")
         pending = transition.get("pending_children")
         if (
             not all(isinstance(transition.get(field), str) and transition[field]
-                    for field in ("from_identity", "to_identity"))
+                    for field in (
+                        "from_identity", "to_identity", "created_at",
+                        "from_event_id",
+                    ))
             or not re.fullmatch(r"[0-9a-f]{64}", str(transition.get("sha256", "")))
+            or not re.fullmatch(
+                r"[0-9a-f]{64}", str(transition.get("from_value_sha256", "")),
+            )
+            or not isinstance(transition.get("expected_revision"), int)
+            or transition["expected_revision"] < 0
             or not isinstance(pending, list) or not pending
         ):
             raise LinearProjectionError("invalid_terminal_child_source_transition")
@@ -1079,7 +1089,7 @@ def _completed_owned_missing_closures(
     }
 
 
-def _valid_main_to_exact_source_transition(first: str, second: str) -> bool:
+def _valid_reviewed_source_transition(first: str, second: str) -> bool:
     pattern = re.compile(
         r"https://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.+)"
     )
@@ -1088,8 +1098,12 @@ def _valid_main_to_exact_source_transition(first: str, second: str) -> bool:
     return bool(
         left and right
         and same_plan_document(first, second)
-        and left.group(3) == "main"
+        and (
+            left.group(3) == "main"
+            or re.fullmatch(r"[0-9a-f]{40}", left.group(3))
+        )
         and re.fullmatch(r"[0-9a-f]{40}", right.group(3))
+        and left.group(3) != right.group(3)
         and (left.group(1).lower(), left.group(2).lower(), left.group(4))
         == (right.group(1).lower(), right.group(2).lower(), right.group(4))
     )
@@ -1098,7 +1112,7 @@ def _valid_main_to_exact_source_transition(first: str, second: str) -> bool:
 def prepare_terminal_child_source_transition(
     manifest: dict[str, Any], snapshot: dict[str, Any], state: Any,
 ) -> dict[str, Any]:
-    """Validate or replay one exact main-to-commit source-only transition."""
+    """Validate or replay one exact same-document source-only transition."""
     result = deepcopy(manifest)
     _reviewed_manifest(result)
     transition = result.get("terminal_child_source_transition")
@@ -1118,11 +1132,67 @@ def prepare_terminal_child_source_transition(
     if (
         old_source not in ({"identity": transition["from_identity"],
                             "sha256": transition["sha256"]}, expected_source)
-        or not _valid_main_to_exact_source_transition(
+        or not _valid_reviewed_source_transition(
             transition["from_identity"], transition["to_identity"],
         )
     ):
         raise LinearProjectionError("terminal_child_source_transition_invalid_route")
+    original_contract = {field: deepcopy(result[field])
+                         for field in REVIEW_CONTRACT_FIELDS}
+    predecessor = next((
+        event for event in state.events
+        if event["event_id"] == transition["from_event_id"]
+    ), None)
+    if (
+        predecessor is None
+        or (predecessor["kind"], predecessor["key"]) != ("source", "root")
+        or predecessor["value"] != {
+            "identity": transition["from_identity"],
+            "sha256": transition["sha256"],
+        }
+        or _value_digest(predecessor["value"])
+        != transition["from_value_sha256"]
+    ):
+        raise LinearProjectionError(
+            "terminal_child_source_transition_predecessor_mismatch"
+        )
+    if predecessor.get("schema_version") != 2 or not isinstance(
+        predecessor.get("authority"), dict,
+    ):
+        raise LinearProjectionError(
+            "terminal_child_source_transition_requires_v2_source_predecessor"
+        )
+    expected_event = build_projection_event(
+        workstream_id=predecessor["workstream_id"], kind="source", key="root",
+        value=expected_source, plan_revision=transition["sha256"],
+        expected_revision=transition["expected_revision"],
+        created_at=transition["created_at"],
+        supersedes_event_id=predecessor["event_id"],
+        authority=predecessor["authority"],
+    )
+    reviewed_source = next((
+        head for head in original_contract["expected_active_heads"]
+        if (head["kind"], head["key"]) == ("source", "root")
+    ), None)
+    if old_source == expected_source:
+        if source_head != expected_event:
+            raise LinearProjectionError(
+                "terminal_child_source_transition_replay_event_mismatch"
+            )
+    elif reviewed_source != {
+        "kind": "source", "key": "root",
+        "event_id": transition["from_event_id"],
+        "value_sha256": transition["from_value_sha256"],
+    }:
+        raise LinearProjectionError(
+            "terminal_child_source_transition_predecessor_mismatch"
+        )
+    elif original_contract["expected_projection_revision"] != transition[
+        "expected_revision"
+    ]:
+        raise LinearProjectionError(
+            "terminal_child_source_transition_predecessor_mismatch"
+        )
     desired = result["projection"]
     source_item = next((item for item in desired if item["kind"] == "source"), None)
     if source_item is None or source_item["value"] != expected_source:
@@ -1176,16 +1246,13 @@ def prepare_terminal_child_source_transition(
                 f"terminal_child_source_transition_unrelated_change:"
                 f"{identity[0]}:{identity[1]}"
             )
-    original_contract = {field: deepcopy(result[field])
-                         for field in REVIEW_CONTRACT_FIELDS}
     current_contract = projection_review_contract(state)
     if current_contract != original_contract:
         expected_revision = original_contract["expected_projection_revision"]
         progress = state.events[expected_revision:]
         if not (
             len(progress) == 1
-            and (progress[0]["kind"], progress[0]["key"]) == ("source", "root")
-            and progress[0]["value"] == expected_source
+            and progress[0] == expected_event
             and all(
                 field in {"expected_projection_revision", "expected_active_heads"}
                 or current_contract[field] == original_contract[field]
@@ -3546,6 +3613,10 @@ def reconcile_required_projection(
             raise LinearProjectionError(
                 "terminal_child_source_transition_review_stale_reload_required"
             )
+        if created_at != source_transition["created_at"]:
+            raise LinearProjectionError(
+                "terminal_child_source_transition_execution_contract_mismatch"
+            )
         for item in desired:
             identity = (item["kind"], item["key"])
             current = active_heads.get(identity)
@@ -4338,6 +4409,16 @@ def main() -> int:
         # ordered closure/scope prefix and rejects every unrelated drift.
         if manifest.get("terminal_child_repairs"):
             manifest = prepare_terminal_child_repairs(
+                manifest, graph, projection_state,
+            )
+        # A source-only batch may likewise have committed its sole exact event
+        # before the caller received the response.  Advance that retained
+        # manifest through the full-envelope replay validator before inactive
+        # candidate source synchronization compares the reviewed contract with
+        # the now N+1 target frontier.  The post-sync call below remains the
+        # final authenticated-source validation.
+        if manifest.get("terminal_child_source_transition"):
+            manifest = prepare_terminal_child_source_transition(
                 manifest, graph, projection_state,
             )
         manifest, authenticated_source = synchronize_manifest_source(

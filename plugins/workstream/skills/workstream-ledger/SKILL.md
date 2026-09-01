@@ -280,17 +280,24 @@ predecessor. For terminal
 children it uses predecessor-authorized evidence seeding and explicitly stages
 closure repair and later keys; it never copies a closure as authority. After
 each manifest is applied, rerun the same `prepare` command. It recognizes only
-the authenticated canonical prefix it emitted and advances through evidence
-seed, closure repair, remaining projection, and `activation_ready`. Any other
-nonempty inactive candidate refuses rather than being merged or guessed.
+the authenticated canonical prefix it emitted and advances through staged
+same-digest source-locator transition, evidence seed, closure repair, remaining
+projection, and `activation_ready`. The captured GEN-14 split prefix completes
+its strict evidence/disposition/scope normalization before the source-only
+stage. Any other nonempty inactive candidate refuses rather than being merged
+or guessed.
 
 Projection has an explicit safe preview/apply path. Reuse the preview's exact
 timestamp and digest:
 
 Use `projection_preview.invocation.remote_head` and
 `projection_preview.invocation.created_at` from the latest generation prepare
-result. These normally equal the requested prepare inputs. During the one
-content-addressed GEN-14 split-prefix repair they instead finish a durable
+result. The command's `--plan-identity` and authenticated `--plan-source` bytes
+must resolve to the exact identity and digest in
+`projection_preview.invocation.source`; the phase may intentionally retain the
+active locator while the top-level generation contract names the later target
+locator. The head and timestamp normally equal the requested prepare inputs.
+During the one content-addressed GEN-14 split-prefix repair they instead finish a durable
 disposition-only crash prefix at its recorded head and timestamp before any
 later ordinary head transition.
 
@@ -773,9 +780,15 @@ Changing a URL or revision is a synchronized source transition, never an
 implicit identity alias.
 When legacy completed ownership already blocks full authority, a reviewed
 `terminal_child_source_transition` may perform only the same-document
-`blob/main` to immutable 40-character commit transition at the same digest.
+`blob/main` or immutable 40-character commit to a different immutable
+40-character commit at the same digest.
 It freezes every non-source head and disposition, fences the exact pending
-children, and returns partial authority until evidence seeding and closure.
+children, and binds the reviewed predecessor event, write revision, and
+timestamp so response-loss replay accepts only the exact full source-event
+envelope. Generation prepare exposes this phase only after the inactive target
+passes the canonical phase-specific prefix validators; the content-addressed
+GEN-14 split lineage completes its strict normalization tail first. It returns
+partial authority until evidence seeding and closure.
 
 ### Terminal-child projection repair
 
