@@ -216,7 +216,8 @@ Full-authority output requires the append-only scope, source, provenance, and
 attach/successor disposition projection. Before replacing a plan, use
 `workstreamctl generation prepare GEN-123 --plan-source ./PLAN.md
 --plan-identity <URL> --remote-head <head> --created-at <UTC>
---retired-at <UTC>` to derive a
+--started-state-id <started-state-uuid>
+--manifest-output ./target-projection.json > generation-review.json` to derive a
 zero-write, all-keys-accounted target manifest and retirement proof. Terminal
 evidence and closure are explicit staged phases; rerunning the same command
 after each apply derives the next manifest until `activation_ready`. Only the
@@ -224,7 +225,7 @@ exact authenticated prefix of the prior phase is accepted. Preview a reviewed pr
 with `workstreamctl projection GEN-123 manifest.json --remote-head <head>
 --plan-source ./PLAN.md --created-at <UTC> --preview`, then apply the unchanged
 batch with `--apply --expected-preview-sha256 <preview-sha256>` and the same
-timestamp. The older flagless form remains compatibility apply behavior;
+timestamp. A flagless invocation refuses before live access;
 the manifest fences the exact current projection revision and active
 key/event/value-digest set. Retirement is explicit and names the reviewed head;
 omission never deletes live state. A stale review refuses before writing. A

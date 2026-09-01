@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import io
+import sys
 import unittest
+from unittest import mock
 
 from workstream_root_transition import (
-    RootTransitionError, RootTransitionTransport,
+    RootTransitionError, RootTransitionTransport, main as root_main,
 )
 from workstream_linear import LinearTransportError
 
@@ -73,6 +76,12 @@ class FakeClient:
             return {"team": {"issues": {"nodes": [self.root()], "pageInfo": {
                 "hasNextPage": False, "endCursor": None,
             }}}}
+        if "WorkstreamResumeRoot" in query:
+            return {"issue": {**self.root(), "children": {
+                "nodes": [], "pageInfo": {
+                    "hasNextPage": False, "endCursor": None,
+                },
+            }}}
         if "WorkstreamDeltaComments" in query:
             return {"issue": {
                 "id": ROOT_ID, "identifier": TOKEN,
@@ -120,6 +129,20 @@ class FakeClient:
 
 
 class RootTransitionTests(unittest.TestCase):
+
+    def test_apply_missing_fences_refuses_before_auth_or_network(self):
+        argv = [
+            "workstream_root_transition.py", "plan-url", TOKEN,
+            "--to", MAIN, "--operator-contract", "review.json",
+            "--plan-source", "PLAN.md", "--apply",
+        ]
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch(
+            "workstream_root_transition.resolve_linear_route",
+            side_effect=AssertionError("invalid local CLI reached auth/network"),
+        ), mock.patch.object(sys, "stderr", stderr):
+            self.assertEqual(root_main(), 2)
+        self.assertIn("root_transition_expected_fence_invalid", stderr.getvalue())
     def transport(self, fake):
         return RootTransitionTransport(
             fake, token=TOKEN, authority=AUTHORITY,
@@ -206,6 +229,78 @@ class RootTransitionTests(unittest.TestCase):
                     expected_intent_sha256=preview["intent_sha256"],
                 )
             self.assertFalse(any("WorkstreamRootTransition(" in query for query, _ in fake.calls))
+
+    def test_live_operator_recomputation_refuses_after_validation_drift_zero_write(self):
+        fake = FakeClient()
+        observed_frontiers = []
+
+        def validate(_snapshot, comments):
+            observed_frontiers.append([item["id"] for item in comments])
+            if any(item.get("id") == "post-validation-drift" for item in comments):
+                raise RootTransitionError("operator_contract_live_state_drift")
+            return OPERATOR_AUTHORIZATION
+
+        transport = RootTransitionTransport(
+            fake, token=TOKEN, authority=AUTHORITY,
+            operator_validator=validate,
+        )
+        preview = transport.preview(operation="plan-url", target=MAIN)
+        self.assertEqual(observed_frontiers, [["ordinary"]])
+        fake.comments.append({
+            "id": "post-validation-drift", "body": "new projection material",
+            "createdAt": "t1", "updatedAt": "t1",
+        })
+        calls_before = len(fake.calls)
+        with self.assertRaisesRegex(
+            RootTransitionError, "operator_contract_live_state_drift"
+        ):
+            transport.apply(
+                operation="plan-url", target=MAIN,
+                expected_snapshot_sha256=preview["expected_snapshot_sha256"],
+                expected_frontier_sha256=preview["expected_frontier_sha256"],
+                expected_intent_sha256=preview["intent_sha256"],
+            )
+        new_calls = fake.calls[calls_before:]
+        self.assertFalse(any(
+            "WorkstreamDeltaCommentCreate" in query
+            or "WorkstreamRootTransition(" in query
+            for query, _ in new_calls
+        ))
+
+        prewrite = FakeClient()
+
+        def validate_prewrite(_snapshot, comments):
+            if any(item.get("id") == "prewrite-drift" for item in comments):
+                raise RootTransitionError("operator_contract_prewrite_drift")
+            return OPERATOR_AUTHORIZATION
+
+        def drift_after_reservation():
+            prewrite.comments.append({
+                "id": "prewrite-drift", "body": "new projection material",
+                "createdAt": "t2", "updatedAt": "t2",
+            })
+
+        transport = RootTransitionTransport(
+            prewrite, token=TOKEN, authority=AUTHORITY,
+            operator_validator=validate_prewrite,
+            after_reservation_created=drift_after_reservation,
+        )
+        preview = transport.preview(operation="plan-url", target=MAIN)
+        with self.assertRaisesRegex(
+            RootTransitionError, "operator_contract_prewrite_drift"
+        ):
+            transport.apply(
+                operation="plan-url", target=MAIN,
+                expected_snapshot_sha256=preview["expected_snapshot_sha256"],
+                expected_frontier_sha256=preview["expected_frontier_sha256"],
+                expected_intent_sha256=preview["intent_sha256"],
+            )
+        self.assertTrue(any(
+            "WorkstreamDeltaCommentCreate" in query for query, _ in prewrite.calls
+        ))
+        self.assertFalse(any(
+            "WorkstreamRootTransition(" in query for query, _ in prewrite.calls
+        ))
 
     def test_reopen_requires_terminal_root_and_reviewed_started_state(self):
         fake = FakeClient()

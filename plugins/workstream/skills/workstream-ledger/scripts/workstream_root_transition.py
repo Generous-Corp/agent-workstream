@@ -283,7 +283,10 @@ def authenticated_started_state(
 class RootTransitionTransport:
     def __init__(
         self, client: Any, *, token: str, authority: dict[str, str],
-        operator_authorization: dict[str, Any],
+        operator_authorization: dict[str, Any] | None = None,
+        operator_validator: Callable[
+            [dict[str, Any], list[dict[str, Any]]], dict[str, Any]
+        ] | None = None,
         after_reservation_created: Callable[[], None] | None = None,
     ):
         self.client = client
@@ -293,16 +296,14 @@ class RootTransitionTransport:
             "schema_version", "contract_sha256", "source", "generation",
             "native_transition", "retirement_sha256", "frontiers_sha256",
         }
-        if (
-            not isinstance(operator_authorization, dict)
-            or set(operator_authorization) != required_operator
-            or operator_authorization.get("schema_version") != 1
-            or not all(HEX64.fullmatch(str(operator_authorization.get(field, "")))
-                       for field in ("contract_sha256", "retirement_sha256",
-                                     "frontiers_sha256"))
-        ):
+        if (operator_authorization is None) == (operator_validator is None):
             raise RootTransitionError("root_transition_operator_authorization_required")
-        self.operator_authorization = deepcopy(operator_authorization)
+        self._required_operator = required_operator
+        self.operator_authorization = (
+            self._validated_authorization(operator_authorization)
+            if operator_authorization is not None else None
+        )
+        self.operator_validator = operator_validator
         self.after_reservation_created = after_reservation_created
         self.graph = LinearGraphQLTransport(
             client, team_id=authority["team_id"],
@@ -314,15 +315,45 @@ class RootTransitionTransport:
         )
 
     def _read(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        first = self.graph.snapshot_for_root(self.token, include_description=True)
+        first = self.graph.snapshot_for_root(
+            self.token, include_description=True, include_child_comments=True,
+        )
         comments = self.comments.comments()
-        second = self.graph.snapshot_for_root(self.token, include_description=True)
+        second = self.graph.snapshot_for_root(
+            self.token, include_description=True, include_child_comments=True,
+        )
         final_comments = self.comments.comments()
-        final = self.graph.snapshot_for_root(self.token, include_description=True)
+        final = self.graph.snapshot_for_root(
+            self.token, include_description=True, include_child_comments=True,
+        )
         if first != second or second != final or comments != final_comments:
             raise RootTransitionError("root_transition_snapshot_changed_during_read")
         _validate_authority(final, self.token, self.authority)
         return final, final_comments
+
+    def _validated_authorization(
+        self, authorization: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(authorization, dict)
+            or set(authorization) != self._required_operator
+            or authorization.get("schema_version") != 1
+            or not all(HEX64.fullmatch(str(authorization.get(field, "")))
+                       for field in ("contract_sha256", "retirement_sha256",
+                                     "frontiers_sha256"))
+        ):
+            raise RootTransitionError("root_transition_operator_authorization_required")
+        return deepcopy(authorization)
+
+    def _authorize(
+        self, snapshot: dict[str, Any], comments: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        authorization = (
+            self.operator_validator(snapshot, comments)
+            if self.operator_validator is not None
+            else self.operator_authorization
+        )
+        return self._validated_authorization(authorization)
 
     def _started_state(self, state_id: str) -> dict[str, Any]:
         return authenticated_started_state(
@@ -371,9 +402,10 @@ class RootTransitionTransport:
 
     def preview(self, *, operation: str, target: str) -> dict[str, Any]:
         snapshot, comments = self._read()
+        operator_authorization = self._authorize(snapshot, comments)
         root = snapshot["root"]
         if operation == "plan-url":
-            if target != (self.operator_authorization.get("source") or {}).get("identity"):
+            if target != (operator_authorization.get("source") or {}).get("identity"):
                 raise RootTransitionError(
                     "root_transition_plan_url_not_authorized_by_candidate"
                 )
@@ -385,7 +417,7 @@ class RootTransitionTransport:
             after = {"canonical_plan_url": target}
         elif operation == "reopen":
             authorized_state = (
-                (self.operator_authorization.get("native_transition") or {})
+                (operator_authorization.get("native_transition") or {})
                 .get("target_state") or {}
             )
             if target != authorized_state.get("id"):
@@ -414,7 +446,7 @@ class RootTransitionTransport:
             "expected_frontier_sha256": frontier,
             "before": before, "after": after, "update": update,
             "preserved_root": _preserved_root(snapshot, operation),
-            "operator_authorization": deepcopy(self.operator_authorization),
+            "operator_authorization": deepcopy(operator_authorization),
         }
         return {
             "apply": False, "conditional_update_available": False,
@@ -442,6 +474,7 @@ class RootTransitionTransport:
         ):
             raise RootTransitionError("root_transition_expected_fence_invalid")
         snapshot, comments = self._read()
+        current_authorization = self._authorize(snapshot, comments)
         reviewed_state = self._started_state(target) if operation == "reopen" else None
         slot = _slot_id(self.authority, expected_snapshot_sha256, expected_frontier_sha256)
         reserved = [item for item in comments if item.get("id") == slot]
@@ -479,11 +512,18 @@ class RootTransitionTransport:
             if self.after_reservation_created is not None:
                 self.after_reservation_created()
             immediate, immediate_comments = self._read()
+            immediate_authorization = self._authorize(
+                immediate, immediate_comments,
+            )
             self._assert_reservation(
                 immediate_comments, slot=slot, body=reservation_body,
             )
             if (
-                snapshot_sha256(immediate) != expected_snapshot_sha256
+                immediate_authorization
+                != reservation.get("operator_authorization")
+                or current_authorization
+                != reservation.get("operator_authorization")
+                or snapshot_sha256(immediate) != expected_snapshot_sha256
                 or comment_frontier_sha256(immediate_comments, exclude_id=slot)
                 != expected_frontier_sha256
             ):
@@ -506,6 +546,8 @@ class RootTransitionTransport:
                 or reservation.get("expected_frontier_sha256") != expected_frontier_sha256
                 or reservation.get("authority") != self.authority
                 or reservation.get("intent_sha256") != expected_intent_sha256
+                or reservation.get("operator_authorization")
+                != current_authorization
                 or not _reservation_matches_request(
                     reservation, operation=operation, target=target,
                 )
@@ -531,8 +573,11 @@ class RootTransitionTransport:
             ):
                 raise RootTransitionError("root_transition_replay_intent_mismatch")
         final, final_comments = self._read()
+        final_authorization = self._authorize(final, final_comments)
         reservation_body = _encode(reservation)
         self._assert_reservation(final_comments, slot=slot, body=reservation_body)
+        if final_authorization != reservation.get("operator_authorization"):
+            raise RootTransitionError("root_transition_postwrite_operator_drift")
         final_root = final["root"]
         if _preserved_root(final, operation) != reservation.get("preserved_root"):
             raise RootTransitionError("root_transition_postwrite_unrelated_root_drift")
@@ -599,6 +644,17 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
+        fences = (
+            args.expected_snapshot_sha256,
+            args.expected_frontier_sha256,
+            args.expected_intent_sha256,
+        )
+        if args.apply and not all(
+            isinstance(item, str) and HEX64.fullmatch(item) for item in fences
+        ):
+            raise RootTransitionError("root_transition_expected_fence_invalid")
+        if not args.apply and any(fences):
+            raise RootTransitionError("root_transition_preview_rejects_apply_fences")
         route, _ = resolve_linear_route(
             config_path=args.config, workspace_id=args.linear_workspace_id,
             team_id=args.linear_team_id, project_id=args.linear_project_id,
@@ -617,37 +673,29 @@ def main() -> int:
         )["source"]
         with Path(args.operator_contract).open(encoding="utf-8") as handle:
             contract = json.load(handle)
-        linear = LinearGraphQLTransport(
-            client, team_id=authority["team_id"],
-            workspace_id=authority["workspace_id"],
-            project_id=authority["project_id"],
-        )
-        root_snapshot = linear.snapshot_for_root(
-            args.token.upper(), include_description=True,
-            include_child_comments=True,
-        )
-        _validate_authority(root_snapshot, args.token.upper(), authority)
-        comments = LinearCommentEventAdapter(
-            client, issue_id=args.token.upper(), **authority,
-        ).comments()
         target_state_id = (
             ((contract.get("native_transition") or {}).get("target_state") or {})
             .get("id")
         ) if isinstance(contract, dict) else None
         if not isinstance(target_state_id, str):
             raise RootTransitionError("root_transition_operator_native_state_invalid")
-        started_state = authenticated_started_state(
-            client, authority=authority, state_id=target_state_id,
-        )
-        operator_authorization = validate_operator_contract(
-            contract, source=source, token=args.token.upper(),
-            authority=authority, comments=comments,
-            graph=root_snapshot, started_state=started_state,
-            description_plan_revision=root_snapshot["root"].get("plan_revision"),
-        )
+
+        def operator_validator(
+            snapshot: dict[str, Any], comments: list[dict[str, Any]],
+        ) -> dict[str, Any]:
+            started_state = authenticated_started_state(
+                client, authority=authority, state_id=target_state_id,
+            )
+            return validate_operator_contract(
+                contract, source=source, token=args.token.upper(),
+                authority=authority, comments=comments,
+                graph=snapshot, started_state=started_state,
+                description_plan_revision=snapshot["root"].get("plan_revision"),
+            )
+
         transport = RootTransitionTransport(
             client, token=args.token.upper(), authority=authority,
-            operator_authorization=operator_authorization,
+            operator_validator=operator_validator,
         )
         operation = args.command
         target = args.to if operation == "plan-url" else args.state_id

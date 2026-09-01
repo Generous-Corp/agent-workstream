@@ -16,8 +16,11 @@ from copy import deepcopy
 import hashlib
 import hmac
 import json
+import os
 import re
 import sys
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 import uuid
 from typing import Any, Callable
@@ -1484,6 +1487,7 @@ def assert_generation_write_authority(
 CandidateLoader = Callable[[str], dict[str, Any]]
 NativeRootLoader = Callable[[], dict[str, Any]]
 SourceLoader = Callable[[], dict[str, str]]
+OperatorValidator = Callable[[], dict[str, Any]]
 
 
 def native_root_activation_proof(
@@ -1541,6 +1545,7 @@ class GenerationTransport:
         legacy_description_plan_revision: str | None = None,
         native_root_loader: NativeRootLoader | None = None,
         source_loader: SourceLoader | None = None,
+        operator_validator: OperatorValidator | None = None,
     ):
         self.client = client
         self.issue_id = issue_id
@@ -1550,7 +1555,20 @@ class GenerationTransport:
         self.legacy_description_plan_revision = legacy_description_plan_revision
         self.native_root_loader = native_root_loader
         self.source_loader = source_loader
+        self.operator_validator = operator_validator
         self._capability_checked = False
+
+    def _validate_operator(self, retirement: dict[str, Any]) -> None:
+        if self.operator_validator is None:
+            return
+        authorization = self.operator_validator()
+        if (
+            not isinstance(authorization, dict)
+            or authorization.get("retirement_proof") != retirement
+        ):
+            raise WorkstreamGenerationError(
+                "generation_operator_contract_live_state_drift"
+            )
 
     def _native_root_proof(
         self, expected_sha256: str | None, *, require_reviewed: bool,
@@ -2302,6 +2320,7 @@ class GenerationTransport:
             )
             if replay:
                 return replay
+        self._validate_operator(retirement)
         selected = select_plan_generation(
             comments, workstream_id=self.workstream_id,
             description_plan_revision=self.legacy_description_plan_revision,
@@ -2529,6 +2548,7 @@ class GenerationTransport:
                     "two_phase_finalization": finalization,
                     "final_candidate": prepared_post["receipt"],
                 }
+        self._validate_operator(retirement)
         selected = select_plan_generation(
             comments, workstream_id=self.workstream_id,
             description_plan_revision=self.legacy_description_plan_revision,
@@ -2638,6 +2658,7 @@ class GenerationTransport:
             )
         comments = self._comments()
         self._assert_reservation_live(comments, reservation)
+        self._validate_operator(retirement)
         from_state, to_state = self._states(comments, from_plan, target_plan_revision)
         selected_before_seal = select_plan_generation(
             comments, workstream_id=self.workstream_id,
@@ -3197,6 +3218,13 @@ def parser() -> argparse.ArgumentParser:
                 "--started-state-id", required=True,
                 help="reviewed Linear started-state UUID for native root reopen",
             )
+            command.add_argument(
+                "--manifest-output",
+                help=(
+                    "atomically write the exact nested projection manifest for "
+                    "the next projection preview/apply"
+                ),
+            )
         if name == "activate":
             command.add_argument(
                 "--operator-contract",
@@ -3228,6 +3256,25 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
+        if args.command == "activate" and args.retirement_proof:
+            raise WorkstreamGenerationError(
+                "generation_legacy_retirement_proof_cannot_authorize_operator"
+            )
+        aborting = args.command == "activate" and args.abort_reservation_id
+        if not aborting and (
+            not args.plan_source
+            or (args.command == "activate" and not args.operator_contract)
+        ):
+            raise WorkstreamGenerationError(
+                "generation_candidate_cli_arguments_incomplete"
+            )
+        if (
+            args.command == "activate" and args.apply and not aborting
+            and not HEX64.fullmatch(str(args.expected_native_root_sha256 or ""))
+        ):
+            raise WorkstreamGenerationError(
+                "generation_activate_apply_requires_reviewed_native_root_proof"
+            )
         client, authority = _route_and_client(args)
         if args.command == "activate" and args.abort_reservation_id:
             if (
@@ -3248,14 +3295,6 @@ def main() -> int:
             json.dump(output, sys.stdout, ensure_ascii=False, sort_keys=True, indent=2)
             sys.stdout.write("\n")
             return 0
-        if args.command == "activate" and args.retirement_proof:
-            raise WorkstreamGenerationError(
-                "generation_legacy_retirement_proof_cannot_authorize_operator"
-            )
-        if not args.plan_source or (
-            args.command == "activate" and not args.operator_contract
-        ):
-            raise WorkstreamGenerationError("generation_candidate_cli_arguments_incomplete")
         source = plan_payload(args.plan_source, args.plan_identity or args.plan_source)["source"]
         if args.command == "prepare":
             state_result = client.execute(PREPARE_STARTED_STATE_QUERY, {
@@ -3304,6 +3343,28 @@ def main() -> int:
                 remote_head=args.remote_head,
                 started_state=started_state,
             )
+            if args.manifest_output:
+                destination = Path(args.manifest_output)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                encoded = json.dumps(
+                    output["projection_preview"]["manifest"],
+                    ensure_ascii=False, sort_keys=True, indent=2,
+                ) + "\n"
+                descriptor, temporary = tempfile.mkstemp(
+                    prefix=f".{destination.name}.", dir=destination.parent,
+                )
+                try:
+                    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                        handle.write(encoded)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary, destination)
+                except BaseException:
+                    try:
+                        os.unlink(temporary)
+                    except FileNotFoundError:
+                        pass
+                    raise
             json.dump(output, sys.stdout, ensure_ascii=False, sort_keys=True, indent=2)
             sys.stdout.write("\n")
             return 0
@@ -3338,6 +3399,48 @@ def main() -> int:
             include_child_comments=(args.command == "activate"),
         )
         description_plan_revision = initial_root_snapshot["root"].get("plan_revision")
+        operator_contract = None
+        activation_operator_validator = None
+        if args.command == "activate":
+            with open(args.operator_contract, encoding="utf-8") as handle:
+                operator_contract = json.load(handle)
+
+            def activation_operator_validator() -> dict[str, Any]:
+                graph_before = linear_transport.snapshot_for_root(
+                    args.token.upper(), include_description=True,
+                    include_child_comments=True,
+                )
+                adapter = LinearProjectionAdapter(
+                    client, issue_id=args.token.upper(),
+                    workstream_id=args.token.upper(),
+                    plan_revision=source["sha256"], **authority,
+                )
+                comments_before = adapter._comments()
+                graph_after = linear_transport.snapshot_for_root(
+                    args.token.upper(), include_description=True,
+                    include_child_comments=True,
+                )
+                comments_after = adapter._comments()
+                graph_fence = linear_transport.snapshot_for_root(
+                    args.token.upper(), include_description=True,
+                    include_child_comments=True,
+                )
+                if (
+                    graph_before != graph_after or graph_after != graph_fence
+                    or comments_before != comments_after
+                ):
+                    raise WorkstreamGenerationError(
+                        "generation_operator_snapshot_changed_during_read"
+                    )
+                return validate_activation_operator_contract(
+                    operator_contract, source={
+                        "identity": source["identity"], "sha256": source["sha256"],
+                    }, workstream_id=args.token.upper(), authority=authority,
+                    comments=comments_after, graph=graph_fence,
+                    description_plan_revision=graph_fence["root"].get("plan_revision"),
+                    created_at=args.created_at, remote_head=args.remote_head,
+                )
+
         transport = GenerationTransport(
             client, issue_id=args.token.upper(), workstream_id=args.token.upper(),
             authority=authority, candidate_loader=loader,
@@ -3352,25 +3455,14 @@ def main() -> int:
                 )["source"])
                 if args.command == "activate" else None
             ),
+            operator_validator=activation_operator_validator,
         )
         retirement = None
         if args.command == "activate":
-            with open(args.operator_contract, encoding="utf-8") as handle:
-                operator_contract = json.load(handle)
-            comments = LinearProjectionAdapter(
-                client, issue_id=args.token.upper(),
-                workstream_id=args.token.upper(),
-                plan_revision=source["sha256"], **authority,
-            )._comments()
-            operator = validate_activation_operator_contract(
-                operator_contract, source={
-                    "identity": source["identity"], "sha256": source["sha256"],
-                }, workstream_id=args.token.upper(), authority=authority,
-                comments=comments, graph=initial_root_snapshot,
-                description_plan_revision=description_plan_revision,
-                created_at=args.created_at, remote_head=args.remote_head,
+            retirement = (
+                operator_contract.get("retirement_proof")
+                if isinstance(operator_contract, dict) else None
             )
-            retirement = operator["retirement_proof"]
         if not args.apply and args.command == "activate":
             output = transport.preview_activate(
                 target_plan_revision=source["sha256"],

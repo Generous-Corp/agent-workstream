@@ -546,14 +546,47 @@ class GenerationTransitionTests(unittest.TestCase):
             )
 
     def test_prepare_cli_is_zero_write_and_has_no_apply_flag(self):
-        args = parser().parse_args([
-            "prepare", WORKSTREAM, "--plan-source", "PLAN.md",
-            "--created-at", "2026-08-31T23:00:00Z",
-            "--remote-head", "e" * 40,
-            "--started-state-id", STARTED_STATE["id"],
-        ])
-        self.assertEqual(args.command, "prepare")
-        self.assertFalse(hasattr(args, "apply"))
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = f"{directory}/target-projection.json"
+            arguments = [
+                "prepare", WORKSTREAM, "--plan-source", "PLAN.md",
+                "--created-at", "2026-08-31T23:00:00Z",
+                "--remote-head", "e" * 40,
+                "--started-state-id", STARTED_STATE["id"],
+                "--manifest-output", manifest_path,
+            ]
+            args = parser().parse_args(arguments)
+            self.assertEqual(args.command, "prepare")
+            self.assertEqual(args.manifest_output, manifest_path)
+            self.assertFalse(hasattr(args, "apply"))
+
+            original_execute = self.client.execute
+
+            def execute(query, variables):
+                if "query WorkstreamGenerationPrepareState" in query:
+                    return {
+                        "team": {"id": "team", "organization": {"id": "workspace"}},
+                        "workflowState": {
+                            "id": STARTED_STATE["id"], "name": STARTED_STATE["name"],
+                            "type": STARTED_STATE["type"], "team": {"id": "team"},
+                        },
+                    }
+                return original_execute(query, variables)
+
+            self.client.execute = execute
+            stdout = io.StringIO()
+            writes = len(self.client.mutations)
+            with patch.object(sys, "argv", ["workstream_generation.py", *arguments]), \
+                 patch("workstream_generation._route_and_client", return_value=(self.client, AUTHORITY)), \
+                 patch("workstream_generation.plan_payload", return_value={"source": {
+                     "identity": f"https://example.test/{NEW}", "sha256": NEW,
+                 }}), patch.object(sys, "stdout", stdout):
+                self.assertEqual(main(), 0)
+            output = json.loads(stdout.getvalue())
+            with open(manifest_path, encoding="utf-8") as handle:
+                emitted_manifest = json.load(handle)
+            self.assertEqual(emitted_manifest, output["projection_preview"]["manifest"])
+            self.assertEqual(len(self.client.mutations), writes)
         with self.assertRaises(SystemExit):
             parser().parse_args([
                 "prepare", WORKSTREAM, "--plan-source", "PLAN.md",
@@ -876,6 +909,157 @@ class GenerationTransitionTests(unittest.TestCase):
             native_root_loader=lambda: linear.snapshot_for_root(WORKSTREAM),
             source_loader=lambda: deepcopy(source_state),
         )
+
+    def test_activation_accepts_exact_prepared_v2_retirement_and_refuses_tamper(self):
+        target = adapter(self.client, NEW)
+        revision = target.state().revision
+        contract = self.generation_preparation()
+        for phase in range(3):
+            if contract["projection_preview"]["phase"] == "activation_ready":
+                break
+            current_values = {
+                (event["kind"], event["key"]): event["value"]
+                for event in target.state().events
+            }
+            for index, item in enumerate(
+                contract["projection_preview"]["manifest"]["projection"]
+            ):
+                if current_values.get((item["kind"], item["key"])) == item["value"]:
+                    continue
+                target.append(build_projection_event(
+                    workstream_id=WORKSTREAM, kind=item["kind"], key=item["key"],
+                    value=deepcopy(item["value"]), plan_revision=NEW,
+                    expected_revision=revision,
+                    created_at=f"target-{phase}-{index}", authority=AUTHORITY,
+                ))
+                revision += 1
+            if contract["projection_preview"]["phase"] == "complete_projection":
+                disposition = {
+                    "disposition": "attach", "remote_head": contract["remote_head"],
+                    "recovered_from_checkpoint": None,
+                }
+                if current_values.get(("disposition", "root")) != disposition:
+                    target.append(build_projection_event(
+                        workstream_id=WORKSTREAM, kind="disposition", key="root",
+                        value=disposition, plan_revision=NEW,
+                        expected_revision=revision,
+                        created_at=f"target-{phase}-disposition", authority=AUTHORITY,
+                    ))
+                    revision += 1
+            contract = self.generation_preparation()
+        self.assertEqual(contract["projection_preview"]["phase"], "activation_ready")
+        retirement = contract["retirement_proof"]
+
+        race = deepcopy(self.client)
+        race_linear = LinearGraphQLTransport(
+            race, workspace_id="workspace", team_id="team", project_id="project",
+        )
+
+        def validate_race_operator():
+            graph = race_linear.snapshot_for_root(
+                WORKSTREAM, include_description=True, include_child_comments=True,
+            )
+            observed = prepare_generation_operator_contract(
+                comments=deepcopy(race.comments), graph=graph,
+                workstream_id=WORKSTREAM, authority=AUTHORITY,
+                description_plan_revision=OLD,
+                target_source={
+                    "identity": f"https://example.test/{NEW}", "sha256": NEW,
+                }, created_at=contract["created_at"],
+                remote_head=contract["remote_head"], started_state=STARTED_STATE,
+            )
+            return {"retirement_proof": observed["retirement_proof"]}
+
+        injected = {"done": False}
+
+        def drift_after_reservation(item, _client):
+            if injected["done"] or "workstream-generation-reservation" not in item["body"]:
+                return
+            injected["done"] = True
+            state = adapter(race, NEW).state()
+            event = build_projection_event(
+                workstream_id=WORKSTREAM, kind="choice", key="unexpected-drift",
+                value={"event_id": "unexpected-drift", "decision": "late"},
+                plan_revision=NEW, expected_revision=state.revision,
+                created_at="late-drift", authority=AUTHORITY,
+            )
+            race.comments.append({
+                "id": projection_slot_id(
+                    WORKSTREAM, NEW, state.revision, AUTHORITY,
+                ), "body": encode_projection_comment(event),
+                "createdAt": "late-drift", "updatedAt": "late-drift",
+            })
+
+        race.before_each_create = drift_after_reservation
+        race_transport = GenerationTransport(
+            race, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
+            authority=AUTHORITY, candidate_loader=Loader(race),
+            legacy_description_plan_revision=OLD,
+            native_root_loader=lambda: race_linear.snapshot_for_root(WORKSTREAM),
+            operator_validator=validate_race_operator,
+        )
+        race_preview = race_transport.preview_activate(
+            target_plan_revision=NEW, created_at=contract["created_at"],
+            retirement=retirement,
+        )
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError, "generation_prepare_noncanonical_target_prefix",
+        ):
+            race_transport.activate(
+                target_plan_revision=NEW, created_at=contract["created_at"],
+                retirement=retirement,
+                expected_native_root_sha256=(
+                    race_preview["native_root_activation_proof"]["sha256"]
+                ),
+            )
+        self.assertFalse(any(
+            "generation_candidate_seal" in item.get("body", "")
+            for item in race.comments
+        ))
+
+        transport = self.native_fenced_transport()
+        for field, value in (
+            ("ordering", "caller assertion"),
+            ("schema_version", 1),
+        ):
+            tampered = deepcopy(retirement)
+            if field == "schema_version":
+                tampered[field] = value
+            else:
+                tampered["authenticated_quiescence"][field] = value
+            writes = len(self.client.mutations)
+            with self.assertRaisesRegex(
+                (WorkstreamGenerationError, LinearProjectionError),
+                "retirement|candidate_seal",
+            ):
+                transport.preview_activate(
+                    target_plan_revision=NEW, created_at=contract["created_at"],
+                    retirement=tampered,
+                )
+            self.assertEqual(len(self.client.mutations), writes)
+        preview = transport.preview_activate(
+            target_plan_revision=NEW, created_at=contract["created_at"],
+            retirement=retirement,
+        )
+        receipt = transport.activate(
+            target_plan_revision=NEW, created_at=contract["created_at"],
+            retirement=retirement,
+            expected_native_root_sha256=preview["native_root_activation_proof"]["sha256"],
+        )
+        self.assertEqual(receipt["activated_plan_revision"], NEW)
+        writes = len(self.client.mutations)
+
+        def stale_fresh_prepare():
+            raise WorkstreamGenerationError("fresh_prepare_must_not_gate_exact_replay")
+
+        transport.operator_validator = stale_fresh_prepare
+        replay = transport.activate(
+            target_plan_revision=NEW, created_at=contract["created_at"],
+            retirement=retirement,
+            expected_native_root_sha256=preview["native_root_activation_proof"]["sha256"],
+        )
+        self.assertEqual(replay["event_id"], receipt["event_id"])
+        self.assertEqual(len(self.client.mutations), writes)
 
     def test_terminal_native_root_refuses_preview_and_apply_before_first_write(self):
         project_full(self.client, NEW)
@@ -1873,7 +2057,7 @@ class GenerationTransitionTests(unittest.TestCase):
             writes = len(self.client.mutations)
             with patch.object(sys, "argv", argv), patch(
                 "workstream_generation._route_and_client",
-                return_value=(self.client, AUTHORITY),
+                side_effect=AssertionError("invalid local CLI reached auth/network"),
             ), patch("workstream_generation.plan_payload", return_value={
                 "source": {
                     "identity": f"https://example.test/{NEW}",
@@ -1889,6 +2073,18 @@ class GenerationTransitionTests(unittest.TestCase):
         )
         self.assertEqual(len(self.client.mutations), writes)
         self.assertEqual(stdout.getvalue(), "")
+
+        argv = [
+            "workstream_generation.py", "activate", WORKSTREAM,
+            "--plan-source", "plan", "--created-at", "now",
+        ]
+        stderr = io.StringIO()
+        with patch.object(sys, "argv", argv), patch(
+            "workstream_generation._route_and_client",
+            side_effect=AssertionError("invalid local CLI reached auth/network"),
+        ), patch.object(sys, "stderr", stderr):
+            self.assertEqual(main(), 2)
+        self.assertIn("generation_candidate_cli_arguments_incomplete", stderr.getvalue())
 
     def test_activation_preview_refuses_unrelated_pending_boundary(self):
         project_full(self.client, NEW)

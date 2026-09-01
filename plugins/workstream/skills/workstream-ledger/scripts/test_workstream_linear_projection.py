@@ -8928,7 +8928,8 @@ class ProjectionTests(unittest.TestCase):
         # The preflight is stable and within budget, but the child grows before
         # the first append. The exact input frontier must refuse without a write.
         code, error = invoke([
-            graph, graph, graph, graph, graph, grown, grown, grown,
+            graph, graph, graph, graph, graph, graph, graph,
+            grown, grown, grown,
         ])
         self.assertEqual(code, 2)
         self.assertIn(

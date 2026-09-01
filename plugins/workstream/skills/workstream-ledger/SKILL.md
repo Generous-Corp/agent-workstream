@@ -264,10 +264,14 @@ workstreamctl generation prepare GEN-123 --plan-source ./PLAN.md \
   --remote-head <authenticated-exact-head> \
   --created-at <reviewed-utc-time> \
   --started-state-id <authenticated-linear-started-state-uuid> \
+  --manifest-output ./target-projection.json \
   > generation-review.json
 ```
 
-`prepare` has no apply mode. It accounts for every active projection key and
+`prepare` has no apply mode. `--manifest-output` atomically writes the exact
+nested `projection_preview.manifest` consumed by the next projection command;
+do not copy or edit that payload by hand. It accounts for every active projection
+key and
 emits an authenticated predecessor-quiescence proof, the exact reviewed native
 reopen state, and the first target manifest. The proof binds the current route,
 selected generation, material/checkpoint frontiers, and predecessor projection;
@@ -301,8 +305,11 @@ After the target projection is complete, rerun `generation prepare` and use its
 exact `activation_ready` operator contract for the reviewed `root-transition`
 locator migration and reopen described below. Once that exact root is in the
 contract's authenticated `started` state, preview activation. Activation
-recomputes the contract from live authenticated state; a caller-authored
-retirement file or an edited phase/self-digest cannot authorize it:
+recomputes the contract from a stable live graph/comment pair and again after
+reservation immediately before the authority-changing seal. Exact historical
+replay/finalization uses the original contract-bound stored artifacts rather
+than requiring the obsolete pre-activation view. A caller-authored retirement
+file or an edited phase/self-digest cannot authorize it:
 
 ```sh
 workstreamctl generation activate GEN-123 --plan-source ./PLAN.md \
