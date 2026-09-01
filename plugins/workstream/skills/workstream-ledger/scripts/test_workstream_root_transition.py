@@ -10,9 +10,13 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import workstream_root_transition
+from workstream_generation import validate_activation_operator_contract
+
 from workstream_root_transition import (
     RootTransitionError, RootTransitionTransport, main as root_main,
-    validate_active_locator_authorization, validate_operator_contract,
+    reopen_transition_witness_context, validate_active_locator_authorization,
+    validate_operator_contract,
 )
 from workstream_linear import LinearTransportError
 
@@ -193,6 +197,7 @@ class RootTransitionTests(unittest.TestCase):
         return RootTransitionTransport(
             fake, token=TOKEN, authority=AUTHORITY,
             operator_authorization=OPERATOR_AUTHORIZATION,
+            operator_contract_sha256="6" * 64,
         )
 
     def locator_transport(self, fake):
@@ -928,6 +933,237 @@ class RootTransitionTests(unittest.TestCase):
         with self.assertRaisesRegex(RootTransitionError, "requires_terminal"):
             self.transport(another).preview(operation="reopen", target=STARTED_STATE)
 
+    def test_reopen_response_loss_reconstructs_exact_normalized_pre_state(self):
+        reviewed = []
+
+        def validator(graph, _comments):
+            root = graph["root"]
+            reviewed.append({
+                key: deepcopy(root.get(key))
+                for key in ("state", "state_id", "status", "status_type")
+            })
+            if (
+                (root.get("state") or {}).get("type") != "completed"
+                or root.get("state_id") != "done-state"
+                or root.get("status") != "Done"
+                or root.get("status_type") != "completed"
+            ):
+                raise RootTransitionError(
+                    "generation_prepare_legacy_split_head_"
+                    "recomputed_frontier_changed"
+                )
+            return deepcopy(OPERATOR_AUTHORIZATION)
+
+        successful = FakeClient()
+        successful_transport = RootTransitionTransport(
+            successful, token=TOKEN, authority=AUTHORITY,
+            operator_validator=validator,
+            operator_contract_sha256="6" * 64,
+        )
+        successful_preview = successful_transport.preview(
+            operation="reopen", target=STARTED_STATE,
+        )
+        successful_result = successful_transport.apply(
+            operation="reopen", target=STARTED_STATE,
+            expected_snapshot_sha256=successful_preview[
+                "expected_snapshot_sha256"
+            ],
+            expected_frontier_sha256=successful_preview[
+                "expected_frontier_sha256"
+            ],
+            expected_intent_sha256=successful_preview["intent_sha256"],
+        )
+        self.assertEqual(successful_result["result"], "applied_or_exact_replay")
+        self.assertIn(
+            "root_transition_recovery_receipt", successful_result,
+        )
+        self.assertEqual(sum(
+            "WorkstreamRootTransition(" in query
+            for query, _ in successful.calls
+        ), 1)
+
+        fake = FakeClient()
+
+        transport = RootTransitionTransport(
+            fake, token=TOKEN, authority=AUTHORITY,
+            operator_validator=validator,
+            operator_contract_sha256="6" * 64,
+        )
+        preview = transport.preview(operation="reopen", target=STARTED_STATE)
+        args = {
+            "operation": "reopen", "target": STARTED_STATE,
+            "expected_snapshot_sha256": preview["expected_snapshot_sha256"],
+            "expected_frontier_sha256": preview["expected_frontier_sha256"],
+            "expected_intent_sha256": preview["intent_sha256"],
+        }
+        fake.lose_issue_update_response_once = True
+        with self.assertRaisesRegex(LinearTransportError, "response lost"):
+            transport.apply(**args)
+        writes = sum(
+            "WorkstreamRootTransition(" in query for query, _ in fake.calls
+        )
+        replay = transport.apply(**args)
+        self.assertEqual(replay["result"], "applied_or_exact_replay")
+        self.assertIn("root_transition_recovery_receipt", replay)
+        self.assertEqual(sum(
+            "WorkstreamRootTransition(" in query for query, _ in fake.calls
+        ), writes)
+        self.assertTrue(all(
+            item == {
+                "state": {
+                    "id": "done-state", "name": "Done",
+                    "type": "completed",
+                },
+                "state_id": "done-state", "status": "Done",
+                "status_type": "completed",
+            }
+            for item in reviewed
+        ))
+        fake.comments.append({
+            "id": "unrelated-after-reopen", "body": "drift",
+            "createdAt": "after", "updatedAt": "after",
+        })
+        with self.assertRaisesRegex(
+            RootTransitionError, "root_transition_reopen_witness_mismatch",
+        ):
+            transport.apply(**args)
+        self.assertEqual(sum(
+            "WorkstreamRootTransition(" in query for query, _ in fake.calls
+        ), writes)
+
+    def test_activation_validates_saved_contract_through_reopen_witness(self):
+        source = {"identity": MAIN, "sha256": "f" * 64}
+        contract = {
+            "schema_version": 1, "workstream_id": TOKEN,
+            "created_at": "2030-01-01T00:00:00Z",
+            "authenticated_route": deepcopy(AUTHORITY), "source": source,
+            "native_transition": {
+                "operation": "reopen",
+                "target_state": deepcopy(OPERATOR_AUTHORIZATION[
+                    "native_transition"
+                ]["target_state"]),
+            },
+            "remote_head": "a" * 40,
+            "generation": deepcopy(OPERATOR_AUTHORIZATION["generation"]),
+            "frontiers": {},
+            "retirement_proof": {"declaration_sha256": "2" * 64},
+            "projection_preview": {"phase": "activation_ready"},
+            "contract_sha256": "1" * 64,
+        }
+        authorization = {
+            **deepcopy(OPERATOR_AUTHORIZATION),
+            "frontiers_sha256": workstream_root_transition._digest({}),
+        }
+        fake = FakeClient()
+        transport = RootTransitionTransport(
+            fake, token=TOKEN, authority=AUTHORITY,
+            operator_authorization=authorization,
+            operator_contract_sha256=workstream_root_transition._digest(
+                contract
+            ),
+        )
+        preview = transport.preview(operation="reopen", target=STARTED_STATE)
+        reservation = {
+            **preview["intent"], "intent_sha256": preview["intent_sha256"],
+        }
+        fake.comments.append({
+            "id": preview["reservation_slot_id"],
+            "body": workstream_root_transition._encode(reservation),
+            "createdAt": "reserved", "updatedAt": "reserved",
+        })
+        fake.state = {
+            "id": STARTED_STATE, "name": "In Progress", "type": "started",
+        }
+        fake.updated_at = "post-native"
+        graph, comments = transport._read()
+        with mock.patch(
+            "workstream_generation.prepare_generation_operator_contract",
+            return_value=contract,
+        ) as prepare:
+            result = validate_activation_operator_contract(
+                contract, source=source, workstream_id=TOKEN,
+                authority=AUTHORITY, comments=comments, graph=graph,
+                description_plan_revision="e" * 64,
+                created_at=contract["created_at"],
+                remote_head=contract["remote_head"],
+            )
+        self.assertEqual(result["authorization"], authorization)
+        self.assertIn("root_transition_recovery_receipt", result)
+        prepared_root = prepare.call_args.kwargs["graph"]["root"]
+        self.assertEqual(
+            [
+                prepared_root["state"]["type"], prepared_root["state_id"],
+                prepared_root["status"], prepared_root["status_type"],
+            ],
+            ["completed", "done-state", "Done", "completed"],
+        )
+        context_args = {
+            "graph": graph, "token": TOKEN, "authority": AUTHORITY,
+            "contract_sha256": contract["contract_sha256"],
+            "target_state": contract["native_transition"]["target_state"],
+            "operator_contract_sha256": workstream_root_transition._digest(
+                contract
+            ),
+        }
+        witness_comment = next(
+            item for item in comments
+            if item["id"] == preview["reservation_slot_id"]
+        )
+        duplicate = [*deepcopy(comments), {
+            **deepcopy(witness_comment),
+            "id": "55555555-5555-4555-8555-555555555555",
+        }]
+        with self.assertRaisesRegex(
+            RootTransitionError, "root_transition_reopen_witness_ambiguous",
+        ):
+            reopen_transition_witness_context(
+                comments=duplicate, **context_args,
+            )
+        for name, mutate_comment, mutate_graph in (
+            (
+                "slot", lambda item: item.update({
+                    "id": "55555555-5555-4555-8555-555555555555",
+                }), lambda _graph: None,
+            ),
+            (
+                "before_state", lambda item: item["reservation"]["before"]
+                ["state"].update({"type": "started"}),
+                lambda _graph: None,
+            ),
+            (
+                "preserved_root", lambda item: item["reservation"]
+                ["preserved_root"].update({"title": "forged"}),
+                lambda _graph: None,
+            ),
+            (
+                "normalized_state_copy", lambda _item: None,
+                lambda current: current["root"].update({
+                    "state_id": "different-state",
+                }),
+            ),
+        ):
+            candidate_comments = deepcopy(comments)
+            candidate_graph = deepcopy(graph)
+            candidate = next(
+                item for item in candidate_comments
+                if item["id"] == preview["reservation_slot_id"]
+            )
+            if name == "slot":
+                mutate_comment(candidate)
+            elif name != "normalized_state_copy":
+                value = workstream_root_transition._decode(candidate["body"])
+                wrapper = {"reservation": value}
+                mutate_comment(wrapper)
+                candidate["body"] = workstream_root_transition._encode(value)
+            mutate_graph(candidate_graph)
+            with self.subTest(witness_mutation=name), self.assertRaisesRegex(
+                RootTransitionError, "root_transition_reopen_witness_mismatch",
+            ):
+                reopen_transition_witness_context(
+                    comments=candidate_comments, graph=candidate_graph,
+                    **{key: value for key, value in context_args.items()
+                       if key != "graph"},
+                )
     def test_reservation_collision_refuses_before_issue_update(self):
         fake = FakeClient()
         transport = self.transport(fake)

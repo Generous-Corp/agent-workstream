@@ -804,6 +804,16 @@ The irreversible reconciler revalidates that lineage and the carried stored
 frontier before substituting the recomputed live-input fence, and rederives
 every already-present closure from the fenced child snapshot and evidence
 rather than trusting equality between an active closure and the manifest.
+An exact native-root reopen response-loss replay is authorized only by its
+unique deterministic root-transition reservation. The writer verifies the
+stored intent, route, terminal before-state, exact started after-state,
+unrelated root and comment frontier, then reconstructs only `state`,
+`state_id`, `status`, and `status_type` to revalidate the saved operator
+contract. Generation activation binds the resulting deterministic receipt,
+the full initially reviewed native-root observation, and a material native-root
+digest excluding only `updatedAt`; protocol-owned comment clock changes cannot
+invalidate finalization, while every state, route, or unrelated-root change
+still refuses.
 
 ### Terminal-child projection repair
 
