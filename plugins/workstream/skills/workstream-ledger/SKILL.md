@@ -530,6 +530,10 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.49 adds the authenticated root material-boundary checkpoint
+operator, exact crash replay, true-root and deterministic-slot proof, and
+postwrite ordinary-resume and native-graph verification.
+
 Version 0.4.48 adds phase-aware generation preparation, explicit reviewed
 projection and native-root transitions, exact crash replay, and warm-session
 continuation that keeps authorized delivery moving while tracking is
