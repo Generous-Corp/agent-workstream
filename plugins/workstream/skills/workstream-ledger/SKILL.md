@@ -432,6 +432,10 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.46 authenticates the active dependency graph during resume and
+makes canonical plan replacement a recoverable two-phase transition. Stale
+plan generations remain bounded and non-executable until exact activation.
+
 Version 0.4.45 keeps authenticated resume within the default 24 KiB contract by
 deferring only digest-bound verbose detail after full-history validation. Exact
 authority fields and executable next actions remain available, while an
