@@ -191,9 +191,18 @@ routing detail, and older history with counts/digests. Add `--include-history`
 for an audit or closure pass; explicit
 byte/item caps still fail loudly rather than truncating required current state.
 Full-authority output requires the append-only scope, source, provenance, and
-attach/successor disposition projection. A reviewed projection manifest can be
-applied idempotently with `workstreamctl projection GEN-123 manifest.json
---remote-head <40-or-64-hex-head> --plan-source ./PLAN.md --plan-identity <URL>`;
+attach/successor disposition projection. Before replacing a plan, use
+`workstreamctl generation prepare GEN-123 --plan-source ./PLAN.md
+--plan-identity <URL> --remote-head <head> --created-at <UTC>
+--retired-at <UTC>` to derive a
+zero-write, all-keys-accounted target manifest and retirement proof. Terminal
+evidence and closure are explicit staged phases; rerunning the same command
+after each apply derives the next manifest until `activation_ready`. Only the
+exact authenticated prefix of the prior phase is accepted. Preview a reviewed projection
+with `workstreamctl projection GEN-123 manifest.json --remote-head <head>
+--plan-source ./PLAN.md --created-at <UTC> --preview`, then apply the unchanged
+batch with `--apply --expected-preview-sha256 <preview-sha256>` and the same
+timestamp. The older flagless form remains compatibility apply behavior;
 the manifest fences the exact current projection revision and active
 key/event/value-digest set. Retirement is explicit and names the reviewed head;
 omission never deletes live state. A stale review refuses before writing. A

@@ -255,7 +255,43 @@ python3 "$WORKSTREAM_SKILL_ROOT/scripts/workstream_generation.py" \
 ```
 
 Do not bootstrap a description-backed root. For a reviewed plan replacement,
-first build the complete candidate projection, then provide a structured
+derive the complete zero-write operator contract from authenticated live state
+and the exact target plan:
+
+```sh
+workstreamctl generation prepare GEN-123 --plan-source ./PLAN.md \
+  --plan-identity <canonical-immutable-plan-url> \
+  --remote-head <authenticated-exact-head> \
+  --created-at <reviewed-utc-time> --retired-at <reviewed-utc-time> \
+  > generation-review.json
+```
+
+`prepare` has no apply mode. It accounts for every active projection key and
+emits the retirement proof plus the first target manifest. For terminal
+children it uses predecessor-authorized evidence seeding and explicitly stages
+closure repair and later keys; it never copies a closure as authority. After
+each manifest is applied, rerun the same `prepare` command. It recognizes only
+the authenticated canonical prefix it emitted and advances through evidence
+seed, closure repair, remaining projection, and `activation_ready`. Any other
+nonempty inactive candidate refuses rather than being merged or guessed.
+
+Projection has an explicit safe preview/apply path. Reuse the preview's exact
+timestamp and digest:
+
+```sh
+workstreamctl projection GEN-123 target-projection.json \
+  --remote-head <authenticated-exact-head> --plan-source ./PLAN.md \
+  --plan-identity <canonical-immutable-plan-url> \
+  --created-at <reviewed-utc-time> --preview > projection-preview.json
+workstreamctl projection GEN-123 target-projection.json \
+  --remote-head <same-head> --plan-source ./PLAN.md \
+  --plan-identity <same-url> --created-at <same-time> \
+  --apply --expected-preview-sha256 <preview-sha256>
+```
+
+The flagless projection invocation remains compatibility apply behavior and
+reports `legacy_implicit_apply`; new automation must use the digest-gated path.
+After the target projection is complete, use the generated structured
 retirement proof for the current active epoch:
 
 ```sh

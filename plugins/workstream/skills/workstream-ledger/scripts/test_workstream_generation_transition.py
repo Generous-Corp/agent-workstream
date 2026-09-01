@@ -10,10 +10,13 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+import workstream_projection
+
 from workstream_delta import Delta
 from workstream_generation import (
     GenerationTransport, WorkstreamGenerationError, _digest,
     build_retirement_proof, generation_quarantine_metadata, main, parser,
+    prepare_generation_operator_contract,
     encode_generation_finalization, generation_finalization_slot_id,
     native_root_activation_proof,
     pending_generation_reservations, reduce_generation_checkpoint_comments,
@@ -335,6 +338,389 @@ class GenerationTransitionTests(unittest.TestCase):
                 item["event_id"] for item in checkpoints.checkpoints
                 if item["plan_revision"] == predecessor
             ),
+        )
+
+    def generation_preparation(self):
+        graph = LinearGraphQLTransport(
+            self.client, workspace_id="workspace", team_id="team",
+            project_id="project",
+        ).snapshot_for_root(
+            WORKSTREAM, include_description=True, include_child_comments=True,
+        )
+        return prepare_generation_operator_contract(
+            comments=deepcopy(self.client.comments), graph=graph,
+            workstream_id=WORKSTREAM, authority=AUTHORITY,
+            description_plan_revision=OLD,
+            target_source={
+                "identity": f"https://example.test/{NEW}", "sha256": NEW,
+            },
+            created_at="2026-08-31T23:00:00Z",
+            retired_at="2026-08-31T22:59:59Z",
+            remote_head="e" * 40,
+        )
+
+    def test_prepare_emits_complete_zero_write_operator_contract(self):
+        writes = len(self.client.mutations)
+        comments = deepcopy(self.client.comments)
+        first = self.generation_preparation()
+        second = self.generation_preparation()
+        self.assertEqual(first, second)
+        self.assertEqual(len(self.client.mutations), writes)
+        self.assertEqual(self.client.comments, comments)
+        self.assertEqual(first["projection_preview"]["writes_performed"], 0)
+        self.assertFalse(first["projection_preview"]["apply"])
+        self.assertEqual(
+            first["retirement_proof"]["provenance_event_ids"],
+            [next(
+                event["event_id"] for event in adapter(self.client, OLD).state().events
+                if event["kind"] == "provenance"
+            )],
+        )
+        accounting = first["projection_preview"]["active_key_accounting"]
+        classified = {
+            (item["kind"], item["key"])
+            for category in accounting.values() for item in category
+        }
+        self.assertEqual(classified, {
+            ("scope", "root"), ("source", "root"),
+            ("provenance", "generation"), ("disposition", "root"),
+        })
+        items = {
+            (item["kind"], item["key"]): item["value"]
+            for item in first["projection_preview"]["manifest"]["projection"]
+        }
+        self.assertEqual(items[("source", "root")], {
+            "identity": f"https://example.test/{NEW}", "sha256": NEW,
+        })
+        self.assertNotIn(("disposition", "root"), items)
+        self.assertEqual(first["contract_sha256"], _digest({
+            key: value for key, value in first.items()
+            if key != "contract_sha256"
+        }))
+
+    def test_prepare_refuses_nonempty_inactive_candidate_without_mutation(self):
+        project_full(self.client, NEW)
+        writes = len(self.client.mutations)
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "noncanonical_target_prefix",
+        ):
+            self.generation_preparation()
+        self.assertEqual(len(self.client.mutations), writes)
+
+    def test_prepare_requires_exact_source_and_timestamps(self):
+        graph = LinearGraphQLTransport(
+            self.client, workspace_id="workspace", team_id="team",
+            project_id="project",
+        ).snapshot_for_root(WORKSTREAM)
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "exact_source_and_timestamps_required",
+        ):
+            prepare_generation_operator_contract(
+                comments=deepcopy(self.client.comments), graph=graph,
+                workstream_id=WORKSTREAM, authority=AUTHORITY,
+                description_plan_revision=OLD,
+                target_source={"identity": "target", "sha256": "not-a-digest"},
+                created_at="", retired_at="now",
+                remote_head="e" * 40,
+            )
+
+    def test_prepare_cli_is_zero_write_and_has_no_apply_flag(self):
+        args = parser().parse_args([
+            "prepare", WORKSTREAM, "--plan-source", "PLAN.md",
+            "--created-at", "2026-08-31T23:00:00Z",
+            "--retired-at", "2026-08-31T22:59:59Z",
+            "--remote-head", "e" * 40,
+        ])
+        self.assertEqual(args.command, "prepare")
+        self.assertFalse(hasattr(args, "apply"))
+        with self.assertRaises(SystemExit):
+            parser().parse_args([
+                "prepare", WORKSTREAM, "--plan-source", "PLAN.md",
+                "--created-at", "2026-08-31T23:00:00Z",
+                "--retired-at", "2026-08-31T22:59:59Z",
+                "--remote-head", "e" * 40, "--apply",
+            ])
+
+    def test_prepare_stages_terminal_evidence_and_closure_without_copying_closure(self):
+        from types import SimpleNamespace
+        predecessor = adapter(self.client, OLD).state()
+        base_events = deepcopy(list(predecessor.events))
+        next(
+            event for event in base_events
+            if (event["kind"], event["key"]) == ("scope", "root")
+        )["value"]["child_ownership"] = {"GEN-72": "github.com:id:R_repo"}
+        predecessor_events = [*base_events, {
+            "schema_version": 2, "kind": "evidence_contract", "key": "terminal",
+            "event_id": "wsp_" + "7" * 32,
+            "value": {
+                "owning_child": "GEN-72", "plan_revision": OLD,
+                "repository_key": "github.com:id:R_repo", "exact_head": "e" * 40,
+            },
+        }, {
+            "schema_version": 2, "kind": "child_closure", "key": "GEN-72",
+            "event_id": "wsp_" + "8" * 32,
+            "value": {"child_identifier": "GEN-72", "plan_revision": OLD},
+        }]
+        predecessor_state = SimpleNamespace(
+            revision=len(predecessor_events), events=predecessor_events,
+            snapshot=deepcopy(predecessor.snapshot),
+        )
+        target_state = SimpleNamespace(
+            revision=0, events=[], snapshot={"projection_history": predecessor_events},
+        )
+        self.client.children = [{"identifier": "GEN-72"}]
+        readback = {
+            "child_identifier": "GEN-72", "child_issue_id": "child-72",
+            "assignee_id": "agent", "workspace_id": "workspace",
+            "team_id": "team", "project_id": "project",
+            "parent_issue_id": AUTHORITY["root_issue_id"],
+        }
+        binding = {
+            "schema_version": 1, "plan_revision": OLD,
+            "projection_revision": 6, "projection_events_sha256": "1" * 64,
+            "projection_frontier_event_id": "frontier",
+            "projection_frontier_sha256": "2" * 64,
+            "projection_history_sha256": "3" * 64,
+            "material_revision": 0, "material_events_sha256": "4" * 64,
+            "checkpoint_event_id": None, "checkpoint_events_sha256": "5" * 64,
+            "input_frontier_sha256": "6" * 64,
+            "evidence_heads": [{
+                "child_identifier": "GEN-72", "key": "terminal",
+                "evidence_event_id": "wsp_" + "7" * 32,
+                "evidence_value_sha256": "7" * 64,
+                "closure_event_id": "wsp_" + "8" * 32,
+                "closure_value_sha256": "8" * 64,
+            }],
+        }
+        with patch(
+            "workstream_generation.terminal_child_readback",
+            return_value=readback,
+        ), patch(
+            "workstream_projection.terminal_child_readback",
+            return_value=readback,
+        ), patch(
+            "workstream_projection.evidence_errors", return_value=[],
+        ), patch(
+            "workstream_generation.reduce_projection_comments",
+            side_effect=lambda _comments, **kwargs: (
+                predecessor_state
+                if kwargs["expected_plan_revision"] == OLD else target_state
+            ),
+        ), patch(
+            "workstream_projection.terminal_child_evidence_seed_predecessor_contract",
+            return_value=(binding, {"terminal": {
+                "evidence_event_id": "wsp_" + "7" * 32,
+                "evidence_value_sha256": "7" * 64,
+                "closure_event_id": "wsp_" + "8" * 32,
+                "closure_value_sha256": "8" * 64,
+            }}),
+        ):
+            prepared = prepare_generation_operator_contract(
+                comments=deepcopy(self.client.comments),
+                graph={"root": {}, "children": [{"identifier": "GEN-72"}]},
+                workstream_id=WORKSTREAM, authority=AUTHORITY,
+                description_plan_revision=OLD,
+                target_source={
+                    "identity": f"https://example.test/{NEW}", "sha256": NEW,
+                },
+                created_at="2026-08-31T23:00:00Z",
+                retired_at="2026-08-31T22:59:59Z",
+                remote_head="e" * 40,
+            )
+        preview = prepared["projection_preview"]
+        self.assertEqual(preview["terminal_child_stage"], {
+            "state": "terminal_evidence_seed_required",
+            "children": ["GEN-72"],
+        })
+        self.assertEqual(preview["phase"], "terminal_evidence_seed")
+        manifest = preview["manifest"]
+        self.assertEqual(
+            manifest["terminal_child_evidence_seeds"][0]["evidence_keys"],
+            ["terminal"],
+        )
+        self.assertEqual(
+            manifest["terminal_child_evidence_seed_predecessor"], binding,
+        )
+        identities = {
+            (item["kind"], item["key"]) for item in manifest["projection"]
+        }
+        self.assertIn(("evidence_contract", "terminal"), identities)
+        self.assertNotIn(("child_closure", "GEN-72"), identities)
+        closure_stage = next(
+            item for item in preview["active_key_accounting"]["staged"]
+            if item["kind"] == "child_closure"
+        )
+        self.assertEqual(closure_stage["phase"], "terminal_child_closure_repair")
+
+    def test_prepare_continues_canonical_seed_through_activation_readiness(self):
+        from types import SimpleNamespace
+        predecessor = adapter(self.client, OLD).state()
+        base = deepcopy(list(predecessor.events))
+        scope = next(
+            event for event in base
+            if (event["kind"], event["key"]) == ("scope", "root")
+        )["value"]
+        scope["child_ownership"] = {"GEN-72": "github.com:id:R_repo"}
+        evidence_old = {
+            "owning_child": "GEN-72", "plan_revision": OLD,
+            "repository_key": "github.com:id:R_repo", "exact_head": "e" * 40,
+        }
+        predecessor_events = [*base, {
+            "schema_version": 2, "kind": "evidence_contract", "key": "terminal",
+            "event_id": "wsp_" + "7" * 32, "value": evidence_old,
+        }, {
+            "schema_version": 2, "kind": "child_closure", "key": "GEN-72",
+            "event_id": "wsp_" + "8" * 32,
+            "value": {"child_identifier": "GEN-72", "plan_revision": OLD},
+        }, {
+            "schema_version": 2, "kind": "choice", "key": "keep-me",
+            "event_id": "wsp_" + "9" * 32, "value": {"decision": "preserve"},
+        }]
+        predecessor_state = SimpleNamespace(
+            revision=len(predecessor_events), events=predecessor_events,
+            snapshot={**deepcopy(predecessor.snapshot),
+                      "projection_history": predecessor_events},
+        )
+        evidence_new = {**evidence_old, "plan_revision": NEW}
+        common = [
+            {**deepcopy(predecessor_events[0]), "plan_revision": NEW,
+             "event_id": "wsp_" + "a" * 32},
+            {**deepcopy(predecessor_events[1]), "plan_revision": NEW,
+             "event_id": "wsp_" + "b" * 32,
+             "value": {"identity": f"https://example.test/{NEW}", "sha256": NEW}},
+            {**deepcopy(predecessor_events[2]), "plan_revision": NEW,
+             "event_id": "wsp_" + "c" * 32},
+            {"schema_version": 2, "kind": "evidence_contract", "key": "terminal",
+             "event_id": "wsp_" + "d" * 32, "value": evidence_new},
+            {"schema_version": 2, "kind": "disposition", "key": "root",
+             "event_id": "wsp_" + "e" * 32,
+             "value": {"disposition": "attach", "remote_head": "e" * 40,
+                       "recovered_from_checkpoint": None}},
+        ]
+        closure = {
+            "schema_version": 2, "kind": "child_closure", "key": "GEN-72",
+            "event_id": "wsp_" + "f" * 32,
+            "value": {"child_identifier": "GEN-72", "plan_revision": NEW},
+        }
+        choice = {
+            "schema_version": 2, "kind": "choice", "key": "keep-me",
+            "event_id": "wsp_" + "1" * 32, "value": {"decision": "preserve"},
+        }
+        target_events = list(common)
+
+        def state(events):
+            return SimpleNamespace(
+                revision=len(events), events=deepcopy(events),
+                snapshot={"projection_history": [*predecessor_events, *events]},
+            )
+
+        readback = {
+            "child_identifier": "GEN-72", "child_issue_id": "child-72",
+            "assignee_id": "agent", "workspace_id": "workspace",
+            "team_id": "team", "project_id": "project",
+            "parent_issue_id": AUTHORITY["root_issue_id"],
+        }
+        binding = {
+            "schema_version": 1, "plan_revision": OLD,
+            "projection_revision": len(predecessor_events),
+            "projection_events_sha256": "1" * 64,
+            "projection_frontier_event_id": "frontier",
+            "projection_frontier_sha256": "2" * 64,
+            "projection_history_sha256": "3" * 64,
+            "material_revision": 0, "material_events_sha256": "4" * 64,
+            "checkpoint_event_id": None, "checkpoint_events_sha256": "5" * 64,
+            "input_frontier_sha256": "6" * 64,
+            "evidence_heads": [{
+                "child_identifier": "GEN-72", "key": "terminal",
+                "evidence_event_id": "wsp_" + "7" * 32,
+                "evidence_value_sha256": "7" * 64,
+                "closure_event_id": "wsp_" + "8" * 32,
+                "closure_value_sha256": "8" * 64,
+            }],
+        }
+
+        def normalize_seed(manifest, _graph, target, **_kwargs):
+            result = deepcopy(manifest)
+            result.update(workstream_projection.projection_review_contract(target))
+            return result
+
+        def normalize_repair(manifest, _graph, _target):
+            result = deepcopy(manifest)
+            if not any(item["kind"] == "child_closure"
+                       for item in result["projection"]):
+                result["projection"].append({
+                    "kind": "child_closure", "key": "GEN-72",
+                    "value": deepcopy(closure["value"]),
+                })
+            return result
+
+        def run(events):
+            target = state(events)
+            with patch(
+                "workstream_generation.reduce_projection_comments",
+                side_effect=lambda _comments, **kwargs: (
+                    predecessor_state
+                    if kwargs["expected_plan_revision"] == OLD else target
+                ),
+            ), patch(
+                "workstream_generation.terminal_child_readback",
+                return_value=readback,
+            ), patch(
+                "workstream_projection.terminal_child_evidence_seed_predecessor_contract",
+                return_value=(binding, {"terminal": {
+                    "evidence_event_id": "wsp_" + "7" * 32,
+                    "evidence_value_sha256": "7" * 64,
+                    "closure_event_id": "wsp_" + "8" * 32,
+                    "closure_value_sha256": "8" * 64,
+                }}),
+            ), patch(
+                "workstream_projection.prepare_terminal_child_evidence_seeds",
+                side_effect=normalize_seed,
+            ), patch(
+                "workstream_projection.prepare_terminal_child_repairs",
+                side_effect=normalize_repair,
+            ):
+                return prepare_generation_operator_contract(
+                    comments=deepcopy(self.client.comments),
+                    graph={"root": {}, "children": [{"identifier": "GEN-72"}]},
+                    workstream_id=WORKSTREAM, authority=AUTHORITY,
+                    description_plan_revision=OLD,
+                    target_source={
+                        "identity": f"https://example.test/{NEW}", "sha256": NEW,
+                    },
+                    created_at="2026-08-31T23:00:00Z",
+                    retired_at="2026-08-31T22:59:59Z",
+                    remote_head="e" * 40,
+                )
+
+        repair = run(target_events)
+        self.assertEqual(
+            repair["projection_preview"]["phase"], "terminal_closure_repair",
+        )
+        self.assertIn(
+            "terminal_child_repairs",
+            repair["projection_preview"]["manifest"],
+        )
+        target_events.append(closure)
+        post = run(target_events)
+        self.assertEqual(post["projection_preview"]["phase"], "complete_projection")
+        self.assertNotIn(
+            "terminal_child_repairs", post["projection_preview"]["manifest"],
+        )
+        self.assertIn(
+            ("choice", "keep-me"), {
+                (item["kind"], item["key"])
+                for item in post["projection_preview"]["manifest"]["projection"]
+            },
+        )
+        target_events.append(choice)
+        ready = run(target_events)
+        self.assertEqual(ready["projection_preview"]["phase"], "activation_ready")
+        self.assertEqual(
+            ready["projection_preview"]["next_gate"],
+            "preview_generation_activation",
         )
 
     def native_root_sha(self, client=None):
