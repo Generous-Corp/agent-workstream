@@ -82,8 +82,13 @@ class RootCheckpointTests(unittest.TestCase):
                 self.assertEqual(preview["material_revision"], 180)
                 self.assertEqual(preview["writes_performed"], 0)
                 resume = {
-                    "resume_authority": "full", "executable": True,
-                    "plan_revision": digest, "dependency_graph": {},
+                    "resume_authority": "full", "workstream_id": token,
+                    "plan_revision": digest,
+                    "source": {"identity": plan.name, "sha256": digest},
+                    "authenticated_route": route,
+                    "dependency_graph": {
+                        "route": route, "plan_revision": digest,
+                    },
                     "latest_checkpoint": {
                         "checkpoint_event_id": preview["checkpoint"]["event_id"],
                         "root_revision": 180,
@@ -223,6 +228,79 @@ class RootCheckpointTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     payload["replay_guidance"].split()[0], "Rerun",
+                )
+
+    def test_native_state_id_drift_during_resume_is_applied_but_not_success(self):
+        token = "GEN-14"
+        route = fixture.AUTHORITY
+        with patch.object(fixture, "WORKSTREAM", token):
+            client = fixture.FakeClient()
+            with tempfile.NamedTemporaryFile("w+", suffix=".md") as plan:
+                text = "# resume state drift\n"
+                plan.write(text)
+                plan.flush()
+                digest = hashlib.sha256(text.encode()).hexdigest()
+                source = {"identity": plan.name, "sha256": digest}
+                client.description = (
+                    f"Plan revision: {digest}\nNext action: Continue."
+                )
+                fixture.project_full(client, digest, identity=plan.name)
+                common = [
+                    token, "--created-at", "2026-09-01T06:30:00Z",
+                    "--agent", "codex", "--provider", "openai",
+                    "--session-id", "s", "--machine", "M5",
+                    "--worktree-state", "unknown",
+                    "--before-status", "In Progress",
+                    "--after-status", "In Progress", "--next-action", "Continue",
+                ]
+                with patch.object(
+                    checkpoint_cli, "_client_and_route",
+                    return_value=(client, route),
+                ):
+                    preview = checkpoint_cli.run(common)
+                    resume = {
+                        "resume_authority": "full", "workstream_id": token,
+                        "plan_revision": digest, "source": source,
+                        "authenticated_route": route,
+                        "dependency_graph": {
+                            "route": route, "plan_revision": digest,
+                        },
+                        "latest_checkpoint": {
+                            "checkpoint_event_id": preview["checkpoint"]["event_id"],
+                            "root_revision": 0,
+                            "acknowledgement": {
+                                "remote_id": preview["deterministic_slot_id"],
+                            },
+                        },
+                    }
+
+                    def resume_then_drift(*_args, **_kwargs):
+                        client.graph_state_id = "drifted-during-resume"
+                        return resume
+
+                    with patch.object(
+                        checkpoint_cli, "_ordinary_resume",
+                        side_effect=resume_then_drift,
+                    ), self.assertRaises(
+                        checkpoint_cli.CheckpointPartialApplyError,
+                    ) as raised:
+                        checkpoint_cli.run([
+                            *common, "--apply",
+                            "--expected-material-revision", "0",
+                            "--expected-preview-sha256", preview["preview_sha256"],
+                        ])
+                payload = raised.exception.payload
+                self.assertEqual(
+                    payload["reason"],
+                    "checkpoint_applied_but_resume_native_root_drift",
+                )
+                self.assertEqual(
+                    payload["checkpoint"]["receipt"]["event_id"],
+                    preview["checkpoint"]["event_id"],
+                )
+                self.assertEqual(
+                    payload["projection"]["receipt"]["event_id"],
+                    preview["projection_candidate"]["event_id"],
                 )
 
     def test_apply_requires_reviewed_fences_before_live_access(self):

@@ -500,6 +500,12 @@ def run(
             checkpoint_receipt=receipt,
             projection_receipt=projection_receipt,
         ) from error
+    if _root_surface(client, route, preview["workstream_id"]) != native_before:
+        raise _partial_apply_error(
+            "checkpoint_applied_but_resume_native_root_drift", preview,
+            checkpoint_receipt=receipt,
+            projection_receipt=projection_receipt,
+        )
     latest_checkpoint = resume.get("latest_checkpoint") or {}
     if (
         resume.get("plan_revision") != preview["source"]["sha256"]
