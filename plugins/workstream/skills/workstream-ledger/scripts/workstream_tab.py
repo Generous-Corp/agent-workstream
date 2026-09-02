@@ -77,7 +77,9 @@ def terminal_manager(environ: Mapping[str, str]) -> str | None:
             "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_SOCKET_PATH",
         )
     )
-    herdr_present = "HERDR_ENV" in environ or herdr_fields_present
+    # A marker-only non-1 value is not terminal provenance. It may coexist with
+    # explicit cmux identity or the bounded implicit cmux resolver.
+    herdr_present = herdr_enabled or herdr_fields_present
     cmux_present = any(environ.get(key) for key in (
         "CMUX_SURFACE_ID", "CMUX_WORKSPACE_ID", "CMUX_SOCKET_PATH",
     ))

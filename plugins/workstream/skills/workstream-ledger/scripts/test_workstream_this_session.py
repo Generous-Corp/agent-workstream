@@ -688,7 +688,12 @@ class ThisSessionTests(unittest.TestCase):
                     ),
                 ):
                     result = session.resume_this_session(
-                        environ={"CODEX_SESSION_ID": "new-session"},
+                        # A disabled marker alone is not HerdR provenance and
+                        # must not block bounded implicit cmux discovery.
+                        environ={
+                            "CODEX_SESSION_ID": "new-session",
+                            "HERDR_ENV": "0",
+                        },
                         runner=full_resume_runner([]),
                         terminal_runner=terminal_runner,
                         which=lambda _: "/opt/cmux", binding_path=db,

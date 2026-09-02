@@ -585,6 +585,22 @@ class WorkstreamTabTests(unittest.TestCase):
                 runner=FakeHerdr(), which=lambda _: None,
             )
 
+    def test_non_enabled_herdr_marker_allows_explicit_cmux(self):
+        for marker in ("", "0", "disabled"):
+            with self.subTest(marker=marker):
+                fake = FakeCmux("Linear · GEN-37")
+                result = tab.apply_title(
+                    "GEN-37", environ={
+                        "HERDR_ENV": marker,
+                        "CMUX_SURFACE_ID": "surface:7",
+                    }, runner=fake, which=lambda _: "/opt/cmux",
+                )
+                self.assertEqual(result["status"], "unchanged")
+                self.assertTrue(fake.calls)
+                self.assertNotIn(
+                    ["tab", "get"], [call[1:3] for call in fake.calls],
+                )
+
     def test_post_rename_readback_unavailable_remains_fatal(self):
         fake = FakeCmux("Linear")
         reads = 0
