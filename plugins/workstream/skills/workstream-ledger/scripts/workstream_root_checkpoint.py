@@ -27,9 +27,11 @@ from workstream_linear_events import (
     reduce_event_comments,
 )
 from workstream_linear_checkpoints import LinearCheckpointAdapter
+from workstream_linear_checkpoints import encode_checkpoint_comment
 from workstream_linear_projection import (
     build_projection_event, LinearProjectionAdapter,
-    reduce_projection_comments, select_plan_generation,
+    encode_projection_comment, reduce_projection_comments,
+    LinearProjectionError, projection_slot_id, select_plan_generation,
 )
 from workstream_root_transition import _validate_authority
 
@@ -142,6 +144,84 @@ def _root_authority_graph(graph: dict[str, Any]) -> dict[str, Any]:
     normalized = deepcopy(graph)
     normalized["root"].pop("updatedAt", None)
     return normalized
+
+
+def _validate_proposed_full_authority(
+    *, client: Any, graph: dict[str, Any], comments: list[dict[str, Any]],
+    checkpoint: dict[str, Any], checkpoint_remote_id: str,
+    projection_candidate: dict[str, Any], checkpoint_replay: bool,
+    projection_replay: bool, workstream_id: str, route: dict[str, str],
+    source: dict[str, str], selected_generation: dict[str, Any],
+) -> None:
+    """Run resume's authority join against the exact proposed durable state."""
+    from workstream_linear_projection import (
+        bind_active_plan_generation, child_mutation_authorizations_from_comments,
+    )
+    from workstream_plan import plan_payload
+    from workstream_relation_readback import read_relation_targets
+    from workstream_resume import (
+        add_live_child_material_history, add_material_history,
+        ResumeError, validate_snapshot,
+    )
+
+    proposed_comments = deepcopy(comments)
+    if not checkpoint_replay:
+        proposed_comments.append({
+            "id": checkpoint_remote_id,
+            "body": encode_checkpoint_comment(checkpoint),
+            "createdAt": checkpoint["execution"]["session_id"],
+            "updatedAt": checkpoint["execution"]["session_id"],
+        })
+    if not projection_replay:
+        proposed_comments.append({
+            "id": projection_slot_id(
+                workstream_id, projection_candidate["plan_revision"],
+                projection_candidate["expected_revision"], route,
+            ),
+            "body": encode_projection_comment(projection_candidate),
+            "createdAt": projection_candidate["created_at"],
+            "updatedAt": projection_candidate["created_at"],
+        })
+    try:
+        authenticated_source = plan_payload(
+            source["identity"], source["identity"],
+        )["source"]
+        proposed_graph = bind_active_plan_generation(
+            deepcopy(graph), proposed_comments, workstream_id=workstream_id,
+            selected=selected_generation, authenticated_route=route,
+        )
+        mutation_authorizations = child_mutation_authorizations_from_comments(
+            proposed_comments, workstream_id=workstream_id,
+            description_plan_revision=selected_generation[
+                "description_plan_revision"
+            ], authenticated_route=route,
+        )
+        if mutation_authorizations:
+            proposed_graph = LinearGraphQLTransport(
+                client, workspace_id=route["workspace_id"],
+                team_id=route["team_id"], project_id=route["project_id"],
+            ).recover_authorized_children(
+                proposed_graph, mutation_authorizations,
+            )
+        proposed_graph = add_live_child_material_history(
+            proposed_graph, authenticated_route=route,
+            root_comments=proposed_comments,
+        )
+        joined = add_material_history(
+            proposed_graph, proposed_comments, workstream_id,
+            authenticated_route=route, authenticated_source=authenticated_source,
+            relation_target_resolver=lambda relations: read_relation_targets(
+                client, relations,
+            ),
+        )
+        validate_snapshot(
+            joined, workstream_id, require_projection_authority=True,
+            require_dependency_graph=False,
+        )
+    except (LinearProjectionError, ResumeError, LinearTransportError) as error:
+        raise LinearTransportError(
+            "checkpoint_proposed_resume_refused:" + str(error)
+        ) from error
 
 
 def _json_argument(value: str, *, field: str, expected: type) -> Any:
@@ -395,6 +475,14 @@ def _prepare(args: argparse.Namespace, client: Any, route: dict[str, str]):
         "checkpoint": checkpoint,
         "projection_candidate": candidate,
     }
+    _validate_proposed_full_authority(
+        client=client, graph=graph_after, comments=comments,
+        checkpoint=checkpoint,
+        checkpoint_remote_id=contract["deterministic_slot_id"],
+        projection_candidate=candidate, checkpoint_replay=checkpoint_replay,
+        projection_replay=projection_replay, workstream_id=workstream_id,
+        route=route, source=source, selected_generation=selected,
+    )
     return (
         {**contract, "preview_sha256": _digest(contract)}, adapter,
         projection_replay,
@@ -593,6 +681,9 @@ def run(
         for item in before_persist.checkpoints
     )
     def validate_immediate_prewrite() -> None:
+        latest_preview, _, _ = _prepare(args, client, route)
+        if latest_preview != preview:
+            raise LinearTransportError("checkpoint_preview_stale_reload_required")
         if _root_surface(client, route, preview["workstream_id"]) != native_before:
             raise LinearTransportError("checkpoint_native_root_prewrite_drift")
 
@@ -601,7 +692,10 @@ def run(
             preview["checkpoint"], prewrite_validator=validate_immediate_prewrite,
         )
     except (LinearTransportError, OSError, TimeoutError) as error:
-        if str(error) == "checkpoint_native_root_prewrite_drift":
+        if str(error) in {
+            "checkpoint_native_root_prewrite_drift",
+            "checkpoint_preview_stale_reload_required",
+        }:
             raise
         try:
             observed = adapter._state()

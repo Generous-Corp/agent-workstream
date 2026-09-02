@@ -23,6 +23,63 @@ import test_workstream_generation_transition as fixture
 
 
 class RootCheckpointTests(unittest.TestCase):
+    def test_proposed_resume_rejects_stale_recovered_checkpoint_before_write(self):
+        token = "GEN-37"
+        route = fixture.AUTHORITY
+        client = fixture.FakeClient()
+        with tempfile.NamedTemporaryFile("w+", suffix=".md") as plan:
+            text = "# stale recovery\n"
+            plan.write(text); plan.flush()
+            digest = hashlib.sha256(text.encode()).hexdigest()
+            client.description = f"Plan revision: {digest}\nNext action: Continue"
+            fixture.project_full(client, digest, identity=plan.name)
+            graph = checkpoint_cli.LinearGraphQLTransport(
+                client, workspace_id=route["workspace_id"],
+                team_id=route["team_id"], project_id=route["project_id"],
+            ).snapshot_for_root(token, include_description=True,
+                                include_child_comments=True)
+            comments = checkpoint_cli.LinearProjectionAdapter(
+                client, issue_id=token, workstream_id=token,
+                plan_revision=digest, **route,
+            )._comments()
+            checkpoint = checkpoint_cli.build_checkpoint(
+                workstream_id=token, boundary_id="material-0", root_revision=0,
+                plan_revision=digest, before_status="In Progress",
+                after_status="In Progress", execution={"agent": "codex",
+                "provider": "openai", "session_id": "s", "machine": "M5",
+                "worktree": {"state": "safe", "path": "/tmp/x",
+                "branch": "main", "head": "e" * 40}}, exact_head="e" * 40,
+                evidence=[], blocker=None, next_action="Continue",
+            )
+            current = checkpoint_cli.reduce_projection_comments(
+                comments, workstream_id=token, expected_plan_revision=digest,
+                authenticated_route=route,
+            ).events[-1]
+            candidate = checkpoint_cli.build_projection_event(
+                workstream_id=token, kind="disposition", key="root",
+                value={"disposition": "attach", "remote_head": "e" * 40,
+                       "recovered_from_checkpoint": "wsc_" + "0" * 32},
+                plan_revision=digest, expected_revision=4, created_at="4",
+                supersedes_event_id=current["event_id"], authority=route,
+            )
+            with self.assertRaisesRegex(
+                checkpoint_cli.LinearTransportError,
+                "checkpoint_proposed_resume_refused:disposition_checkpoint_stale",
+            ):
+                checkpoint_cli._validate_proposed_full_authority(
+                    client=client, graph=graph, comments=comments,
+                    checkpoint=checkpoint,
+                    checkpoint_remote_id="slot-checkpoint",
+                    projection_candidate=candidate, checkpoint_replay=False,
+                    projection_replay=False, workstream_id=token, route=route,
+                    source={"identity": plan.name, "sha256": digest},
+                    selected_generation={"plan_revision": digest,
+                    "description_plan_revision": digest,
+                    "transition_tip_event_id": None,
+                    "activation_epoch": None,
+                    "authority_origin": "generation_genesis"},
+                )
+
     def test_real_run_accepts_and_replays_multi_checkpoint_fixed_envelope(self):
         token = "GEN-37"
         route = {
