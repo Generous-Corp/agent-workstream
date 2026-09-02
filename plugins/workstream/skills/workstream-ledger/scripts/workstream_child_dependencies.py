@@ -56,6 +56,10 @@ FRONTIER_FIELDS = {
 AUTHORITY_FIELDS = {
     "workspace_id", "team_id", "project_id", "root_issue_id", "root_identifier",
 }
+# Bound both GraphQL document complexity and requested relation nodes per call:
+# at most 20 children x 2 independently validated directions x 50 rows.
+RELATION_READ_BATCH_SIZE = 20
+RELATION_READ_PAGE_SIZE = 50
 
 RELATION_CAPABILITY_QUERY = """
 query WorkstreamChildDependencyCapabilities {
@@ -87,40 +91,40 @@ mutation WorkstreamChildDependencyCreate($input: IssueRelationCreateInput!) {
 }
 """
 
-RELATIONS_QUERY = """
-query WorkstreamChildRelations($issueId: String!, $after: String) {
-  issue(id: $issueId) {
-    id identifier parent { id identifier }
-    team { id organization { id } }
-    project { id }
-    relations(first: 250, after: $after, includeArchived: true) {
-      nodes {
+RELATIONS_QUERY = f"""
+query WorkstreamChildRelations($issueId: String!, $after: String) {{
+  issue(id: $issueId) {{
+    id identifier parent {{ id identifier }}
+    team {{ id organization {{ id }} }}
+    project {{ id }}
+    relations(first: {RELATION_READ_PAGE_SIZE}, after: $after, includeArchived: true) {{
+      nodes {{
         id type archivedAt
-        issue { id identifier parent { id } team { id organization { id } } project { id } }
-        relatedIssue { id identifier parent { id } team { id organization { id } } project { id } }
-      }
-      pageInfo { hasNextPage endCursor }
-    }
-  }
-}
+        issue {{ id identifier parent {{ id }} team {{ id organization {{ id }} }} project {{ id }} }}
+        relatedIssue {{ id identifier parent {{ id }} team {{ id organization {{ id }} }} project {{ id }} }}
+      }}
+      pageInfo {{ hasNextPage endCursor }}
+    }}
+  }}
+}}
 """
 
-INVERSE_RELATIONS_QUERY = """
-query WorkstreamChildInverseRelations($issueId: String!, $after: String) {
-  issue(id: $issueId) {
-    id identifier parent { id identifier }
-    team { id organization { id } }
-    project { id }
-    inverseRelations(first: 250, after: $after, includeArchived: true) {
-      nodes {
+INVERSE_RELATIONS_QUERY = f"""
+query WorkstreamChildInverseRelations($issueId: String!, $after: String) {{
+  issue(id: $issueId) {{
+    id identifier parent {{ id identifier }}
+    team {{ id organization {{ id }} }}
+    project {{ id }}
+    inverseRelations(first: {RELATION_READ_PAGE_SIZE}, after: $after, includeArchived: true) {{
+      nodes {{
         id type archivedAt
-        issue { id identifier parent { id } team { id organization { id } } project { id } }
-        relatedIssue { id identifier parent { id } team { id organization { id } } project { id } }
-      }
-      pageInfo { hasNextPage endCursor }
-    }
-  }
-}
+        issue {{ id identifier parent {{ id }} team {{ id organization {{ id }} }} project {{ id }} }}
+        relatedIssue {{ id identifier parent {{ id }} team {{ id organization {{ id }} }} project {{ id }} }}
+      }}
+      pageInfo {{ hasNextPage endCursor }}
+    }}
+  }}
+}}
 """
 
 ALL_RELATION_SLOTS_QUERY = """
@@ -1377,13 +1381,12 @@ class LinearChildDependencyAdapter:
         )
 
     def _relation_connection(
-        self, identity: dict[str, str], *, inverse: bool,
+        self, identity: dict[str, str], *, inverse: bool, after: str,
     ) -> list[dict[str, Any]]:
         query = INVERSE_RELATIONS_QUERY if inverse else RELATIONS_QUERY
         field = "inverseRelations" if inverse else "relations"
         result: list[dict[str, Any]] = []
-        after: str | None = None
-        seen: set[str] = set()
+        seen = {after}
         while True:
             response = self.client.execute(
                 query, {"issueId": identity["identifier"], "after": after},
@@ -1416,16 +1419,108 @@ class LinearChildDependencyAdapter:
                 raise ChildDependencyError("invalid_dependency_pagination_cursor")
             seen.add(after)
 
+    def _relation_first_pages_query(
+        self, owned: dict[str, dict[str, str]],
+    ) -> tuple[str, dict[str, str], dict[str, dict[str, str]]]:
+        variables: dict[str, str] = {}
+        aliases: dict[str, dict[str, str]] = {}
+        selections: list[str] = []
+        for index, (_child_id, identity) in enumerate(sorted(owned.items())):
+            alias = f"child_{index}"
+            variables[alias] = identity["identifier"]
+            aliases[alias] = identity
+            selections.append(f"""
+  {alias}: issue(id: ${alias}) {{
+    id identifier parent {{ id identifier }}
+    team {{ id organization {{ id }} }}
+    project {{ id }}
+    relations(first: {RELATION_READ_PAGE_SIZE}, includeArchived: true) {{
+      nodes {{
+        id type archivedAt
+        issue {{ id identifier parent {{ id }} team {{ id organization {{ id }} }} project {{ id }} }}
+        relatedIssue {{ id identifier parent {{ id }} team {{ id organization {{ id }} }} project {{ id }} }}
+      }}
+      pageInfo {{ hasNextPage endCursor }}
+    }}
+    inverseRelations(first: {RELATION_READ_PAGE_SIZE}, includeArchived: true) {{
+      nodes {{
+        id type archivedAt
+        issue {{ id identifier parent {{ id }} team {{ id organization {{ id }} }} project {{ id }} }}
+        relatedIssue {{ id identifier parent {{ id }} team {{ id organization {{ id }} }} project {{ id }} }}
+      }}
+      pageInfo {{ hasNextPage endCursor }}
+    }}
+  }}""")
+        declarations = ", ".join(
+            f"${alias}: String!" for alias in aliases
+        )
+        query = (
+            f"query WorkstreamChildRelationFirstPages({declarations}) {{"
+            + "".join(selections)
+            + "\n}\n"
+        )
+        return query, variables, aliases
+
+    def _validate_relation_issue(
+        self, issue: Any, identity: dict[str, str],
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(issue, dict)
+            or issue.get("id") != identity["issue_id"]
+            or str(issue.get("identifier", "")).upper() != identity["identifier"]
+        ):
+            raise ChildDependencyError("dependency_child_identity_mismatch")
+        if (issue.get("parent") or {}).get("id") != self.authority["root_issue_id"]:
+            raise ChildDependencyError("cross_root_dependency")
+        validate_issue_route(
+            issue, workspace_id=self.authority["workspace_id"],
+            team_id=self.authority["team_id"], project_id=self.authority["project_id"],
+        )
+        return issue
+
     def _relations(
         self, owned: dict[str, dict[str, str]],
     ) -> dict[str, dict[str, list[dict[str, Any]]]]:
-        return {
-            child_id: {
-                "relations": self._relation_connection(identity, inverse=False),
-                "inverse_relations": self._relation_connection(identity, inverse=True),
-            }
-            for child_id, identity in sorted(owned.items())
+        """Read bounded owned-child first pages together, then continuations."""
+        surfaces = {
+            child_id: {"relations": [], "inverse_relations": []}
+            for child_id in sorted(owned)
         }
+        if not owned:
+            return surfaces
+        ordered = sorted(owned.items())
+        for start in range(0, len(ordered), RELATION_READ_BATCH_SIZE):
+            batch = dict(ordered[start:start + RELATION_READ_BATCH_SIZE])
+            query, variables, aliases = self._relation_first_pages_query(batch)
+            response = self.client.execute(query, variables)
+            if not isinstance(response, dict):
+                raise ChildDependencyError("invalid_dependency_readback")
+            for alias, identity in aliases.items():
+                issue = self._validate_relation_issue(response.get(alias), identity)
+                for field, surface_name, inverse in (
+                    ("relations", "relations", False),
+                    ("inverseRelations", "inverse_relations", True),
+                ):
+                    connection = issue.get(field)
+                    if not isinstance(connection, dict):
+                        raise ChildDependencyError("invalid_dependency_connection")
+                    nodes = connection.get("nodes")
+                    page_info = connection.get("pageInfo")
+                    if not isinstance(nodes, list) or not isinstance(page_info, dict):
+                        raise ChildDependencyError("invalid_dependency_connection")
+                    surfaces[identity["issue_id"]][surface_name].extend(nodes)
+                    if page_info.get("hasNextPage"):
+                        after = page_info.get("endCursor")
+                        if not isinstance(after, str) or not after:
+                            raise ChildDependencyError(
+                                "invalid_dependency_pagination_cursor"
+                            )
+                        surfaces[identity["issue_id"]][surface_name].extend(
+                            self._relation_connection(
+                                identity, inverse=inverse, after=after,
+                            )
+                        )
+        return surfaces
 
     def _read_state(
         self, declared_children: list[dict[str, Any]] | None,

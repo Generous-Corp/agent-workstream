@@ -178,6 +178,38 @@ class FakeClient:
                 "nodes": deepcopy(self.native_relations),
                 "pageInfo": {"hasNextPage": False, "endCursor": None},
             }}
+        if "query WorkstreamChildRelationFirstPages" in query:
+            result = {}
+            for alias, identifier in variables.items():
+                child = next(
+                    item for item in self.children
+                    if item["identifier"] == identifier
+                )
+                child_id = child.get("id")
+                forward = [
+                    relation for relation in self.native_relations
+                    if (relation.get("issue") or {}).get("id") == child_id
+                ]
+                inverse = [
+                    relation for relation in self.native_relations
+                    if (relation.get("relatedIssue") or {}).get("id") == child_id
+                ]
+                result[alias] = {
+                    **deepcopy(child),
+                    "relations": {
+                        "nodes": deepcopy(forward),
+                        "pageInfo": {
+                            "hasNextPage": False, "endCursor": None,
+                        },
+                    },
+                    "inverseRelations": {
+                        "nodes": deepcopy(inverse),
+                        "pageInfo": {
+                            "hasNextPage": False, "endCursor": None,
+                        },
+                    },
+                }
+            return result
         if "query WorkstreamResumeRoot" in query:
             root = self.root_issue()
             if self.expanded_resume_project:

@@ -16,6 +16,7 @@ import json
 import hashlib
 import re
 import ssl
+import urllib.error
 import urllib.request
 import uuid
 from typing import Any, Protocol
@@ -48,11 +49,24 @@ class LinearTransportError(RuntimeError):
     pass
 
 
+class LinearRateLimitedError(LinearTransportError):
+    """A retryable provider throttle; callers decide when to try again."""
+
+    code = "RATELIMITED"
+    retryable = True
+
+    def __init__(self, *, http_status: int | None = None):
+        super().__init__("linear_rate_limited")
+        self.http_status = http_status
+
+
 class GraphQLClient(Protocol):
     def execute(self, query: str, variables: dict[str, Any]) -> dict[str, Any]: ...
 
 
 class HttpGraphQLClient:
+    HTTP_ERROR_BODY_LIMIT = 64 * 1024
+
     def __init__(
         self,
         token: str,
@@ -72,13 +86,52 @@ class HttpGraphQLClient:
             self.endpoint, data=body,
             headers={"Authorization": self.token, "Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(
-            request, timeout=20, context=self.ssl_context
-        ) as response:
-            payload = json.load(response)
-        if payload.get("errors"):
-            raise LinearTransportError(json.dumps(payload["errors"], sort_keys=True))
+        try:
+            with urllib.request.urlopen(
+                request, timeout=20, context=self.ssl_context
+            ) as response:
+                payload = json.load(response)
+        except urllib.error.HTTPError as exc:
+            error_body = b""
+            try:
+                error_body = exc.read(self.HTTP_ERROR_BODY_LIMIT + 1)
+            except Exception:
+                pass
+            finally:
+                try:
+                    exc.close()
+                except Exception:
+                    pass
+            error_payload = None
+            if len(error_body) <= self.HTTP_ERROR_BODY_LIMIT:
+                try:
+                    error_payload = json.loads(error_body)
+                except (TypeError, ValueError):
+                    pass
+            errors = (
+                error_payload.get("errors")
+                if isinstance(error_payload, dict) else None
+            )
+            if self._is_rate_limited(errors):
+                raise LinearRateLimitedError(http_status=exc.code) from None
+            raise LinearTransportError(
+                f"linear_http_error:status={exc.code}"
+            ) from None
+        errors = payload.get("errors")
+        if errors:
+            if self._is_rate_limited(errors):
+                raise LinearRateLimitedError(http_status=200)
+            raise LinearTransportError(json.dumps(errors, sort_keys=True))
         return payload.get("data", {})
+
+    @staticmethod
+    def _is_rate_limited(errors: Any) -> bool:
+        return isinstance(errors, list) and any(
+            isinstance(error, dict)
+            and isinstance(error.get("extensions"), dict)
+            and error["extensions"].get("code") == "RATELIMITED"
+            for error in errors
+        )
 
 
 ISSUES_QUERY = """

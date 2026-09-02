@@ -33,6 +33,7 @@ MAX_BINDING_CHAIN_EVENTS = 4096
 MAX_RESUME_REFUSAL_REASON_BYTES = 512
 RESUME_REFUSAL_PREFIX = "workstream resume refused: "
 RESUME_REFUSAL_REASONS = (
+    re.compile(r"linear_rate_limited"),
     re.compile(
         r"completed_owned_child_closure_missing:"
         r"GEN-[1-9][0-9]*(?:,GEN-[1-9][0-9]*)*"

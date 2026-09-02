@@ -4333,6 +4333,15 @@ def reconcile_required_projection(
                 "checkpoint_authority_changed_reload_required"
             )
 
+    # Live Linear writes must re-fence immediately around every append so a
+    # concurrent mutation cannot be hidden inside a batch.  The in-memory
+    # preview has no external writer and instead fences the complete reviewed
+    # surface once before simulation and once after it; doing this per simulated
+    # item needlessly amplifies the live readback requests used by the preview.
+    fence_policy = getattr(adapter, "fence_policy", "per_append")
+    if fence_policy not in {"per_append", "batch"}:
+        raise LinearProjectionError("invalid_projection_fence_policy")
+
     fence_terminal_repairs()
     fence_projection_inputs()
     fence_predecessor_projection_history()
@@ -4382,9 +4391,10 @@ def reconcile_required_projection(
     expected_active_heads = dict(active_heads)
     expected_latest_heads = dict(latest_heads)
     for item in write_items:
-        fence_projection_inputs()
-        fence_predecessor_projection_history()
-        fence_checkpoint_authority()
+        if fence_policy == "per_append":
+            fence_projection_inputs()
+            fence_predecessor_projection_history()
+            fence_checkpoint_authority()
         state = adapter.state()
         if projection_review_contract(state) != _contract_from_heads(
             expected_revision, expected_active_heads,
@@ -4405,10 +4415,11 @@ def reconcile_required_projection(
         if active_current is not None and active_current["value"] == item["value"]:
             continue
         latest_current = expected_latest_heads.get(identity)
-        fence_terminal_repairs()
-        fence_projection_inputs()
-        fence_predecessor_projection_history()
-        fence_checkpoint_authority()
+        if fence_policy == "per_append":
+            fence_terminal_repairs()
+            fence_projection_inputs()
+            fence_predecessor_projection_history()
+            fence_checkpoint_authority()
         event = build_projection_event(
             workstream_id=adapter.workstream_id,
             kind=item["kind"], key=item["key"], value=item["value"],
@@ -4456,9 +4467,10 @@ def reconcile_required_projection(
             ],
         ):
             raise LinearProjectionError("projection_changed_during_reconcile")
-        fence_projection_inputs()
-        fence_predecessor_projection_history()
-        fence_checkpoint_authority()
+        if fence_policy == "per_append":
+            fence_projection_inputs()
+            fence_predecessor_projection_history()
+            fence_checkpoint_authority()
 
     fence_terminal_repairs()
     fence_projection_inputs()
@@ -4479,9 +4491,10 @@ def reconcile_required_projection(
         ],
     ):
         raise LinearProjectionError("projection_final_contract_mismatch")
-    fence_projection_inputs()
-    fence_predecessor_projection_history()
-    fence_checkpoint_authority()
+    if fence_policy == "per_append":
+        fence_projection_inputs()
+        fence_predecessor_projection_history()
+        fence_checkpoint_authority()
     active: dict[tuple[str, str], dict[str, Any]] = {}
     for event in final.events:
         identity = (event["kind"], event["key"])
@@ -4528,6 +4541,11 @@ class ProjectionPreviewAdapter:
     the projection methods used by ``reconcile_required_projection``.  No
     GraphQL client is retained, so preview cannot accidentally mutate Linear.
     """
+
+    # reconcile_required_projection uses this explicit capability to keep
+    # preview readbacks bounded while retaining the live adapter's per-append
+    # drift fences.
+    fence_policy = "batch"
 
     def __init__(
         self, adapter: LinearProjectionAdapter,

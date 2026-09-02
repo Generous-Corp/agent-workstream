@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
+import json
 import os
 import ssl
 import threading
 import unittest
+import urllib.error
 import uuid
 from unittest import mock
 
@@ -15,6 +17,7 @@ from workstream_linear import (
     issue_key,
     LinearGraphQLTransport,
     LinearTransportError,
+    LinearRateLimitedError,
     MARKER,
     PLAN_DETAILS_END,
     PLAN_DETAILS_START,
@@ -305,6 +308,98 @@ class LinearTransportTests(unittest.TestCase):
 
         self.assertEqual(result, {"ok": True})
         self.assertIs(urlopen.call_args.kwargs["context"], context)
+
+    @staticmethod
+    def _http_error(status, body):
+        response = mock.Mock()
+        response.read.side_effect = lambda size: body[:size]
+        return urllib.error.HTTPError(
+            "https://api.linear.app/graphql", status, "provider message",
+            {}, response,
+        ), response
+
+    def test_http_client_recognizes_linear_rate_limit_on_http_400(self):
+        body = json.dumps({
+            "errors": [{
+                "message": "rate limited",
+                "extensions": {"code": "RATELIMITED"},
+            }],
+        }).encode()
+        error, response = self._http_error(400, body)
+        with mock.patch(
+            "workstream_linear.urllib.request.urlopen", side_effect=error,
+        ) as urlopen, self.assertRaises(LinearRateLimitedError) as raised:
+            HttpGraphQLClient("secret-token").execute("query { ok }", {})
+
+        urlopen.assert_called_once()
+        self.assertEqual(str(raised.exception), "linear_rate_limited")
+        self.assertEqual(raised.exception.http_status, 400)
+        self.assertTrue(raised.exception.retryable)
+        response.read.assert_called_once_with(
+            HttpGraphQLClient.HTTP_ERROR_BODY_LIMIT + 1
+        )
+
+    def test_http_client_recognizes_rate_limit_in_http_200_graphql_errors(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.read.return_value = json.dumps({
+            "errors": [{
+                "message": "rate limited",
+                "extensions": {"code": "RATELIMITED", "statusCode": 429},
+            }],
+        }).encode()
+        with mock.patch(
+            "workstream_linear.urllib.request.urlopen", return_value=response,
+        ), self.assertRaises(LinearRateLimitedError) as raised:
+            HttpGraphQLClient("secret-token").execute("query { ok }", {})
+
+        self.assertEqual(str(raised.exception), "linear_rate_limited")
+        self.assertEqual(raised.exception.http_status, 200)
+
+    def test_http_client_http_error_does_not_expose_malformed_body_or_token(self):
+        secret = "secret-token-do-not-leak"
+        error, _response = self._http_error(
+            502, b'{"malformed":"provider-secret-do-not-leak"',
+        )
+        with mock.patch(
+            "workstream_linear.urllib.request.urlopen", side_effect=error,
+        ), self.assertRaises(LinearTransportError) as raised:
+            HttpGraphQLClient(secret).execute("query { ok }", {})
+
+        self.assertEqual(str(raised.exception), "linear_http_error:status=502")
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertNotIn("provider-secret", str(raised.exception))
+
+    def test_http_client_http_error_does_not_expose_valid_secret_body(self):
+        body = json.dumps({
+            "errors": [{
+                "message": "provider-secret-do-not-leak",
+                "extensions": {"code": "BAD_USER_INPUT"},
+            }],
+        }).encode()
+        error, _response = self._http_error(400, body)
+        with mock.patch(
+            "workstream_linear.urllib.request.urlopen", side_effect=error,
+        ), self.assertRaises(LinearTransportError) as raised:
+            HttpGraphQLClient("secret-token").execute("query { ok }", {})
+
+        self.assertEqual(str(raised.exception), "linear_http_error:status=400")
+        self.assertNotIn("provider-secret", str(raised.exception))
+
+    def test_http_client_does_not_trust_oversized_rate_limit_prefix(self):
+        prefix = b'{"errors":[{"extensions":{"code":"RATELIMITED"}}]}'
+        body = prefix + b" " * (HttpGraphQLClient.HTTP_ERROR_BODY_LIMIT + 1)
+        error, response = self._http_error(400, body)
+        with mock.patch(
+            "workstream_linear.urllib.request.urlopen", side_effect=error,
+        ), self.assertRaises(LinearTransportError) as raised:
+            HttpGraphQLClient("secret-token").execute("query { ok }", {})
+
+        self.assertEqual(str(raised.exception), "linear_http_error:status=400")
+        response.read.assert_called_once_with(
+            HttpGraphQLClient.HTTP_ERROR_BODY_LIMIT + 1
+        )
 
     def test_macos_framework_python_uses_system_ca_bundle(self):
         paths = ssl.DefaultVerifyPaths(None, None, "SSL_CERT_FILE", "/missing", "SSL_CERT_DIR", "/missing-dir")

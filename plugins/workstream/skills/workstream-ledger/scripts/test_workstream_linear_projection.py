@@ -290,10 +290,43 @@ def reviewed_retirement(adapter, kind, key):
 class FakeProjectionClient:
     def __init__(self):
         self.comments: list[dict] = []
+        self.relations: list[dict] = []
+        self.relation_page_size = 250
         self.calls: list[tuple[str, dict]] = []
 
     def execute(self, query, variables):
         self.calls.append((query, variables))
+        if "query WorkstreamChildRelationFirstPages" in query:
+            return {
+                alias: {
+                    "id": MOCK_CHILD_IDS.get(
+                        identifier.upper(), mock_child_uuid(identifier.upper()),
+                    ),
+                    "identifier": identifier.upper(),
+                    "parent": {"id": ROOT_UUID, "identifier": "GEN-37"},
+                    "team": {"id": "team", "organization": {"id": "workspace"}},
+                    "project": {"id": "project"},
+                    "relations": {"nodes": [], "pageInfo": {
+                        "hasNextPage": False, "endCursor": None,
+                    }},
+                    "inverseRelations": {"nodes": [], "pageInfo": {
+                        "hasNextPage": False, "endCursor": None,
+                    }},
+                }
+                for alias, identifier in variables.items()
+            }
+        if "query WorkstreamChildDependencySlots" in query:
+            start = int(variables.get("after") or 0)
+            nodes = self.relations[start:start + self.relation_page_size]
+            end = start + len(nodes)
+            has_next = end < len(self.relations)
+            return {"issueRelations": {
+                "nodes": [deepcopy(relation) for relation in nodes],
+                "pageInfo": {
+                    "hasNextPage": has_next,
+                    "endCursor": str(end) if has_next else None,
+                },
+            }}
         if (
             "query WorkstreamChildRelations" in query
             or "query WorkstreamChildInverseRelations" in query
@@ -6899,6 +6932,64 @@ class ProjectionTests(unittest.TestCase):
             [("child_closure", "GEN-70")],
         )
         self.assertNotIn("GEN-72", adapter.state().snapshot.get("child_closures", {}))
+
+    def test_projection_preview_fences_multi_item_batch_only_before_and_after(self):
+        client, live_adapter, source, graph, _children, manifest = (
+            self.multi_terminal_repair_fixture()
+        )
+        prepared = prepare_terminal_child_repairs(
+            manifest, graph, live_adapter.state(),
+        )
+        preview_snapshot, unresolved = (
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37", prepared, live_adapter,
+                authenticated_route=AUTHORITY, authenticated_source=source,
+                remote_head=HEAD,
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        )
+        expected = {
+            repair["child_identifier"]: repair[
+                "expected_child_readback_sha256"
+            ]
+            for repair in prepared["terminal_child_repairs"]
+        }
+        fence_calls = {
+            "terminal": 0, "projection_input": 0,
+            "predecessor": 0, "checkpoint": 0,
+        }
+
+        def counted_fence(child_ids):
+            fence_calls["terminal"] += 1
+            return {child_id: expected[child_id] for child_id in child_ids}
+
+        def counted_projection_input_fence():
+            fence_calls["projection_input"] += 1
+            return "f" * 64
+
+        def counted_checkpoint_fence():
+            fence_calls["checkpoint"] += 1
+            return None
+
+        live_comments_before = deepcopy(client.comments)
+        preview = ProjectionPreviewAdapter(live_adapter, client.comments)
+        result = reconcile_required_projection(
+            preview, preview_snapshot, prepared, remote_head=HEAD,
+            created_at="2026-08-27T20:00:00Z",
+            authenticated_source=source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=counted_fence,
+            projection_input_fence=counted_projection_input_fence,
+            checkpoint_fence=counted_checkpoint_fence,
+            legacy_unresolved_relation_heads=unresolved,
+            expected_projection_input_frontier="f" * 64,
+        )
+        self.assertGreater(len(result["writes"]), 1)
+        self.assertEqual(fence_calls, {
+            "terminal": 2, "projection_input": 2,
+            "predecessor": 0, "checkpoint": 2,
+        })
+        self.assertEqual(client.comments, live_comments_before)
 
     def test_multi_terminal_direct_writer_requires_complete_repair_set(self):
         client, adapter, source, graph, _children, manifest = (
