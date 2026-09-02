@@ -1002,6 +1002,246 @@ class ClassificationAuthorityTests(unittest.TestCase):
                 gh.assert_not_called()
 
 
+class LegacyProcessedCompatibilityTests(unittest.TestCase):
+    """Original five-field processed markers are hints, never receipts."""
+
+    repo = "private/ingress"
+    issue = 7
+
+    @staticmethod
+    def capture(event_id, *, session_id="session-a", workstream_id="GEN-37"):
+        return {
+            "schema_version": 1,
+            "event_id": event_id,
+            "captured_at": "2026-08-29T01:00:00Z",
+            "provider": "codex",
+            "session_id": session_id,
+            "turn_id": f"turn-{event_id}",
+            "surface_id": f"surface-{session_id}",
+            "workspace_id": "workspace-1",
+            "cwd": "/repo",
+            "workstream_id": workstream_id,
+            "context_url": "https://linear.app/generous/issue/GEN-37/x",
+            "prompt": f"Prompt for {event_id}",
+            "prompt_sha256": "a" * 64,
+            "redactions": 0,
+            "truncated": False,
+        }
+
+    @staticmethod
+    def legacy(event_id, disposition="promoted", *, promoted_issue="GEN-37"):
+        return {
+            "schema_version": 1,
+            "event_id": event_id,
+            "processed_at": "2026-08-29T01:01:00Z",
+            "disposition": disposition,
+            "promoted_issue": promoted_issue,
+        }
+
+    def recover(self, issues, comments, *, workstream="GEN-37"):
+        effects = [issues] + [[comments[number]] for number in comments]
+        with mock.patch.object(MODULE, "gh", side_effect=effects):
+            return MODULE.remote_events(self.repo, workstream)
+
+    def promotion(self, capture):
+        request = {
+            "schema_version": 1,
+            "ingress": {
+                "repo": self.repo, "remote_issue": self.issue,
+                "event_id": capture["event_id"],
+                "prompt_sha256": capture["prompt_sha256"],
+            },
+            "authority": {
+                "workspace_id": "11111111-1111-4111-8111-111111111111",
+                "team_id": "22222222-2222-4222-8222-222222222222",
+                "project_id": "33333333-3333-4333-8333-333333333333",
+                "root_issue_id": "44444444-4444-4444-8444-444444444444",
+            },
+            "workstream_id": "GEN-37",
+            "plan_revision": "b" * 64,
+            "expected_material_revision": 0,
+            "changes": [{"kind": "requirement", "payload": {"text": "Keep open"}}],
+        }
+        return MODULE.promotion_payload(request, capture)
+
+    def test_live_shape_legacy_history_keeps_all_thirty_events_across_two_sessions(self):
+        comments = []
+        dispositions = ("promoted", "no-material-delta", "superseded")
+        for index in range(30):
+            event_id = f"wsi_live_{index:02d}"
+            session_id = "session-a" if index < 15 else "session-b"
+            capture = self.capture(event_id, session_id=session_id)
+            legacy = self.legacy(event_id, dispositions[index % len(dispositions)])
+            comments.extend([
+                {"id": index * 2, "body": MODULE.comment_body(
+                    MODULE.CAPTURE_MARKER, capture)},
+                {"id": index * 2 + 1, "body": MODULE.comment_body(
+                    MODULE.PROCESSED_MARKER, legacy)},
+            ])
+        events = self.recover(
+            [{"number": self.issue, "url": "i", "title": "ingress"}],
+            {self.issue: comments},
+        )
+        self.assertEqual(len(events), 30)
+        self.assertEqual({event["session_id"] for event in events}, {
+            "session-a", "session-b",
+        })
+        self.assertEqual(
+            {event["classification_hint"]["dispositions"][0] for event in events},
+            set(dispositions),
+        )
+        self.assertTrue(all(
+            event["classification_hint"]["authoritative"] is False for event in events
+        ))
+
+    def test_legacy_promoted_marker_with_matching_binding_does_not_suppress(self):
+        capture = self.capture("wsi_bound", workstream_id=None)
+        binding = {
+            "event_id": "wsi_bound", "workstream_id": "GEN-37",
+            "context_url": "https://linear.app/generous/issue/GEN-37/x",
+        }
+        comments = [
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture)},
+            {"body": MODULE.comment_body(MODULE.BIND_MARKER, binding)},
+            {"body": MODULE.comment_body(
+                MODULE.PROCESSED_MARKER, self.legacy("wsi_bound"))},
+        ]
+        events = self.recover(
+            [{"number": self.issue, "url": "i", "title": "ingress"}],
+            {self.issue: comments},
+        )
+        self.assertEqual([event["event_id"] for event in events], ["wsi_bound"])
+        self.assertEqual(events[0]["workstream_id"], "GEN-37")
+        self.assertEqual(events[0]["classification_hint"]["dispositions"], ["promoted"])
+
+    def test_legacy_marker_leaves_a_staged_modern_promotion_visible(self):
+        capture = self.capture("wsi_staged")
+        promotion = self.promotion(capture)
+        comments = [
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture)},
+            {"body": MODULE.comment_body(MODULE.PROMOTION_MARKER, promotion)},
+            {"body": MODULE.comment_body(
+                MODULE.PROCESSED_MARKER, self.legacy("wsi_staged"))},
+        ]
+        events = self.recover(
+            [{"number": self.issue, "url": "i", "title": "ingress"}],
+            {self.issue: comments},
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["promotion_state"], "staged")
+        self.assertEqual(events[0]["promotion"], promotion)
+
+    def test_legacy_orphan_and_cross_route_markers_establish_no_route(self):
+        capture = self.capture("wsi_cross")
+        issue_seven = [
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture)},
+        ]
+        issue_eight = [
+            {"body": MODULE.comment_body(
+                MODULE.PROCESSED_MARKER, self.legacy("wsi_cross"))},
+            {"body": MODULE.comment_body(
+                MODULE.PROCESSED_MARKER, self.legacy("wsi_orphan"))},
+        ]
+        events = self.recover(
+            [
+                {"number": 7, "url": "i7", "title": "ingress"},
+                {"number": 8, "url": "i8", "title": "ingress"},
+            ],
+            {7: issue_seven, 8: issue_eight},
+        )
+        self.assertEqual([event["event_id"] for event in events], ["wsi_cross"])
+        self.assertNotIn("classification_hint", events[0])
+
+    def test_modern_orphan_and_cross_route_receipts_still_refuse(self):
+        def modern(event_id):
+            return {
+                "schema_version": 1, "event_id": event_id,
+                "processed_at": "2026-08-29T01:02:00Z", "disposition": "promoted",
+                "promoted_issue": "GEN-37", "promotion_id": "wsp_" + "b" * 32,
+                "material_event_id": "wsd_" + "c" * 32, "material_revision": 1,
+                "material_remote_id": "linear-1",
+            }
+
+        orphan = [{"body": MODULE.comment_body(
+            MODULE.PROCESSED_MARKER, modern("wsi_orphan"))}]
+        with self.subTest(case="orphan"), self.assertRaisesRegex(
+            ValueError, "processed_without_capture:wsi_orphan"
+        ):
+            self.recover(
+                [{"number": 8, "url": "i8", "title": "ingress"}], {8: orphan},
+            )
+
+        capture = self.capture("wsi_cross")
+        issue_seven = [{"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture)}]
+        issue_eight = [{"body": MODULE.comment_body(
+            MODULE.PROCESSED_MARKER, modern("wsi_cross"))}]
+        with self.subTest(case="cross-route"), self.assertRaisesRegex(
+            ValueError, "ingress_event_route_collision:wsi_cross"
+        ):
+            self.recover(
+                [
+                    {"number": 7, "url": "i7", "title": "ingress"},
+                    {"number": 8, "url": "i8", "title": "ingress"},
+                ],
+                {7: issue_seven, 8: issue_eight},
+            )
+
+    def test_partial_float_and_invalid_value_legacy_lookalikes_fail_closed(self):
+        variants = {
+            "partial": {**self.legacy("wsi_bad"), "promotion_id": "wsp_bad"},
+            "float": {**self.legacy("wsi_bad"), "schema_version": 1.0},
+            "invalid": {**self.legacy("wsi_bad"), "promoted_issue": 37},
+        }
+        capture = self.capture("wsi_bad")
+        for name, marker in variants.items():
+            with self.subTest(name=name), self.assertRaisesRegex(
+                ValueError, "processed_promotion_schema_invalid"
+            ):
+                MODULE.reduce_ingress_comments([
+                    {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture)},
+                    {"body": MODULE.comment_body(MODULE.PROCESSED_MARKER, marker)},
+                ], event_id="wsi_bad", repo=self.repo, issue=self.issue)
+
+    def test_conflicting_legacy_and_modern_forms_refuse_before_linear_readback(self):
+        capture = self.capture("wsi_conflict")
+        promotion = self.promotion(capture)
+        delta = MODULE.promotion_delta(promotion)
+        modern = {
+            "schema_version": 1, "event_id": "wsi_conflict",
+            "processed_at": "2026-08-29T01:02:00Z", "disposition": "promoted",
+            "promoted_issue": "GEN-37", "promotion_id": promotion["promotion_id"],
+            "material_event_id": delta.event_id, "material_revision": 1,
+            "material_remote_id": "linear-1",
+        }
+        comments = [
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture)},
+            {"body": MODULE.comment_body(MODULE.PROMOTION_MARKER, promotion)},
+            {"body": MODULE.comment_body(
+                MODULE.PROCESSED_MARKER, self.legacy("wsi_conflict"))},
+            {"body": MODULE.comment_body(MODULE.PROCESSED_MARKER, modern)},
+        ]
+        with self.assertRaisesRegex(ValueError, "conflicting_processed:wsi_conflict"):
+            self.recover(
+                [{"number": self.issue, "url": "i", "title": "ingress"}],
+                {self.issue: comments},
+            )
+
+    def test_malformed_capture_invalid_escape_remains_quarantined(self):
+        malformed = (
+            MODULE.CAPTURE_MARKER
+            + '\n```json\n{"event_id":"wsi_bad_escape","prompt":"bad\\q"}\n```'
+        )
+        comments = [
+            {"body": malformed},
+            {"body": MODULE.comment_body(
+                MODULE.PROCESSED_MARKER, self.legacy("wsi_bad_escape"))},
+        ]
+        self.assertEqual(self.recover(
+            [{"number": self.issue, "url": "i", "title": "ingress"}],
+            {self.issue: comments},
+        ), [])
+
+
 class ManagedPromotionTests(unittest.TestCase):
     """Raw capture must survive every boundary through processed successor proof."""
 

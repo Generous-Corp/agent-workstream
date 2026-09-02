@@ -747,6 +747,34 @@ def _payload_without_time(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if key != "processed_at"}
 
 
+def _is_exact_legacy_processed_hint(payload: Any) -> bool:
+    """Recognize the original five-field marker without granting it authority."""
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version", "event_id", "processed_at", "disposition", "promoted_issue",
+    }:
+        return False
+    promoted_issue = payload.get("promoted_issue")
+    return (
+        type(payload.get("schema_version")) is int
+        and payload["schema_version"] == 1
+        and isinstance(payload.get("event_id"), str)
+        and bool(payload["event_id"])
+        and len(payload["event_id"].encode("utf-8")) <= 256
+        and isinstance(payload.get("processed_at"), str)
+        and bool(payload["processed_at"])
+        and payload.get("disposition")
+        in {"promoted", "no-material-delta", "superseded"}
+        and (
+            promoted_issue is None
+            or (
+                isinstance(promoted_issue, str)
+                and bool(promoted_issue)
+                and len(promoted_issue.encode("utf-8")) <= 256
+            )
+        )
+    )
+
+
 def reduce_ingress_comments(
     comments: list[dict[str, Any]], *, event_id: str,
     repo: str | None = None, issue: int | None = None,
@@ -799,7 +827,8 @@ def reduce_ingress_comments(
             or promotion.get("source_captured_at") != capture.get("captured_at")
         ):
             raise ValueError(f"promotion_capture_mismatch:{event_id}")
-    if disposition:
+    legacy_disposition = _is_exact_legacy_processed_hint(disposition)
+    if disposition and not legacy_disposition:
         if disposition.get("disposition") == "promoted":
             if set(disposition) != {
                 "schema_version", "event_id", "processed_at", "disposition", "promoted_issue",
@@ -827,7 +856,11 @@ def reduce_ingress_comments(
                 raise ValueError(f"processed_without_promotion:{event_id}")
         elif promotion:
             raise ValueError(f"promotion_disposition_mismatch:{event_id}")
-    return {"capture": capture, "promotion": promotion, "processed": disposition}
+    return {
+        "capture": capture,
+        "promotion": promotion,
+        "processed": None if legacy_disposition else disposition,
+    }
 
 
 def remote_issue_comments(repo: str, issue: int) -> list[dict[str, Any]]:
@@ -957,7 +990,10 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
         disposition = item.get("disposition")
         event_id = item.get("event_id")
         if (
-            disposition not in {"no-material-delta", "superseded"}
+            (
+                disposition not in {"no-material-delta", "superseded"}
+                and not _is_exact_legacy_processed_hint(item)
+            )
             or not isinstance(event_id, str)
             or not event_id
             or len(event_id.encode("utf-8")) > 256
@@ -1017,6 +1053,8 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
             item = parse_comment(comment.get("body", ""), PROCESSED_MARKER)
             if item:
                 record_mutable_hint(item, comment, issue_number)
+                if _is_exact_legacy_processed_hint(item):
+                    continue
                 if not isinstance(item, dict) or item.get("disposition") != "promoted":
                     continue
                 event_id = item.get("event_id")
