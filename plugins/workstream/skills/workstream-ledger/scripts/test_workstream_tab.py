@@ -17,16 +17,23 @@ SPEC.loader.exec_module(tab)
 
 
 class FakeCmux:
-    def __init__(self, title="Linear", accept_rename=True):
+    def __init__(self, title="Linear", accept_rename=True,
+                 *, resolve_target=None):
         self.title = title
         self.accept_rename = accept_rename
         self.calls = []
         self.options = []
+        self.resolve_target = resolve_target
 
     def __call__(self, argv, **kwargs):
         self.calls.append(argv)
         self.options.append(kwargs)
-        if argv[1] == "ping":
+        if argv[1] == "rpc":
+            output = json.dumps({
+                "workspace_id": "workspace:3",
+                "surface_id": self.resolve_target,
+            }) if self.resolve_target else "{}"
+        elif argv[1] == "ping":
             output = "pong"
         elif argv[1] == "identify":
             output = json.dumps({"caller": {
@@ -99,6 +106,61 @@ class WorkstreamTabTests(unittest.TestCase):
             "ping", "identify", "list-pane-surfaces", "rename-tab", "list-pane-surfaces",
         ])
         self.assertEqual(fake.calls[3][-1], "Linear · GEN-37")
+
+    def test_surface_id_precedes_workspace_valued_legacy_tab_id(self):
+        fake = FakeCmux("Linear", resolve_target="surface:7")
+        result = tab.apply_title(
+            "GEN-37", environ={
+                "CMUX_SURFACE_ID": "surface:7",
+                "CMUX_TAB_ID": "workspace:3",
+            }, runner=fake, which=lambda _: "/opt/cmux",
+        )
+        self.assertEqual(result["status"], "updated")
+        self.assertEqual(fake.calls[1][fake.calls[1].index("--surface") + 1], "surface:7")
+
+    def test_absent_surface_uses_one_bounded_controlling_tty_target(self):
+        fake = FakeCmux("Linear", resolve_target="surface:7")
+        with mock.patch.object(tab, "_bounded_ancestor_pids", return_value=[42]):
+            result = tab.apply_title(
+                "GEN-37", environ={"CMUX_SOCKET_PATH": "/tmp/cmux.sock"}, runner=fake,
+                which=lambda _: "/opt/cmux",
+            )
+        self.assertEqual(result["status"], "updated")
+        self.assertTrue(any("agent.resolve_delivery_target" in call for call in fake.calls))
+
+    def test_explicit_target_failure_never_retargets_through_tty(self):
+        fake = FakeCmux("Linear", resolve_target="surface:other")
+        def runner(argv, **kwargs):
+            if argv[1] == "identify" and "surface:missing" in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "unknown surface")
+            return fake(argv, **kwargs)
+        with mock.patch.object(tab, "_bounded_ancestor_pids", return_value=[42]):
+            result = tab.apply_title(
+                "GEN-37", target="surface:missing", runner=runner,
+                which=lambda _: "/opt/cmux",
+            )
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["reason"], "cmux_target_unresolved")
+        self.assertNotIn("rename-tab", [call[1] for call in fake.calls])
+
+    def test_tty_target_resolver_preserves_unresolved_vs_ambiguous(self):
+        with mock.patch.object(tab, "_bounded_ancestor_pids", return_value=[1, 2]):
+            def ambiguous(argv, **kwargs):
+                payload = json.loads(argv[-1])
+                surface = "surface:a" if payload["pid"] == 1 else "surface:b"
+                return subprocess.CompletedProcess(argv, 0, json.dumps({
+                    "workspace_id": "workspace:3", "surface_id": surface,
+                }), "")
+            with self.assertRaisesRegex(tab.TabTitleError, "cmux_target_ambiguous"):
+                tab._resolve_cmux_tty_target("cmux", ambiguous, {})
+
+        with mock.patch.object(tab, "_bounded_ancestor_pids", return_value=[1]):
+            with self.assertRaisesRegex(tab.TabTitleError, "cmux_target_unresolved"):
+                tab._resolve_cmux_tty_target(
+                    "cmux", lambda argv, **kwargs: subprocess.CompletedProcess(
+                        argv, 0, "{}", "",
+                    ), {},
+                )
 
     def test_cmux_commands_inherit_the_exact_socket_namespace(self):
         fake = FakeCmux("Linear · GEN-37")
