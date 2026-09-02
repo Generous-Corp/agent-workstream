@@ -766,6 +766,9 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             < tuple(map(int, value["minimum_writer_version"].split(".")))
             for writer in value["writers"]
         )
+        or {writer["machine_id"] for writer in value["writers"]}
+        != {"M1", "M3", "M5"}
+        or len(value["writers"]) != 3
     ):
         raise LinearProjectionError("invalid_writer_fleet_gate")
     if event["kind"] in {

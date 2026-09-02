@@ -18,11 +18,11 @@ def gated_state():
         "legacy_writer_count": 0, "plan_revision": fixture.PLAN,
         "observed_at": "2026-09-02T10:00:00Z",
         "writers": [{
-            "writer_id": "shipyard-primary", "machine_id": "M5",
+            "writer_id": f"shipyard-{machine}", "machine_id": machine,
             "version": "0.4.82", "source_commit": "c" * 40,
             "source_tree_sha256": "d" * 64,
             "observed_at": "2026-09-02T10:00:00Z",
-        }],
+        } for machine in ("M1", "M3", "M5")],
     }
     state.events.append(build_projection_event(
         workstream_id="GEN-91", kind="writer_fleet_gate", key="root",

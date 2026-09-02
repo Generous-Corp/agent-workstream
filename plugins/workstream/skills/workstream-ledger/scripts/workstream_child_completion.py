@@ -39,6 +39,7 @@ from workstream_resume import (
 
 
 MINIMUM_WRITER_VERSION = "0.4.82"
+SANCTIONED_FLEET_MACHINE_IDS = frozenset({"M1", "M3", "M5"})
 
 
 class ChildCompletionError(RuntimeError):
@@ -97,6 +98,64 @@ def _post_child_valid(
     )
 
 
+def _validate_pending_finalizer(
+    reservation: dict[str, Any], *, snapshot: dict[str, Any], state: Any,
+    comments: list[dict[str, Any]], child_comments: list[dict[str, Any]],
+    root_token: str,
+) -> None:
+    """Re-prove every saved fence before finalizing a post-native crash."""
+    fences = reservation.get("intent_fences")
+    frontiers = (fences or {}).get("frontiers")
+    if not isinstance(fences, dict) or not isinstance(frontiers, dict):
+        raise ChildCompletionError("child_completion_recovery_fences_missing")
+    if _digest(frontiers) != fences.get("frontiers_sha256"):
+        raise ChildCompletionError("child_completion_recovery_fences_tampered")
+    root = snapshot.get("root") or {}
+    if _digest(_native_child(root)) != frontiers.get("native_root_sha256"):
+        raise ChildCompletionError("child_completion_recovery_root_drift")
+    child_id = fences.get("child_issue_id")
+    child = next((item for item in snapshot.get("children", [])
+                  if item.get("id") == child_id), None)
+    if child is None or _digest(_native_child(child)) != _digest(
+        fences.get("native_child_after")
+    ):
+        raise ChildCompletionError("child_completion_recovery_child_drift")
+    slot = ledger_boundary_slot_id(
+        root_token, reservation["material_revision"],
+        reservation["frontier_ids"], reservation["authority"],
+    )
+    root_comments = [item for item in comments if item.get("id") != slot]
+    expected = frontiers.get("root") or {}
+    if (_digest(root_comments) != expected.get("comments_sha256")
+            or _digest(child_comments) != (frontiers.get("child") or {}).get(
+                "comments_sha256")):
+        raise ChildCompletionError("child_completion_recovery_comment_drift")
+    root_events = reduce_event_comments(comments, workstream_id=root_token)
+    child_events = reduce_event_comments(
+        child_comments, workstream_id=str(child.get("identifier", "")).upper(),
+    )
+    if root_events.revision != frontiers["root"].get("material_revision") \
+            or child_events.revision != frontiers["child"].get("material_revision"):
+        raise ChildCompletionError("child_completion_recovery_material_drift")
+    root_checkpoints = reduce_checkpoint_comments(comments, workstream_id=root_token)
+    child_checkpoints = reduce_checkpoint_comments(
+        child_comments, workstream_id=str(child.get("identifier", "")).upper(),
+    )
+    if [item["event_id"] for item in root_checkpoints.checkpoints] \
+            != frontiers["root"].get("checkpoint_event_ids") \
+            or [item["event_id"] for item in child_checkpoints.checkpoints] \
+            != frontiers["child"].get("checkpoint_event_ids"):
+        raise ChildCompletionError("child_completion_recovery_checkpoint_drift")
+    remote_ids = [((getattr(state, "remote_ids", {}) or {}).get(item["event_id"]))
+                  for item in state.events]
+    if remote_ids[:len(reservation.get("projection_frontier_ids", []))] \
+            != reservation.get("projection_frontier_ids"):
+        raise ChildCompletionError("child_completion_recovery_projection_drift")
+    if any(event["event_id"] == reservation["intent_event"]["event_id"]
+           for event in state.events):
+        raise ChildCompletionError("child_completion_recovery_already_finalized")
+
+
 def _eligible_fleet_gate(
     state: Any, *, plan_revision: str,
 ) -> dict[str, Any]:
@@ -112,6 +171,11 @@ def _eligible_fleet_gate(
         or value.get("legacy_writer_count") != 0
         or value.get("plan_revision") != plan_revision
         or not isinstance(value.get("writers"), list) or not value["writers"]
+        or {writer.get("machine_id") for writer in value["writers"]}
+        != SANCTIONED_FLEET_MACHINE_IDS
+        or len(value["writers"]) != len(SANCTIONED_FLEET_MACHINE_IDS)
+        or len({writer.get("writer_id") for writer in value["writers"]})
+        != len(value["writers"])
     ):
         raise ChildCompletionError("current_zero_legacy_writer_fleet_gate_required")
     return {"event_id": event["event_id"], "value_sha256": _digest(value)}
@@ -651,6 +715,11 @@ def run(argv: list[str]) -> dict[str, Any]:
              and item["intent_event"]["key"] == child_token]
         if len(pending) != 1 or pending[0]["intent_event"]["value"] != desired["value"]:
             raise ChildCompletionError("post_native_completion_reservation_required")
+        _validate_pending_finalizer(
+            pending[0], snapshot=snapshot, state=state, comments=comments,
+            child_comments=(graph.get("child_comments") or {}).get(child_token, []),
+            root_token=token,
+        )
         recovery = {
             "schema_version": 1, "operation_status": "post_native_finalization_ready",
             "intent_event": pending[0]["intent_event"],

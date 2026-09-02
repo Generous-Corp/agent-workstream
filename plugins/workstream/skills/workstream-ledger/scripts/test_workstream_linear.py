@@ -1507,6 +1507,41 @@ class LinearTransportTests(unittest.TestCase):
         )
         self.assertEqual(client.execute.call_count, 2)
 
+    def test_resume_collects_comments_for_terminal_children(self):
+        root = {
+            "id": "root-id", "identifier": "GEN-37", "title": "Root",
+            "description": "Plan revision: sha\nLedger revision: 0",
+            "url": "https://linear/GEN-37", "updatedAt": "now",
+            "state": {"name": "In Progress", "type": "started"},
+            "team": {"id": "team", "organization": {"id": "workspace"}},
+            "project": {"id": "project", "name": "Linear Integration"},
+        }
+        child = {
+            "id": "child-id", "identifier": "GEN-92", "title": "Child",
+            "description": "Next action: done", "url": "https://linear/GEN-92",
+            "updatedAt": "later", "archivedAt": None,
+            "state": {"id": "done", "name": "Done", "type": "completed"},
+            "parent": {"id": "root-id", "identifier": "GEN-37"},
+            "team": {"id": "team", "organization": {"id": "workspace"}},
+            "project": {"id": "project"}, "assignee": None,
+            "comments": {
+                "nodes": [{"id": "terminal-comment", "body": "receipt"}],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            },
+        }
+        client = mock.Mock()
+        client.execute.return_value = {"issue": {
+            **root, "children": {"nodes": [child],
+            "pageInfo": {"hasNextPage": False, "endCursor": None}},
+        }}
+        snapshot = LinearGraphQLTransport(client, team_id="team").snapshot_for_root(
+            "GEN-37", include_child_comments=True,
+        )
+        self.assertEqual(
+            [item["id"] for item in snapshot["child_comments"]["GEN-92"]],
+            ["terminal-comment"],
+        )
+
     def test_recover_authorized_reparented_child_preserves_exact_state(self):
         child_id = "22222222-2222-4222-8222-222222222222"
         client = mock.Mock()
