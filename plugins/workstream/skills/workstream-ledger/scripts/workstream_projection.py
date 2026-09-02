@@ -56,6 +56,7 @@ from workstream_child_dependencies import (
 from workstream_projection_history import (
     carried_predecessor_evidence_authority,
     closure_bound_historical_evidence, ProjectionHistoryError,
+    validated_nonprimary_backfill_authority,
 )
 
 
@@ -2642,6 +2643,14 @@ def prepare_terminal_child_evidence_seeds(
                 contract["nonprimary_backfill_authority"] = deepcopy(
                     nonprimary_backfill
                 )
+                if validated_nonprimary_backfill_authority(
+                    {"value": contract}, scope_value, list(state.events),
+                    list(state.events),
+                    trusted_receipt=nonprimary_backfill,
+                ) is None:
+                    raise LinearProjectionError(
+                        f"terminal_child_evidence_seed_nonprimary_backfill_contract_invalid:{child_id}:{key}"
+                    )
             historical_authority = contract.get(
                 "predecessor_closure_authority"
             )

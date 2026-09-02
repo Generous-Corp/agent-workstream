@@ -6116,7 +6116,11 @@ class ProjectionTests(unittest.TestCase):
             if event["kind"] == "evidence_contract"
             and event["value"].get("owning_child") == "GEN-70"
         )
-        old_head = evidence["value"]["exact_head"]
+        old_head = HEAD
+        evidence["value"]["exact_head"] = new_head
+        for layer in evidence["value"]["layers"].values():
+            for receipt in layer.get("receipts", []):
+                receipt["exact_head"] = new_head
         scope_anchor = next(
             event for event in events
             if (event["kind"], event["key"]) == ("scope", "root")
@@ -6127,7 +6131,7 @@ class ProjectionTests(unittest.TestCase):
         )
         evidence["value"]["nonprimary_backfill_authority"] = {
             "repository_key": evidence["value"]["repository_key"],
-            "from_exact_head": old_head, "to_exact_head": old_head,
+            "from_exact_head": old_head, "to_exact_head": new_head,
             "from_scope_event_id": scope_anchor["event_id"],
             "from_scope_value_sha256": canonical_digest(scope_anchor["value"]),
             "from_disposition_event_id": disposition_anchor["event_id"],
@@ -6140,6 +6144,9 @@ class ProjectionTests(unittest.TestCase):
             "merge_sha": "d" * 40,
             "checks_sha256": "e" * 64,
         }
+        trusted_receipt = deepcopy(
+            evidence["value"]["nonprimary_backfill_authority"]
+        )
         closure = next(
             event for event in events
             if (event["kind"], event["key"]) == ("child_closure", "GEN-70")
@@ -6151,16 +6158,39 @@ class ProjectionTests(unittest.TestCase):
         closure["value"]["evidence_receipts_sha256"] = evidence_receipts_sha256(
             [evidence["value"]]
         )
+        closure["value"]["exact_head"] = new_head
         current_scope = deepcopy(strict["scope"])
         primary = next(
             repository for repository in current_scope["repositories"]
             if repository_key(repository) == current_scope["primary_repository"]
         )
-        primary["exact_head"] = new_head
-        self.assertTrue(
-            closure_bound_historical_evidence(
-                events, current_scope, projection_history=events,
-            )
+        primary["exact_head"] = old_head
+        current_scope["primary_repository"] = "github.com:id:R_other"
+        other = deepcopy(primary)
+        other["provider_repository_id"] = "R_other"
+        other["slug"] = "github.com/acme/other"
+        other["exact_head"] = new_head
+        other["identity_resolution"]["provider_repository_id"] = "R_other"
+        other["identity_resolution"]["resolved_slug"] = "github.com/acme/other"
+        other["identity_resolution"]["evidence"][0].update({
+            "provider_repository_id": "R_other",
+            "resolved_slug": "github.com/acme/other",
+        })
+        current_scope["repositories"].append(other)
+        current_scope["child_ownership"]["GEN-71"] = "github.com:id:R_other"
+        authority = workstream_projection.validated_nonprimary_backfill_authority(
+            evidence, current_scope, events, events,
+            trusted_receipt=trusted_receipt,
+        )
+        self.assertIsNotNone(
+            authority,
+            f"owner={evidence['value'].get('repository_key')} primary={current_scope.get('primary_repository')} repos={[repository_key(r) for r in current_scope['repositories']]} heads={[r.get('exact_head') for r in current_scope['repositories']]}",
+        )
+        self.assertIsNone(
+            workstream_projection.validated_nonprimary_backfill_authority(
+                evidence, current_scope, events, events,
+            ),
+            "mutable carried receipt cannot self-authenticate provider evidence",
         )
         for field, forged in (
             ("provider_repository_id", "WRONG_PROVIDER"),
@@ -6176,23 +6206,20 @@ class ProjectionTests(unittest.TestCase):
                 and event["value"].get("owning_child") == "GEN-70"
             )
             mutated_evidence["value"]["nonprimary_backfill_authority"][field] = forged
-            with self.assertRaisesRegex(
-                ProjectionHistoryError,
-                r"closure_history_(repository|evidence_set)_mismatch:GEN-70",
-            ):
-                closure_bound_historical_evidence(
-                    mutated, current_scope, projection_history=mutated,
-                )
+            mutated_authority = workstream_projection.validated_nonprimary_backfill_authority(
+                mutated_evidence, current_scope, mutated, mutated,
+                trusted_receipt=trusted_receipt,
+            )
+            self.assertIsNone(mutated_authority, field)
         evidence["value"]["nonprimary_backfill_authority"][
             "repository_key"
         ] = "github.com:id:forged"
-        with self.assertRaisesRegex(
-            ProjectionHistoryError,
-            r"closure_history_(repository|evidence_set)_mismatch:GEN-70",
-        ):
-            closure_bound_historical_evidence(
-                events, current_scope, projection_history=events,
+        self.assertIsNone(
+            workstream_projection.validated_nonprimary_backfill_authority(
+                evidence, current_scope, events, events,
+                trusted_receipt=trusted_receipt,
             )
+        )
 
     def test_current_head_closure_cannot_precede_its_evidence(self):
         _client, _adapter, _source, _graph, strict, _new_head = (
