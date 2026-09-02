@@ -415,7 +415,8 @@ def semantic_ledger_reservations(
     authenticated_route: dict[str, str], current_plan_revision: str,
     intent_event: dict[str, Any], expected_material_revision: int | None = None,
     expected_projection_revision: int | None = None,
-) -> list[tuple[dict[str, Any], str | None]]:
+    expected_projection_frontier_ids: list[str] | None = None,
+) -> list[tuple[dict[str, Any], str]]:
     """Find authenticated reservations even when their remote slot drifted.
 
     Older Linear transports accepted the caller-supplied slot in the input but
@@ -429,8 +430,67 @@ def semantic_ledger_reservations(
         intent_event, ensure_ascii=False, sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
-    expected_core = None
-    matches: list[tuple[dict[str, Any], str | None]] = []
+    if (
+        expected_material_revision is None
+        or expected_projection_revision is None
+        or not isinstance(expected_projection_frontier_ids, list)
+        or len(expected_projection_frontier_ids) != expected_projection_revision
+        or not all(
+            isinstance(item, str) and item
+            for item in expected_projection_frontier_ids
+        )
+    ):
+        raise LinearEventError("invalid_semantic_reservation_expectation")
+    expected_core = {
+        "schema_version": 1,
+        "workstream_id": workstream_id,
+        "material_revision": expected_material_revision,
+        "intent_kind": "child_mutation_projection",
+        "plan_revision": current_plan_revision,
+        "projection_revision": expected_projection_revision,
+        "projection_frontier_ids": expected_projection_frontier_ids,
+        "authority": authenticated_route,
+        "intent_event": intent_event,
+        "intent_sha256": expected_intent_sha,
+    }
+    expected_value = intent_event.get("value") or {}
+
+    def claims_intent(candidate: Any) -> bool:
+        if not isinstance(candidate, dict):
+            return False
+        event = candidate.get("intent_event") or {}
+        value = event.get("value") or {}
+        expected_event_id = intent_event.get("event_id")
+        expected_proposal_id = expected_value.get("proposal_id")
+        expected_proposal_remote_id = expected_value.get("proposal_remote_id")
+        return bool(
+            (
+                isinstance(expected_event_id, str) and expected_event_id
+                and event.get("event_id") == expected_event_id
+            )
+            or (
+                isinstance(expected_proposal_id, str) and expected_proposal_id
+                and value.get("proposal_id") == expected_proposal_id
+            )
+            or (
+                isinstance(expected_proposal_remote_id, str)
+                and expected_proposal_remote_id
+                and value.get("proposal_remote_id")
+                == expected_proposal_remote_id
+            )
+            or (
+                candidate.get("workstream_id") == workstream_id
+                and candidate.get("intent_kind")
+                == "child_mutation_projection"
+                and candidate.get("material_revision")
+                == expected_material_revision
+                and candidate.get("projection_revision")
+                == expected_projection_revision
+            )
+        )
+
+    matches: list[tuple[dict[str, Any], str]] = []
+    seen_remote_ids: set[str] = set()
     for comment in comments:
         body = comment.get("body") or ""
         if not isinstance(body, str) or body.count(SERIALIZATION_PREFIX) != 1:
@@ -443,6 +503,12 @@ def semantic_ledger_reservations(
                 found[0] + "=" * (-len(found[0]) % 4)
             ))
             reservation = envelope["reservation"]
+        except (binascii.Error, KeyError, TypeError, ValueError,
+                json.JSONDecodeError):
+            continue
+        if not claims_intent(reservation):
+            continue
+        try:
             canonical = json.dumps(
                 reservation, ensure_ascii=False, sort_keys=True,
                 separators=(",", ":"),
@@ -450,31 +516,23 @@ def semantic_ledger_reservations(
             if set(envelope) != {"reservation", "sha256"} or not hmac.compare_digest(
                 envelope["sha256"], hashlib.sha256(canonical).hexdigest()
             ) or encode_ledger_reservation(reservation) != body:
-                continue
+                raise ValueError("reservation authentication mismatch")
         except (binascii.Error, KeyError, TypeError, ValueError,
                 json.JSONDecodeError, LinearEventError):
-            continue
-        if (
-            reservation.get("workstream_id") != workstream_id
-            or reservation.get("authority") != authenticated_route
-            or reservation.get("plan_revision") != current_plan_revision
-            or reservation.get("intent_kind") != "child_mutation_projection"
-            or reservation.get("intent_event") != intent_event
-            or reservation.get("intent_sha256") != expected_intent_sha
-            or (expected_material_revision is not None and
-                reservation.get("material_revision") != expected_material_revision)
-            or (expected_projection_revision is not None and
-                reservation.get("projection_revision") != expected_projection_revision)
-        ):
-            continue
-        core = json.dumps(_reservation_retry_core(reservation),
-                          ensure_ascii=False, sort_keys=True,
-                          separators=(",", ":"))
-        if expected_core is None:
-            expected_core = core
-        if core != expected_core:
+            raise LinearEventError(
+                "ledger_reservation_authentication_failed"
+            ) from None
+        if _reservation_retry_core(reservation) != expected_core:
             raise LinearEventError("ledger_reservation_intent_conflict")
-        matches.append((reservation, comment.get("id")))
+        remote_id = comment.get("id")
+        if (
+            not isinstance(remote_id, str)
+            or not remote_id
+            or remote_id in seen_remote_ids
+        ):
+            raise LinearEventError("ledger_reservation_intent_conflict")
+        seen_remote_ids.add(remote_id)
+        matches.append((reservation, remote_id))
     return matches
 
 

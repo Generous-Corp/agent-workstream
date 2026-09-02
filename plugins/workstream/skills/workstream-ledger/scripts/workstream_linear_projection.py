@@ -4586,45 +4586,6 @@ class LinearProjectionAdapter:
         )
 
         comments = self._comments()
-        # Recover a reservation whose Linear comment id differs from the
-        # deterministic slot (older transports ignored caller-supplied ids).
-        # Match immutable intent, not the collision/frontier serialization;
-        # conflicting bodies remain fail-closed and never create another slot.
-        semantic = semantic_ledger_reservations(
-            comments, workstream_id=self.workstream_id,
-            authenticated_route=self.authority,
-            current_plan_revision=self.plan_revision,
-            intent_event=event,
-            expected_material_revision=reduce_event_comments(
-                comments, workstream_id=self.workstream_id,
-            ).revision,
-            expected_projection_revision=event["expected_revision"],
-        )
-        if semantic:
-            # Do not resurrect an orphaned reservation: the child proposal is
-            # part of the immutable intent and must still be remotely live.
-            from workstream_child_proposal import _comments, proposal_index
-            child_value = event.get("value") or {}
-            child_comments = _comments(
-                self.client, child_value.get("child_workstream_id", ""),
-            )
-            proposal = proposal_index(child_comments).get(
-                child_value.get("proposal_id"),
-            )
-            if proposal is not None and (
-                proposal[1].get("id") == child_value.get("proposal_remote_id")
-            ):
-                return semantic[0][0]
-        pending = pending_ledger_reservations(
-            comments, workstream_id=self.workstream_id,
-            authenticated_route=self.authority,
-            current_plan_revision=self.plan_revision,
-        )
-        exact = [item for item in pending if item["intent_event"] == event]
-        if len(exact) == 1:
-            return exact[0]
-        if exact or pending:
-            raise LinearProjectionError("child_mutation_serialization_reserved")
         assert_no_pending_generation_reservation(
             comments, workstream_id=self.workstream_id,
             authenticated_route=self.authority,
@@ -4641,6 +4602,66 @@ class LinearProjectionAdapter:
         material = reduce_event_comments(
             comments, workstream_id=self.workstream_id,
         )
+        projection_frontier_ids = [
+            state.remote_ids[item["event_id"]] for item in state.events
+        ]
+        # Recover a reservation whose Linear comment id differs from the
+        # deterministic slot (older transports ignored caller-supplied ids).
+        # Match immutable intent, not the collision/frontier serialization;
+        # conflicting bodies remain fail-closed and never create another slot.
+        semantic = semantic_ledger_reservations(
+            comments, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+            current_plan_revision=self.plan_revision,
+            intent_event=event,
+            expected_material_revision=material.revision,
+            expected_projection_revision=state.revision,
+            expected_projection_frontier_ids=projection_frontier_ids,
+        )
+        if semantic:
+            # The reservation precedes proposal publication, so a missing
+            # proposal is the expected crash prefix.  If one is present it must
+            # be the exact authenticated proposal for this intent.
+            from workstream_child_proposal import _comments, proposal_index
+            child_value = event.get("value") or {}
+            child_comments = _comments(
+                self.client, child_value.get("child_workstream_id", ""),
+            )
+            proposal = proposal_index(child_comments).get(
+                child_value.get("proposal_id"),
+            )
+            if proposal is not None:
+                proposal_value, proposal_comment = proposal
+                if (
+                    proposal_comment.get("id")
+                    != child_value.get("proposal_remote_id")
+                    or proposal_value.get("proposal_id")
+                    != child_value.get("proposal_id")
+                    or proposal_value.get("kind")
+                    != child_value.get("mutation_kind")
+                    or proposal_value.get("child_workstream_id")
+                    != child_value.get("child_workstream_id")
+                    or proposal_value.get("child_issue_id")
+                    != child_value.get("child_issue_id")
+                    or proposal_value.get("plan_revision")
+                    != child_value.get("plan_revision")
+                    or proposal_value.get("record_sha256")
+                    != child_value.get("record_sha256")
+                ):
+                    raise LinearProjectionError(
+                        "child_mutation_proposal_missing_or_mismatch"
+                    )
+            return semantic[0][0]
+        pending = pending_ledger_reservations(
+            comments, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+            current_plan_revision=self.plan_revision,
+        )
+        exact = [item for item in pending if item["intent_event"] == event]
+        if len(exact) == 1:
+            return exact[0]
+        if exact or pending:
+            raise LinearProjectionError("child_mutation_serialization_reserved")
         checkpoints = reduce_checkpoint_comments(
             comments, workstream_id=self.workstream_id,
         )
@@ -4657,9 +4678,7 @@ class LinearProjectionAdapter:
             "intent_kind": "child_mutation_projection",
             "plan_revision": self.plan_revision,
             "projection_revision": state.revision,
-            "projection_frontier_ids": [
-                state.remote_ids[item["event_id"]] for item in state.events
-            ],
+            "projection_frontier_ids": projection_frontier_ids,
             "frontier_ids": frontier, "authority": self.authority,
             "intent_event": event,
             "intent_sha256": hashlib.sha256(_canonical(event)).hexdigest(),
@@ -4676,14 +4695,40 @@ class LinearProjectionAdapter:
         except (LinearTransportError, OSError, TimeoutError):
             response = None
         after = self._comments()
-        observed = [
-            item for item in pending_ledger_reservations(
-                after, workstream_id=self.workstream_id,
-                authenticated_route=self.authority,
-                current_plan_revision=self.plan_revision,
-            )
-            if item["intent_event"] == event
+        after_state = reduce_projection_comments(
+            after, workstream_id=self.workstream_id,
+            expected_plan_revision=self.plan_revision,
+            authenticated_route=self.authority,
+        )
+        after_material = reduce_event_comments(
+            after, workstream_id=self.workstream_id,
+        )
+        after_projection_frontier_ids = [
+            after_state.remote_ids[item["event_id"]]
+            for item in after_state.events
         ]
+        assert_no_pending_generation_reservation(
+            after, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+        )
+        if (
+            after_state.revision != state.revision
+            or after_material.revision != material.revision
+            or after_projection_frontier_ids != projection_frontier_ids
+        ):
+            raise LinearProjectionError(
+                "child_mutation_reservation_postwrite_authority_changed"
+            )
+        observed_pairs = semantic_ledger_reservations(
+            after, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+            current_plan_revision=self.plan_revision,
+            intent_event=event,
+            expected_material_revision=material.revision,
+            expected_projection_revision=state.revision,
+            expected_projection_frontier_ids=projection_frontier_ids,
+        )
+        observed = [item for item, _remote_id in observed_pairs]
         if len(observed) != 1:
             raise LinearProjectionError(
                 "child_mutation_serialization_slot_lost_reload_required"
@@ -4693,7 +4738,10 @@ class LinearProjectionAdapter:
             comment = created.get("comment") or {}
             if (
                 created.get("success") is not True
-                or comment.get("id") != slot or comment.get("body") != body
+                or comment.get("id") not in {
+                    remote_id for _item, remote_id in observed_pairs
+                }
+                or comment.get("body") != body
             ):
                 raise LinearProjectionError(
                     "child_mutation_reservation_unconfirmed"
