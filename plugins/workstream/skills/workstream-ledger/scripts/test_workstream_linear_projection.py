@@ -5747,6 +5747,98 @@ class ProjectionTests(unittest.TestCase):
             )
         self.assertEqual(len(client.comments), writes)
 
+    def test_terminal_seed_nonprimary_merged_head_backfill_requires_reviewed_receipt(self):
+        (
+            client, adapter, _source, graph, _children, manifest, new_head,
+            secondary,
+        ) = self.terminal_seed_nonprimary_owner_head_transition_fixture()
+        manifest = deepcopy(manifest)
+        manifest.pop("terminal_child_evidence_seed_head_transition", None)
+        manifest["terminal_child_evidence_seeds"] = [
+            seed for seed in manifest["terminal_child_evidence_seeds"]
+            if seed["child_identifier"] == "GEN-70"
+        ]
+        manifest["projection"] = [
+            item for item in manifest["projection"]
+            if not (
+                item["kind"] == "evidence_contract"
+                and item["value"].get("owning_child") == "GEN-72"
+            )
+        ]
+        active = workstream_projection._active_heads(adapter.state())
+        desired_scope = next(
+            item["value"] for item in manifest["projection"]
+            if (item["kind"], item["key"]) == ("scope", "root")
+        )
+        secondary_desired = next(
+            repository for repository in desired_scope["repositories"]
+            if repository_key(repository) == "github.com:id:R_secondary"
+        )
+        primary_key = desired_scope["primary_repository"]
+        primary_current = next(
+            repository for repository in active[ ("scope", "root") ]["value"]["repositories"]
+            if repository_key(repository) == primary_key
+        )
+        primary_desired = next(
+            repository for repository in desired_scope["repositories"]
+            if repository_key(repository) == primary_key
+        )
+        primary_desired["exact_head"] = primary_current["exact_head"]
+        contract = next(
+            item["value"] for item in manifest["projection"]
+            if item["kind"] == "evidence_contract"
+            and item["value"]["owning_child"] == "GEN-70"
+        )
+        contract["exact_head"] = new_head
+        for layer in contract["layers"].values():
+            for receipt in layer.get("receipts", []):
+                receipt["exact_head"] = new_head
+        scope_event = active[("scope", "root")]
+        disposition_event = active[("disposition", "root")]
+        backfill = {
+            "repository_key": "github.com:id:R_secondary",
+            "from_exact_head": secondary["exact_head"], "to_exact_head": new_head,
+            "from_scope_event_id": scope_event["event_id"],
+            "from_scope_value_sha256": canonical_digest(scope_event["value"]),
+            "from_disposition_event_id": disposition_event["event_id"],
+            "from_disposition_value_sha256": canonical_digest(disposition_event["value"]),
+            "input_frontier_sha256": workstream_projection.projection_input_frontier_sha256(
+                graph, client.comments,
+            ),
+            "provider_repository_id": "R_secondary",
+            "pull_request_number": 522,
+            "merge_sha": "6" * 40,
+            "checks_sha256": "7" * 64,
+        }
+        manifest["terminal_child_evidence_seed_nonprimary_backfill"] = backfill
+        prepared = prepare_terminal_child_evidence_seeds(
+            manifest, graph, adapter.state(), remote_head=disposition_event["value"]["remote_head"],
+        )
+        self.assertEqual(
+            prepared["terminal_child_evidence_seed_nonprimary_backfill"], backfill,
+        )
+        forged = deepcopy(manifest)
+        forged["terminal_child_evidence_seed_nonprimary_backfill"]["to_exact_head"] = "8" * 40
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_evidence_seed_nonprimary_backfill_contract_invalid",
+        ):
+            prepare_terminal_child_evidence_seeds(
+                forged, graph, adapter.state(), remote_head=disposition_event["value"]["remote_head"],
+            )
+        forged_provider = deepcopy(manifest)
+        forged_provider["terminal_child_evidence_seed_nonprimary_backfill"][
+            "provider_repository_id"
+        ] = "R_forged"
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_evidence_seed_nonprimary_backfill_contract_invalid",
+        ):
+            prepare_terminal_child_evidence_seeds(
+                forged_provider, graph, adapter.state(),
+                remote_head=disposition_event["value"]["remote_head"],
+            )
+
     def test_terminal_seed_head_transition_secondary_owner_negatives(self):
         (
             client, adapter, _source, graph, _children, manifest, new_head,
