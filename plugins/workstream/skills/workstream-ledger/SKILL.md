@@ -873,6 +873,21 @@ still refuses.
 
 After a material child transition to Linear's `completed` state, run the
 model-free projection reconciliation before treating resume as authoritative.
+Prepare the routine reviewed manifest from authenticated live state with:
+
+```sh
+workstreamctl child-completion-prepare GEN-123 --child GEN-124 \
+  --evidence-contract evidence.json --plan-source ./PLAN.md \
+  --plan-identity <canonical-url> > child-completion.json
+```
+
+This command is read-only. Its `projection_manifest` is the complete input for
+the normal `projection` preview/apply pair. It emits an evidence-only phase when
+the contract is not active, `native_transition_required` while the child is
+open, and a fenced `terminal_child_repairs` phase only after authenticated
+native readback says the child is completed. Rerun it after each phase; never
+copy a closure forward or infer completion from the evidence file.
+
 A reviewed `terminal_child_repairs` batch must fence every exact child issue
 from one authenticated root snapshot, including each
 parent/workspace/team/project route, exact assignee state (including explicitly
