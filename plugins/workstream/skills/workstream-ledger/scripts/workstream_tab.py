@@ -20,6 +20,7 @@ TOKEN_IN_TITLE = re.compile(r"(?<![A-Z0-9])([A-Z][A-Z0-9]*-\d+)(?![A-Z0-9])", re
 SEPARATOR = " · "
 TIMEOUT_SECONDS = 3
 MAX_PROJECT_LABEL_LENGTH = 120
+MAX_ANCESTOR_DEPTH = 8
 
 
 class TabTitleError(RuntimeError):
@@ -169,6 +170,58 @@ def _surface_context(
     if not all(isinstance(item, str) and item for item in fields.values()):
         raise TabTitleError("invalid_cmux_identify_response")
     return SurfaceContext(**fields)
+
+
+def _bounded_ancestor_pids() -> list[int]:
+    pids: list[int] = []
+    current = os.getppid()
+    for _ in range(MAX_ANCESTOR_DEPTH):
+        if current <= 1 or current in pids:
+            break
+        pids.append(current)
+        try:
+            observed = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(current)],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                timeout=2, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            break
+        try:
+            current = int(observed.stdout.strip()) if observed.returncode == 0 else 0
+        except ValueError:
+            break
+    return pids
+
+
+def _resolve_cmux_tty_target(
+    cmux: str, runner: Runner, environ: Mapping[str, str],
+) -> str:
+    pairs: set[tuple[str, str]] = set()
+    for pid in _bounded_ancestor_pids():
+        result = _run(
+            runner, [cmux, "rpc", "agent.resolve_delivery_target", json.dumps({
+                "pid": pid, "pid_resolution": "controlling_tty",
+            }, separators=(",", ":"))],
+            environment=environ, allow_unavailable=True,
+        )
+        if result is None:
+            continue
+        try:
+            value = json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        workspace = value.get("workspace_id")
+        surface = value.get("surface_id")
+        if isinstance(workspace, str) and workspace and isinstance(surface, str) and surface:
+            pairs.add((workspace, surface))
+    if len(pairs) != 1:
+        raise TabTitleError(
+            "cmux_target_unresolved" if not pairs else "cmux_target_ambiguous"
+        )
+    return next(iter(pairs))[1]
 
 
 def _read_title(
@@ -322,23 +375,43 @@ def apply_title(
             token, environ=environ, runner=runner, which=which,
             project_name=project_name, automatic_title=automatic_title,
         )
-    target = target or environ.get("CMUX_TAB_ID") or environ.get("CMUX_SURFACE_ID")
-    if not target:
+    # Surface identity is authoritative; CMUX_TAB_ID is a legacy alias and can
+    # contain a workspace UUID in some runtimes. Never let it shadow a surface.
+    caller_explicit_target = target is not None
+    target = target or environ.get("CMUX_SURFACE_ID") or environ.get("CMUX_TAB_ID")
+    if not target and not any(environ.get(key) for key in (
+        "CMUX_SURFACE_ID", "CMUX_TAB_ID", "CMUX_WORKSPACE_ID", "CMUX_SOCKET_PATH",
+    )):
         return {"status": "unavailable", "reason": "not_in_cmux_surface", "token": token}
     cmux = which("cmux")
     if not cmux:
         return {"status": "unavailable", "reason": "cmux_cli_unavailable", "token": token}
+    if not target:
+        try:
+            target = _resolve_cmux_tty_target(cmux, runner, environ)
+        except TabTitleError as error:
+            reason = str(error) if str(error) in {
+                "cmux_target_ambiguous", "cmux_target_unresolved",
+            } else "cmux_target_unresolved"
+            return {"status": "unavailable", "reason": reason, "token": token}
     try:
         context = _surface_context(
             cmux, target, runner, environment=environ,
         )
     except TabTitleError as error:
-        if str(error) == "cmux_target_unresolved":
-            return {
-                "status": "unavailable", "reason": "cmux_target_unresolved",
-                "token": token,
-            }
-        raise
+        if str(error) == "cmux_target_unresolved" and not caller_explicit_target and not environ.get("CMUX_SURFACE_ID"):
+            try:
+                target = _resolve_cmux_tty_target(cmux, runner, environ)
+                context = _surface_context(cmux, target, runner, environment=environ)
+            except TabTitleError as fallback_error:
+                context = None
+                fallback_reason = str(fallback_error)
+        else:
+            return {"status": "unavailable", "reason": "cmux_target_unresolved", "token": token}
+        if context is None:
+            return {"status": "unavailable", "reason": locals().get(
+                "fallback_reason", "cmux_target_unresolved",
+            ), "token": token}
     if context is None:
         return {"status": "unavailable", "reason": "cmux_unavailable", "token": token}
     before = _read_title(
