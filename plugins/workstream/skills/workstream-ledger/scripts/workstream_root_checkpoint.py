@@ -22,11 +22,11 @@ from workstream_linear import (
     LinearTransportError,
 )
 from workstream_linear_events import (
-    canonical_authenticated_source,
+    canonical_authenticated_source, LinearCommentEventAdapter,
     ledger_boundary_slot_id, ledger_serialization_frontier, material_frontier,
     reduce_event_comments,
 )
-from workstream_linear_checkpoints import LinearCheckpointAdapter
+from workstream_linear_checkpoints import LinearCheckpointAdapter, LinearCheckpointError
 from workstream_linear_checkpoints import encode_checkpoint_comment
 from workstream_linear_projection import (
     build_projection_event, LinearProjectionAdapter,
@@ -34,6 +34,7 @@ from workstream_linear_projection import (
     LinearProjectionError, projection_slot_id, select_plan_generation,
 )
 from workstream_root_transition import _validate_authority
+from workstream_child_dependencies import LinearChildDependencyAdapter
 
 
 class CheckpointPartialApplyError(LinearTransportError):
@@ -157,11 +158,15 @@ def _validate_proposed_full_authority(
     from workstream_linear_projection import (
         bind_active_plan_generation, child_mutation_authorizations_from_comments,
     )
+    from workstream_generation import (
+        assert_generation_write_authority,
+        assert_no_pending_generation_reservation,
+    )
     from workstream_plan import plan_payload
     from workstream_relation_readback import read_relation_targets
     from workstream_resume import (
         add_live_child_material_history, add_material_history,
-        ResumeError, validate_snapshot,
+        ResumeError, compact_context, validate_snapshot,
     )
 
     proposed_comments = deepcopy(comments)
@@ -190,6 +195,15 @@ def _validate_proposed_full_authority(
             deepcopy(graph), proposed_comments, workstream_id=workstream_id,
             selected=selected_generation, authenticated_route=route,
         )
+        assert_no_pending_generation_reservation(
+            proposed_comments, workstream_id=workstream_id,
+            authenticated_route=route,
+        )
+        assert_generation_write_authority(
+            proposed_comments, workstream_id=workstream_id,
+            plan_revision=selected_generation["plan_revision"],
+            authenticated_route=route,
+        )
         mutation_authorizations = child_mutation_authorizations_from_comments(
             proposed_comments, workstream_id=workstream_id,
             description_plan_revision=selected_generation[
@@ -207,6 +221,58 @@ def _validate_proposed_full_authority(
             proposed_graph, authenticated_route=route,
             root_comments=proposed_comments,
         )
+        # Re-run the production native dependency join against the proposed
+        # durable comments.  The producer snapshot is only a candidate: the
+        # root/child graph and relation edges must come from an exact Linear
+        # readback, with material/projection frontiers authenticated before any
+        # checkpoint or disposition append.
+        dependency_adapter = LinearChildDependencyAdapter(
+            client, workspace_id=route["workspace_id"],
+            team_id=route["team_id"], project_id=route["project_id"],
+            root_issue_id=route["root_issue_id"], root_identifier=workstream_id,
+            plan_revision=selected_generation["plan_revision"],
+        )
+        baseline_comments = {
+            item.get("id"): item for item in comments
+        }
+
+        def dependency_reread() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+            fresh_graph = LinearGraphQLTransport(
+                client, workspace_id=route["workspace_id"],
+                team_id=route["team_id"], project_id=route["project_id"],
+            ).snapshot_for_root(
+                workstream_id, include_description=True,
+                include_child_comments=True,
+            )
+            fresh_comments = LinearCommentEventAdapter(
+                client, issue_id=workstream_id,
+                workspace_id=route["workspace_id"], team_id=route["team_id"],
+                project_id=route["project_id"],
+            ).comments()
+            fresh_by_id = {item.get("id"): item for item in fresh_comments}
+            # The proposed checkpoint/projection comments are not remote yet;
+            # every pre-existing comment must nevertheless be byte-identical
+            # to this fresh read.  Never let a stale in-memory proposal mask a
+            # concurrent Linear frontier change.
+            if any(fresh_by_id.get(key) != value for key, value in baseline_comments.items()):
+                raise LinearTransportError(
+                    "checkpoint_dependency_frontier_changed_during_read"
+                )
+            merged = list(fresh_comments)
+            for item in proposed_comments:
+                if item.get("id") not in fresh_by_id:
+                    merged.append(item)
+            return fresh_graph, merged
+
+        proposed_graph["dependency_graph"] = (
+            dependency_adapter.read_authorized_graph_for_snapshot(
+                proposed_graph, proposed_comments,
+                generation_selector_plan_revision=(
+                    proposed_graph["root"].get("plan_revision")
+                ),
+                reread=dependency_reread,
+            )
+        )
         joined = add_material_history(
             proposed_graph, proposed_comments, workstream_id,
             authenticated_route=route, authenticated_source=authenticated_source,
@@ -216,8 +282,27 @@ def _validate_proposed_full_authority(
         )
         validate_snapshot(
             joined, workstream_id, require_projection_authority=True,
-            require_dependency_graph=False,
+            # Legacy roots with no dependency declarations have no graph to
+            # authenticate.  Whenever the snapshot carries dependency
+            # authority, require the same strict graph join as production
+            # resume (including relation-target readback).
+            require_dependency_graph=bool(
+                joined.get("dependencies") or joined.get("dependency_graph")
+            ),
         )
+        # Exercise the exact producer-side compact envelope and limits used by
+        # ordinary resume.  This catches an over-budget or over-item proposal
+        # before either append; the post-write command still performs its own
+        # authenticated reread.
+        if joined.get("dependency_graph") is not None:
+            compact = compact_context(
+                joined, workstream_id, max_bytes=24 * 1024, max_items=100,
+                require_projection_authority=True,
+                require_dependency_graph=True,
+            )
+            if len(json.dumps(compact, ensure_ascii=False,
+                              sort_keys=True, separators=(",", ":")).encode()) > 24 * 1024:
+                raise ResumeError("resume_context_over_budget")
     except (LinearProjectionError, ResumeError, LinearTransportError) as error:
         raise LinearTransportError(
             "checkpoint_proposed_resume_refused:" + str(error)
@@ -429,6 +514,26 @@ def _prepare(args: argparse.Namespace, client: Any, route: dict[str, str]):
             authority=route,
         )
     )
+    unresolved_quarantine = projection.snapshot.get(
+        "projection_unresolved_quarantine"
+    ) or []
+    if unresolved_quarantine:
+        raise LinearTransportError(
+            "checkpoint_projection_unresolved_quarantine_refused"
+        )
+    projection_quarantine = projection.snapshot.get(
+        "projection_quarantined"
+    ) or []
+    projection_frontier = {
+        "revision": projection.revision,
+        "event_ids": [event["event_id"] for event in projection.events],
+        "remote_ids": {
+            event["event_id"]: projection.remote_ids.get(event["event_id"])
+            for event in projection.events
+        },
+        "events_sha256": _digest(list(projection.events)),
+        "quarantined_sha256": _digest(projection_quarantine),
+    }
     checkpoint_ids = sorted(item["event_id"] for item in state.checkpoints)
     if checkpoint_replay:
         checkpoint_ids = [
@@ -474,6 +579,8 @@ def _prepare(args: argparse.Namespace, client: Any, route: dict[str, str]):
         },
         "checkpoint": checkpoint,
         "projection_candidate": candidate,
+        "projection_frontier": projection_frontier,
+        "projection_quarantine": projection_quarantine,
     }
     _validate_proposed_full_authority(
         client=client, graph=graph_after, comments=comments,
@@ -533,14 +640,206 @@ def _comments_match_owned_append(
     return set(after_by_id) == expected_ids
 
 
+def _compensate_checkpoint_projection(
+    *, client: Any, preview: dict[str, Any], route: dict[str, str],
+    native_before: dict[str, Any], checkpoint_receipt: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Append at most one safe disposition compensation for a checkpoint.
+
+    Linear cannot atomically append the checkpoint and its projection.  This
+    narrow repair is deliberately conservative: it is eligible only when a
+    fresh read proves that all authority except ``recovered_from_checkpoint``
+    is unchanged and the active disposition still names the checkpoint's exact
+    head.  Any ambiguity or race returns ``None``; callers must surface their
+    existing partial-apply handle rather than retrying or guessing.
+    """
+    checkpoint = preview["checkpoint"]
+    if (checkpoint_receipt.get("event_id") != checkpoint.get("event_id")
+            or (checkpoint_receipt.get("acknowledgement") or {}).get("state")
+            != "remote_acknowledged"):
+        return None
+    # Compensation is reserved for the known strict-resume stale-pointer
+    # incident.  Budget, source, dependency, lifecycle, and transport errors
+    # must remain partial/refused rather than triggering a speculative write.
+    # The native root and complete comment graph are the first fence.  A
+    # comment append legitimately changes updatedAt, so compare the normalized
+    # authority graph only.
+    try:
+        observed_native = _root_surface(client, route, preview["workstream_id"])
+    except (LinearTransportError, OSError, TimeoutError):
+        return None
+    if observed_native.get("authority_graph_sha256") != native_before.get(
+            "authority_graph_sha256"):
+        return None
+    # Re-run the complete producer oracle after the checkpoint append.  This
+    # is intentionally more than a projection reread: _prepare authenticates
+    # the selected generation and source bytes, native lifecycle/children,
+    # child material, relations and dependency graph, quarantine, material
+    # frontier, and the canonical latest checkpoint.  The only compatible
+    # difference is that the checkpoint is now an exact replay and the fresh
+    # disposition candidate supersedes the still-stale predecessor pointer.
+    try:
+        fresh, _, fresh_projection_replay = _prepare(args, client, route)
+    except (LinearProjectionError, LinearTransportError, OSError, TimeoutError):
+        return None
+    if (
+        fresh_projection_replay
+        or fresh["workstream_id"] != preview["workstream_id"]
+        or fresh["source"] != preview["source"]
+        or fresh["active_generation"] != preview["active_generation"]
+        or fresh["material_revision"] != preview["material_revision"]
+        or fresh["material_event_ids"] != preview["material_event_ids"]
+        or fresh["material_frontier"] != preview["material_frontier"]
+        or fresh["checkpoint"] != checkpoint
+        or fresh["projection_frontier"] != preview["projection_frontier"]
+        or fresh["projection_candidate"] != preview["projection_candidate"]
+        or fresh["projection_quarantine"] != preview["projection_quarantine"]
+    ):
+        return None
+    projection = LinearProjectionAdapter(
+        client, issue_id=preview["workstream_id"],
+        workstream_id=preview["workstream_id"],
+        plan_revision=preview["source"]["sha256"], **route,
+    )
+    try:
+        state = projection.state()
+        candidate = fresh["projection_candidate"]
+        if state.revision != candidate.get("expected_revision"):
+            return None
+        current = next((event for event in reversed(state.events)
+                         if event["kind"] == "disposition"
+                         and event["key"] == "root"), None)
+    except (LinearProjectionError, LinearTransportError, OSError, TimeoutError):
+        return None
+    if current is None:
+        return None
+    value = current.get("value")
+    if not isinstance(value, dict):
+        return None
+    expected = preview["projection_candidate"].get("value") or {}
+    # Only the recovery pointer may differ.  Preserve the live mode/head and
+    # reject a head mismatch rather than silently changing repository authority.
+    if set(value) - {"recovered_from_checkpoint"} != set(expected) - {
+            "recovered_from_checkpoint"}:
+        return None
+    for key in set(value) | set(expected):
+        if key == "recovered_from_checkpoint":
+            continue
+        if value.get(key) != expected.get(key):
+            return None
+    exact_head = checkpoint.get("exact_head")
+    if exact_head is not None and value.get("remote_head") != exact_head:
+        return None
+    # A newer checkpoint or a different checkpoint already represented in the
+    # disposition makes this repair ambiguous.  Exact replay is a no-write.
+    recovered = value.get("recovered_from_checkpoint")
+    if recovered == checkpoint["event_id"]:
+        return {
+            "event_id": current["event_id"],
+            "remote_id": state.remote_ids.get(current["event_id"]),
+            "revision": state.revision,
+            "disposition": "existing",
+            "checkpoint_event_id": checkpoint["event_id"],
+        }
+    # A correction may advance only the exact disposition event reviewed by
+    # the original preview, and a non-null pointer must be the checkpoint's
+    # own canonical predecessor.  The exact projection-frontier equality above
+    # proves that event has not been superseded or rebased since review.
+    reviewed_predecessor_event = preview["projection_candidate"].get(
+        "supersedes_event_id"
+    )
+    checkpoint_predecessor = checkpoint.get("predecessor_event_id")
+    if (
+        not isinstance(reviewed_predecessor_event, str)
+        or current.get("event_id") != reviewed_predecessor_event
+        or (
+            recovered is not None
+            and recovered != checkpoint_predecessor
+        )
+    ):
+        return None
+    # The fresh producer oracle already proved the acknowledged checkpoint is
+    # the canonical latest record at this exact material frontier.  Retain the
+    # remote-slot check because the reviewed receipt is the caller's durable
+    # proof, not merely an equivalent checkpoint body found elsewhere.
+    try:
+        checkpoint_adapter = LinearCheckpointAdapter(
+            client, issue_id=preview["workstream_id"],
+            workstream_id=preview["workstream_id"], issue_uuid=route["root_issue_id"],
+            workspace_id=route["workspace_id"], team_id=route["team_id"],
+            project_id=route["project_id"],
+        )
+        checkpoint_state = checkpoint_adapter._state()
+        observed = next((item for item in checkpoint_state.checkpoints
+                         if item["event_id"] == checkpoint["event_id"]), None)
+        # Compensation is valid only for the canonical latest checkpoint in
+        # this plan generation. A newer material boundary must never be
+        # overwritten by a pointer to an older checkpoint.
+        generations = checkpoint_adapter._recover_checkpoint_generations(
+            checkpoint_state
+        )
+        latest = generations.get(checkpoint["plan_revision"])
+        ack = (checkpoint_receipt.get("acknowledgement") or {})
+        if (observed is None
+                or latest is None
+                or latest.get("checkpoint_event_id") != checkpoint["event_id"]
+                or latest.get("root_revision") != preview["material_revision"]
+                or not isinstance(ack.get("remote_id"), str)
+                or checkpoint_state.remote_ids.get(checkpoint["event_id"])
+                != ack.get("remote_id")
+                or (observed.get("acknowledgement") or {}) != ack
+                or checkpoint["root_revision"] != preview["material_revision"]):
+            return None
+        # The durable body normalizes its acknowledgement after the remote
+        # receipt. Compare all producer fields separately, excluding that
+        # server-assigned acknowledgement rather than comparing pending vs
+        # acknowledged records wholesale.
+        if {
+            key: value for key, value in observed.items()
+            if key != "acknowledgement"
+        } != {
+            key: value for key, value in checkpoint.items()
+            if key != "acknowledgement"
+        }:
+            return None
+    except (LinearCheckpointError, LinearTransportError, OSError, TimeoutError):
+        return None
+    candidate = fresh["projection_candidate"]
+    quarantined = state.snapshot.get("projection_quarantined") or []
+    if (
+        state.snapshot.get("projection_unresolved_quarantine")
+        or quarantined != (preview.get("projection_quarantine") or [])
+        or quarantined != (fresh.get("projection_quarantine") or [])
+    ):
+        return None
+    try:
+        receipt = projection.append(
+            candidate, expected_material_revision=preview["material_revision"],
+            expected_quarantine_count=len(quarantined),
+            expected_quarantine_sha256=_digest(quarantined),
+        )
+    except (LinearProjectionError, LinearTransportError, OSError, TimeoutError):
+        return None
+    return {
+        **receipt,
+        "acknowledgement": {
+            "state": "remote_acknowledged",
+            "remote_id": receipt["remote_id"],
+            "applied_revision": receipt["revision"],
+        },
+    }
+
+
 def _partial_apply_error(
     reason: str, preview: dict[str, Any], *,
     checkpoint_receipt: dict[str, Any] | None = None,
     projection_receipt: dict[str, Any] | None = None,
+    failure: dict[str, str] | None = None,
 ) -> CheckpointPartialApplyError:
     checkpoint = preview["checkpoint"]
     candidate = preview["projection_candidate"]
-    return CheckpointPartialApplyError({
+    payload = {
         "schema_version": 1,
         "status": "applied_or_unknown_replay_required",
         "reason": reason,
@@ -561,7 +860,10 @@ def _partial_apply_error(
             "receipts, review its fresh digest, then apply with the same material "
             "revision, timestamp, execution inputs, and authenticated route/source."
         ),
-    })
+    }
+    if failure is not None:
+        payload["failure"] = failure
+    return CheckpointPartialApplyError(payload)
 
 
 def _ordinary_resume(
@@ -642,6 +944,20 @@ def _ordinary_resume(
             if binding.get("checkpoint_sha256") != _digest(expected_tip):
                 raise LinearTransportError("checkpoint_ordinary_resume_checkpoint_mismatch")
     return value
+
+
+def _is_exact_stale_checkpoint_resume_refusal(error: BaseException) -> bool:
+    """Accept only the two canonical local/production error envelopes."""
+    return str(error) in {
+        (
+            "checkpoint_ordinary_resume_refused:"
+            "disposition_checkpoint_stale_reconcile_required"
+        ),
+        (
+            "checkpoint_ordinary_resume_refused:workstream resume refused: "
+            "disposition_checkpoint_stale_reconcile_required"
+        ),
+    }
 
 
 def run(
@@ -736,6 +1052,8 @@ def run(
             checkpoint_receipt=receipt,
         )
     projection_receipt = None
+    projection_apply_unconfirmed = False
+    projection_apply_error: Exception | None = None
     comments_before_projection = comments_after_checkpoint
     if not projection_replay:
         projection_adapter = LinearProjectionAdapter(
@@ -744,9 +1062,12 @@ def run(
             plan_revision=preview["source"]["sha256"], **route,
         )
         try:
+            quarantine = preview.get("projection_quarantine") or []
             projection_receipt = projection_adapter.append(
                 preview["projection_candidate"],
                 expected_material_revision=preview["material_revision"],
+                expected_quarantine_count=len(quarantine),
+                expected_quarantine_sha256=_digest(quarantine),
             )
         except (LinearTransportError, OSError, TimeoutError) as error:
             try:
@@ -767,10 +1088,14 @@ def run(
                     "recovered_after_transport_failure": True,
                 }
             except (LinearTransportError, OSError, StopIteration, TimeoutError):
-                raise _partial_apply_error(
-                    "checkpoint_projection_apply_unknown_replay_required",
-                    preview, checkpoint_receipt=receipt,
-                ) from error
+                # The checkpoint is durable but Linear did not acknowledge the
+                # paired projection and a fresh read cannot find it.  Preserve
+                # this exact non-atomic state long enough to ask ordinary
+                # resume what is wrong.  Only its precise stale-pointer refusal
+                # is eligible for the bounded compensation below; every other
+                # result remains a partial apply.
+                projection_apply_unconfirmed = True
+                projection_apply_error = error
     else:
         projection_receipt = {
             "event_id": preview["projection_candidate"]["event_id"],
@@ -780,14 +1105,21 @@ def run(
         client, route, preview["workstream_id"],
     )
     comments_after_projection = adapter._comments()
-    projection_remote_id = projection_receipt.get("remote_id") or ""
+    projection_remote_id = (
+        projection_receipt.get("remote_id") if projection_receipt else ""
+    ) or ""
     projection_surface_matches = (
         after_projection_surface == after_checkpoint_surface
         if projection_replay else _same_root_authority(
             after_projection_surface, after_checkpoint_surface,
         )
     )
-    if (
+    unconfirmed_surface_is_unchanged = (
+        projection_apply_unconfirmed
+        and after_projection_surface == after_checkpoint_surface
+        and comments_after_projection == comments_before_projection
+    )
+    if not unconfirmed_surface_is_unchanged and (
         not projection_surface_matches
         or (not projection_replay and not projection_remote_id)
         or not _comments_match_owned_append(
@@ -819,11 +1151,54 @@ def run(
             expected_remote_id=receipt["acknowledgement"]["remote_id"],
         )
     except (LinearTransportError, OSError, TimeoutError) as error:
-        raise _partial_apply_error(
-            "checkpoint_applied_but_ordinary_resume_refused", preview,
-            checkpoint_receipt=receipt,
-            projection_receipt=projection_receipt,
-        ) from error
+        # One bounded compensation is allowed for the only non-atomic gap:
+        # the checkpoint was acknowledged but its recovery pointer was lost.
+        # The helper rereads every authority surface and uses projection CAS;
+        # if it cannot prove compatibility it returns None and we preserve the
+        # precise partial-apply handle below.
+        compensation = None
+        if (projection_apply_unconfirmed
+                and _is_exact_stale_checkpoint_resume_refusal(error)):
+            compensation = _compensate_checkpoint_projection(
+                client=client, preview=preview, route=route,
+                native_before=native_before, checkpoint_receipt=receipt, args=args,
+            )
+        if compensation is not None:
+            # The correction is already durable and acknowledged.  Preserve
+            # its exact receipt before any subsequent read can fail so the
+            # partial handle never regresses to the original unknown append.
+            projection_receipt = compensation
+            try:
+                after_projection_surface = _root_surface(
+                    client, route, preview["workstream_id"],
+                )
+                comments_after_projection = adapter._comments()
+                resume = _ordinary_resume(
+                    preview["workstream_id"], args=args, route=route,
+                    source=preview["source"],
+                    expected_checkpoint=acknowledged_tip,
+                    expected_remote_id=receipt["acknowledgement"]["remote_id"],
+                )
+            except (LinearTransportError, OSError, TimeoutError) as second_error:
+                raise _partial_apply_error(
+                    "checkpoint_compensation_applied_but_resume_refused",
+                    preview, checkpoint_receipt=receipt,
+                    projection_receipt=projection_receipt,
+                    failure={
+                        "stage": "post_compensation_ordinary_resume",
+                        "reason": str(second_error),
+                    },
+                ) from second_error
+        if "resume" not in locals():
+            raise _partial_apply_error(
+                (
+                    "checkpoint_projection_apply_unknown_replay_required"
+                    if projection_apply_unconfirmed
+                    else "checkpoint_applied_but_ordinary_resume_refused"
+                ), preview,
+                checkpoint_receipt=receipt,
+                projection_receipt=projection_receipt,
+            ) from (projection_apply_error or error)
     if _root_surface(
         client, route, preview["workstream_id"],
     ) != after_projection_surface or adapter._comments() != comments_after_projection:

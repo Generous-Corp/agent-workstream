@@ -96,6 +96,11 @@ class FakeClient:
         self.comment_clock = 0
         self.expanded_resume_project = False
         self.dependency_graph = "stable-dependency-graph"
+        # Native relation slots used by checkpoint/resume's authoritative
+        # dependency transport.  Keep this fixture explicit so a missing or
+        # malformed relation surface fails closed instead of silently falling
+        # back to the projected graph.
+        self.native_relations: list[dict] = []
 
     def root_issue(self):
         return {
@@ -153,6 +158,26 @@ class FakeClient:
             raise AssertionError("generation protocol must never issueUpdate")
         if "CommentCreateCapability" in query:
             return {"__type": {"inputFields": [{"name": "id"}]}}
+        if "WorkstreamChildDependencyCapabilities" in query:
+            return {
+                "relationInput": {"inputFields": [
+                    {"name": name} for name in (
+                        "id", "issueId", "relatedIssueId", "type",
+                    )
+                ]},
+                "relationType": {"enumValues": [{"name": "blocks"}]},
+                "issueType": {"fields": [
+                    {"name": "relations"}, {"name": "inverseRelations"},
+                ]},
+                "queryType": {"fields": [{
+                    "name": "issueRelations", "args": [{"name": "includeArchived"}],
+                }]},
+            }
+        if "WorkstreamChildDependencySlots" in query:
+            return {"issueRelations": {
+                "nodes": deepcopy(self.native_relations),
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }}
         if "query WorkstreamResumeRoot" in query:
             root = self.root_issue()
             if self.expanded_resume_project:
@@ -196,8 +221,17 @@ class FakeClient:
                 "inverseRelations"
                 if "InverseRelations" in query else "relations"
             )
+            relevant = [
+                relation for relation in self.native_relations
+                if (relation.get("issue") or {}).get("id") == child.get("id")
+                or (relation.get("relatedIssue") or {}).get("id") == child.get("id")
+            ]
+            if field == "relations":
+                relevant = [r for r in relevant if (r.get("issue") or {}).get("id") == child.get("id")]
+            else:
+                relevant = [r for r in relevant if (r.get("relatedIssue") or {}).get("id") == child.get("id")]
             return {"issue": {**deepcopy(child), field: {
-                "nodes": [], "pageInfo": {
+                "nodes": deepcopy(relevant), "pageInfo": {
                     "hasNextPage": False, "endCursor": None,
                 },
             }}}

@@ -17,12 +17,907 @@ from workstream_linear_checkpoints import (
 from workstream_generation import strict_candidate_loader
 from workstream_resume import ResumeError
 from workstream_root_transition import RootTransitionError
+from workstream_child_dependencies import ChildDependencyError
 import workstream_resume as resume_cli
 import workstream_root_checkpoint as checkpoint_cli
+import workstream_linear_projection as projection_module
 import test_workstream_generation_transition as fixture
+import test_workstream_linear_projection as projection_fixture
 
 
 class RootCheckpointTests(unittest.TestCase):
+    def _minimal_checkpoint_fixture(self):
+        token = "GEN-37"
+        route = fixture.AUTHORITY
+        client = fixture.FakeClient()
+        plan = tempfile.NamedTemporaryFile("w+", suffix=".md")
+        self.addCleanup(plan.close)
+        text = "# checkpoint dependency oracle\n"
+        plan.write(text); plan.flush()
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        client.description = f"Plan revision: {digest}\nNext action: Continue"
+        fixture.project_full(client, digest, identity=plan.name)
+        client.mutations.clear()
+        command = [
+            token, "--boundary-id", "material-0",
+            "--created-at", "2026-09-01T06:30:00Z", "--agent", "codex",
+            "--provider", "openai", "--session-id", "oracle",
+            "--machine", "M5", "--worktree-state", "safe",
+            "--worktree-path", "/tmp/gen37", "--worktree-branch", "gen37",
+            "--worktree-head", "e" * 40, "--exact-head", "e" * 40,
+            "--before-status", "In Progress", "--after-status", "In Progress",
+            "--next-action", "Continue",
+        ]
+        return client, route, command
+
+    def _checkpoint_only_state(
+        self, *, plan_text="# compensation fixture\n",
+        client_factory=fixture.FakeClient, persist=True,
+        resolved_quarantine=False,
+    ):
+        client, route, command = self._minimal_checkpoint_fixture()
+        plan_identity = next(
+            event["value"]["identity"]
+            for event in checkpoint_cli.LinearProjectionAdapter(
+                client, issue_id="GEN-37", workstream_id="GEN-37",
+                plan_revision=client.description.split(":", 1)[1].split()[0],
+                **route,
+            ).state().events
+            if event["kind"] == "source"
+        )
+        # _minimal_checkpoint_fixture owns this temporary file.  Rebuild the
+        # client around caller-selected canonical bytes before preview.
+        with open(plan_identity, "w", encoding="utf-8") as handle:
+            handle.write(plan_text)
+        digest = hashlib.sha256(plan_text.encode()).hexdigest()
+        client = client_factory()
+        client.description = f"Plan revision: {digest}\nNext action: Continue"
+        fixture.project_full(client, digest, identity=plan_identity)
+        if resolved_quarantine:
+            legacy = projection_fixture.legacy_event(
+                "provenance", "late-v1", {
+                    "agent": "legacy", "machine": "M3",
+                    "session_id": "resolved-late-v1",
+                }, 4, "resolved-late-v1",
+            )
+            legacy["plan_revision"] = digest
+            legacy["event_id"] = projection_module._event_id(legacy)
+            client.comments.append(projection_fixture.legacy_comment(
+                legacy, "resolved-late-v1",
+            ))
+            projection = checkpoint_cli.LinearProjectionAdapter(
+                client, issue_id="GEN-37", workstream_id="GEN-37",
+                plan_revision=digest, **route,
+            )
+            projection.append(checkpoint_cli.build_projection_event(
+                workstream_id="GEN-37", kind="quarantine_disposition",
+                key="root", value={
+                    "event_ids": [legacy["event_id"]],
+                    "events_sha256": checkpoint_cli._digest([legacy]),
+                    "review_artifact_identity": (
+                        "https://example.test/reviews/resolved-v1.md"
+                    ),
+                    "review_artifact_sha256": "d" * 64,
+                    "reviewed_at": "2026-09-01T06:29:00Z",
+                }, plan_revision=digest, expected_revision=4,
+                created_at="resolved-quarantine", authority=route,
+            ))
+            state = projection.state()
+            self.assertEqual(
+                state.snapshot["projection_quarantined"], [legacy],
+            )
+            self.assertEqual(
+                state.snapshot["projection_unresolved_quarantine"], [],
+            )
+        client.mutations.clear()
+        with patch.object(
+            checkpoint_cli, "_client_and_route", return_value=(client, route),
+        ):
+            preview = checkpoint_cli.run(command)
+        native_before = checkpoint_cli._root_surface(client, route, "GEN-37")
+        checkpoint_adapter = LinearCheckpointAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            issue_uuid=route["root_issue_id"], workspace_id=route["workspace_id"],
+            team_id=route["team_id"], project_id=route["project_id"],
+        )
+        receipt = (
+            checkpoint_adapter.persist(preview["checkpoint"])
+            if persist else None
+        )
+        loader = strict_candidate_loader(
+            client, token="GEN-37", authority=route,
+            plan_source=plan_identity, plan_identity=plan_identity,
+            max_bytes=24 * 1024, max_items=100,
+        )
+        return (
+            client, route, command, preview, native_before, receipt, loader,
+            digest, plan_identity,
+        )
+
+    def _predecessor_pointer_state(self, *, wrong_predecessor=False):
+        (
+            client, route, command, first_preview, _native, _receipt, _loader,
+            digest, plan_identity,
+        ) = self._checkpoint_only_state(persist=False)
+        checkpoint_adapter = LinearCheckpointAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            issue_uuid=route["root_issue_id"], workspace_id=route["workspace_id"],
+            team_id=route["team_id"], project_id=route["project_id"],
+        )
+        first_receipt = checkpoint_adapter.persist(first_preview["checkpoint"])
+        projection = checkpoint_cli.LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=digest, **route,
+        )
+        projection.append(
+            first_preview["projection_candidate"], expected_material_revision=0,
+            expected_quarantine_count=0,
+            expected_quarantine_sha256=checkpoint_cli._digest([]),
+        )
+        if wrong_predecessor:
+            state = projection.state()
+            current = next(
+                event for event in reversed(state.events)
+                if event["kind"] == "disposition" and event["key"] == "root"
+            )
+            projection.append(checkpoint_cli.build_projection_event(
+                workstream_id="GEN-37", kind="disposition", key="root",
+                value={
+                    **current["value"],
+                    "recovered_from_checkpoint": "wsc_" + "f" * 32,
+                }, plan_revision=digest, expected_revision=state.revision,
+                created_at="wrong-predecessor",
+                supersedes_event_id=current["event_id"], authority=route,
+            ))
+        LinearCommentEventAdapter(
+            client, issue_id="GEN-37", plan_revision=digest, **route,
+        ).apply(Delta(
+            "material-1", "GEN-37", "requirement", "second-boundary",
+            {"requirement": "continue"}, 0, "material-1",
+        ))
+        second_command = list(command)
+        for flag, value in (
+            ("--boundary-id", "material-1"),
+            ("--created-at", "2026-09-01T06:31:00Z"),
+            ("--session-id", "successor"),
+        ):
+            second_command[second_command.index(flag) + 1] = value
+        with patch.object(
+            checkpoint_cli, "_client_and_route", return_value=(client, route),
+        ):
+            preview = checkpoint_cli.run(second_command)
+        self.assertEqual(
+            preview["checkpoint"]["predecessor_event_id"],
+            first_receipt["event_id"],
+        )
+        native_before = checkpoint_cli._root_surface(client, route, "GEN-37")
+        receipt = checkpoint_adapter.persist(preview["checkpoint"])
+        loader = strict_candidate_loader(
+            client, token="GEN-37", authority=route,
+            plan_source=plan_identity, plan_identity=plan_identity,
+            max_bytes=24 * 1024, max_items=100,
+        )
+        return (
+            client, route, second_command, preview, native_before, receipt,
+            loader, digest, first_receipt,
+        )
+
+    def _assert_projection_loss_compensates(self, *, resolved_quarantine):
+        (
+            client, route, command, _manual_preview, _native, _receipt, loader,
+            digest, _plan_identity,
+        ) = self._checkpoint_only_state(
+            persist=False, resolved_quarantine=resolved_quarantine,
+        )
+        # Reconstruct the production boundary through one ordinary apply: the
+        # checkpoint becomes acknowledged, its disposition still names the
+        # predecessor because the projection request is not accepted, and the
+        # first strict resume observes that exact durable state.
+        original_append = checkpoint_cli.LinearProjectionAdapter.append
+        append_attempts = 0
+
+        def lose_first_projection(adapter, event, **kwargs):
+            nonlocal append_attempts
+            append_attempts += 1
+            if append_attempts == 1:
+                raise checkpoint_cli.LinearTransportError(
+                    "projection request refused before commit"
+                )
+            return original_append(adapter, event, **kwargs)
+
+        resume_calls = 0
+
+        def exact_resume_state(*_args, **_kwargs):
+            nonlocal resume_calls
+            resume_calls += 1
+            if resume_calls == 1:
+                with self.assertRaisesRegex(
+                    ResumeError,
+                    "disposition_checkpoint_stale_reconcile_required",
+                ):
+                    loader(digest)
+                raise checkpoint_cli.LinearTransportError(
+                    "checkpoint_ordinary_resume_refused:"
+                    + (
+                        "workstream resume refused: "
+                        if resolved_quarantine else ""
+                    )
+                    + "disposition_checkpoint_stale_reconcile_required"
+                )
+            self.assertEqual(loader(digest)["resume_authority"], "full")
+            checkpoint_adapter = LinearCheckpointAdapter(
+                client, issue_id="GEN-37", workstream_id="GEN-37",
+                issue_uuid=route["root_issue_id"],
+                workspace_id=route["workspace_id"], team_id=route["team_id"],
+                project_id=route["project_id"],
+            )
+            tip = checkpoint_adapter._recover_checkpoint_generations(
+                checkpoint_adapter._state(),
+            )[digest]
+            return {
+                "resume_authority": "full", "plan_revision": digest,
+                "latest_checkpoint": {
+                    "checkpoint_event_id": tip["checkpoint_event_id"],
+                    "root_revision": tip["root_revision"],
+                    "acknowledgement": tip["acknowledgement"],
+                },
+            }
+
+        writes_before = len(client.mutations)
+        with patch.object(
+            checkpoint_cli, "_client_and_route", return_value=(client, route),
+        ), patch.object(
+            checkpoint_cli.LinearProjectionAdapter, "append",
+            new=lose_first_projection,
+        ), patch.object(
+            checkpoint_cli, "_ordinary_resume", side_effect=exact_resume_state,
+        ), patch.object(
+            checkpoint_cli, "_compensate_checkpoint_projection",
+            wraps=checkpoint_cli._compensate_checkpoint_projection,
+        ) as compensate_spy:
+            replay_preview = checkpoint_cli.run(command)
+            applied = checkpoint_cli.run([
+                *command, "--apply", "--expected-material-revision", "0",
+                "--expected-preview-sha256", replay_preview["preview_sha256"],
+            ])
+        self.assertEqual(compensate_spy.call_count, 1)
+        self.assertEqual(resume_calls, 2)
+        self.assertEqual(append_attempts, 2)
+        self.assertEqual(applied["resume_authority"], "full")
+        self.assertEqual(applied["writes_performed"], 2)
+        self.assertEqual(len(client.mutations), writes_before + 2)
+        final_projection = checkpoint_cli.LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=digest, **route,
+        ).state()
+        disposition = final_projection.snapshot["disposition"]
+        self.assertEqual(
+            disposition["recovered_from_checkpoint"],
+            replay_preview["checkpoint"]["event_id"],
+        )
+        if resolved_quarantine:
+            self.assertEqual(
+                len(final_projection.snapshot["projection_quarantined"]), 1,
+            )
+            self.assertEqual(
+                final_projection.snapshot["projection_unresolved_quarantine"],
+                [],
+            )
+        self.assertEqual(loader(digest)["resume_authority"], "full")
+
+        # The exact retry is a genuine zero-write replay and never invokes the
+        # compensation path again.
+        writes_before_replay = len(client.mutations)
+        resume_calls = 1
+        with patch.object(
+            checkpoint_cli, "_client_and_route", return_value=(client, route),
+        ), patch.object(
+            checkpoint_cli, "_ordinary_resume", side_effect=exact_resume_state,
+        ), patch.object(
+            checkpoint_cli, "_compensate_checkpoint_projection",
+            wraps=checkpoint_cli._compensate_checkpoint_projection,
+        ) as replay_spy:
+            final_preview = checkpoint_cli.run(command)
+            final = checkpoint_cli.run([
+                *command, "--apply", "--expected-material-revision", "0",
+                "--expected-preview-sha256", final_preview["preview_sha256"],
+            ])
+        self.assertEqual(final["writes_performed"], 0)
+        self.assertEqual(replay_spy.call_count, 0)
+        self.assertEqual(len(client.mutations), writes_before_replay)
+
+    def test_projection_loss_stale_resume_compensates_once_and_replays(self):
+        self._assert_projection_loss_compensates(resolved_quarantine=False)
+
+    def test_resolved_quarantine_stale_resume_compensates_and_replays(self):
+        self._assert_projection_loss_compensates(resolved_quarantine=True)
+
+    def test_exact_predecessor_pointer_compensates_to_successor_and_replays(self):
+        (
+            client, route, command, preview, native_before, receipt, loader,
+            digest, predecessor_receipt,
+        ) = self._predecessor_pointer_state()
+        disposition_before = checkpoint_cli.LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=digest, **route,
+        ).state().snapshot["disposition"]
+        self.assertEqual(
+            disposition_before["recovered_from_checkpoint"],
+            predecessor_receipt["event_id"],
+        )
+        with self.assertRaisesRegex(
+            ResumeError, "disposition_checkpoint_stale_reconcile_required",
+        ):
+            loader(digest)
+        writes = len(client.mutations)
+        with patch.object(
+            checkpoint_cli, "_compensate_checkpoint_projection",
+            wraps=checkpoint_cli._compensate_checkpoint_projection,
+        ) as spy:
+            correction = checkpoint_cli._compensate_checkpoint_projection(
+                client=client, preview=preview, route=route,
+                native_before=native_before, checkpoint_receipt=receipt,
+                args=checkpoint_cli.parser().parse_args(command),
+            )
+        self.assertEqual(spy.call_count, 1)
+        self.assertIsNotNone(correction)
+        self.assertEqual(len(client.mutations), writes + 1)
+        self.assertEqual(loader(digest)["resume_authority"], "full")
+        self.assertEqual(
+            checkpoint_cli.LinearProjectionAdapter(
+                client, issue_id="GEN-37", workstream_id="GEN-37",
+                plan_revision=digest, **route,
+            ).state().snapshot["disposition"]["recovered_from_checkpoint"],
+            receipt["event_id"],
+        )
+
+        # The public command sees both records as exact replays, performs no
+        # compensation, and writes nothing.
+        checkpoint_state = LinearCheckpointAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            issue_uuid=route["root_issue_id"], workspace_id=route["workspace_id"],
+            team_id=route["team_id"], project_id=route["project_id"],
+        )
+        tip = checkpoint_state._recover_checkpoint_generations(
+            checkpoint_state._state(),
+        )[digest]
+        full = {
+            "resume_authority": "full", "plan_revision": digest,
+            "latest_checkpoint": {
+                "checkpoint_event_id": tip["checkpoint_event_id"],
+                "root_revision": tip["root_revision"],
+                "acknowledgement": tip["acknowledgement"],
+            },
+        }
+        writes = len(client.mutations)
+        with patch.object(
+            checkpoint_cli, "_client_and_route", return_value=(client, route),
+        ), patch.object(
+            checkpoint_cli, "_ordinary_resume", return_value=full,
+        ), patch.object(
+            checkpoint_cli, "_compensate_checkpoint_projection",
+            wraps=checkpoint_cli._compensate_checkpoint_projection,
+        ) as replay_spy:
+            replay_preview = checkpoint_cli.run(command)
+            replay = checkpoint_cli.run([
+                *command, "--apply", "--expected-material-revision", "1",
+                "--expected-preview-sha256", replay_preview["preview_sha256"],
+            ])
+        self.assertEqual(replay["writes_performed"], 0)
+        self.assertEqual(replay_spy.call_count, 0)
+        self.assertEqual(len(client.mutations), writes)
+
+    def test_wrong_reviewed_predecessor_pointer_refuses_zero_writes(self):
+        (
+            client, route, command, preview, native_before, receipt, _loader,
+            digest, predecessor_receipt,
+        ) = self._predecessor_pointer_state(wrong_predecessor=True)
+        current_pointer = checkpoint_cli.LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=digest, **route,
+        ).state().snapshot["disposition"]["recovered_from_checkpoint"]
+        self.assertNotEqual(current_pointer, predecessor_receipt["event_id"])
+        writes = len(client.mutations)
+        with patch.object(
+            checkpoint_cli, "_compensate_checkpoint_projection",
+            wraps=checkpoint_cli._compensate_checkpoint_projection,
+        ) as spy:
+            correction = checkpoint_cli._compensate_checkpoint_projection(
+                client=client, preview=preview, route=route,
+                native_before=native_before, checkpoint_receipt=receipt,
+                args=checkpoint_cli.parser().parse_args(command),
+            )
+        self.assertEqual(spy.call_count, 1)
+        self.assertIsNone(correction)
+        self.assertEqual(len(client.mutations), writes)
+        self.assertEqual(
+            checkpoint_cli.LinearProjectionAdapter(
+                client, issue_id="GEN-37", workstream_id="GEN-37",
+                plan_revision=digest, **route,
+            ).state().snapshot["disposition"]["recovered_from_checkpoint"],
+            current_pointer,
+        )
+
+    def test_compensation_refuses_every_changed_authority_surface_zero_writes(self):
+        def invoke(state, *, dependency_error=None):
+            (
+                client, route, command, preview, native_before, receipt, _loader,
+                _digest_value, _plan_identity,
+            ) = state
+            args = checkpoint_cli.parser().parse_args(command)
+            writes = len(client.mutations)
+            from contextlib import nullcontext
+            context = (
+                patch.object(
+                    checkpoint_cli.LinearChildDependencyAdapter,
+                    "read_authorized_graph_for_snapshot",
+                    side_effect=dependency_error,
+                )
+                if dependency_error is not None else nullcontext()
+            )
+            with context, patch.object(
+                checkpoint_cli, "_compensate_checkpoint_projection",
+                wraps=checkpoint_cli._compensate_checkpoint_projection,
+            ) as spy:
+                result = checkpoint_cli._compensate_checkpoint_projection(
+                    client=client, preview=preview, route=route,
+                    native_before=native_before, checkpoint_receipt=receipt,
+                    args=args,
+                )
+            self.assertEqual(spy.call_count, 1)
+            self.assertIsNone(result)
+            self.assertEqual(len(client.mutations), writes)
+
+        # Source bytes drift under the same identity.
+        state = self._checkpoint_only_state(plan_text="# source before\n")
+        with open(state[-1], "w", encoding="utf-8") as handle:
+            handle.write("# source after\n")
+        invoke(state)
+
+        # Source identity drift with identical bytes is independently fenced.
+        state = self._checkpoint_only_state(plan_text="# identity bytes\n")
+        client, route, _, _, _, _, _, digest, source_identity = state
+        replacement = tempfile.NamedTemporaryFile("w+", suffix=".md")
+        self.addCleanup(replacement.close)
+        replacement.write("# identity bytes\n")
+        replacement.flush()
+        projection = checkpoint_cli.LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=digest, **route,
+        )
+        projection_state = projection.state()
+        current_source = next(
+            event for event in reversed(projection_state.events)
+            if event["kind"] == "source" and event["key"] == "root"
+        )
+        projection.append(checkpoint_cli.build_projection_event(
+            workstream_id="GEN-37", kind="source", key="root",
+            value={"identity": replacement.name, "sha256": digest},
+            plan_revision=digest, expected_revision=projection_state.revision,
+            created_at="source-identity-drift",
+            supersedes_event_id=current_source["event_id"], authority=route,
+        ))
+        self.assertNotEqual(source_identity, replacement.name)
+        invoke(state)
+
+        # Human-visible lifecycle/native state transition.
+        class ChildAwareClient(fixture.FakeClient):
+            def execute(self, query, variables):
+                result = super().execute(query, variables)
+                if "query WorkstreamResumeRoot" in query:
+                    result["issue"]["children"]["nodes"] = deepcopy(self.children)
+                return result
+
+        state = self._checkpoint_only_state()
+        state[0].graph_status = "Done"
+        state[0].graph_status_type = "completed"
+        state[0].graph_state_id = "done-state"
+        invoke(state)
+
+        # Native child graph drift.
+        state = self._checkpoint_only_state(client_factory=ChildAwareClient)
+        state[0].children.append({
+            "id": "child-id", "identifier": "GEN-72", "title": "Child",
+            "description": "Next action: Continue.",
+            "url": "https://linear.test/GEN-72", "updatedAt": "child-time",
+            "archivedAt": None,
+            "parent": {"id": state[1]["root_issue_id"], "identifier": "GEN-37"},
+            "project": {"id": state[1]["project_id"]},
+            "team": {"id": state[1]["team_id"],
+                     "organization": {"id": state[1]["workspace_id"]}},
+            "assignee": None,
+            "state": {"id": "child-state", "name": "In Progress",
+                      "type": "started"},
+            "comments": {"nodes": [], "pageInfo": {
+                "hasNextPage": False, "endCursor": None,
+            }},
+        })
+        invoke(state)
+
+        # The full fresh producer oracle, not a projection-only shortcut,
+        # refuses relation/dependency readback drift.
+        for reason in (
+            "dependency_relation_frontier_changed",
+            "authenticated_dependency_graph_missing",
+        ):
+            with self.subTest(reason=reason):
+                invoke(
+                    self._checkpoint_only_state(),
+                    dependency_error=ChildDependencyError(reason),
+                )
+
+    def test_compensation_refuses_quarantine_newer_checkpoint_and_projection_race(self):
+        # A late schema-v1 event is unresolved quarantine, never repair input.
+        state = self._checkpoint_only_state()
+        client, route, command, preview, native_before, receipt, _, digest, _ = state
+        legacy = projection_fixture.legacy_event(
+            "provenance", "late-v1",
+            {"agent": "legacy", "machine": "M3", "session_id": "late-v1"},
+            4, "late-v1",
+        )
+        legacy["plan_revision"] = digest
+        legacy["event_id"] = projection_module._event_id(legacy)
+        client.comments.append(projection_fixture.legacy_comment(legacy, "late-v1"))
+        writes = len(client.mutations)
+        with patch.object(
+            checkpoint_cli, "_compensate_checkpoint_projection",
+            wraps=checkpoint_cli._compensate_checkpoint_projection,
+        ) as spy:
+            result = checkpoint_cli._compensate_checkpoint_projection(
+                client=client, preview=preview, route=route,
+                native_before=native_before, checkpoint_receipt=receipt,
+                args=checkpoint_cli.parser().parse_args(command),
+            )
+        self.assertEqual(spy.call_count, 1)
+        self.assertIsNone(result)
+        self.assertEqual(len(client.mutations), writes)
+
+        # A newer canonical material/checkpoint frontier makes the old pointer
+        # ambiguous and cannot be rolled back by compensation.
+        state = self._checkpoint_only_state()
+        client, route, command, preview, native_before, receipt, _, digest, _ = state
+        LinearCommentEventAdapter(
+            client, issue_id="GEN-37", plan_revision=digest, **route,
+        ).apply(Delta(
+            "material-1", "GEN-37", "requirement", "new-frontier",
+            {"requirement": "newer"}, 0, "later-material",
+        ))
+        newer = checkpoint_cli.build_checkpoint(
+            workstream_id="GEN-37", boundary_id="material-1", root_revision=1,
+            plan_revision=digest, before_status="In Progress",
+            after_status="In Progress", execution={
+                "agent": "codex", "provider": "openai", "session_id": "newer",
+                "machine": "M5", "worktree": {
+                    "state": "safe", "path": "/tmp/newer", "branch": "newer",
+                    "head": "e" * 40,
+                },
+            }, exact_head="e" * 40, evidence=[], blocker=None,
+            next_action="Continue", predecessor_event_id=receipt["event_id"],
+        )
+        LinearCheckpointAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            issue_uuid=route["root_issue_id"], workspace_id=route["workspace_id"],
+            team_id=route["team_id"], project_id=route["project_id"],
+        ).persist(newer)
+        writes = len(client.mutations)
+        result = checkpoint_cli._compensate_checkpoint_projection(
+            client=client, preview=preview, route=route,
+            native_before=native_before, checkpoint_receipt=receipt,
+            args=checkpoint_cli.parser().parse_args(command),
+        )
+        self.assertIsNone(result)
+        self.assertEqual(len(client.mutations), writes)
+
+        # A competing projection wins after the fresh oracle but before our
+        # CAS append.  The helper emits no correction and never rebases.
+        state = self._checkpoint_only_state()
+        client, route, command, preview, native_before, receipt, _, digest, _ = state
+        original_append = checkpoint_cli.LinearProjectionAdapter.append
+        raced = False
+
+        def inject_competitor(adapter, candidate, **kwargs):
+            nonlocal raced
+            if not raced:
+                raced = True
+                current = adapter.state()
+                competitor = checkpoint_cli.build_projection_event(
+                    workstream_id="GEN-37", kind="provenance", key="race",
+                    value={"agent": "codex", "machine": "M3",
+                           "session_id": "competitor"},
+                    plan_revision=digest, expected_revision=current.revision,
+                    created_at="race", authority=route,
+                )
+                original_append(
+                    adapter, competitor, expected_material_revision=0,
+                    expected_quarantine_count=0,
+                    expected_quarantine_sha256=checkpoint_cli._digest([]),
+                )
+            return original_append(adapter, candidate, **kwargs)
+
+        writes = len(client.mutations)
+        with patch.object(
+            checkpoint_cli.LinearProjectionAdapter, "append",
+            new=inject_competitor,
+        ):
+            result = checkpoint_cli._compensate_checkpoint_projection(
+                client=client, preview=preview, route=route,
+                native_before=native_before, checkpoint_receipt=receipt,
+                args=checkpoint_cli.parser().parse_args(command),
+            )
+        self.assertIsNone(result)
+        self.assertEqual(len(client.mutations), writes + 1)
+        self.assertFalse(any(
+            event["kind"] == "disposition"
+            and event["value"].get("recovered_from_checkpoint") == receipt["event_id"]
+            for event in checkpoint_cli.LinearProjectionAdapter(
+                client, issue_id="GEN-37", workstream_id="GEN-37",
+                plan_revision=digest, **route,
+            ).state().events
+        ))
+
+    def test_non_stale_resume_refusal_never_invokes_compensation(self):
+        state = self._checkpoint_only_state()
+        client, route, command = state[:3]
+        original_append = checkpoint_cli.LinearProjectionAdapter.append
+        attempts = 0
+
+        def refuse_first(adapter, event, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise checkpoint_cli.LinearTransportError("projection unavailable")
+            return original_append(adapter, event, **kwargs)
+
+        with patch.object(
+            checkpoint_cli, "_client_and_route", return_value=(client, route),
+        ), patch.object(
+            checkpoint_cli.LinearProjectionAdapter, "append", new=refuse_first,
+        ), patch.object(
+            checkpoint_cli, "_ordinary_resume",
+            side_effect=checkpoint_cli.LinearTransportError(
+                "outer:checkpoint_ordinary_resume_refused:workstream resume "
+                "refused: disposition_checkpoint_stale_reconcile_required"
+            ),
+        ), patch.object(
+            checkpoint_cli, "_compensate_checkpoint_projection",
+            wraps=checkpoint_cli._compensate_checkpoint_projection,
+        ) as spy:
+            preview = checkpoint_cli.run(command)
+            with self.assertRaises(
+                checkpoint_cli.CheckpointPartialApplyError,
+            ) as raised:
+                checkpoint_cli.run([
+                    *command, "--apply", "--expected-material-revision", "0",
+                    "--expected-preview-sha256", preview["preview_sha256"],
+                ])
+        self.assertEqual(spy.call_count, 0)
+        self.assertEqual(
+            raised.exception.payload["reason"],
+            "checkpoint_projection_apply_unknown_replay_required",
+        )
+
+    def test_stale_resume_refusal_parser_accepts_only_canonical_envelopes(self):
+        accepted = (
+            "checkpoint_ordinary_resume_refused:"
+            "disposition_checkpoint_stale_reconcile_required",
+            "checkpoint_ordinary_resume_refused:workstream resume refused: "
+            "disposition_checkpoint_stale_reconcile_required",
+        )
+        for value in accepted:
+            self.assertTrue(
+                checkpoint_cli._is_exact_stale_checkpoint_resume_refusal(
+                    checkpoint_cli.LinearTransportError(value)
+                )
+            )
+        for value in (
+            "outer:" + accepted[1],
+            accepted[1] + ":extra",
+            "checkpoint_ordinary_resume_refused:transport failed; "
+            "disposition_checkpoint_stale_reconcile_required",
+            "checkpoint_ordinary_resume_refused:workstream resume refused: "
+            "prefix disposition_checkpoint_stale_reconcile_required",
+        ):
+            self.assertFalse(
+                checkpoint_cli._is_exact_stale_checkpoint_resume_refusal(
+                    checkpoint_cli.LinearTransportError(value)
+                )
+            )
+
+    def test_pre_oracle_projection_advance_refuses_compensation_zero_writes(self):
+        state = self._checkpoint_only_state()
+        client, route, command, preview, native_before, receipt, _, digest, _ = state
+        projection = checkpoint_cli.LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=digest, **route,
+        )
+        current = projection.state()
+        projection.append(checkpoint_cli.build_projection_event(
+            workstream_id="GEN-37", kind="provenance", key="intervening",
+            value={"agent": "codex", "machine": "M1",
+                   "session_id": "intervening"},
+            plan_revision=digest, expected_revision=current.revision,
+            created_at="intervening", authority=route,
+        ))
+        writes = len(client.mutations)
+        with patch.object(
+            checkpoint_cli, "_compensate_checkpoint_projection",
+            wraps=checkpoint_cli._compensate_checkpoint_projection,
+        ) as spy:
+            result = checkpoint_cli._compensate_checkpoint_projection(
+                client=client, preview=preview, route=route,
+                native_before=native_before, checkpoint_receipt=receipt,
+                args=checkpoint_cli.parser().parse_args(command),
+            )
+        self.assertEqual(spy.call_count, 1)
+        self.assertIsNone(result)
+        self.assertEqual(len(client.mutations), writes)
+        self.assertIsNone(projection.state().snapshot["disposition"]
+                          ["recovered_from_checkpoint"])
+
+    def test_durable_compensation_receipt_survives_second_resume_refusal(self):
+        (
+            client, route, command, _preview, _native, _receipt, _loader,
+            _digest_value, _plan_identity,
+        ) = self._checkpoint_only_state(persist=False)
+        original_append = checkpoint_cli.LinearProjectionAdapter.append
+        append_attempts = 0
+
+        def lose_initial_projection(adapter, event, **kwargs):
+            nonlocal append_attempts
+            append_attempts += 1
+            if append_attempts == 1:
+                raise checkpoint_cli.LinearTransportError(
+                    "initial projection refused before commit"
+                )
+            return original_append(adapter, event, **kwargs)
+
+        # Checkpoint is mutation one.  Compensation is mutation two; simulate
+        # its response being lost after Linear durably commits it.
+        client.commit_then_fail_at.add(2)
+        resume_failures = iter((
+            checkpoint_cli.LinearTransportError(
+                "checkpoint_ordinary_resume_refused:workstream resume refused: "
+                "disposition_checkpoint_stale_reconcile_required"
+            ),
+            checkpoint_cli.LinearTransportError(
+                "checkpoint_ordinary_resume_refused:workstream resume refused: "
+                "resume_context_over_budget"
+            ),
+        ))
+        with patch.object(
+            checkpoint_cli, "_client_and_route", return_value=(client, route),
+        ), patch.object(
+            checkpoint_cli.LinearProjectionAdapter, "append",
+            new=lose_initial_projection,
+        ), patch.object(
+            checkpoint_cli, "_ordinary_resume", side_effect=resume_failures,
+        ):
+            preview = checkpoint_cli.run(command)
+            with self.assertRaises(
+                checkpoint_cli.CheckpointPartialApplyError,
+            ) as raised:
+                checkpoint_cli.run([
+                    *command, "--apply", "--expected-material-revision", "0",
+                    "--expected-preview-sha256", preview["preview_sha256"],
+                ])
+        payload = raised.exception.payload
+        self.assertEqual(
+            payload["reason"],
+            "checkpoint_compensation_applied_but_resume_refused",
+        )
+        correction = payload["projection"]["receipt"]
+        self.assertEqual(correction["event_id"], preview["projection_candidate"]
+                         ["event_id"])
+        self.assertIsInstance(correction["remote_id"], str)
+        self.assertEqual(correction["revision"],
+                         preview["projection_candidate"]["expected_revision"] + 1)
+        self.assertEqual(correction["acknowledgement"], {
+            "state": "remote_acknowledged",
+            "remote_id": correction["remote_id"],
+            "applied_revision": correction["revision"],
+        })
+        self.assertEqual(payload["failure"], {
+            "stage": "post_compensation_ordinary_resume",
+            "reason": (
+                "checkpoint_ordinary_resume_refused:workstream resume refused: "
+                "resume_context_over_budget"
+            ),
+        })
+        self.assertEqual(len(client.mutations), 2)
+
+    def test_native_dependency_graph_missing_or_invalid_refuses_zero_writes(self):
+        for failure in (
+            ChildDependencyError("authenticated_dependency_graph_missing"),
+            ChildDependencyError("invalid_dependency_issue_graph"),
+        ):
+            with self.subTest(reason=str(failure)):
+                client, route, command = self._minimal_checkpoint_fixture()
+                with patch.object(
+                    checkpoint_cli, "_client_and_route",
+                    return_value=(client, route),
+                ), patch.object(
+                    checkpoint_cli.LinearChildDependencyAdapter,
+                    "read_authorized_graph_for_snapshot",
+                    side_effect=failure,
+                ), self.assertRaisesRegex(
+                    checkpoint_cli.LinearTransportError,
+                    "checkpoint_proposed_resume_refused",
+                ):
+                    checkpoint_cli.run(command)
+                self.assertEqual(client.mutations, [])
+
+    def test_native_dependency_context_over_budget_refuses_zero_writes(self):
+        client, route, command = self._minimal_checkpoint_fixture()
+        with patch.object(
+            checkpoint_cli, "_client_and_route", return_value=(client, route),
+        ), patch.object(
+            resume_cli, "compact_context",
+            side_effect=ResumeError("resume_context_over_budget"),
+        ), self.assertRaisesRegex(
+            checkpoint_cli.LinearTransportError,
+            "checkpoint_proposed_resume_refused:resume_context_over_budget",
+        ):
+            checkpoint_cli.run(command)
+        self.assertEqual(client.mutations, [])
+
+    def test_legacy_projection_quarantine_refuses_preview_and_append_fence(self):
+        client, route, command = self._minimal_checkpoint_fixture()
+        # Inject a genuine schema-v1 event after the modern projection.  This
+        # is the same late-writer shape that production reduces into the
+        # unresolved quarantine surface.
+        digest = client.description.split(":", 1)[1].split()[0]
+        legacy = projection_fixture.legacy_event(
+        "provenance", "late-v1", {
+            "agent": "legacy", "machine": "M3", "session_id": "late-v1",
+        },
+            4, "2026-09-01T06:31:00Z",
+        )
+        legacy["plan_revision"] = digest
+        legacy["event_id"] = projection_module._event_id(legacy)
+        client.comments.append(
+            projection_fixture.legacy_comment(legacy, "legacy-quarantine")
+        )
+        client.mutations.clear()
+        state = checkpoint_cli.LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=digest, **route,
+        ).state()
+        quarantine = state.snapshot["projection_unresolved_quarantine"]
+        self.assertEqual(len(quarantine), 1)
+        with patch.object(
+            checkpoint_cli, "_client_and_route", return_value=(client, route),
+        ), self.assertRaisesRegex(
+            checkpoint_cli.LinearTransportError,
+            "checkpoint_projection_unresolved_quarantine_refused",
+        ):
+            checkpoint_cli.run(command)
+        self.assertEqual(client.mutations, [])
+
+        # The native projection transport independently fences an append using
+        # the exact quarantined event list and digest; a stale/wrong fence is
+        # a zero-write refusal rather than an implicit quarantine repair.
+        adapter = checkpoint_cli.LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=digest, **route,
+        )
+        current = adapter.state()
+        candidate = checkpoint_cli.build_projection_event(
+            workstream_id="GEN-37", kind="provenance", key="fenced",
+            value={"agent": "codex", "machine": "M5", "session_id": "fenced"},
+            plan_revision=digest, expected_revision=current.revision,
+            created_at="2026-09-01T06:32:00Z", authority=route,
+        )
+        with self.assertRaisesRegex(
+            checkpoint_cli.LinearProjectionError,
+            "projection_quarantine_changed_reload_required",
+        ):
+            adapter.append(
+                candidate, expected_material_revision=0,
+                expected_quarantine_count=1,
+                expected_quarantine_sha256="0" * 64,
+            )
+        self.assertEqual(client.mutations, [])
+
     def test_proposed_resume_rejects_stale_recovered_checkpoint_before_write(self):
         token = "GEN-37"
         route = fixture.AUTHORITY
