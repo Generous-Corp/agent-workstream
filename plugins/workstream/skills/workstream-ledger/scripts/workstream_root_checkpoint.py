@@ -22,6 +22,7 @@ from workstream_linear import (
     LinearTransportError,
 )
 from workstream_linear_events import (
+    canonical_authenticated_source,
     ledger_boundary_slot_id, ledger_serialization_frontier, material_frontier,
     reduce_event_comments,
 )
@@ -506,6 +507,7 @@ def _ordinary_resume(
         raise LinearTransportError("checkpoint_ordinary_resume_invalid_json") from error
     if not isinstance(value, dict):
         raise LinearTransportError("checkpoint_ordinary_resume_invalid_json")
+    source = canonical_authenticated_source(source)
     if (
         value.get("resume_authority") != "full"
         or value.get("workstream_id") != token

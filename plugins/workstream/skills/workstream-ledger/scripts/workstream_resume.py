@@ -36,6 +36,7 @@ from workstream_linear_events import (
     LinearCommentEventAdapter,
     LinearEventError,
     apply_material_semantic_repairs,
+    canonical_authenticated_source,
     ledger_serialization_frontier,
     reduce_event_comments,
 )
@@ -2492,6 +2493,11 @@ def _fixed_frontier_authority_envelope(
         key: brief(value)
         for key, value in (context.get("authenticated_route") or {}).items()
     }
+    raw_source = context.get("authenticated_source")
+    canonical_source = (
+        canonical_authenticated_source(raw_source)
+        if raw_source is not None else None
+    )
     source_brief = {
         key: brief(value)
         for key, value in (context.get("authenticated_source") or {}).items()
@@ -2551,7 +2557,7 @@ def _fixed_frontier_authority_envelope(
                 sort_keys=True, separators=(",", ":"),
             ).encode()).hexdigest(),
             "source_sha256": hashlib.sha256(json.dumps(
-                context.get("authenticated_source"), ensure_ascii=False,
+                canonical_source, ensure_ascii=False,
                 sort_keys=True, separators=(",", ":"),
             ).encode()).hexdigest(),
             "checkpoint_sha256": hashlib.sha256(json.dumps(
