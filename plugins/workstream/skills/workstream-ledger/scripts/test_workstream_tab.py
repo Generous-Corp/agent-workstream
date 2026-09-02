@@ -18,21 +18,41 @@ SPEC.loader.exec_module(tab)
 
 class FakeCmux:
     def __init__(self, title="Linear", accept_rename=True,
-                 *, resolve_target=None):
+                 *, resolve_target=None,
+                 surface_id="surface-uuid-7", surface_ref="surface:7",
+                 workspace_id="workspace-uuid-3", workspace_ref="workspace:3",
+                 pane_id="pane-uuid-2", pane_ref="pane:2"):
         self.title = title
         self.accept_rename = accept_rename
         self.calls = []
         self.options = []
         self.resolve_target = resolve_target
+        self.surface_id = surface_id
+        self.surface_ref = surface_ref
+        self.workspace_id = workspace_id
+        self.workspace_ref = workspace_ref
+        self.pane_id = pane_id
+        self.pane_ref = pane_ref
 
     def __call__(self, argv, **kwargs):
         self.calls.append(argv)
         self.options.append(kwargs)
         if argv[1] == "rpc":
-            output = json.dumps({
-                "workspace_id": "workspace:3",
-                "surface_id": self.resolve_target,
-            }) if self.resolve_target else "{}"
+            if argv[2] == "workspace.list":
+                output = json.dumps({"workspaces": [{
+                    "id": self.workspace_id, "ref": self.workspace_ref,
+                }]})
+            elif argv[2] == "surface.list":
+                output = json.dumps({"surfaces": [{
+                    "id": self.surface_id, "ref": self.surface_ref,
+                    "pane_id": self.pane_id, "pane_ref": self.pane_ref,
+                    "title": self.title,
+                }]})
+            else:
+                output = json.dumps({
+                    "workspace_id": self.workspace_id,
+                    "surface_id": self.resolve_target,
+                }) if self.resolve_target else "{}"
         elif argv[1] == "ping":
             output = "pong"
         elif argv[1] == "identify":
@@ -43,11 +63,14 @@ class FakeCmux:
                 "bundle_identifier": "com.cmuxterm.app",
                 "app_bundle_path": "/Applications/cmux.app",
                 "caller": {
-                "surface_ref": "surface:7", "pane_ref": "pane:2",
-                "workspace_ref": "workspace:3", "window_ref": "window:1",
+                "surface_ref": self.surface_ref, "pane_ref": self.pane_ref,
+                "workspace_ref": self.workspace_ref, "window_ref": "window:1",
             }})
         elif argv[1] == "list-pane-surfaces":
-            output = json.dumps({"surfaces": [{"ref": "surface:7", "title": self.title}]})
+            output = json.dumps({"surfaces": [{
+                "id": self.surface_id, "ref": self.surface_ref,
+                "title": self.title,
+            }]})
         elif argv[1] == "rename-tab":
             if self.accept_rename:
                 self.title = argv[-1]
@@ -109,10 +132,12 @@ class WorkstreamTabTests(unittest.TestCase):
         self.assertEqual(result["status"], "updated")
         self.assertEqual(result["title"], "Linear · GEN-37")
         self.assertEqual([call[1] for call in fake.calls], [
-            "ping", "identify", "list-pane-surfaces", "list-pane-surfaces",
+            "ping", "identify", "rpc", "rpc", "list-pane-surfaces",
+            "ping", "identify", "rpc", "rpc", "list-pane-surfaces",
             "rename-tab", "list-pane-surfaces",
         ])
-        self.assertEqual(fake.calls[4][-1], "Linear · GEN-37")
+        rename = next(call for call in fake.calls if call[1] == "rename-tab")
+        self.assertEqual(rename[-1], "Linear · GEN-37")
 
     def test_surface_id_precedes_workspace_valued_legacy_tab_id(self):
         fake = FakeCmux("Linear", resolve_target="surface:7")
@@ -124,6 +149,31 @@ class WorkstreamTabTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "updated")
         self.assertEqual(fake.calls[1][fake.calls[1].index("--surface") + 1], "surface:7")
+
+    def test_canonical_uuid_target_authenticates_ref_only_cmux_caller(self):
+        workspace_id = "5763BFC4-F0AC-4EE6-BDA9-76D3DA25F0AC"
+        surface_id = "C79BBE38-546F-41A3-B1F9-7C5D66C526F4"
+        fake = FakeCmux(
+            "Linear · GEN-37", surface_id=surface_id,
+            surface_ref="surface:2", workspace_id=workspace_id,
+            workspace_ref="workspace:1", pane_id="pane-uuid-1",
+            pane_ref="pane:1",
+        )
+        result = tab.apply_title(
+            "GEN-37", target=surface_id, expected_workspace=workspace_id,
+            expected_provenance={
+                "socket_path": "/tmp/cmux.sock",
+                "bundle_identifier": "com.cmuxterm.app",
+                "app_bundle_path": "/Applications/cmux.app",
+            }, environ={"CMUX_SOCKET_PATH": "/tmp/cmux.sock"},
+            runner=fake, which=lambda _: "/opt/cmux",
+        )
+        self.assertEqual(result["status"], "unchanged")
+        self.assertEqual(result["surface"], "surface:2")
+        identify = next(call for call in fake.calls if call[1] == "identify")
+        self.assertEqual(
+            identify[identify.index("--surface") + 1], surface_id,
+        )
 
     def test_absent_surface_uses_one_bounded_controlling_tty_target(self):
         fake = FakeCmux("Linear", resolve_target="surface:7")
@@ -196,7 +246,8 @@ class WorkstreamTabTests(unittest.TestCase):
             automatic_title="~/Code/pulp",
         )
         self.assertEqual(generated["title"], "Linear Integration · GEN-37")
-        self.assertEqual(fake.calls[4][-1], "Linear Integration · GEN-37")
+        rename = next(call for call in fake.calls if call[1] == "rename-tab")
+        self.assertEqual(rename[-1], "Linear Integration · GEN-37")
 
         _, custom = self.apply(
             "My project", project_name="Linear Integration",
@@ -466,12 +517,13 @@ class WorkstreamTabTests(unittest.TestCase):
                 else:
                     untrusted["HERDR_ENV"] = flag
                 fake = FakeHerdr()
-                result = tab.apply_title(
-                    "GEN-37", environ=untrusted, runner=fake,
-                    which=lambda _: None,
-                )
-                self.assertEqual(result["status"], "unavailable")
-                self.assertEqual(result["reason"], "not_in_cmux_surface")
+                with self.assertRaisesRegex(
+                    tab.TabTitleError, "herdr_environment_flag_required",
+                ):
+                    tab.apply_title(
+                        "GEN-37", environ=untrusted, runner=fake,
+                        which=lambda _: None,
+                    )
                 self.assertEqual(fake.calls, [])
 
                 ambiguous = dict(untrusted, CMUX_SURFACE_ID="surface:7")
@@ -482,6 +534,15 @@ class WorkstreamTabTests(unittest.TestCase):
                         "GEN-37", environ=ambiguous, runner=fake,
                         which=lambda _: None,
                     )
+
+        partial = {"HERDR_TAB_ID": "w1:t1"}
+        with self.assertRaisesRegex(
+            tab.TabTitleError, "herdr_environment_flag_required",
+        ):
+            tab.apply_title(
+                "GEN-37", environ=partial, runner=FakeHerdr(),
+                which=lambda _: "/opt/cmux",
+            )
 
         with self.assertRaisesRegex(
             tab.TabTitleError, "terminal_context_ambiguous",

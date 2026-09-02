@@ -621,6 +621,101 @@ class ThisSessionTests(unittest.TestCase):
         self.assertEqual(result["workspace_id"], workspace_id)
         self.assertEqual(result["target_id"], surface_id)
 
+    def test_no_env_full_wrapper_normalizes_uuid_ref_title_and_binding(self):
+        workspace_id = "5763BFC4-F0AC-4EE6-BDA9-76D3DA25F0AC"
+        surface_id = "C79BBE38-546F-41A3-B1F9-7C5D66C526F4"
+        provenance = {
+            "socket_path": "/tmp/cmux-a.sock",
+            "bundle_identifier": "com.cmuxterm.app",
+            "app_bundle_path": "/Applications/cmux.app",
+        }
+        for name, title, seeded, expected_tab in (
+            ("suffix", "Linear · GEN-37", False, "unchanged"),
+            ("binding", "Linear", True, "updated"),
+        ):
+            with self.subTest(name=name):
+                db = Path(self.temp.name) / f"uuid-ref-{name}.sqlite3"
+                fake = FakeCmux(
+                    title, surface=surface_id, surface_ref="surface:2",
+                    workspace=workspace_id, workspace_ref="workspace:1",
+                    pane="9058DC8D-9EA7-426D-94C8-7D649EC97476",
+                    pane_ref="pane:1",
+                )
+                if seeded:
+                    resolution = {
+                        "manager": "cmux", "workspace_id": workspace_id,
+                        "target_id": surface_id,
+                        "cmux_socket_path": provenance["socket_path"],
+                        "terminal_provenance": dict(provenance),
+                        "namespace_sha256": session._namespace(
+                            "cmux", provenance,
+                        ),
+                        "workstream_id": "GEN-37",
+                    }
+                    session.record_successor_binding(
+                        db, resolution,
+                        environ={"CODEX_SESSION_ID": "old-session"},
+                        created_at="2026-09-01T00:00:00Z",
+                    )
+
+                def terminal_runner(argv, **kwargs):
+                    if "agent.resolve_delivery_target" in argv:
+                        return subprocess.CompletedProcess(
+                            argv, 0, json.dumps({
+                                "surface_id": surface_id,
+                                "workspace_id": workspace_id,
+                            }), "",
+                        )
+                    result = fake(argv, **kwargs)
+                    if "identify" in argv and "--no-caller" not in argv:
+                        value = json.loads(result.stdout)
+                        # cmux 0.501 authenticates this exact UUID selector but
+                        # reports only its caller refs in production.
+                        value["caller"] = {
+                            "surface_ref": "surface:2",
+                            "workspace_ref": "workspace:1",
+                            "pane_ref": "pane:1", "window_ref": "window:1",
+                        }
+                        result.stdout = json.dumps(value)
+                    return result
+
+                with (
+                    mock.patch.object(
+                        session, "_bounded_ancestor_pids", return_value=[101],
+                    ),
+                    mock.patch.object(
+                        session, "_default_socket_candidates", return_value=[],
+                    ),
+                ):
+                    result = session.resume_this_session(
+                        environ={"CODEX_SESSION_ID": "new-session"},
+                        runner=full_resume_runner([]),
+                        terminal_runner=terminal_runner,
+                        which=lambda _: "/opt/cmux", binding_path=db,
+                        resume_script=Path("resume.py"),
+                        created_at="2026-09-01T01:00:00Z",
+                    )
+                self.assertEqual(result["resume_authority"], "full")
+                self.assertEqual(result["tab_binding"]["status"], expected_tab)
+                self.assertEqual(fake.title, "Linear · GEN-37")
+                self.assertEqual(result["resume_binding"]["writes_performed"], 1)
+                self.assertEqual(
+                    result["this_session_resolution"]["workspace_id"],
+                    workspace_id,
+                )
+                self.assertEqual(
+                    result["this_session_resolution"]["target_id"],
+                    surface_id,
+                )
+                connection = sqlite3.connect(db)
+                self.assertEqual(connection.execute(
+                    "SELECT count(*) FROM terminal_binding_events_v1"
+                ).fetchone()[0], 2 if seeded else 1)
+                self.assertEqual(connection.execute(
+                    "SELECT provider_session_id FROM terminal_bindings_v1"
+                ).fetchone()[0], "new-session")
+                connection.close()
+
     def test_cmux_ancestor_disagreement_refuses_before_title_or_resume(self):
         fake = FakeCmux("Linear · GEN-37")
         counter = 0
@@ -893,7 +988,7 @@ class ThisSessionTests(unittest.TestCase):
                 resume_calls = []
                 with self.assertRaisesRegex(
                     session.ThisSessionError,
-                    "session_context_unavailable:cmux_cli",
+                    "session_context_invalid:HERDR_ENV",
                 ):
                     session.resume_this_session(
                         environ=env, runner=full_resume_runner(resume_calls),
@@ -903,6 +998,39 @@ class ThisSessionTests(unittest.TestCase):
                 self.assertEqual(resume_calls, [])
                 self.assertEqual(fake.calls, [])
                 self.assertFalse(self.db.exists())
+
+    def test_unflagged_herdr_tuple_never_falls_through_to_cmux_ancestor(self):
+        env = self.herdr_env("/tmp/herdr-stale.sock")
+        del env["HERDR_ENV"]
+        fake = FakeCmux(
+            "Linear · GEN-37", surface="surface-live-cmux",
+            workspace="workspace-live-cmux",
+        )
+        with self.assertRaisesRegex(
+            session.ThisSessionError, "session_context_invalid:HERDR_ENV",
+        ):
+            session.resolve_this_session(
+                environ=env, runner=fake, which=lambda _: "/opt/cmux",
+                binding_path=self.db, pid_chain=[101, 100],
+                socket_candidates=[Path("/tmp/cmux-live.sock")],
+            )
+        self.assertEqual(fake.calls, [])
+        self.assertFalse(self.db.exists())
+
+    def test_flagged_partial_herdr_context_refuses_before_any_adapter_call(self):
+        env = self.herdr_env()
+        del env["HERDR_SOCKET_PATH"]
+        fake = FakeHerdr()
+        with self.assertRaisesRegex(
+            session.ThisSessionError,
+            "session_context_invalid:HERDR_SOCKET_PATH",
+        ):
+            session.resolve_this_session(
+                environ=env, runner=fake, which=lambda _: "/opt/cmux",
+                binding_path=self.db, pid_chain=[101],
+            )
+        self.assertEqual(fake.calls, [])
+        self.assertFalse(self.db.exists())
 
     def test_mixed_cmux_and_herdr_provenance_refuses(self):
         env = dict(self.herdr_env(), CMUX_SURFACE_ID="surface-old")

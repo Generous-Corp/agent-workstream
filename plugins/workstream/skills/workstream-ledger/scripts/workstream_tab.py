@@ -72,16 +72,19 @@ def terminal_manager(environ: Mapping[str, str]) -> str | None:
     herdr_enabled = environ.get("HERDR_ENV") == "1"
     # Treat every injected HerdR field as context for ambiguity detection, but
     # never grant adapter selection without HerdR's explicit environment flag.
-    herdr_present = environ.get("HERDR_ENV") is not None or any(
-        environ.get(key) for key in (
+    herdr_fields_present = any(
+        key in environ for key in (
             "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_SOCKET_PATH",
         )
     )
+    herdr_present = "HERDR_ENV" in environ or herdr_fields_present
     cmux_present = any(environ.get(key) for key in (
         "CMUX_SURFACE_ID", "CMUX_WORKSPACE_ID", "CMUX_SOCKET_PATH",
     ))
     if herdr_present and cmux_present:
         raise TabTitleError("terminal_context_ambiguous")
+    if herdr_fields_present and not herdr_enabled:
+        raise TabTitleError("herdr_environment_flag_required")
     if herdr_enabled:
         return "herdr"
     if cmux_present:
@@ -211,12 +214,6 @@ def _surface_context(
     caller = value.get("caller")
     if not isinstance(caller, dict):
         raise TabTitleError("cmux_target_unresolved")
-    if target not in {caller.get("surface_id"), caller.get("surface_ref")}:
-        raise TabTitleError("cmux_target_identity_mismatch")
-    if expected_workspace is not None and expected_workspace not in {
-        caller.get("workspace_id"), caller.get("workspace_ref"),
-    }:
-        raise TabTitleError("cmux_workspace_changed")
     if expected_provenance is not None:
         fields = ("socket_path", "bundle_identifier", "app_bundle_path")
         if (
@@ -225,15 +222,94 @@ def _surface_context(
                    for field in fields)
         ):
             raise TabTitleError("cmux_provenance_changed")
-    fields = {
-        "surface": caller.get("surface_ref"),
-        "pane": caller.get("pane_ref"),
-        "workspace": caller.get("workspace_ref"),
-        "window": caller.get("window_ref"),
-    }
-    if not all(isinstance(item, str) and item for item in fields.values()):
+
+    def aliases(row: Mapping[str, Any], *names: str) -> set[str]:
+        return {
+            row[name] for name in names
+            if isinstance(row.get(name), str) and row[name]
+        }
+
+    caller_workspaces = aliases(caller, "workspace_id", "workspace_ref")
+    caller_surfaces = aliases(caller, "surface_id", "surface_ref")
+    caller_panes = aliases(caller, "pane_id", "pane_ref")
+    window_ref = caller.get("window_ref")
+    if (
+        not caller_workspaces or not caller_surfaces or not caller_panes
+        or not isinstance(window_ref, str) or not window_ref
+    ):
         raise TabTitleError("invalid_cmux_identify_response")
-    return SurfaceContext(**fields)
+
+    workspace_result = _run(
+        runner, [cmux, "rpc", "workspace.list", "{}"],
+        allow_unavailable=True, environment=environment,
+    )
+    if workspace_result is None:
+        raise TabTitleError("cmux_target_unresolved")
+    workspace_value = _json_result(
+        workspace_result, "invalid_cmux_workspace_response",
+    )
+    workspaces = workspace_value.get("workspaces")
+    if not isinstance(workspaces, list):
+        raise TabTitleError("invalid_cmux_workspace_response")
+    workspace_matches = []
+    for row in workspaces:
+        if not isinstance(row, dict):
+            continue
+        row_aliases = aliases(row, "id", "ref")
+        if (
+            caller_workspaces <= row_aliases
+            and all(isinstance(row.get(field), str) and row[field]
+                    for field in ("id", "ref"))
+        ):
+            workspace_matches.append((row, row_aliases))
+    if len(workspace_matches) != 1:
+        raise TabTitleError(
+            "cmux_workspace_changed"
+            if expected_workspace is not None
+            else "cmux_target_identity_mismatch"
+        )
+    workspace, workspace_aliases = workspace_matches[0]
+    if (
+        expected_workspace is not None
+        and expected_workspace not in workspace_aliases
+    ):
+        raise TabTitleError("cmux_workspace_changed")
+
+    surface_result = _run(
+        runner, [cmux, "rpc", "surface.list", json.dumps({
+            "workspace_id": workspace["id"],
+        }, separators=(",", ":"))], allow_unavailable=True,
+        environment=environment,
+    )
+    if surface_result is None:
+        raise TabTitleError("cmux_target_unresolved")
+    surface_value = _json_result(
+        surface_result, "invalid_cmux_surface_response",
+    )
+    surfaces = surface_value.get("surfaces")
+    if not isinstance(surfaces, list):
+        raise TabTitleError("invalid_cmux_surface_response")
+    surface_matches = []
+    for row in surfaces:
+        if not isinstance(row, dict):
+            continue
+        row_aliases = aliases(row, "id", "ref")
+        pane_aliases = aliases(row, "pane_id", "pane_ref")
+        if (
+            target in row_aliases
+            and caller_surfaces <= row_aliases
+            and caller_panes <= pane_aliases
+            and all(isinstance(row.get(field), str) and row[field]
+                    for field in ("id", "ref", "pane_id", "pane_ref"))
+        ):
+            surface_matches.append(row)
+    if len(surface_matches) != 1:
+        raise TabTitleError("cmux_target_identity_mismatch")
+    surface = surface_matches[0]
+    return SurfaceContext(
+        surface=surface["ref"], pane=surface["pane_ref"],
+        workspace=workspace["ref"], window=window_ref,
+    )
 
 
 def _bounded_ancestor_pids() -> list[int]:
@@ -536,18 +612,26 @@ def apply_title(
         }
     assert after is not None
     if status == "updated":
+        fenced_context = _surface_context(
+            cmux, target, runner, environment=environ,
+            expected_workspace=expected_workspace,
+            expected_provenance=expected_provenance,
+        )
+        if fenced_context is None or fenced_context != context:
+            raise TabTitleError("cmux_target_identity_mismatch")
         fenced_before = _read_title(
-            cmux, context, runner, environment=environ,
+            cmux, fenced_context, runner, environment=environ,
         )
         if fenced_before != before:
             raise TabTitleError("cmux_title_changed")
         _run(runner, [
-            cmux, "rename-tab", "--surface", context.surface,
-            "--workspace", context.workspace, "--window", context.window,
+            cmux, "rename-tab", "--surface", fenced_context.surface,
+            "--workspace", fenced_context.workspace,
+            "--window", fenced_context.window,
             "--", after,
         ], environment=environ)
         observed = _read_title(
-            cmux, context, runner, environment=environ,
+            cmux, fenced_context, runner, environment=environ,
         )
         if observed != after:
             raise TabTitleError("cmux_title_readback_mismatch")

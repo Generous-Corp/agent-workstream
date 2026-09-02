@@ -95,6 +95,10 @@ def _terminal_identity(environ: Mapping[str, str]) -> dict[str, Any] | None:
     try:
         manager = workstream_tab.terminal_manager(environ)
     except workstream_tab.TabTitleError as error:
+        if str(error) == "herdr_environment_flag_required":
+            raise ThisSessionError(
+                "session_context_invalid:HERDR_ENV"
+            ) from error
         raise ThisSessionError("session_context_ambiguous") from error
     if manager == "herdr":
         target = _identity(environ.get("HERDR_TAB_ID"), "HERDR_TAB_ID")
