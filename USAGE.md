@@ -117,10 +117,10 @@ lifecycle boundary, the agent's first command is:
 python3 "<absolute directory of the SKILL.md loaded for this turn>/scripts/workstream_resume.py" GEN-123
 ```
 
-The cold path substitutes the runtime-supplied loaded skill path directly; it
-does not search the filesystem, inspect cwd/environment, probe `PATH`, or
-execute the placeholder. Initial recovery always omits `--include-history`
-and runs before memory, worktree, repository, or PR inspection.
+The authoritative `workstream-resume` skill performs this first: it waits on
+the same process across nonterminal tool yields, rejects historical-state
+substitution, and reports the tab-adapter result immediately after full
+authority. Do not duplicate that policy here.
 
 A warm `continue` nudge does not repeat resume when the exact same provider
 session and workstream retain the prior full route, source, generation,

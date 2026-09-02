@@ -113,11 +113,16 @@ class SkillContractTests(unittest.TestCase):
         resume = " ".join(self.resume_skill().split())
         self.assertIn("A pasted result, prior provider session", resume)
         self.assertIn("One bare continuation nudge may select that sole warm retained workstream", resume)
+        self.assertIn("An explicit different handle or multiple possible retained workstreams is cold", resume)
         self.assertIn("status checks", resume)
         self.assertIn("must run this as the first functional command", resume)
         self.assertIn("agent/session handoff", resume)
         self.assertIn("perform live resume and reconcile the pending journal", resume)
         self.assertIn("Auth, semantic, generation, budget", resume)
+        self.assertIn("attach-or-successor disposition", resume)
+        self.assertIn("The snapshot is not live repository or landing truth", resume)
+        self.assertIn("narrow Linear read/sync failure", resume)
+        self.assertIn("without claiming reconciled tracking authority", resume)
 
     def test_unreachable_degraded_runtime_is_not_packaged(self):
         scripts = (
@@ -201,8 +206,8 @@ class SkillContractTests(unittest.TestCase):
         resume = self.resume_skill()
         ledger = self.skill()
         flat = " ".join(resume.split())
-        self.assertLess(len(resume.encode()), 6000)
-        self.assertLessEqual(len(resume.splitlines()), 90)
+        self.assertLess(len(resume.encode()), 6500)
+        self.assertLessEqual(len(resume.splitlines()), 100)
         self.assertIn("existing workstream handle", resume)
         self.assertIn("after workstream-resume has returned", ledger)
         command = resume.split("```sh", 1)[1].split("```", 1)[0]
@@ -213,13 +218,23 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("For a status-only request, report the bounded snapshot and stop", flat)
         self.assertIn("do not load `workstream-ledger`", flat)
 
+    def test_resume_description_covers_all_dispatch_triggers(self):
+        description = self.resume_skill().split("description:", 1)[1].split("\n", 1)[0]
+        for phrase in (
+            "exactly one", "existing workstream handle", "Linear issue URL",
+            "tab title", "literal \"resume this session\"",
+            "bare continue", "same provider session",
+            "one retained authorized workstream",
+        ):
+            self.assertIn(phrase, description)
+
     def test_resume_entry_packaging_and_versions(self):
         root = Path(__file__).parents[1]
         plugin = root / "plugins/workstream"
         codex = json.loads((plugin / ".codex-plugin/plugin.json").read_text())
         claude = json.loads((plugin / ".claude-plugin/plugin.json").read_text())
         self.assertEqual(codex["version"], claude["version"])
-        self.assertEqual(codex["version"], "0.4.73")
+        self.assertEqual(codex["version"], "0.4.74")
         shim = plugin / "skills/workstream-resume/scripts/workstream_resume.py"
         target = plugin / "skills/workstream-ledger/scripts/workstream_resume.py"
         self.assertTrue(shim.is_file())
@@ -236,6 +251,28 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("must return `full`", resume)
         self.assertIn("adapter failure cannot downgrade", resume)
         self.assertIn("installs no hook", resume)
+
+    def test_cold_resume_waits_for_same_process_and_updates_title_immediately(self):
+        resume = " ".join(self.resume_skill().split())
+        wait = resume.index("wait on that same process until it terminates")
+        no_rerun = resume.index("never rerun it")
+        no_substitute = resume.index("must never be replaced with memory")
+        full = resume.index("Only captured exit-0 JSON with `resume_authority: full`")
+        adapter = resume.index("After successful recovery, carry the token immediately")
+        self.assertLess(wait, no_rerun)
+        self.assertLess(no_rerun, no_substitute)
+        self.assertLess(full, adapter)
+        self.assertIn("optional no-op, never silently skipped (report it)", resume)
+        self.assertIn("same explicit token plus inherited terminal identity", resume)
+        self.assertIn("exact namespaced cmux/HerdR identity", resume)
+        self.assertIn("bounded controlling-TTY resolver", resume)
+        self.assertIn("one matching persisted binding/title token", resume)
+
+    def test_deferred_audit_detail_requires_exact_compact_hydration(self):
+        resume = " ".join(self.resume_skill().split())
+        self.assertIn("deferred_audit_detail.state` is not `none`", resume)
+        self.assertIn("exact compact route/selectors", resume)
+        self.assertIn("full` validates complete history, not the excerpt", resume)
 
     def test_resume_shim_forwards_exact_argv_and_missing_target_refuses(self):
         source = (
