@@ -26,7 +26,7 @@ from workstream_checkpoint import (
 from workstream_linear import (
     HttpGraphQLClient, LinearGraphQLTransport,
     LinearTransportError,
-    resolve_authenticated_issue_route,
+    resolve_authenticated_resume_target,
 )
 from workstream_linear_checkpoints import (
     LinearCheckpointError,
@@ -2096,6 +2096,58 @@ def validate_snapshot(
             raise ResumeError("projection_authority_absent")
         if snapshot.get("authenticated_source") is None:
             raise ResumeError("projection_source_bytes_unverified")
+    requested_focus = snapshot.get("requested_focus")
+    if requested_focus is not None:
+        focus_fields = {
+            "kind", "identifier", "issue_id", "parent_issue_id",
+            "root_identifier", "repository_key", "status",
+        }
+        if (
+            not isinstance(requested_focus, dict)
+            or set(requested_focus) != focus_fields
+            or requested_focus.get("kind") != "owned_child"
+            or requested_focus.get("root_identifier") != identifier.upper()
+            or not all(isinstance(requested_focus.get(field), str)
+                       and requested_focus[field] for field in focus_fields - {"kind"})
+            or not re.fullmatch(
+                r"[A-Z][A-Z0-9]*-\d+", requested_focus.get("identifier", ""),
+            )
+            or authenticated_route is None
+            or scope is None
+        ):
+            raise ResumeError("invalid_requested_child_focus")
+        focus_identifier = requested_focus["identifier"]
+        focus_issue_id = requested_focus["issue_id"]
+        matches = [child for child in children if isinstance(child, dict) and (
+            str(child.get("identifier", "")).upper() == focus_identifier
+            or child.get("id") == focus_issue_id
+        )]
+        if len(matches) != 1:
+            raise ResumeError("invalid_requested_child_focus:child_missing_or_ambiguous")
+        focus_child = matches[0]
+        child_parent = focus_child.get("parent")
+        child_project = focus_child.get("project")
+        child_team = focus_child.get("team")
+        child_organization = (
+            child_team.get("organization") if isinstance(child_team, dict) else None
+        )
+        if (
+            not isinstance(child_parent, dict)
+            or not isinstance(child_project, dict)
+            or not isinstance(child_team, dict)
+            or not isinstance(child_organization, dict)
+            or str(focus_child.get("identifier", "")).upper() != focus_identifier
+            or focus_child.get("id") != focus_issue_id
+            or focus_child.get("status") != requested_focus["status"]
+            or child_parent.get("id") != authenticated_route["root_issue_id"]
+            or child_parent.get("id") != requested_focus["parent_issue_id"]
+            or child_project.get("id") != authenticated_route["project_id"]
+            or child_team.get("id") != authenticated_route["team_id"]
+            or child_organization.get("id") != authenticated_route["workspace_id"]
+            or scope["child_ownership"].get(focus_identifier)
+            != requested_focus["repository_key"]
+        ):
+            raise ResumeError("invalid_requested_child_focus:authority_mismatch")
     repairs = snapshot.get("material_semantic_repairs", [])
     raw_material_events = snapshot.get("raw_material_events", material_events)
     if not isinstance(repairs, list) or not isinstance(raw_material_events, list):
@@ -2126,7 +2178,8 @@ def validate_snapshot(
             "lifecycle_recovery": lifecycle_recovery,
             "authenticated_route": authenticated_route,
             "dependency_graph": dependency_graph,
-            "authenticated_source": snapshot.get("authenticated_source")}
+            "authenticated_source": snapshot.get("authenticated_source"),
+            "requested_focus": requested_focus}
 
 
 DEFAULT_RESUME_MAX_BYTES = 24 * 1024
@@ -2345,7 +2398,7 @@ def _bounded_authority_envelope(
         "status", "material_event_revision", "checkpoint_recovery",
         "surface_availability", "projection_revision", "projection_recovery",
         "lifecycle_recovery", "projection_quarantine", "authenticated_route",
-        "authenticated_source", "history", "resume_authority",
+        "authenticated_source", "requested_focus", "history", "resume_authority",
     )
     deferred_names = sorted(
         set(context) - set(keep) - {"deferred_audit_detail"}
@@ -2609,6 +2662,8 @@ def _fixed_frontier_authority_envelope(
             ),
         },
     }
+    if context.get("requested_focus") is not None:
+        result["requested_focus"] = deepcopy(context["requested_focus"])
     return result
 
 
@@ -2876,6 +2931,12 @@ def compact_context(
             "projection_unresolved_quarantine"
         ]
         context["closure_receipts"] = clean.get("closure_receipts", [])
+    if clean.get("requested_focus") is not None:
+        context["requested_focus"] = deepcopy(clean["requested_focus"])
+    hydration_token = (
+        extract_token(clean["requested_focus"]["identifier"])
+        if clean.get("requested_focus") is not None else normalized_token
+    )
     context = _without_raw_transcripts(context)
     item_count = child_material_item_count + _checkpoint_item_count(
         context["latest_checkpoint"]
@@ -2909,13 +2970,13 @@ def compact_context(
         original_bytes = len(encoded)
         audit_route = {
             "command": (
-                f"workstreamctl resume {normalized_token} "
+                f"workstreamctl resume {hydration_token} "
                 "--max-bytes 2147483647 --max-items 2147483647"
             ),
             "command_role": "display_only",
             "launcher": "current_workstream_resume_skill_script",
             "args": [
-                normalized_token, "--max-bytes", "2147483647",
+                hydration_token, "--max-bytes", "2147483647",
                 "--max-items", "2147483647",
             ],
             "representation": "compact_validated",
@@ -2923,13 +2984,13 @@ def compact_context(
         }
         full_history_route = {
             "command": (
-                f"workstreamctl resume {normalized_token} --include-history "
+                f"workstreamctl resume {hydration_token} --include-history "
                 "--max-bytes 2147483647 --max-items 2147483647"
             ),
             "command_role": "display_only",
             "launcher": "current_workstream_resume_skill_script",
             "args": [
-                normalized_token, "--include-history", "--max-bytes",
+                hydration_token, "--include-history", "--max-bytes",
                 "2147483647", "--max-items", "2147483647",
             ],
             "representation": "full_validated",
@@ -2996,6 +3057,59 @@ def compact_context(
     return context
 
 
+def validate_requested_child_focus(
+    *, focus: dict[str, str], native_children: list[dict[str, Any]],
+    authorized_snapshot: dict[str, Any], route: dict[str, str],
+) -> dict[str, str]:
+    """Bind a requested child selector to root-native and projected ownership."""
+    token = focus["identifier"]
+    issue_id = focus["issue_id"]
+
+    def exact_child(children: Any, *, label: str) -> dict[str, Any]:
+        if not isinstance(children, list):
+            raise ResumeError(f"requested_child_{label}_missing")
+        matches = [item for item in children if isinstance(item, dict) and (
+            str(item.get("identifier", "")).upper() == token
+            or item.get("id") == issue_id
+        )]
+        if len(matches) != 1:
+            raise ResumeError(f"requested_child_{label}_missing_or_ambiguous")
+        child = matches[0]
+        parent = child.get("parent")
+        project = child.get("project")
+        team = child.get("team")
+        organization = team.get("organization") if isinstance(team, dict) else None
+        if (
+            not isinstance(parent, dict)
+            or not isinstance(project, dict)
+            or not isinstance(team, dict)
+            or not isinstance(organization, dict)
+            or str(child.get("identifier", "")).upper() != token
+            or child.get("id") != issue_id
+            or parent.get("id") != route["root_issue_id"]
+            or project.get("id") != route["project_id"]
+            or team.get("id") != route["team_id"]
+            or organization.get("id") != route["workspace_id"]
+        ):
+            raise ResumeError(f"requested_child_{label}_identity_mismatch")
+        return child
+
+    native = exact_child(native_children, label="native")
+    exact_child(authorized_snapshot.get("children"), label="authorized")
+    scope = authorized_snapshot.get("scope") or {}
+    ownership = scope.get("child_ownership") or {}
+    repository_key = ownership.get(token)
+    if not isinstance(repository_key, str) or not repository_key:
+        raise ResumeError("requested_child_unowned")
+    status = native.get("status")
+    if not isinstance(status, str) or not status:
+        raise ResumeError("requested_child_native_state_malformed")
+    return {
+        **focus, "repository_key": repository_key,
+        "status": status,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("token", help="stable Linear root issue identifier")
@@ -3025,7 +3139,10 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
-        token = extract_token(args.token)
+        requested_token = extract_token(args.token)
+        token = requested_token
+        requested_focus = None
+        native_children: list[dict[str, Any]] = []
         authenticated_source = None
         if args.snapshot is not None and not args.inspection_only:
             raise ResumeError("snapshot_input_requires_inspection_only")
@@ -3043,7 +3160,9 @@ def main() -> int:
                     "or install ~/.config/agent-workstream/linear.token"
                 )
             client = HttpGraphQLClient(api_key, args.linear_endpoint)
-            route = resolve_authenticated_issue_route(client, token, route)
+            route, token, requested_focus = resolve_authenticated_resume_target(
+                client, requested_token, route,
+            )
             transport = LinearGraphQLTransport(
                 client,
                 team_id=route["team_id"],
@@ -3053,6 +3172,7 @@ def main() -> int:
             live_graph_snapshot = transport.snapshot_for_root(
                 token, include_child_comments=True, include_description=True,
             )
+            native_children = deepcopy(live_graph_snapshot.get("children") or [])
             # The canonical-plan label is also part of the authenticated native
             # root readback used by dependency and lifecycle fences. Read it
             # without removing it from the shared snapshot.
@@ -3156,6 +3276,11 @@ def main() -> int:
                         client, relations,
                     ),
                 )
+                if requested_focus is not None:
+                    snapshot["requested_focus"] = validate_requested_child_focus(
+                        focus=requested_focus, native_children=native_children,
+                        authorized_snapshot=snapshot, route=route,
+                    )
                 freshness = plan_generation_freshness(
                     token=token,
                     description=root_description,

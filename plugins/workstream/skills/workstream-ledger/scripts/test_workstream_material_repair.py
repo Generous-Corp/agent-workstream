@@ -489,8 +489,8 @@ class MaterialRepairCliTests(unittest.TestCase):
                 ), mock.patch.object(
                     workstream_resume, "resolve_linear_route", return_value=(None, None),
                 ), mock.patch.object(
-                    workstream_resume, "resolve_authenticated_issue_route",
-                    return_value=self.route,
+                    workstream_resume, "resolve_authenticated_resume_target",
+                    return_value=(self.route, "GEN-37", None),
                 ), mock.patch.object(
                     workstream_resume, "plan_payload",
                     return_value={"source": {**successor_source, "bytes": 10}},

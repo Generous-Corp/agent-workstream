@@ -1821,7 +1821,21 @@ class ResumeTests(unittest.TestCase):
         }]
         snapshot["material_event_revision"] = 2
         snapshot["root"]["revision"] = 2
+        snapshot = self.live_snapshot(snapshot, {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project",
+            "root_issue_id": "33333333-3333-4333-8333-333333333333",
+        })
         snapshot = self.full_authority_snapshot(snapshot)
+        requested_focus = {
+            "kind": "owned_child", "identifier": "GEN-38",
+            "issue_id": "child-0",
+            "parent_issue_id": snapshot["authenticated_route"]["root_issue_id"],
+            "root_identifier": "GEN-37",
+            "repository_key": "github.com:id:R_agent_workstream",
+            "status": "In Progress",
+        }
+        snapshot["requested_focus"] = copy.deepcopy(requested_focus)
         before = copy.deepcopy(snapshot)
 
         unbounded = MODULE.compact_context(
@@ -1859,6 +1873,8 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(snapshot, before)
         self.assertEqual(first["resume_authority"], "full")
+        self.assertEqual(first["requested_focus"], requested_focus)
+        self.assertEqual(unbounded["requested_focus"], requested_focus)
         self.assertEqual(
             first["context_schema"]["envelope"],
             "verbose_current_detail_v1",
@@ -1876,12 +1892,12 @@ class ResumeTests(unittest.TestCase):
         )
         self.assertEqual(
             first["deferred_audit_detail"]["audit_route"]["command"],
-            "workstreamctl resume GEN-37 "
+            "workstreamctl resume GEN-38 "
             "--max-bytes 2147483647 --max-items 2147483647",
         )
         self.assertEqual(
             first["deferred_audit_detail"]["full_history_route"]["command"],
-            "workstreamctl resume GEN-37 --include-history "
+            "workstreamctl resume GEN-38 --include-history "
             "--max-bytes 2147483647 --max-items 2147483647",
         )
         audit_route = first["deferred_audit_detail"]["audit_route"]
@@ -1890,9 +1906,14 @@ class ResumeTests(unittest.TestCase):
             "current_workstream_resume_skill_script",
         )
         self.assertEqual(audit_route["args"], [
-            "GEN-37", "--max-bytes", "2147483647",
+            "GEN-38", "--max-bytes", "2147483647",
             "--max-items", "2147483647",
         ])
+        self.assertEqual(
+            first["deferred_audit_detail"]["full_history_route"]["args"],
+            ["GEN-38", "--include-history", "--max-bytes", "2147483647",
+             "--max-items", "2147483647"],
+        )
         launcher = (
             Path(MODULE.__file__).resolve().parents[2]
             / "workstream-resume" / "scripts" / "workstream_resume.py"
@@ -2014,7 +2035,21 @@ class ResumeTests(unittest.TestCase):
                 } for step in range(8)],
             },
         } for index in range(96)]
+        snapshot = self.live_snapshot(snapshot, {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project",
+            "root_issue_id": "33333333-3333-4333-8333-333333333333",
+        })
         snapshot = self.full_authority_snapshot(snapshot)
+        requested_focus = {
+            "kind": "owned_child", "identifier": "GEN-38",
+            "issue_id": "child-0",
+            "parent_issue_id": snapshot["authenticated_route"]["root_issue_id"],
+            "root_identifier": "GEN-37",
+            "repository_key": "github.com:id:R_agent_workstream",
+            "status": "In Progress",
+        }
+        snapshot["requested_focus"] = copy.deepcopy(requested_focus)
         unbounded = MODULE.compact_context(
             snapshot, "GEN-37", max_bytes=8 * 1024 * 1024,
             require_projection_authority=True,
@@ -2029,6 +2064,8 @@ class ResumeTests(unittest.TestCase):
         encoded = MODULE._default_output_bytes(context)
         self.assertLessEqual(len(encoded), MODULE.DEFAULT_RESUME_MAX_BYTES)
         self.assertEqual(context["resume_authority"], "full")
+        self.assertEqual(context["requested_focus"], requested_focus)
+        self.assertEqual(unbounded["requested_focus"], requested_focus)
         self.assertEqual(
             context["context_schema"]["envelope"],
             "fixed_frontier_authority_v1",
@@ -2082,6 +2119,14 @@ class ResumeTests(unittest.TestCase):
             "--include-history",
             context["deferred_audit_detail"]["full_history_route"]["command"],
         )
+        self.assertEqual(
+            context["deferred_audit_detail"]["audit_route"]["args"][0],
+            "GEN-38",
+        )
+        self.assertEqual(
+            context["deferred_audit_detail"]["full_history_route"]["args"][0],
+            "GEN-38",
+        )
         child = context["execution_frontier"]["children"][0]
         self.assertEqual(child[1], "In Progress")
         self.assertEqual(child[2], "codex-owner")
@@ -2104,6 +2149,84 @@ class ResumeTests(unittest.TestCase):
             ["child_dependency_graph"],
             ".dependency_graph",
         )
+
+    def test_hydration_route_does_not_infer_child_from_verbose_content(self):
+        snapshot = self.snapshot()
+        snapshot["children"] = snapshot["children"][:1]
+        snapshot["root"]["next_action"] = (
+            "Resume GEN-38 after reviewing the child. " + ("x" * 40_000)
+        )
+        snapshot = self.full_authority_snapshot(snapshot)
+        context = MODULE.compact_context(
+            snapshot, "GEN-37", require_projection_authority=True,
+        )
+        self.assertNotIn("requested_focus", context)
+        self.assertEqual(
+            context["deferred_audit_detail"]["audit_route"]["args"][0],
+            "GEN-37",
+        )
+        self.assertEqual(
+            context["deferred_audit_detail"]["full_history_route"]["args"][0],
+            "GEN-37",
+        )
+
+    def test_oversized_forged_child_focus_refuses_before_hydration_routing(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project",
+            "root_issue_id": "33333333-3333-4333-8333-333333333333",
+        }
+
+        def oversized(kind):
+            snapshot = self.snapshot()
+            snapshot["children"] = snapshot["children"][:1]
+            if kind == "verbose":
+                snapshot["root"]["next_action"] = "Continue. " + ("v" * 40_000)
+            else:
+                snapshot["decisions"] = [{
+                    "id": f"D-{index:02d}", "status": "accepted",
+                    "decision": "Review " + (f"{index:02d}" * 4_000),
+                } for index in range(96)]
+            snapshot = self.full_authority_snapshot(
+                self.live_snapshot(snapshot, route)
+            )
+            snapshot["requested_focus"] = {
+                "kind": "owned_child", "identifier": "GEN-38",
+                "issue_id": "child-0", "parent_issue_id": route["root_issue_id"],
+                "root_identifier": "GEN-37",
+                "repository_key": "github.com:id:R_agent_workstream",
+                "status": "In Progress",
+            }
+            return snapshot
+
+        def nonexistent(focus):
+            focus["identifier"] = "GEN-999"
+            focus["issue_id"] = "child-999"
+
+        mutations = {
+            "nonexistent": nonexistent,
+            "uuid": lambda focus: focus.__setitem__("issue_id", "child-forged"),
+            "repository": lambda focus: focus.__setitem__(
+                "repository_key", "github.com:id:R_other",
+            ),
+            "state": lambda focus: focus.__setitem__("status", "Done"),
+        }
+        for kind in ("verbose", "fixed"):
+            for name, mutate in mutations.items():
+                with self.subTest(envelope=kind, mutation=name):
+                    snapshot = oversized(kind)
+                    mutate(snapshot["requested_focus"])
+                    with mock.patch.object(
+                        MODULE, "_compact_verbose_current_detail",
+                        wraps=MODULE._compact_verbose_current_detail,
+                    ) as compactor, self.assertRaisesRegex(
+                        MODULE.ResumeError, "invalid_requested_child_focus",
+                    ):
+                        MODULE.compact_context(
+                            snapshot, "GEN-37",
+                            require_projection_authority=True,
+                        )
+                    compactor.assert_not_called()
 
     def test_mature_resume_contradiction_refuses_before_compaction(self):
         snapshot = self.snapshot()
@@ -2419,7 +2542,7 @@ class ResumeTests(unittest.TestCase):
         comments = mock.Mock()
         comments.comments.return_value = []
         with mock.patch.object(MODULE, "HttpGraphQLClient", return_value=client), \
-             mock.patch.object(MODULE, "resolve_authenticated_issue_route", return_value=authenticated_route), \
+             mock.patch.object(MODULE, "resolve_authenticated_resume_target", return_value=(authenticated_route, "GEN-37", None)), \
              mock.patch.object(MODULE, "LinearGraphQLTransport", return_value=transport), \
              mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
              mock.patch.object(MODULE, "load_linear_api_key", return_value="secret"), \
@@ -2430,6 +2553,229 @@ class ResumeTests(unittest.TestCase):
             "GEN-37", include_child_comments=True, include_description=True,
         )
         comments.comments.assert_called_once_with()
+
+    def test_owned_child_focus_survives_ordinary_and_audit_contexts(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project",
+            "root_issue_id": "33333333-3333-4333-8333-333333333333",
+        }
+        for token in ("GEN-91", "GEN-92", "GEN-93", "GEN-94"):
+            with self.subTest(token=token):
+                raw = self.snapshot()
+                raw["children"] = [{
+                    "identifier": token, "title": token,
+                    "status": "In Progress", "next_action": "Continue",
+                }]
+                live = self.live_snapshot(raw, route)
+                native = copy.deepcopy(live["children"])
+                authorized = self.full_authority_snapshot(live)
+                focus = MODULE.validate_requested_child_focus(
+                    focus={
+                        "kind": "owned_child", "identifier": token,
+                        "issue_id": "child-0",
+                        "parent_issue_id": route["root_issue_id"],
+                        "root_identifier": "GEN-37",
+                    }, native_children=native,
+                    authorized_snapshot=authorized, route=route,
+                )
+                authorized["requested_focus"] = focus
+                ordinary = MODULE.compact_context(
+                    authorized, "GEN-37", max_bytes=2_147_483_647,
+                    max_items=2_147_483_647,
+                    require_projection_authority=True,
+                    require_dependency_graph=True,
+                )
+                audit = MODULE.compact_context(
+                    authorized, "GEN-37", max_bytes=2_147_483_647,
+                    max_items=2_147_483_647,
+                    require_projection_authority=True,
+                    require_dependency_graph=True, include_history=True,
+                )
+                self.assertEqual(ordinary["requested_focus"], focus)
+                self.assertEqual(audit["requested_focus"], focus)
+                self.assertEqual(ordinary["workstream_id"], "GEN-37")
+
+    def test_child_focus_refuses_missing_unowned_and_route_drift(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        raw = self.live_snapshot(self.snapshot(), route)
+        native = copy.deepcopy(raw["children"])
+        authorized = {
+            "children": copy.deepcopy(raw["children"]),
+            "scope": {"child_ownership": {
+                "GEN-38": "github.com:id:R_repo",
+            }},
+        }
+        focus = {
+            "kind": "owned_child", "identifier": "GEN-38",
+            "issue_id": "child-0", "parent_issue_id": "root-uuid",
+            "root_identifier": "GEN-37",
+        }
+        cases = []
+        missing = copy.deepcopy(native)
+        missing.clear()
+        cases.append((missing, authorized, "requested_child_native"))
+        unowned = copy.deepcopy(authorized)
+        unowned["scope"]["child_ownership"] = {}
+        cases.append((native, unowned, "requested_child_unowned"))
+        drifted = copy.deepcopy(native)
+        drifted[0]["project"] = {"id": "other"}
+        cases.append((drifted, authorized, "requested_child_native_identity_mismatch"))
+        malformed = copy.deepcopy(authorized)
+        malformed["children"][0]["id"] = "other"
+        cases.append((native, malformed, "requested_child_authorized_identity_mismatch"))
+        for observed, snapshot, reason in cases:
+            with self.subTest(reason=reason), self.assertRaisesRegex(
+                MODULE.ResumeError, reason,
+            ):
+                MODULE.validate_requested_child_focus(
+                    focus=focus, native_children=observed,
+                    authorized_snapshot=snapshot, route=route,
+                )
+
+    def test_live_child_handle_executes_root_authority_and_dependency_audit(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        focus = {
+            "kind": "owned_child", "identifier": "GEN-43",
+            "issue_id": "child-43", "parent_issue_id": "root-uuid",
+            "root_identifier": "GEN-37",
+        }
+        child = {
+            "id": "child-43", "identifier": "GEN-43",
+            "status": "In Progress", "parent": {
+                "id": "root-uuid", "identifier": "GEN-37",
+            }, "project": {"id": "project"},
+            "team": {"id": "team", "organization": {"id": "workspace"}},
+        }
+        graph = {
+            "root": {
+                "id": "root-uuid", "identifier": "GEN-37",
+                "description": "Plan revision: " + "a" * 64,
+                "plan_revision": "a" * 64,
+            },
+            "children": [copy.deepcopy(child)], "child_comments": {"GEN-43": []},
+        }
+        source = {"identity": "https://example.test/root-plan", "sha256": "a" * 64}
+        provisional = {**copy.deepcopy(graph), "source": source}
+        final = {
+            **copy.deepcopy(graph), "source": source,
+            "material_event_revision": 4, "projection_revision": 7,
+            "scope": {"child_ownership": {"GEN-43": "github.com:id:R_repo"}},
+        }
+        transport = mock.Mock()
+        transport.snapshot_for_root.return_value = copy.deepcopy(graph)
+        comments = mock.Mock()
+        comments.comments.return_value = []
+        dependency = mock.Mock()
+        dependency.read_authorized_graph.return_value = {"authority": "root"}
+        dependency_constructor = mock.Mock(return_value=dependency)
+        add_material = mock.Mock(side_effect=(provisional, final))
+        stdout = io.StringIO()
+
+        def compact(snapshot, token, *_args, **kwargs):
+            self.assertEqual(token, "GEN-37")
+            self.assertTrue(kwargs["include_history"])
+            self.assertEqual(snapshot["requested_focus"]["identifier"], "GEN-43")
+            self.assertEqual(snapshot["dependency_graph"], {"authority": "root"})
+            return {
+                "workstream_id": token, "resume_authority": "full",
+                "requested_focus": snapshot["requested_focus"],
+            }
+
+        client = mock.Mock()
+        with mock.patch.object(MODULE, "resolve_linear_route", return_value=(None, None)), \
+             mock.patch.object(MODULE, "resolve_authenticated_resume_target", return_value=(route, "GEN-37", focus)), \
+             mock.patch.object(MODULE, "HttpGraphQLClient", return_value=client), \
+             mock.patch.object(MODULE, "LinearGraphQLTransport", return_value=transport), \
+             mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
+             mock.patch.object(MODULE, "select_plan_generation", return_value={
+                 "plan_revision": "a" * 64, "description_plan_revision": "a" * 64,
+             }), \
+             mock.patch.object(MODULE, "bind_active_plan_generation", side_effect=lambda value, *_args, **_kwargs: value), \
+             mock.patch("workstream_linear_projection.child_mutation_authorizations_from_comments", return_value=[]), \
+             mock.patch.object(MODULE, "add_live_child_material_history", side_effect=lambda value, **_kwargs: value), \
+             mock.patch.object(MODULE, "add_material_history", add_material), \
+             mock.patch.object(MODULE, "plan_payload", return_value={"source": source}), \
+             mock.patch.object(MODULE, "plan_generation_freshness", return_value=None), \
+             mock.patch.object(MODULE, "LinearChildDependencyAdapter", dependency_constructor), \
+             mock.patch.object(MODULE, "load_linear_api_key", return_value="secret"), \
+             mock.patch.object(MODULE, "compact_context", side_effect=compact), \
+             mock.patch.object(MODULE.sys, "argv", [
+                 "workstream_resume.py", "GEN-43", "--include-history",
+             ]), \
+             mock.patch.object(MODULE.sys, "stdout", stdout):
+            self.assertEqual(MODULE.main(), 0)
+        transport.snapshot_for_root.assert_called_once_with(
+            "GEN-37", include_child_comments=True, include_description=True,
+        )
+        comments_class_call = comments.comments.call_count
+        self.assertEqual(comments_class_call, 1)
+        dependency_constructor.assert_called_once_with(
+            client, workspace_id="workspace", team_id="team",
+            project_id="project", root_issue_id="root-uuid",
+            root_identifier="GEN-37", plan_revision="a" * 64,
+        )
+        self.assertEqual(json.loads(stdout.getvalue())["requested_focus"]
+                         ["identifier"], "GEN-43")
+        self.assertFalse(any("mutation" in str(call).lower()
+                             for call in client.mock_calls))
+
+    def test_child_handle_root_source_drift_refuses_without_writes(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        graph = {
+            "root": {
+                "id": "root-uuid", "identifier": "GEN-37",
+                "description": "Canonical plan: https://example.test/root",
+                "plan_revision": "a" * 64,
+            },
+            "children": [], "child_comments": {},
+        }
+        transport = mock.Mock()
+        transport.snapshot_for_root.return_value = copy.deepcopy(graph)
+        comments = mock.Mock()
+        comments.comments.return_value = []
+        client = mock.Mock()
+        stderr = io.StringIO()
+        with mock.patch.object(MODULE, "resolve_linear_route", return_value=(None, None)), \
+             mock.patch.object(MODULE, "resolve_authenticated_resume_target", return_value=(route, "GEN-37", {
+                 "kind": "owned_child", "identifier": "GEN-43",
+                 "issue_id": "child-43", "parent_issue_id": "root-uuid",
+                 "root_identifier": "GEN-37",
+             })), \
+             mock.patch.object(MODULE, "HttpGraphQLClient", return_value=client), \
+             mock.patch.object(MODULE, "LinearGraphQLTransport", return_value=transport), \
+             mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
+             mock.patch.object(MODULE, "select_plan_generation", return_value={
+                 "plan_revision": "a" * 64, "description_plan_revision": "a" * 64,
+             }), \
+             mock.patch.object(MODULE, "bind_active_plan_generation", side_effect=lambda value, *_args, **_kwargs: value), \
+             mock.patch("workstream_linear_projection.child_mutation_authorizations_from_comments", return_value=[]), \
+             mock.patch.object(MODULE, "add_live_child_material_history", side_effect=lambda value, **_kwargs: value), \
+             mock.patch.object(MODULE, "add_material_history", return_value={
+                 **graph, "source": {
+                     "identity": "https://example.test/root", "sha256": "a" * 64,
+                 },
+             }), \
+             mock.patch.object(MODULE, "plan_payload", side_effect=MODULE.ResumeError("projection_source_bytes_mismatch")), \
+             mock.patch.object(MODULE, "load_linear_api_key", return_value="secret"), \
+             mock.patch.object(MODULE.sys, "argv", ["workstream_resume.py", "GEN-43"]), \
+             mock.patch.object(MODULE.sys, "stderr", stderr):
+            self.assertEqual(MODULE.main(), 2)
+        self.assertIn("projection_source_bytes_mismatch", stderr.getvalue())
+        transport.snapshot_for_root.assert_called_once_with(
+            "GEN-37", include_child_comments=True, include_description=True,
+        )
+        self.assertFalse(any("mutation" in str(call).lower()
+                             for call in client.mock_calls))
 
     def test_live_cli_automatically_uses_repository_config_route(self):
         route = {
@@ -2445,7 +2791,7 @@ class ResumeTests(unittest.TestCase):
         comments = mock.Mock()
         comments.comments.return_value = []
         with mock.patch.object(MODULE, "resolve_linear_route", return_value=(route, Path(".workstream.json"))), \
-             mock.patch.object(MODULE, "resolve_authenticated_issue_route", return_value=authenticated_route), \
+             mock.patch.object(MODULE, "resolve_authenticated_resume_target", return_value=(authenticated_route, "GEN-37", None)), \
              mock.patch.object(MODULE, "HttpGraphQLClient", return_value=client), \
              mock.patch.object(MODULE, "LinearGraphQLTransport", constructor), \
              mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
@@ -2474,7 +2820,7 @@ class ResumeTests(unittest.TestCase):
         comments.comments.return_value = []
         constructor = mock.Mock(return_value=transport)
         with mock.patch.object(MODULE, "resolve_linear_route", return_value=(None, None)), \
-             mock.patch.object(MODULE, "resolve_authenticated_issue_route", return_value=route) as bootstrap, \
+             mock.patch.object(MODULE, "resolve_authenticated_resume_target", return_value=(route, "GEN-37", None)) as bootstrap, \
              mock.patch.object(MODULE, "HttpGraphQLClient", return_value=client), \
              mock.patch.object(MODULE, "LinearGraphQLTransport", constructor), \
              mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
@@ -2599,7 +2945,7 @@ class ResumeTests(unittest.TestCase):
             return {"status": snapshot["root"]["status"]}
 
         with mock.patch.object(MODULE, "resolve_linear_route", return_value=(None, None)), \
-             mock.patch.object(MODULE, "resolve_authenticated_issue_route", return_value=route), \
+             mock.patch.object(MODULE, "resolve_authenticated_resume_target", return_value=(route, "GEN-37", None)), \
              mock.patch.object(MODULE, "HttpGraphQLClient", return_value=mock.Mock()), \
              mock.patch.object(MODULE, "LinearGraphQLTransport", return_value=transport), \
              mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
@@ -2792,7 +3138,7 @@ class ResumeTests(unittest.TestCase):
                 with mock.patch.object(
                     MODULE, "resolve_linear_route", return_value=(None, None),
                 ), mock.patch.object(
-                    MODULE, "resolve_authenticated_issue_route", return_value=route,
+                    MODULE, "resolve_authenticated_resume_target", return_value=(route, token, None),
                 ), mock.patch.object(
                     MODULE, "HttpGraphQLClient", return_value=client,
                 ), mock.patch.object(

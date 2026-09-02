@@ -168,9 +168,17 @@ query WorkstreamRoute($teamId: String!, $projectId: String!) {
 TOKEN_ROUTE_QUERY = """
 query WorkstreamTokenRoute($issueId: String!) {
   issue(id: $issueId) {
-    id identifier
+    id identifier archivedAt
+    state { id name type }
     team { id organization { id } }
     project { id teams { nodes { id } } }
+    parent {
+      id identifier archivedAt
+      state { id name type }
+      parent { id identifier }
+      team { id organization { id } }
+      project { id teams { nodes { id } } }
+    }
   }
 }
 """
@@ -410,6 +418,103 @@ def resolve_authenticated_issue_route(
             if configured_route.get(field) != observed[field]:
                 raise LinearTransportError(f"configured Linear route mismatches root:{field}")
     return observed
+
+
+def resolve_authenticated_resume_target(
+    client: GraphQLClient, token: str,
+    configured_route: dict[str, str] | None,
+) -> tuple[dict[str, str], str, dict[str, str] | None]:
+    """Resolve a root or one direct child into immutable root authority.
+
+    The requested child remains only a validated focus selector.  All source,
+    scope, material, checkpoint, dependency, and lifecycle authority continues
+    to come from its actual parent root.
+    """
+    normalized = token.upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", normalized):
+        raise LinearTransportError("invalid Linear issue token")
+    issue = client.execute(TOKEN_ROUTE_QUERY, {"issueId": normalized}).get("issue")
+    if not isinstance(issue, dict) or str(issue.get("identifier", "")).upper() != normalized:
+        raise LinearTransportError("Linear workstream issue not found")
+
+    def validate_record(record: dict[str, Any], *, label: str) -> dict[str, str]:
+        issue_id = record.get("id")
+        identifier = str(record.get("identifier", "")).upper()
+        state = record.get("state")
+        if (
+            not isinstance(issue_id, str) or not issue_id
+            or not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", identifier)
+            or not isinstance(state, dict)
+            or not all(isinstance(state.get(field), str) and state[field]
+                       for field in ("id", "name", "type"))
+        ):
+            raise LinearTransportError(f"malformed_{label}_state")
+        if record.get("archivedAt") is not None:
+            raise LinearTransportError(f"{label}_archived")
+        team = record.get("team")
+        project = record.get("project")
+        organization = team.get("organization") if isinstance(team, dict) else None
+        project_teams_connection = (
+            project.get("teams") if isinstance(project, dict) else None
+        )
+        project_team_nodes = (
+            project_teams_connection.get("nodes")
+            if isinstance(project_teams_connection, dict) else None
+        )
+        if (
+            not isinstance(team, dict) or not isinstance(project, dict)
+            or not isinstance(organization, dict)
+            or not isinstance(project_team_nodes, list)
+            or any(not isinstance(item, dict) for item in project_team_nodes)
+        ):
+            raise LinearTransportError(f"{label}_route_incomplete")
+        route = {
+            "workspace_id": organization.get("id"),
+            "team_id": team.get("id"), "project_id": project.get("id"),
+            "root_issue_id": issue_id,
+        }
+        if not all(isinstance(value, str) and value for value in route.values()):
+            raise LinearTransportError(f"{label}_route_incomplete")
+        project_teams = {
+            item.get("id") for item in project_team_nodes
+        }
+        if route["team_id"] not in project_teams:
+            raise LinearTransportError(f"{label}_project_team_mismatch")
+        return {**route, "identifier": identifier}
+
+    requested = validate_record(issue, label="requested_issue")
+    parent = issue.get("parent")
+    if parent is None:
+        route = {key: requested[key] for key in (
+            "workspace_id", "team_id", "project_id", "root_issue_id",
+        )}
+        root_identifier = requested["identifier"]
+        focus = None
+    else:
+        if not isinstance(parent, dict):
+            raise LinearTransportError("malformed_requested_issue_parent")
+        root = validate_record(parent, label="parent_root")
+        if parent.get("parent") is not None:
+            raise LinearTransportError("resume_parent_is_nested_child")
+        for field in ("workspace_id", "team_id", "project_id"):
+            if requested[field] != root[field]:
+                raise LinearTransportError(f"resume_child_parent_route_mismatch:{field}")
+        route = {key: root[key] for key in (
+            "workspace_id", "team_id", "project_id", "root_issue_id",
+        )}
+        root_identifier = root["identifier"]
+        focus = {
+            "kind": "owned_child", "identifier": requested["identifier"],
+            "issue_id": issue["id"], "parent_issue_id": parent["id"],
+            "root_identifier": root_identifier,
+        }
+    if configured_route:
+        for field in ("workspace_id", "team_id", "project_id"):
+            if configured_route.get(field) != route[field]:
+                raise LinearTransportError(
+                    f"configured Linear route mismatches root:{field}"
+                )
+    return route, root_identifier, focus
 
 
 def durable_description(
