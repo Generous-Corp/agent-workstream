@@ -484,6 +484,26 @@ class LinearCheckpointAdapter:
         self._assert_comment_id_capability()
         if prewrite_validator is not None:
             prewrite_validator()
+            final_comments = self._comments()
+            final_material = reduce_event_comments(
+                final_comments, workstream_id=self.workstream_id,
+            )
+            final_checkpoints = self._reduce(final_comments)
+            final_frontier = ledger_serialization_frontier(
+                sorted(item["event_id"] for item in final_checkpoints.checkpoints),
+                final_comments, workstream_id=self.workstream_id,
+                authenticated_route=self._observed_authority,
+                current_plan_revision=checkpoint["plan_revision"],
+                material_revision=final_material.revision,
+            )
+            final_slot = ledger_boundary_slot_id(
+                self.workstream_id, final_material.revision, final_frontier,
+                self._observed_authority,
+            )
+            if final_slot != slot_id or final_material.revision != material.revision:
+                raise LinearCheckpointError(
+                    "checkpoint_serialization_frontier_stale_reload_required"
+                )
 
         try:
             response = self.client.execute(
