@@ -282,6 +282,22 @@ the exact repository ID/coordinate, PR head, merge SHA, and complete successful
 check-run set, then places the canonical check and provider-receipt digests in
 the reviewed manifest. Ordinary projection updates do not require GitHub auth.
 
+For a routine child completion, use `workstreamctl child-completion-prepare
+GEN-123 --child GEN-124 --evidence-contract evidence.json --plan-source
+./PLAN.md --plan-identity <URL>`. It performs authenticated reads only and
+returns a complete `projection_manifest`: first evidence-only, then
+`native_transition_required` until Linear reports the child completed, then an
+exact terminal-repair manifest. Apply only the `evidence_projection_required`
+and `closure_projection_required` manifests during the ordinary sequence. When
+the contract's exact head differs from the active repository scope, it first returns
+`scope_head_projection_required` with a scope-only replacement manifest. That
+phase changes only the matching immutable repository's `exact_head` and refuses
+while any unclosed child on that repository has active evidence at another
+head; evidence for an already closed child does not prevent a later head
+advance. Apply the reviewed scope manifest, then rerun prepare to obtain the
+evidence phase. `native_transition_required` and `complete` are control states.
+Rerun the prepare command between every phase.
+
 Before a reviewed generation activation, two native root mutations have a
 supported, separately fenced front door. Preview `workstreamctl root-transition
 plan-url GEN-123 --to <same-document-blob/main-URL>` to replace one pinned

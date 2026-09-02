@@ -818,11 +818,7 @@ class LinearGraphQLTransport:
             child["plan_revision"] = parse_plan_revision(child.get("description"))
             child["revision"] = parse_root_revision(child.get("description"))
             comment_connection = child.pop("comments", None)
-            terminal = {
-                str(child.get("status", "")).lower(),
-                str(child.get("status_type", "")).lower(),
-            } & {"done", "completed", "cancelled", "canceled", "superseded"}
-            if include_child_comments and not terminal:
+            if include_child_comments:
                 if not isinstance(comment_connection, dict):
                     raise LinearTransportError("missing Linear child comment connection")
                 nodes = comment_connection.get("nodes")

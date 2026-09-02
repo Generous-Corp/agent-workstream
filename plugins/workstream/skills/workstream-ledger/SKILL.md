@@ -873,6 +873,49 @@ still refuses.
 
 After a material child transition to Linear's `completed` state, run the
 model-free projection reconciliation before treating resume as authoritative.
+Prepare the routine reviewed manifest from authenticated live state with:
+
+```sh
+workstreamctl child-completion-prepare GEN-123 --child GEN-124 \
+  --evidence-contract evidence.json --plan-source ./PLAN.md \
+  --plan-identity <canonical-url> > child-completion.json
+```
+
+This command is read-only. `scope_head_projection_required`,
+`evidence_projection_required`, and `closure_projection_required` return an
+applicable `projection_manifest` for the normal `projection` preview/apply
+pair. If the
+contract's exact head differs from the active scope, immutable repository
+identity and child ownership are validated first. Prepare then refuses while
+any active evidence contract for an unclosed child on that repository binds a
+different head. Otherwise it returns `scope_head_projection_required` with a
+complete scope-only replacement manifest: every other active projection value
+and every unrelated scope field is preserved, and only the matching
+repository's `exact_head` changes. An older contract whose child already has an
+active closure does not block the next head, which permits closing one child
+before advancing the shared repository for another. Apply the reviewed scope
+manifest and rerun prepare; it then emits the evidence-only phase when the
+contract is not active, `native_transition_required` while the child is open,
+and a fenced `terminal_child_repairs` phase only after authenticated native
+readback says the child is completed. `native_transition_required` and
+`complete` are control states, not manifests to apply. Rerun it after each
+phase; never copy a closure forward or infer completion from the evidence file.
+
+Native completion uses `workstreamctl child-completion` with the same root,
+child, evidence, and source arguments plus the authenticated completed-state ID
+and a reviewed timestamp. Preview first, then apply with its exact preview
+digest. The command reserves the shared root ledger boundary, changes only the
+child state, appends the exact prospective closure as the reservation finalizer,
+and requires ordinary full resume before success. Before enabling this path,
+deploy version 0.4.82 or newer to every known M1/M3/M5 writer and project one
+active `writer_fleet_gate` for the active plan. That gate records the exact
+writer and machine IDs, installed source commit/tree digest/version receipts,
+observation times, and a zero legacy-writer census. It is operational eligibility
+proof; an old client does not magically understand the new reservation kind.
+Pending reservations written before 0.4.82 lack the full root fence and are
+not guessed through: rollout must first prove there are zero such legacy
+reservations, or route the exact item through a separately reviewed migration.
+
 A reviewed `terminal_child_repairs` batch must fence every exact child issue
 from one authenticated root snapshot, including each
 parent/workspace/team/project route, exact assignee state (including explicitly
