@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -29,6 +30,9 @@ RESUME_TIMEOUT_SECONDS = 60
 TIMEOUT_SECONDS = TERMINAL_TIMEOUT_SECONDS
 MAX_IDENTITY_BYTES = 4096
 MAX_BINDING_CHAIN_EVENTS = 4096
+MAX_RESUME_REFUSAL_REASON_BYTES = 512
+RESUME_REFUSAL_PREFIX = "workstream resume refused: "
+RESUME_REFUSAL_REASON = re.compile(r"[A-Za-z0-9_.:,><=+-]+")
 
 
 class ThisSessionError(RuntimeError):
@@ -36,6 +40,22 @@ class ThisSessionError(RuntimeError):
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+def _resume_refusal_reason(stderr: object) -> str | None:
+    """Expose one bounded machine reason without forwarding arbitrary stderr."""
+    if not isinstance(stderr, str):
+        return None
+    lines = stderr.splitlines()
+    if len(lines) != 1 or not lines[0].startswith(RESUME_REFUSAL_PREFIX):
+        return None
+    reason = lines[0][len(RESUME_REFUSAL_PREFIX):]
+    if (
+        not reason or not RESUME_REFUSAL_REASON.fullmatch(reason)
+        or len(reason.encode("utf-8")) > MAX_RESUME_REFUSAL_REASON_BYTES
+    ):
+        return None
+    return reason
 
 
 def _identity(value: object, name: str) -> str:
@@ -1022,6 +1042,9 @@ def resume_this_session(
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ThisSessionError("workstream_resume_failed") from error
     if resumed.returncode != 0:
+        reason = _resume_refusal_reason(resumed.stderr)
+        if reason is not None:
+            raise ThisSessionError(f"workstream_resume_refused:{reason}")
         raise ThisSessionError(f"workstream_resume_refused:{resumed.returncode}")
     try:
         context = json.loads(resumed.stdout)
