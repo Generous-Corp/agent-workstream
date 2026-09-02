@@ -37,7 +37,13 @@ class RootCheckpointTests(unittest.TestCase):
         digest = hashlib.sha256(
             b"# multi-checkpoint fixed-envelope fixture\n"
         ).hexdigest()
-        source = {"identity": plan.name, "sha256": digest}
+        # The authenticated producer carries derived byte metadata; the
+        # authority contract must bind only identity+sha256 so the consumer's
+        # canonical source remains stable across transports.
+        source = {
+            "identity": plan.name, "sha256": digest,
+            "bytes": len(b"# multi-checkpoint fixed-envelope fixture\n"),
+        }
         client.description = f"Plan revision: {digest}\nNext action: Continue"
         fixture.project_full(client, digest, identity=plan.name)
         material = LinearCommentEventAdapter(
