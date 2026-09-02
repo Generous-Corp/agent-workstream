@@ -19,7 +19,14 @@ import workstream_tab
 
 
 SCHEMA_VERSION = 1
-TIMEOUT_SECONDS = 10
+# Terminal discovery and title-adapter calls must remain responsive.  Linear
+# recovery is an authenticated, cross-process operation and can legitimately
+# take longer, so it has its own bounded budget rather than sharing this one.
+TERMINAL_TIMEOUT_SECONDS = 10
+RESUME_TIMEOUT_SECONDS = 60
+# Compatibility for callers that imported the old constant; all terminal
+# paths use the explicitly named budget above.
+TIMEOUT_SECONDS = TERMINAL_TIMEOUT_SECONDS
 MAX_IDENTITY_BYTES = 4096
 
 
@@ -104,7 +111,7 @@ def _run_json(
     try:
         result = runner(
             list(argv), stdin=subprocess.DEVNULL, capture_output=True, text=True,
-            timeout=TIMEOUT_SECONDS, check=False, env=dict(environment),
+            timeout=TERMINAL_TIMEOUT_SECONDS, check=False, env=dict(environment),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ThisSessionError(reason) from error
@@ -585,7 +592,7 @@ def resume_this_session(
         resumed = runner(
             [sys.executable, str(script), resolution["workstream_id"]],
             stdin=subprocess.DEVNULL, capture_output=True, text=True,
-            timeout=TIMEOUT_SECONDS, check=False, env=dict(environ),
+            timeout=RESUME_TIMEOUT_SECONDS, check=False, env=dict(environ),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ThisSessionError("workstream_resume_failed") from error
