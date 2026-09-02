@@ -274,6 +274,14 @@ and therefore requires `--inspection-only`; only a live authenticated Linear
 read can produce full-authority output. The command writes only reviewed
 changes and verifies a complete live readback.
 
+An exceptional `terminal_child_evidence_seed_nonprimary_backfill` additionally
+requires live GitHub proof on preview and apply. Add
+`--github-token-command gh --github-token-arg auth --github-token-arg token`
+or explicitly select `--github-token-env GITHUB_TOKEN`. The command verifies
+the exact repository ID/coordinate, PR head, merge SHA, and complete successful
+check-run set, then places the canonical check and provider-receipt digests in
+the reviewed manifest. Ordinary projection updates do not require GitHub auth.
+
 Before a reviewed generation activation, two native root mutations have a
 supported, separately fenced front door. Preview `workstreamctl root-transition
 plan-url GEN-123 --to <same-document-blob/main-URL>` to replace one pinned

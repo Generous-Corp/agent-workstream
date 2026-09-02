@@ -9,6 +9,10 @@ import re
 from typing import Any
 
 from workstream_evidence import evidence_errors
+from workstream_github_backfill import (
+    GitHubBackfillReceiptError, VerifiedGitHubBackfillReceipt,
+    validate_github_backfill_receipt,
+)
 from workstream_scope import repository_key, ScopeError, validate_scope
 
 
@@ -23,6 +27,137 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode()).hexdigest()
+
+
+def validated_nonprimary_backfill_authority(
+    event: dict[str, Any], current_scope: dict[str, Any],
+    projection_events: list[dict[str, Any]],
+    projection_history: list[dict[str, Any]] | None = None,
+    *, trusted_receipt: VerifiedGitHubBackfillReceipt | None = None,
+) -> dict[str, Any] | None:
+    """Validate one complete, context-bound non-primary backfill receipt."""
+    value = event.get("value") if isinstance(event, dict) else None
+    receipt = value.get("nonprimary_backfill_authority") if isinstance(value, dict) else None
+    fields = {
+        "repository_key", "from_exact_head", "to_exact_head",
+        "from_scope_event_id", "from_scope_value_sha256",
+        "from_disposition_event_id", "from_disposition_value_sha256",
+        "input_frontier_sha256", "provider_repository_id",
+        "pull_request_number", "merge_sha", "checks_sha256",
+        "provider_receipt_sha256",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != fields:
+        return None
+    repository = next((
+        item for item in current_scope.get("repositories", [])
+        if repository_key(item) == receipt.get("repository_key")
+    ), None)
+    # Provider/PR/check/merge claims are not authenticated by syntax or by a
+    # copy carried in a not-yet-admitted child contract. Admission therefore
+    # requires the distinct typed receipt returned by the authenticated
+    # provider reader. Ordinary replay may instead consume the exact event
+    # already present in reducer-authenticated append-only history.
+    provider_fields = {
+        "schema_version", "provider", "repository",
+        "provider_repository_id", "pull_request_number", "pr_head",
+        "merged", "merged_at", "merge_sha", "checks", "checks_sha256",
+        "provider_receipt_sha256",
+    }
+    try:
+        authenticated_provider_receipt = (
+            validate_github_backfill_receipt(trusted_receipt.as_dict())
+            if isinstance(trusted_receipt, VerifiedGitHubBackfillReceipt)
+            else None
+        )
+    except GitHubBackfillReceiptError:
+        authenticated_provider_receipt = None
+    checks = authenticated_provider_receipt.get("checks") if isinstance(
+        authenticated_provider_receipt, dict
+    ) else None
+    repository_slug = str((repository or {}).get("slug", ""))
+    repository_coordinate = (
+        repository_slug.removeprefix("https://").removeprefix("github.com/")
+    ).lower()
+    trusted_for_admission = bool(
+        isinstance(authenticated_provider_receipt, dict)
+        and set(authenticated_provider_receipt) == provider_fields
+        and authenticated_provider_receipt.get("repository") == repository_coordinate
+        and authenticated_provider_receipt.get("provider_repository_id")
+        == receipt.get("provider_repository_id")
+        and authenticated_provider_receipt.get("pull_request_number")
+        == receipt.get("pull_request_number")
+        and authenticated_provider_receipt.get("pr_head")
+        == receipt.get("to_exact_head")
+        and authenticated_provider_receipt.get("merge_sha")
+        == receipt.get("merge_sha")
+        and _digest(checks) == receipt.get("checks_sha256")
+        and authenticated_provider_receipt.get("checks_sha256")
+        == receipt.get("checks_sha256")
+        and authenticated_provider_receipt.get("provider_receipt_sha256")
+        == receipt.get("provider_receipt_sha256")
+    )
+    event_id = event.get("event_id") if isinstance(event, dict) else None
+    # Both inputs are outputs of the authenticated projection reducer: current
+    # generation events live in projection_events, while predecessor events
+    # live in projection_history. Requiring exact event identity/digest here
+    # permits restart replay without treating an arbitrary nested receipt as
+    # authority.
+    persisted_candidates = [
+        item
+        for item in [*(projection_events or []), *(projection_history or [])]
+        if isinstance(item, dict)
+        and isinstance(event_id, str)
+        and event_id
+        and item.get("event_id") == event_id
+    ]
+    replaying_admitted_event = bool(event_id and persisted_candidates) and all(
+        _digest(item) == _digest(event) for item in persisted_candidates
+    )
+    if not trusted_for_admission and not replaying_admitted_event:
+        return None
+    anchors = {
+        (item.get("kind"), item.get("event_id")): item
+        for item in [*(projection_events or []), *(projection_history or [])]
+    }
+    scope_anchor = anchors.get(("scope", receipt.get("from_scope_event_id")))
+    disposition_anchor = anchors.get(("disposition", receipt.get("from_disposition_event_id")))
+    primary = current_scope.get("primary_repository")
+    def oid(value: Any, widths: set[int]) -> bool:
+        return isinstance(value, str) and len(value) in widths and all(
+            char in "0123456789abcdef" for char in value
+        )
+    valid = (
+        isinstance(value, dict)
+        and isinstance(value.get("owning_child"), str)
+        and repository is not None
+        and receipt["repository_key"] != primary
+        and receipt["provider_repository_id"] == repository.get("provider_repository_id")
+        and receipt["from_exact_head"] == repository.get("exact_head")
+        and receipt["to_exact_head"] == value.get("exact_head")
+        and receipt["from_exact_head"] != receipt["to_exact_head"]
+        and scope_anchor is not None
+        and disposition_anchor is not None
+        and _digest(scope_anchor.get("value")) == receipt["from_scope_value_sha256"]
+        and _digest(disposition_anchor.get("value")) == receipt["from_disposition_value_sha256"]
+        and oid(receipt["from_exact_head"], {40, 64})
+        and oid(receipt["to_exact_head"], {40, 64})
+        and oid(receipt["merge_sha"], {40})
+        and oid(receipt["from_scope_value_sha256"], {64})
+        and oid(receipt["from_disposition_value_sha256"], {64})
+        and oid(receipt["input_frontier_sha256"], {64})
+        and oid(receipt["checks_sha256"], {64})
+        and oid(receipt["provider_receipt_sha256"], {64})
+        and isinstance(receipt["pull_request_number"], int)
+        and not isinstance(receipt["pull_request_number"], bool)
+        and receipt["pull_request_number"] > 0
+    )
+    if not valid:
+        return None
+    return {
+        "child_identifier": value["owning_child"],
+        "repository_key": receipt["repository_key"],
+        "exact_head": receipt["to_exact_head"],
+    }
 
 
 def _active(events: list[dict[str, Any]]) -> dict[tuple[str, str], dict[str, Any]]:
@@ -280,6 +415,11 @@ def closure_bound_historical_evidence(
                 selected_transition_tip_event_id,
                 authorized_prepared_transition_event_id,
             )
+            backfill_authority = validated_nonprimary_backfill_authority(
+                event, current_scope, projection_events, projection_history,
+            )
+            if backfill_authority is not None:
+                authority = backfill_authority
             if authority is not None:
                 carried[event["event_id"]] = authority
     return _closure_bound_single_generation(
@@ -372,7 +512,8 @@ def _closure_bound_single_generation(
             for event in before_evidence
         )
         if carried_closure:
-            historical_repository = current_repository
+            historical_repository = dict(current_repository)
+            historical_repository["exact_head"] = closure.get("exact_head")
         elif (
             (
                 not current_head_closure
