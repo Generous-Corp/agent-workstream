@@ -410,6 +410,74 @@ def reduce_ledger_reservations(
     ))
 
 
+def semantic_ledger_reservations(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    authenticated_route: dict[str, str], current_plan_revision: str,
+    intent_event: dict[str, Any], expected_material_revision: int | None = None,
+    expected_projection_revision: int | None = None,
+) -> list[tuple[dict[str, Any], str | None]]:
+    """Find authenticated reservations even when their remote slot drifted.
+
+    Older Linear transports accepted the caller-supplied slot in the input but
+    returned a generated comment id.  Such comments remain valid immutable
+    intent records, but the slot proof used by ``reduce_ledger_reservations``
+    cannot recognize them.  Recovery may use these records only when the full
+    immutable intent and authority match; frontier/slot serialization is the
+    sole tolerated difference.
+    """
+    expected_intent_sha = hashlib.sha256(json.dumps(
+        intent_event, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    expected_core = None
+    matches: list[tuple[dict[str, Any], str | None]] = []
+    for comment in comments:
+        body = comment.get("body") or ""
+        if not isinstance(body, str) or body.count(SERIALIZATION_PREFIX) != 1:
+            continue
+        found = SERIALIZATION_RE.findall(body)
+        if len(found) != 1:
+            continue
+        try:
+            envelope = json.loads(base64.urlsafe_b64decode(
+                found[0] + "=" * (-len(found[0]) % 4)
+            ))
+            reservation = envelope["reservation"]
+            canonical = json.dumps(
+                reservation, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            if set(envelope) != {"reservation", "sha256"} or not hmac.compare_digest(
+                envelope["sha256"], hashlib.sha256(canonical).hexdigest()
+            ) or encode_ledger_reservation(reservation) != body:
+                continue
+        except (binascii.Error, KeyError, TypeError, ValueError,
+                json.JSONDecodeError, LinearEventError):
+            continue
+        if (
+            reservation.get("workstream_id") != workstream_id
+            or reservation.get("authority") != authenticated_route
+            or reservation.get("plan_revision") != current_plan_revision
+            or reservation.get("intent_kind") != "child_mutation_projection"
+            or reservation.get("intent_event") != intent_event
+            or reservation.get("intent_sha256") != expected_intent_sha
+            or (expected_material_revision is not None and
+                reservation.get("material_revision") != expected_material_revision)
+            or (expected_projection_revision is not None and
+                reservation.get("projection_revision") != expected_projection_revision)
+        ):
+            continue
+        core = json.dumps(_reservation_retry_core(reservation),
+                          ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"))
+        if expected_core is None:
+            expected_core = core
+        if core != expected_core:
+            raise LinearEventError("ledger_reservation_intent_conflict")
+        matches.append((reservation, comment.get("id")))
+    return matches
+
+
 def ledger_serialization_frontier(
     checkpoint_event_ids: list[str], comments: list[dict[str, Any]], *,
     workstream_id: str, authenticated_route: dict[str, str],

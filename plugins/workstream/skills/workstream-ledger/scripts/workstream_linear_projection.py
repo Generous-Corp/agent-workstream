@@ -4582,9 +4582,39 @@ class LinearProjectionAdapter:
         from workstream_linear_events import (
             encode_ledger_reservation, ledger_boundary_slot_id,
             ledger_serialization_frontier, pending_ledger_reservations,
+            semantic_ledger_reservations,
         )
 
         comments = self._comments()
+        # Recover a reservation whose Linear comment id differs from the
+        # deterministic slot (older transports ignored caller-supplied ids).
+        # Match immutable intent, not the collision/frontier serialization;
+        # conflicting bodies remain fail-closed and never create another slot.
+        semantic = semantic_ledger_reservations(
+            comments, workstream_id=self.workstream_id,
+            authenticated_route=self.authority,
+            current_plan_revision=self.plan_revision,
+            intent_event=event,
+            expected_material_revision=reduce_event_comments(
+                comments, workstream_id=self.workstream_id,
+            ).revision,
+            expected_projection_revision=event["expected_revision"],
+        )
+        if semantic:
+            # Do not resurrect an orphaned reservation: the child proposal is
+            # part of the immutable intent and must still be remotely live.
+            from workstream_child_proposal import _comments, proposal_index
+            child_value = event.get("value") or {}
+            child_comments = _comments(
+                self.client, child_value.get("child_workstream_id", ""),
+            )
+            proposal = proposal_index(child_comments).get(
+                child_value.get("proposal_id"),
+            )
+            if proposal is not None and (
+                proposal[1].get("id") == child_value.get("proposal_remote_id")
+            ):
+                return semantic[0][0]
         pending = pending_ledger_reservations(
             comments, workstream_id=self.workstream_id,
             authenticated_route=self.authority,

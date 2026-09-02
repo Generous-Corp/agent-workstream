@@ -567,7 +567,7 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
-Version 0.4.76 authenticates generation-transition tokens as part of the shared
+Version 0.4.77 authenticates generation-transition tokens as part of the shared
 ledger serialization frontier. If response-loss retries left several canonical
 copies of the exact same intent along one deterministic collision chain, the
 reducer treats them as one pending reservation and reuses the first slot.
