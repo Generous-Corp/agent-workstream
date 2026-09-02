@@ -34,9 +34,11 @@ class FakeCmux:
         self.caller_workspace = caller_workspace or workspace
         self.caller_pane = caller_pane or pane
         self.calls = []
+        self.options = []
 
     def __call__(self, argv, **kwargs):
         self.calls.append(argv)
+        self.options.append(kwargs)
         action = next((value for value in (
             "ping", "identify", "list-pane-surfaces", "rename-tab",
         ) if value in argv), None)
@@ -109,9 +111,12 @@ class FakeHerdr:
         return subprocess.CompletedProcess(argv, 0, json.dumps(value), "")
 
 
-def full_resume_runner(calls, *, project="Linear Integration", authority="full"):
+def full_resume_runner(calls, *, project="Linear Integration", authority="full",
+                       options=None):
     def run(argv, **kwargs):
         calls.append(argv)
+        if options is not None:
+            options.append(kwargs)
         return subprocess.CompletedProcess(argv, 0, json.dumps({
             "resume_authority": authority, "workstream_id": argv[-1],
             "project_name": project, "children": [],
@@ -209,6 +214,36 @@ class ThisSessionTests(unittest.TestCase):
             "SELECT count(*) FROM terminal_binding_events_v1"
         ).fetchone()[0], 1)
         connection.close()
+
+    def test_authenticated_resume_timeout_is_separate_from_terminal_budget(self):
+        """A slow Linear recovery must not make terminal probes unbounded."""
+        env = self.cmux_env("211BECC6-0094-4DCB-B5C2-39140C17426A")
+        fake = FakeCmux("Spectr · GEN-37", surface=env["CMUX_SURFACE_ID"])
+        resume_options = []
+        result = session.resume_this_session(
+            environ=env,
+            runner=full_resume_runner([], options=resume_options),
+            terminal_runner=fake,
+            which=lambda _: "/opt/cmux",
+            binding_path=self.db,
+            resume_script=Path("resume.py"),
+            created_at="2026-09-01T01:00:00Z",
+        )
+        self.assertEqual(result["resume_authority"], "full")
+        self.assertEqual(len(resume_options), 1)
+        self.assertEqual(
+            resume_options[0]["timeout"], session.RESUME_TIMEOUT_SECONDS,
+        )
+        self.assertGreaterEqual(session.RESUME_TIMEOUT_SECONDS, 60)
+        self.assertTrue(fake.options)
+        self.assertIn(
+            session.TERMINAL_TIMEOUT_SECONDS,
+            [option["timeout"] for option in fake.options],
+        )
+        self.assertTrue(all(
+            option["timeout"] <= session.TERMINAL_TIMEOUT_SECONDS
+            for option in fake.options
+        ))
 
     def test_two_tokens_and_binding_title_mismatch_refuse_without_resume_or_write(self):
         for title, seed in (("GEN-37 / GEN-38", False), ("Linear · GEN-38", True)):
