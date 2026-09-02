@@ -6199,6 +6199,14 @@ class ProjectionTests(unittest.TestCase):
                 events, current_scope, projection_history=events,
             ),
         )
+        unadmitted = deepcopy(evidence)
+        unadmitted["event_id"] = "wsp_" + "9" * 32
+        self.assertIsNone(
+            workstream_projection.validated_nonprimary_backfill_authority(
+                unadmitted, current_scope, events, events,
+            ),
+            "a copied receipt outside authenticated history has no authority",
+        )
         for field, forged in (
             ("provider_repository_id", "WRONG_PROVIDER"),
             ("from_scope_value_sha256", "f" * 64),
