@@ -108,6 +108,10 @@ def _validate_pending_finalizer(
     frontiers = (fences or {}).get("frontiers")
     if not isinstance(fences, dict) or not isinstance(frontiers, dict):
         raise ChildCompletionError("child_completion_recovery_fences_missing")
+    if not isinstance(fences.get("native_root_before"), dict):
+        raise ChildCompletionError(
+            "child_completion_legacy_reservation_requires_reviewed_migration"
+        )
     if _digest(frontiers) != fences.get("frontiers_sha256"):
         raise ChildCompletionError("child_completion_recovery_fences_tampered")
     root = snapshot.get("root") or {}

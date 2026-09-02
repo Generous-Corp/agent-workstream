@@ -912,6 +912,9 @@ active `writer_fleet_gate` for the active plan. That gate records the exact
 writer and machine IDs, installed source commit/tree digest/version receipts,
 observation times, and a zero legacy-writer census. It is operational eligibility
 proof; an old client does not magically understand the new reservation kind.
+Pending reservations written before 0.4.82 lack the full root fence and are
+not guessed through: rollout must first prove there are zero such legacy
+reservations, or route the exact item through a separately reviewed migration.
 
 A reviewed `terminal_child_repairs` batch must fence every exact child issue
 from one authenticated root snapshot, including each
