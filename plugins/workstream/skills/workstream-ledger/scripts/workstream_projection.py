@@ -617,6 +617,9 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
     legacy_split_seed_allowed = predecessor_seeds_allowed | {
         "terminal_child_evidence_seed_legacy_split_head_repair"
     }
+    nonprimary_backfill_allowed = seeds_allowed | {
+        "terminal_child_evidence_seed_nonprimary_backfill"
+    }
     source_transition_allowed = required | {"terminal_child_source_transition"}
     if not isinstance(manifest, dict) or frozenset(manifest) not in {
         frozenset(required), frozenset(repairs_allowed),
@@ -625,6 +628,7 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         frozenset(seed_transition_allowed),
         frozenset(predecessor_seed_transition_allowed),
         frozenset(legacy_split_seed_allowed),
+        frozenset(nonprimary_backfill_allowed),
         frozenset(source_transition_allowed),
     }:
         raise LinearProjectionError("manifest_review_contract_required")
@@ -882,6 +886,9 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
     seed_head_transition = manifest.get(
         "terminal_child_evidence_seed_head_transition"
     )
+    nonprimary_backfill = manifest.get(
+        "terminal_child_evidence_seed_nonprimary_backfill"
+    )
     legacy_split = manifest.get(
         "terminal_child_evidence_seed_legacy_split_head_repair"
     )
@@ -889,6 +896,56 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         raise LinearProjectionError(
             "terminal_child_evidence_seed_head_transition_ambiguous"
         )
+    if nonprimary_backfill is not None:
+        backfill_fields = {
+            "repository_key", "from_exact_head", "to_exact_head",
+            "from_scope_event_id", "from_scope_value_sha256",
+            "from_disposition_event_id", "from_disposition_value_sha256",
+            "input_frontier_sha256", "provider_repository_id",
+            "pull_request_number", "merge_sha", "checks_sha256",
+        }
+        if (
+            not seeds
+            or seed_head_transition is not None
+            or legacy_split is not None
+            or not isinstance(nonprimary_backfill, dict)
+            or set(nonprimary_backfill) != backfill_fields
+            or not isinstance(nonprimary_backfill.get("repository_key"), str)
+            or not nonprimary_backfill["repository_key"]
+            or any(
+                not re.fullmatch(
+                    r"[0-9a-f]{40}(?:[0-9a-f]{24})?",
+                    str(nonprimary_backfill.get(field, "")),
+                )
+                for field in ("from_exact_head", "to_exact_head")
+            )
+            or not re.fullmatch(
+                r"[0-9a-f]{40}", str(nonprimary_backfill.get("merge_sha", ""))
+            )
+            or nonprimary_backfill["from_exact_head"]
+            == nonprimary_backfill["to_exact_head"]
+            or any(
+                not isinstance(nonprimary_backfill.get(field), str)
+                or not nonprimary_backfill[field]
+                for field in (
+                    "from_scope_event_id", "from_disposition_event_id",
+                    "provider_repository_id",
+                )
+            )
+            or any(
+                not re.fullmatch(r"[0-9a-f]{64}", str(nonprimary_backfill.get(field, "")))
+                for field in (
+                    "from_scope_value_sha256", "from_disposition_value_sha256",
+                    "input_frontier_sha256", "checks_sha256",
+                )
+            )
+            or not isinstance(nonprimary_backfill.get("pull_request_number"), int)
+            or isinstance(nonprimary_backfill.get("pull_request_number"), bool)
+            or nonprimary_backfill["pull_request_number"] <= 0
+        ):
+            raise LinearProjectionError(
+                "invalid_terminal_child_evidence_seed_nonprimary_backfill"
+            )
     if seed_head_transition is not None:
         disposition = seed_head_transition.get("disposition") if isinstance(
             seed_head_transition, dict
@@ -2114,6 +2171,9 @@ def prepare_terminal_child_evidence_seeds(
     legacy_split = result.get(
         "terminal_child_evidence_seed_legacy_split_head_repair"
     )
+    nonprimary_backfill = result.get(
+        "terminal_child_evidence_seed_nonprimary_backfill"
+    )
     if legacy_split is not None:
         _validate_gen14_legacy_split_repair_prefix(
             result, state, desired_scope,
@@ -2370,6 +2430,37 @@ def prepare_terminal_child_evidence_seeds(
         result.get("terminal_child_evidence_seed_head_transition")
         or result.get("terminal_child_evidence_seed_legacy_split_head_repair")
     )
+    if nonprimary_backfill is not None:
+        reviewed_scope_event = next((
+            event for event in state.events
+            if event.get("event_id") == nonprimary_backfill["from_scope_event_id"]
+            and (event.get("kind"), event.get("key")) == ("scope", "root")
+        ), None)
+        reviewed_disposition_event = next((
+            event for event in state.events
+            if event.get("event_id") == nonprimary_backfill["from_disposition_event_id"]
+            and (event.get("kind"), event.get("key")) == ("disposition", "root")
+        ), None)
+        current_disposition = active.get(("disposition", "root"), {}).get("value", {})
+        if (
+            reviewed_scope_event is None
+            or scope_event is None
+            or reviewed_scope_event["event_id"] != scope_event["event_id"]
+            or reviewed_scope_event["value"] != scope_value
+            or canonical_digest(reviewed_scope_event["value"])
+            != nonprimary_backfill["from_scope_value_sha256"]
+            or reviewed_disposition_event is None
+            or active.get(("disposition", "root"), {}).get("event_id")
+            != reviewed_disposition_event["event_id"]
+            or canonical_digest(reviewed_disposition_event["value"])
+            != nonprimary_backfill["from_disposition_value_sha256"]
+            or current_disposition != reviewed_disposition_event["value"]
+            or remote_head != current_disposition.get("remote_head")
+            or nonprimary_backfill["repository_key"] == primary_key
+        ):
+            raise LinearProjectionError(
+                "terminal_child_evidence_seed_nonprimary_backfill_frontier_invalid"
+            )
     if transition is not None:
         reviewed_scope_event = next((
             event for event in state.events
@@ -2521,7 +2612,10 @@ def prepare_terminal_child_evidence_seeds(
                 f"terminal_child_evidence_seed_repository_ambiguous:{child_id}"
             )
         repository = repositories[0]
-        nonprimary_transition = transition is not None and owner != primary_key
+        nonprimary_transition = (
+            (transition is not None or nonprimary_backfill is not None)
+            and owner != primary_key
+        )
         if nonprimary_transition:
             current_repositories = [
                 item for item in scope_value.get("repositories", [])
@@ -2544,6 +2638,10 @@ def prepare_terminal_child_evidence_seeds(
                     f"terminal_child_evidence_seed_contract_missing:{child_id}:{key}"
                 )
             contract = item["value"]
+            if nonprimary_backfill is not None:
+                contract["nonprimary_backfill_authority"] = deepcopy(
+                    nonprimary_backfill
+                )
             historical_authority = contract.get(
                 "predecessor_closure_authority"
             )
@@ -2552,9 +2650,12 @@ def prepare_terminal_child_evidence_seeds(
                 or contract.get("repository_key") != owner
                 or (
                     nonprimary_transition
+                    and nonprimary_backfill is None
                     and contract.get("exact_head") != repository.get("exact_head")
                 )
                 or (
+                    nonprimary_backfill is None
+                    and
                     contract.get("exact_head") != repository.get("exact_head")
                     and historical_authority is None
                 )
@@ -2563,13 +2664,24 @@ def prepare_terminal_child_evidence_seeds(
                 raise LinearProjectionError(
                     f"terminal_child_evidence_seed_contract_invalid:{child_id}:{key}"
                 )
-            if nonprimary_transition and (
+            if nonprimary_transition and nonprimary_backfill is None and (
                 predecessor_binding is None
                 or not isinstance(historical_authority, dict)
             ):
                 raise LinearProjectionError(
                     f"terminal_child_evidence_seed_nonprimary_predecessor_required:"
                     f"{child_id}:{key}"
+                )
+            if nonprimary_backfill is not None and (
+                owner != nonprimary_backfill["repository_key"]
+                or repository.get("provider_repository_id")
+                != nonprimary_backfill["provider_repository_id"]
+                or repository.get("exact_head")
+                != nonprimary_backfill["from_exact_head"]
+                or contract.get("exact_head") != nonprimary_backfill["to_exact_head"]
+            ):
+                raise LinearProjectionError(
+                    f"terminal_child_evidence_seed_nonprimary_backfill_contract_invalid:{child_id}:{key}"
                 )
             current = active.get(identity)
             if (
@@ -2892,6 +3004,14 @@ def prepare_terminal_child_repairs(
                 )
             except ProjectionHistoryError as error:
                 raise LinearProjectionError(str(error)) from error
+            if carried_authorities[-1] is None:
+                backfill = contract.get("nonprimary_backfill_authority")
+                if isinstance(backfill, dict):
+                    carried_authorities[-1] = {
+                        "child_identifier": child_id,
+                        "repository_key": backfill.get("repository_key"),
+                        "exact_head": backfill.get("to_exact_head"),
+                    }
         owners = {
             (contract["repository_key"], contract["exact_head"])
             for contract in contracts
@@ -3242,6 +3362,15 @@ def _require_repairs_for_changed_child_closures(
                     )
                 except ProjectionHistoryError as error:
                     raise LinearProjectionError(str(error)) from error
+                if authority is None:
+                    candidate = event["value"].get(
+                        "nonprimary_backfill_authority"
+                    )
+                    if isinstance(candidate, dict):
+                        authority = {
+                            "repository_key": candidate.get("repository_key"),
+                            "exact_head": candidate.get("to_exact_head"),
+                        }
                 if (
                     authority is None
                     or authority["repository_key"] != closure.get("repository_key")
@@ -3713,6 +3842,9 @@ def reconcile_required_projection(
             "terminal_child_evidence_seed_legacy_split_head_repair"
         )
     )
+    seed_nonprimary_backfill = manifest.get(
+        "terminal_child_evidence_seed_nonprimary_backfill"
+    )
     completed_split_normalization = (
         legacy_split is None
         and isinstance(
@@ -3858,7 +3990,8 @@ def reconcile_required_projection(
                 "terminal_child_evidence_seed_forbids_retirements"
             )
         seed_input_frontier = (
-            seed_head_transition or seed_predecessor or {}
+            seed_head_transition or seed_predecessor
+            or seed_nonprimary_backfill or {}
         ).get("input_frontier_sha256") or repair_predecessor_frontier
         if seed_input_frontier is not None:
             if projection_input_fence is None:
