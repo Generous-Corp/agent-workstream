@@ -190,13 +190,44 @@ def append_proposal(
     except (KeyError, TypeError, ValueError) as error:
         raise LinearTransportError("child_proposal_reservation_mismatch") from error
     root_comments = _comments(client, reservation["workstream_id"])
+    from workstream_generation import assert_no_pending_generation_reservation
+
+    assert_no_pending_generation_reservation(
+        root_comments, workstream_id=reservation["workstream_id"],
+        authenticated_route=reservation["authority"],
+    )
     pending = pending_ledger_reservations(
         root_comments, workstream_id=reservation["workstream_id"],
         authenticated_route=reservation["authority"],
         current_plan_revision=reservation["plan_revision"],
     )
     if [item for item in pending if item == reservation] != [reservation]:
-        raise LinearTransportError("child_proposal_reservation_not_live")
+        from workstream_linear_events import (
+            reduce_event_comments, semantic_ledger_reservations,
+        )
+        from workstream_linear_projection import reduce_projection_comments
+
+        state = reduce_projection_comments(
+            root_comments, workstream_id=reservation["workstream_id"],
+            expected_plan_revision=reservation["plan_revision"],
+            authenticated_route=reservation["authority"],
+        )
+        material = reduce_event_comments(
+            root_comments, workstream_id=reservation["workstream_id"],
+        )
+        semantic = semantic_ledger_reservations(
+            root_comments, workstream_id=reservation["workstream_id"],
+            authenticated_route=reservation["authority"],
+            current_plan_revision=reservation["plan_revision"],
+            intent_event=event,
+            expected_material_revision=material.revision,
+            expected_projection_revision=state.revision,
+            expected_projection_frontier_ids=[
+                state.remote_ids[item["event_id"]] for item in state.events
+            ],
+        )
+        if not any(item == reservation for item, _remote_id in semantic):
+            raise LinearTransportError("child_proposal_reservation_not_live")
     return _append_proposal(client, value)
 
 

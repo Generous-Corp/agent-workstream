@@ -3,22 +3,28 @@ from __future__ import annotations
 
 import base64
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 import tempfile
 import unittest
+import uuid
 from unittest import mock
 
 from workstream_checkpoint import build_checkpoint
-from workstream_child_proposal import _append_proposal, build_proposal
+from workstream_child_proposal import (
+    _append_proposal, build_proposal, encode_proposal, proposal_slot_id,
+)
+from workstream_delta import Delta
 import workstream_child_checkpoint
 import workstream_child_event
 import workstream_child_proposal_activate
 from workstream_linear import LinearTransportError
 from workstream_linear_events import (
     assert_no_pending_ledger_reservation,
-    encode_ledger_reservation, ledger_boundary_slot_id,
-    reduce_ledger_reservations, SERIALIZATION_PREFIX, SERIALIZATION_RE,
+    encode_event_comment, encode_ledger_reservation, ledger_boundary_slot_id,
+    LinearEventError, reduce_event_comments, reduce_ledger_reservations,
+    semantic_ledger_reservations, SERIALIZATION_PREFIX, SERIALIZATION_RE,
 )
 from workstream_generation import (
     _digest, build_retirement_proof, encode_generation_reservation,
@@ -45,6 +51,18 @@ def decode_reservation(body):
     return json.loads(base64.urlsafe_b64decode(
         encoded + "=" * (-len(encoded) % 4)
     ))["reservation"]
+
+
+def encode_forged_reservation_digest(body):
+    encoded = SERIALIZATION_RE.findall(body)[0]
+    envelope = json.loads(base64.urlsafe_b64decode(
+        encoded + "=" * (-len(encoded) % 4)
+    ))
+    envelope["sha256"] = "0" * 64
+    forged = base64.urlsafe_b64encode(json.dumps(
+        envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode()).decode().rstrip("=")
+    return f"{SERIALIZATION_PREFIX}{forged} -->"
 
 
 def install_active_generation(client):
@@ -347,6 +365,136 @@ class WorkstreamChildStateTests(unittest.TestCase):
                 return_value="secret",
             ),
         )
+
+    def generated_reservation_fixture(self):
+        """Reproduce GEN-37's three generated-ID reservations and no proposal."""
+        client = FakeChildStateClient()
+        install_active_generation(client)
+        authority = {**ROUTE, "root_issue_id": ROOT_ID}
+        for revision in range(6, 30):
+            event = build_projection_event(
+                workstream_id="GEN-37", kind="provenance",
+                key=f"production-padding-{revision}",
+                value={
+                    "agent": "codex", "machine": "M3",
+                    "session_id": f"production-padding-{revision}",
+                },
+                plan_revision=PLAN, expected_revision=revision,
+                created_at=f"2026-08-30T00:00:{revision:02d}Z",
+                authority=authority,
+            )
+            client.root_comments.append({
+                "id": projection_slot_id(
+                    "GEN-37", PLAN, event["expected_revision"], authority,
+                ),
+                "body": encode_projection_comment(event),
+                "createdAt": event["created_at"],
+                "updatedAt": event["created_at"],
+            })
+        for revision in range(63):
+            created_at = (
+                f"2026-08-31T{revision // 60:02d}:{revision % 60:02d}:00Z"
+            )
+            delta = Delta(
+                event_id=f"wsd_{revision:032x}", workstream_id="GEN-37",
+                kind="progress", source="system",
+                payload={"next_action": f"production fixture {revision}"},
+                expected_revision=revision, created_at=created_at,
+            )
+            client.root_comments.append({
+                "id": str(uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"agent-workstream-material-{revision}",
+                )),
+                "body": encode_event_comment(delta),
+                "createdAt": created_at, "updatedAt": created_at,
+            })
+        self.assertEqual(reduce_event_comments(
+            client.root_comments, workstream_id="GEN-37",
+        ).revision, 63)
+        self.assertEqual(reduce_projection_comments(
+            client.root_comments, workstream_id="GEN-37",
+            expected_plan_revision=PLAN, authenticated_route=authority,
+        ).revision, 30)
+        args = [
+            *self.common(), "--kind", "progress", "--source", "system",
+            "--expected-revision", "0", "--created-at",
+            "2026-09-02T03:48:00Z", "--event-id",
+            "wsc_gen94_m3_reverse_canary_20260901", "--payload-json",
+            '{"next_action":"GEN-94 M3 reverse canary verified"}',
+        ]
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch, mock.patch(
+            "workstream_linear_events._proven_ledger_reservations",
+            return_value=[],
+        ), mock.patch(
+            "workstream_linear_events.semantic_ledger_reservations",
+            return_value=[],
+        ), self.assertRaisesRegex(
+            LinearTransportError,
+            "child_mutation_serialization_slot_lost_reload_required",
+        ):
+            workstream_child_event.run(args, client_factory=lambda _token: client)
+        original = next(
+            item for item in client.root_comments
+            if SERIALIZATION_PREFIX in item["body"]
+        )
+        reservation = decode_reservation(original["body"])
+        self.assertEqual(reservation["material_revision"], 63)
+        self.assertEqual(reservation["projection_revision"], 30)
+        client.root_comments.remove(original)
+        generated = []
+        for index, length in enumerate((26, 28, 27)):
+            retry = deepcopy(reservation)
+            retry["frontier_ids"] = [
+                f"opaque-frontier-{index}-{item:02d}" for item in range(length)
+            ]
+            comment = {
+                "id": str(uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"agent-workstream-generated-reservation-{index}",
+                )),
+                "body": encode_ledger_reservation(retry),
+                "createdAt": f"2026-09-02T03:48:0{index}Z",
+                "updatedAt": f"2026-09-02T03:48:0{index}Z",
+            }
+            generated.append(comment)
+            client.root_comments.append(comment)
+        self.assertEqual(client.child_comments, [])
+        return client, args, reservation, generated
+
+    @staticmethod
+    def semantic_kwargs(reservation):
+        return {
+            "workstream_id": reservation["workstream_id"],
+            "authenticated_route": reservation["authority"],
+            "current_plan_revision": reservation["plan_revision"],
+            "intent_event": reservation["intent_event"],
+            "expected_material_revision": reservation["material_revision"],
+            "expected_projection_revision": reservation["projection_revision"],
+            "expected_projection_frontier_ids": reservation[
+                "projection_frontier_ids"
+            ],
+        }
+
+    @staticmethod
+    def reservation_with_event(reservation, event):
+        changed = deepcopy(reservation)
+        changed.update({
+            "workstream_id": event["workstream_id"],
+            "authority": deepcopy(event["authority"]),
+            "plan_revision": event["plan_revision"],
+            "projection_revision": event["expected_revision"],
+            "intent_event": event,
+            "intent_sha256": hashlib.sha256(json.dumps(
+                event, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode()).hexdigest(),
+        })
+        changed["projection_frontier_ids"] = changed[
+            "projection_frontier_ids"
+        ][:event["expected_revision"]]
+        return changed
 
     def test_real_projection_adapter_recognizes_legacy_origin_replay(self):
         client = FakeChildStateClient()
@@ -661,6 +809,9 @@ class WorkstreamChildStateTests(unittest.TestCase):
         with route_patch, auth_patch, mock.patch(
             "workstream_linear_events._proven_ledger_reservations",
             return_value=[],
+        ), mock.patch(
+            "workstream_linear_events.semantic_ledger_reservations",
+            return_value=[],
         ):
             for _attempt in range(2):
                 with self.assertRaisesRegex(
@@ -807,6 +958,312 @@ class WorkstreamChildStateTests(unittest.TestCase):
             "GEN-94 M3 reverse canary verified",
         )
 
+    def test_three_generated_reservations_without_proposal_recover_no_fourth(self):
+        client, args, _reservation, generated = self.generated_reservation_fixture()
+        before_root = len(client.root_comments)
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch:
+            recovered = workstream_child_event.run(
+                args, client_factory=lambda _token: client,
+            )
+            root_writes = len(client.root_comments)
+            child_writes = len(client.child_comments)
+            replay = workstream_child_event.run(
+                args, client_factory=lambda _token: client,
+            )
+
+        reservations = [
+            comment for comment in client.root_comments
+            if SERIALIZATION_PREFIX in comment["body"]
+        ]
+        self.assertEqual(reservations, generated)
+        self.assertEqual(root_writes, before_root + 1)
+        self.assertEqual(len(client.root_comments), root_writes)
+        self.assertEqual(child_writes, 1)
+        self.assertEqual(len(client.child_comments), child_writes)
+        self.assertEqual(recovered["proposal"]["disposition"], "created")
+        self.assertEqual(recovered["authorization"]["disposition"], "created")
+        self.assertEqual(replay["authorization"]["disposition"], "existing")
+        self.assertEqual(recovered["receipt"], replay["receipt"])
+        state = reduce_projection_comments(
+            client.root_comments, workstream_id="GEN-37",
+            expected_plan_revision=PLAN,
+            authenticated_route={**ROUTE, "root_issue_id": ROOT_ID},
+        )
+        authorizations = [
+            item for item in state.events
+            if item["kind"] == "child_mutation_authorization"
+            and item["value"]["child_workstream_id"] == "GEN-38"
+        ]
+        self.assertEqual(len(authorizations), 1)
+
+        snapshot = {
+            "root": {
+                "identifier": "GEN-37", "plan_revision": PLAN,
+                "url": "https://linear.test/GEN-37", "revision": 0,
+                "status": "In Progress", "status_type": "started",
+                "next_action": "root action",
+            },
+            "children": [{
+                "id": CHILD_ID, "identifier": "GEN-38", "title": "Child",
+                "url": "https://linear.test/GEN-38", "status": "In Progress",
+                "status_type": "started", "next_action": "issue action",
+                "parent": {"id": ROOT_ID}, "project": {"id": "project"},
+                "team": {"id": "team", "organization": {"id": "workspace"}},
+            }],
+        }
+        enriched = add_child_material_history(
+            snapshot, {"GEN-38": deepcopy(client.child_comments)},
+            authenticated_route={**ROUTE, "root_issue_id": ROOT_ID},
+            root_comments=deepcopy(client.root_comments),
+        )
+        from test_workstream_resume import ResumeTests
+        authority_snapshot = ResumeTests().snapshot()
+        authority_snapshot.update({
+            "children": [deepcopy(enriched["children"][0])],
+            "decisions": [], "provenance": [],
+        })
+        authority_snapshot = ResumeTests().full_authority_snapshot(
+            authority_snapshot
+        )
+        authority_snapshot["children"][0].update({
+            "parent": {
+                "id": authority_snapshot["authenticated_route"]["root_issue_id"],
+                "identifier": "GEN-37",
+            },
+            "team": {"id": "team", "organization": {"id": "workspace"}},
+            "project": {"id": "project"},
+        })
+        authority_context = compact_context(
+            authority_snapshot, "GEN-37", require_projection_authority=True,
+        )
+        self.assertEqual(authority_context["resume_authority"], "full")
+        self.assertEqual(
+            authority_context["children"][0]["next_action"],
+            "GEN-94 M3 reverse canary verified",
+        )
+
+    def test_generated_reservation_lost_response_converges_without_retry(self):
+        client = FakeChildStateClient()
+        install_active_generation(client)
+        args = [
+            *self.common(), "--kind", "progress", "--source", "system",
+            "--expected-revision", "0", "--created-at",
+            "2026-09-02T03:48:00Z", "--event-id",
+            "wsc_gen94_m3_reverse_canary_20260901", "--payload-json",
+            '{"next_action":"GEN-94 M3 reverse canary verified"}',
+        ]
+        original_execute = client.execute
+        generated_id = "9c60b3e5-0918-4ab3-8caa-e7c2bc58f80d"
+
+        def lose_generated_response(query, variables):
+            item = variables.get("input") or {}
+            if (
+                "commentCreate" in query
+                and SERIALIZATION_PREFIX in str(item.get("body", ""))
+            ):
+                client.root_comments.append({
+                    "id": generated_id, "body": item["body"],
+                    "createdAt": "2026-09-02T03:48:00Z",
+                    "updatedAt": "2026-09-02T03:48:00Z",
+                })
+                raise LinearTransportError("lost generated-id response")
+            return original_execute(query, variables)
+
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch, mock.patch.object(
+            client, "execute", side_effect=lose_generated_response,
+        ):
+            result = workstream_child_event.run(
+                args, client_factory=lambda _token: client,
+            )
+        reservations = [
+            comment for comment in client.root_comments
+            if SERIALIZATION_PREFIX in comment["body"]
+        ]
+        self.assertEqual([item["id"] for item in reservations], [generated_id])
+        self.assertEqual(len(client.child_comments), 1)
+        self.assertEqual(result["authorization"]["disposition"], "created")
+
+    def test_semantic_reservation_refuses_every_core_or_authority_drift(self):
+        _client, _args, reservation, generated = self.generated_reservation_fixture()
+        kwargs = self.semantic_kwargs(reservation)
+        matches = semantic_ledger_reservations(generated, **kwargs)
+        self.assertEqual(len(matches), 3)
+        self.assertEqual(
+            sorted(len(item[0]["frontier_ids"]) for item in matches),
+            [26, 27, 28],
+        )
+
+        def rebuild(*, value=None, authority=None, plan_revision=None,
+                    expected_revision=None, workstream_id=None, key=None):
+            original = reservation["intent_event"]
+            return build_projection_event(
+                workstream_id=original["workstream_id"]
+                if workstream_id is None else workstream_id,
+                kind=original["kind"],
+                key=original["key"] if key is None else key,
+                value=deepcopy(original["value"] if value is None else value),
+                plan_revision=original["plan_revision"]
+                if plan_revision is None else plan_revision,
+                expected_revision=original["expected_revision"]
+                if expected_revision is None else expected_revision,
+                created_at=original["created_at"],
+                supersedes_event_id=original["supersedes_event_id"],
+                authority=deepcopy(
+                    original["authority"] if authority is None else authority
+                ),
+            )
+
+        projection_frontier = deepcopy(reservation)
+        projection_frontier["projection_frontier_ids"][0] = "forged-projection"
+
+        material = deepcopy(reservation)
+        material["material_revision"] += 1
+
+        stale_event = rebuild(
+            expected_revision=reservation["projection_revision"] - 1,
+        )
+        projection = self.reservation_with_event(reservation, stale_event)
+
+        generation_value = deepcopy(reservation["intent_event"]["value"])
+        generation_value["generation_authority"]["activation_epoch"] += 1
+        generation = self.reservation_with_event(
+            reservation, rebuild(value=generation_value),
+        )
+
+        record_value = deepcopy(reservation["intent_event"]["value"])
+        record_value["record_sha256"] = "f" * 64
+        record = self.reservation_with_event(
+            reservation, rebuild(value=record_value),
+        )
+
+        child_value = deepcopy(reservation["intent_event"]["value"])
+        child_value["child_workstream_id"] = "GEN-999"
+        child = self.reservation_with_event(
+            reservation, rebuild(value=child_value),
+        )
+
+        kind_value = deepcopy(reservation["intent_event"]["value"])
+        kind_value["mutation_kind"] = "checkpoint"
+        kind = self.reservation_with_event(
+            reservation, rebuild(value=kind_value),
+        )
+
+        proposal_value = deepcopy(reservation["intent_event"]["value"])
+        proposal_value["proposal_id"] = "wscp_" + "f" * 32
+        proposal = self.reservation_with_event(
+            reservation,
+            rebuild(value=proposal_value, key=proposal_value["proposal_id"]),
+        )
+
+        foreign_workstream_value = deepcopy(
+            reservation["intent_event"]["value"]
+        )
+        foreign_workstream_value["generation_authority"][
+            "workstream_id"
+        ] = "GEN-999"
+        foreign_workstream = self.reservation_with_event(
+            reservation, rebuild(
+                value=foreign_workstream_value, workstream_id="GEN-999",
+            ),
+        )
+
+        foreign_authority = deepcopy(reservation["authority"])
+        foreign_authority["root_issue_id"] = (
+            "22222222-2222-4222-8222-222222222222"
+        )
+        route_value = deepcopy(reservation["intent_event"]["value"])
+        route_value.update({
+            "root_issue_id": foreign_authority["root_issue_id"],
+            "route": deepcopy(foreign_authority),
+            "child_parent_issue_id": foreign_authority["root_issue_id"],
+            "child_route": {
+                key: foreign_authority[key]
+                for key in ("workspace_id", "team_id", "project_id")
+            },
+        })
+        route_value["generation_authority"]["authority"] = deepcopy(
+            foreign_authority
+        )
+        route = self.reservation_with_event(
+            reservation,
+            rebuild(value=route_value, authority=foreign_authority),
+        )
+
+        for name, changed in (
+            ("projection_frontier", projection_frontier),
+            ("material_revision", material),
+            ("projection_revision", projection),
+            ("generation", generation),
+            ("record", record),
+            ("child", child),
+            ("kind", kind),
+            ("proposal", proposal),
+            ("workstream", foreign_workstream),
+            ("route", route),
+        ):
+            comment = {
+                "id": f"generated-{name}",
+                "body": encode_ledger_reservation(changed),
+            }
+            with self.subTest(name=name), self.assertRaisesRegex(
+                LinearEventError, "ledger_reservation_intent_conflict",
+            ):
+                semantic_ledger_reservations([comment], **kwargs)
+
+        forged = {
+            "id": "generated-forged-digest",
+            "body": encode_forged_reservation_digest(generated[0]["body"]),
+        }
+        with self.assertRaisesRegex(
+            LinearEventError, "ledger_reservation_authentication_failed",
+        ):
+            semantic_ledger_reservations([forged], **kwargs)
+
+        conflicting = {
+            "id": "generated-conflicting-duplicate",
+            "body": encode_ledger_reservation(projection_frontier),
+        }
+        with self.assertRaisesRegex(
+            LinearEventError, "ledger_reservation_intent_conflict",
+        ):
+            semantic_ledger_reservations([generated[0], conflicting], **kwargs)
+
+    def test_semantic_reservation_reuse_refuses_live_proposal_body_drift(self):
+        client, _args, reservation, _generated = self.generated_reservation_fixture()
+        record = {
+            "event_id": "wsc_gen94_m3_reverse_canary_20260901",
+            "workstream_id": "GEN-38", "kind": "progress", "source": "system",
+            "payload": {"next_action": "GEN-94 M3 reverse canary verified"},
+            "expected_revision": 0, "created_at": "2026-09-02T03:48:00Z",
+        }
+        proposal = build_proposal(
+            "event", record, child_workstream_id="GEN-38",
+            child_issue_id=CHILD_ID, plan_revision=PLAN,
+        )
+        value = reservation["intent_event"]["value"]
+        self.assertEqual(proposal["proposal_id"], value["proposal_id"])
+        self.assertEqual(proposal["record_sha256"], value["record_sha256"])
+        drifted = deepcopy(proposal)
+        drifted["child_issue_id"] = "33333333-3333-4333-8333-333333333333"
+        client.child_comments.append({
+            "id": value["proposal_remote_id"], "body": encode_proposal(drifted),
+            "createdAt": "2026-09-02T03:48:10Z",
+            "updatedAt": "2026-09-02T03:48:10Z",
+        })
+        adapter = LinearProjectionAdapter(
+            client, issue_id="GEN-37", workstream_id="GEN-37",
+            plan_revision=PLAN, **ROUTE, root_issue_id=ROOT_ID,
+        )
+        root_count = len(client.root_comments)
+        with self.assertRaisesRegex(
+            LinearTransportError,
+            "child_mutation_proposal_missing_or_mismatch",
+        ):
+            adapter._reserve_child_mutation_intent(reservation["intent_event"])
+        self.assertEqual(len(client.root_comments), root_count)
+
     def test_duplicate_reservation_material_divergence_is_quarantined(self):
         client = FakeChildStateClient()
         args = [
@@ -817,6 +1274,9 @@ class WorkstreamChildStateTests(unittest.TestCase):
         route_patch, auth_patch = self.patches()
         with route_patch, auth_patch, mock.patch(
             "workstream_linear_events._proven_ledger_reservations",
+            return_value=[],
+        ), mock.patch(
+            "workstream_linear_events.semantic_ledger_reservations",
             return_value=[],
         ), self.assertRaisesRegex(
             LinearTransportError,
