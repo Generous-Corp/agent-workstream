@@ -23,6 +23,7 @@ from workstream_linear import (
     parse_next_action,
     parse_plan_revision,
     parse_root_revision,
+    resolve_authenticated_resume_target,
 )
 from workstream_linear_projection import (
     build_projection_event, encode_projection_comment, LinearProjectionAdapter,
@@ -208,6 +209,67 @@ class FakeChildAuthorization:
 
 
 class LinearTransportTests(unittest.TestCase):
+    @staticmethod
+    def _resume_issue(identifier="GEN-91"):
+        route = {
+            "team": {"id": "team", "organization": {"id": "workspace"}},
+            "project": {"id": "project", "teams": {"nodes": [{"id": "team"}]}},
+        }
+        root = {
+            "id": "root-uuid", "identifier": "GEN-37", "archivedAt": None,
+            "state": {"id": "started", "name": "In Progress", "type": "started"},
+            "parent": None, **route,
+        }
+        return {
+            "id": f"child-{identifier}", "identifier": identifier,
+            "archivedAt": None,
+            "state": {"id": "started", "name": "In Progress", "type": "started"},
+            "parent": root, **route,
+        }
+
+    def test_resume_target_follows_direct_child_to_root(self):
+        for token in ("GEN-43", "GEN-91", "GEN-92", "GEN-93", "GEN-94"):
+            with self.subTest(token=token):
+                client = mock.Mock()
+                client.execute.return_value = {"issue": self._resume_issue(token)}
+                route, root, focus = resolve_authenticated_resume_target(
+                    client, token, {
+                        "workspace_id": "workspace", "team_id": "team",
+                        "project_id": "project",
+                    },
+                )
+                self.assertEqual(root, "GEN-37")
+                self.assertEqual(route["root_issue_id"], "root-uuid")
+                self.assertEqual(focus, {
+                    "kind": "owned_child", "identifier": token,
+                    "issue_id": f"child-{token}", "parent_issue_id": "root-uuid",
+                    "root_identifier": "GEN-37",
+                })
+
+    def test_resume_target_refuses_nested_route_and_malformed_state(self):
+        cases = []
+        nested = self._resume_issue()
+        nested["parent"]["parent"] = {"id": "grand", "identifier": "GEN-1"}
+        cases.append((nested, "resume_parent_is_nested_child"))
+        mismatch = self._resume_issue()
+        mismatch["team"] = {"id": "other", "organization": {"id": "workspace"}}
+        mismatch["project"] = {
+            "id": "project", "teams": {"nodes": [{"id": "other"}]},
+        }
+        cases.append((mismatch, "resume_child_parent_route_mismatch:team_id"))
+        malformed = self._resume_issue()
+        malformed["state"] = {"id": "started", "name": None, "type": "started"}
+        cases.append((malformed, "malformed_requested_issue_state"))
+        archived = self._resume_issue()
+        archived["archivedAt"] = "2026-09-02T00:00:00Z"
+        cases.append((archived, "requested_issue_archived"))
+        for issue, reason in cases:
+            with self.subTest(reason=reason):
+                client = mock.Mock()
+                client.execute.return_value = {"issue": issue}
+                with self.assertRaisesRegex(LinearTransportError, reason):
+                    resolve_authenticated_resume_target(client, "GEN-91", None)
+
     def test_token_only_bootstrap_reads_exact_issue_route(self):
         client = mock.Mock()
         client.execute.return_value = {"issue": {
