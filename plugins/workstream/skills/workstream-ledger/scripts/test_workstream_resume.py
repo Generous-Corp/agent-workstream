@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -26,6 +27,230 @@ import workstream_resume as MODULE
 
 
 class ResumeTests(unittest.TestCase):
+    def inherited_snapshots(self):
+        source = {"identity": "https://example.test/plan", "sha256": "a" * 64}
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "parent-id",
+        }
+        parent = {
+            "root": {
+                "id": "parent-id", "identifier": "GEN-37",
+                "plan_revision": "a" * 64,
+                "description_plan_revision": "a" * 64,
+                "generation_transition_tip_event_id": None,
+                "generation_activation_epoch": 0,
+                "generation_authority_origin": "legacy_description",
+            },
+            "source": source,
+            "scope": {
+                "child_ownership": {"GEN-94": "github.com:id:shipyard"},
+                "repositories": [{
+                    "slug": "github.com/acme/shipyard", "provider_repository_id": "shipyard",
+                    "identity_resolution": {
+                        "provider_repository_id": "shipyard",
+                        "resolved_slug": "github.com/acme/shipyard",
+                        "observed_at": "2026-09-02T00:00:00Z",
+                        "evidence": [{
+                            "kind": "authenticated_provider_readback", "authenticated": True,
+                            "provider_repository_id": "shipyard",
+                            "resolved_slug": "github.com/acme/shipyard",
+                        }],
+                    },
+                }],
+            },
+            "projection_revision": 30,
+            "material_event_revision": 3,
+            "authenticated_route": route,
+            "authenticated_source": source,
+        }
+        child = {
+            "root": {
+                "id": "child-id", "identifier": "GEN-94",
+                "parent": {"id": "parent-id", "identifier": "GEN-37"},
+                "plan_revision": "a" * 64,
+            },
+            "authenticated_route": {**route, "root_issue_id": "child-id"},
+        }
+        return child, parent
+
+    def test_inherited_child_authority_binds_parent_source_generation_and_owner(self):
+        child, parent = self.inherited_snapshots()
+        result = MODULE.inherited_child_authority(
+            child, parent, child_token="GEN-94", child_issue_id="child-id",
+            parent_comments=[],
+        )
+        self.assertEqual(result["source"]["sha256"], "a" * 64)
+        self.assertEqual(result["generation"]["plan_revision"], "a" * 64)
+        self.assertEqual(result["projection_frontier"]["revision"], 30)
+        self.assertEqual(result["owner"], "github.com:id:shipyard")
+        self.assertEqual(result["child_issue_id"], "child-id")
+
+    def test_generation_selector_default_schema_and_opt_in_predecessor(self):
+        default = MODULE.select_plan_generation(
+            [], workstream_id="GEN-37", description_plan_revision="a" * 64,
+        )
+        self.assertNotIn("predecessor_plan_revision", default)
+        opted = MODULE.select_plan_generation(
+            [], workstream_id="GEN-37", description_plan_revision="a" * 64,
+            include_predecessor=True,
+        )
+        self.assertEqual(opted["predecessor_plan_revision"], None)
+
+    def test_inherited_child_authority_rejects_parent_child_mismatch(self):
+        child, parent = self.inherited_snapshots()
+        child["root"]["parent"]["id"] = "other-parent"
+        with self.assertRaisesRegex(MODULE.ResumeError, "inherited_child_parent_mismatch"):
+            MODULE.inherited_child_authority(
+                child, parent, child_token="GEN-94", child_issue_id="child-id",
+                parent_comments=[],
+            )
+
+    def test_inherited_child_authority_rejects_owner_and_source_mismatch(self):
+        child, parent = self.inherited_snapshots()
+        parent["scope"]["child_ownership"] = {}
+        with self.assertRaisesRegex(MODULE.ResumeError, "inherited_child_owner_missing"):
+            MODULE.inherited_child_authority(
+                child, parent, child_token="GEN-94", child_issue_id="child-id",
+                parent_comments=[],
+            )
+        child, parent = self.inherited_snapshots()
+        parent["source"] = {"identity": "https://example.test/plan"}
+        with self.assertRaisesRegex(MODULE.ResumeError, "inherited_child_source_missing"):
+            MODULE.inherited_child_authority(
+                child, parent, child_token="GEN-94", child_issue_id="child-id",
+                parent_comments=[],
+            )
+
+    def test_inherited_child_authority_rejects_route_and_owner_repository_mismatch(self):
+        child, parent = self.inherited_snapshots()
+        child["authenticated_route"]["project_id"] = "other-project"
+        with self.assertRaisesRegex(MODULE.ResumeError, "inherited_child_route_mismatch"):
+            MODULE.inherited_child_authority(
+                child, parent, child_token="GEN-94", child_issue_id="child-id",
+                parent_comments=[],
+            )
+        child, parent = self.inherited_snapshots()
+        parent["scope"]["child_ownership"]["GEN-94"] = "github.com:id:unknown"
+        with self.assertRaisesRegex(MODULE.ResumeError, "inherited_child_owner_mismatch"):
+            MODULE.inherited_child_authority(
+                child, parent, child_token="GEN-94", child_issue_id="child-id",
+                parent_comments=[],
+            )
+
+    def test_inherited_child_authority_rejects_authenticated_source_mismatch(self):
+        child, parent = self.inherited_snapshots()
+        parent["authenticated_source"] = {
+            "identity": "https://example.test/other", "sha256": "b" * 64,
+        }
+        with self.assertRaisesRegex(MODULE.ResumeError, "inherited_child_source_mismatch"):
+            MODULE.inherited_child_authority(
+                child, parent, child_token="GEN-94", child_issue_id="child-id",
+                parent_comments=[],
+            )
+
+    def test_inherited_child_authority_rejects_missing_repository_catalog(self):
+        child, parent = self.inherited_snapshots()
+        parent["scope"]["repositories"] = []
+        with self.assertRaisesRegex(MODULE.ResumeError, "inherited_child_owner_repository_missing"):
+            MODULE.inherited_child_authority(
+                child, parent, child_token="GEN-94", child_issue_id="child-id",
+                parent_comments=[],
+            )
+
+    def test_inherited_child_authority_rejects_plan_revision_mismatch(self):
+        child, parent = self.inherited_snapshots()
+        child["root"]["plan_revision"] = "b" * 64
+        with self.assertRaisesRegex(MODULE.ResumeError, "inherited_child_plan_revision_mismatch"):
+            MODULE.inherited_child_authority(
+                child, parent, child_token="GEN-94", child_issue_id="child-id",
+                parent_comments=[],
+            )
+
+    def test_inherited_child_authority_preserves_older_generation_safety_tail(self):
+        import test_workstream_generation_transition as gf
+        c = gf.FakeClient(); gf.project_full(c, gf.OLD); gf.project_full(c, gf.NEW)
+        x = gf.GenerationTransitionTests("test_mixed_schema_carried_checkpoint_generation_tokens")
+        x.client = c; x.loader = gf.Loader(c)
+        x.transport = gf.GenerationTransport(
+            c, issue_id=gf.WORKSTREAM, workstream_id=gf.WORKSTREAM,
+            authority=gf.AUTHORITY, candidate_loader=x.loader,
+            legacy_description_plan_revision=gf.OLD,
+        )
+        receipt = x.transport.activate(target_plan_revision=gf.NEW, created_at="now", retirement=x.retirement())
+        child, parent = self.inherited_snapshots()
+        parent_comments = copy.deepcopy(c.comments)
+        parent["source"] = {"identity": "https://example.test/new", "sha256": gf.NEW}
+        parent["authenticated_source"] = parent["source"]
+        parent["authenticated_route"] = gf.AUTHORITY
+        parent["root"]["id"] = gf.AUTHORITY["root_issue_id"]
+        child["root"]["parent"]["id"] = gf.AUTHORITY["root_issue_id"]
+        child["authenticated_route"] = {**gf.AUTHORITY, "root_issue_id": "child-id"}
+        parent["root"].update({"plan_revision": gf.NEW, "description_plan_revision": gf.OLD,
+                                "generation_transition_tip_event_id": receipt["event_id"],
+                                "generation_activation_epoch": 0,
+                                "generation_authority_origin": "generation_transition"})
+        child["root"].update({"identifier": "GEN-43", "plan_revision": gf.OLD,
+                               "generation_authority_origin": "legacy_description"})
+        parent["scope"]["child_ownership"]["GEN-43"] = parent["scope"]["child_ownership"].pop("GEN-94")
+        result = MODULE.inherited_child_authority(child, parent, child_token="GEN-43", child_issue_id="child-id", parent_comments=parent_comments)
+        self.assertEqual(result["disposition"], "older_generation_safety_tail")
+        child["root"]["plan_revision"] = "c" * 64
+        with self.assertRaisesRegex(MODULE.ResumeError, "inherited_child_plan_revision_mismatch"):
+            MODULE.inherited_child_authority(child, parent, child_token="GEN-43", child_issue_id="child-id", parent_comments=parent_comments)
+
+    def test_inherited_child_authority_rejects_parent_generation_source_mismatch(self):
+        child, parent = self.inherited_snapshots()
+        parent["root"]["plan_revision"] = "b" * 64
+        with self.assertRaisesRegex(MODULE.ResumeError, "inherited_child_generation_mismatch"):
+            MODULE.inherited_child_authority(
+                child, parent, child_token="GEN-94", child_issue_id="child-id",
+                parent_comments=[],
+            )
+
+    def test_inherited_child_final_path_rejects_nonempty_local_projection(self):
+        for field, value in (
+            ("projection_events", [{"kind": "scope", "key": "root"}]),
+            ("projection_history", [{"event_id": "old"}]),
+            ("projection_quarantined", [{"event_id": "q"}]),
+            ("projection_unresolved_quarantine", [{"event_id": "q"}]),
+            ("quarantine_disposition", {"event_ids": ["q"]}),
+            ("projection_recovery", {"state": "stale_plan"}),
+            ("projection_revision", 1),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                MODULE.ResumeError, "inherited_child_local_projection_conflict"
+            ):
+                MODULE.require_empty_inherited_child_projection({field: value})
+        MODULE.require_empty_inherited_child_projection({"projection_events": []})
+
+    def test_compact_context_emits_inherited_authority_receipt(self):
+        snapshot = self.snapshot()
+        snapshot["root"]["plan_revision"] = "a" * 64
+        snapshot["root"]["parent"] = {"id": "parent-id", "identifier": "GEN-37"}
+        route = {"workspace_id": "w", "team_id": "t", "project_id": "p", "root_issue_id": "root-id"}
+        snapshot["root"]["id"] = "root-id"
+        snapshot["authenticated_route"] = route
+        snapshot["source"] = {"identity": "https://example.test/plan", "sha256": snapshot["root"]["plan_revision"]}
+        snapshot["authenticated_source"] = snapshot["source"]
+        snapshot["inherited_authority"] = {
+            "source": snapshot["source"],
+            "owner": "github.com:id:shipyard", "child_token": "GEN-37",
+            "child_issue_id": "root-id", "parent_token": "GEN-37",
+            "generation": {"plan_revision": snapshot["root"]["plan_revision"], "description_plan_revision": snapshot["root"]["plan_revision"], "generation_transition_tip_event_id": None, "generation_activation_epoch": None, "generation_authority_origin": "legacy_description"},
+            "generation_proof": {"plan_revision": snapshot["root"]["plan_revision"], "generation_transition_tip_event_id": None, "generation_activation_epoch": None, "generation_authority_origin": "legacy_description"},
+            "parent_comments": [],
+            "child_generation": {"plan_revision": snapshot["root"]["plan_revision"]},
+            "projection_frontier": {"material_revision": 0, "revision": 30, "root_readback_sha256": "a" * 64},
+            "parent_route": {**route, "root_issue_id": "parent-id"},
+            "child_route": route,
+            "projection": {"scope": {"child_ownership": {"GEN-37": "github.com:id:shipyard"}, "repositories": [{"slug": "github.com/acme/shipyard", "provider_repository_id": "shipyard", "identity_resolution": {"provider_repository_id": "shipyard", "resolved_slug": "github.com/acme/shipyard", "observed_at": "2026-09-02T00:00:00Z", "evidence": [{"kind": "authenticated_provider_readback", "authenticated": True, "provider_repository_id": "shipyard", "resolved_slug": "github.com/acme/shipyard"}]}}]}, "projection_revision": 30},
+            "disposition": None,
+        }
+        result = MODULE.compact_context(snapshot, "GEN-37")
+        self.assertEqual(result["inherited_authority"]["owner"], "github.com:id:shipyard")
+        self.assertEqual(result["inherited_authority"]["projection_frontier"]["revision"], 30)
+
     def generation_sources(self):
         canonical = "https://github.com/acme/plans/blob/main/PLAN.md"
         immutable = (
@@ -831,7 +1056,7 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(full["children"][0], snapshot["children"][0])
 
     def test_token_mismatch_fails_closed(self):
-        with self.assertRaises(MODULE.ResumeError):
+        with self.assertRaisesRegex(MODULE.ResumeError, "token/root mismatch"):
             MODULE.compact_context(self.snapshot(), "GEN-40")
 
     def test_extracts_one_token_from_title_or_natural_language(self):
@@ -2223,6 +2448,184 @@ class ResumeTests(unittest.TestCase):
                         len(json.dumps(cell, ensure_ascii=False).encode()), 24,
                     )
 
+    def test_fixed_frontier_preserves_inherited_authority_receipt(self):
+        base = self.snapshot()
+        base["authenticated_route"] = {"workspace_id": "workspace", "team_id": "team", "project_id": "project", "root_issue_id": "33333333-3333-4333-8333-333333333333"}
+        base["root"]["parent"] = {"id": base["authenticated_route"]["root_issue_id"], "identifier": "GEN-37"}
+        snapshot = self.full_authority_snapshot(base)
+        native_graph = copy.deepcopy(snapshot.get("dependency_graph"))
+        snapshot["children"] = [{
+            "identifier": f"GEN-{100 + index}", "title": "Child " + ("x" * 500),
+            "status": "In Progress",
+            "status_type": "started", "next_action": "continue",
+        } for index in range(90)]
+        snapshot["scope"] = None
+        snapshot["projection_events"] = []
+        snapshot["projection_revision"] = 0
+        snapshot["dependency_graph"] = None
+        snapshot["decisions"] = [{"id": str(i), "status": "accepted", "decision": "y" * 1000} for i in range(90)]
+        snapshot["inherited_authority"] = {
+            "source": copy.deepcopy(snapshot["source"]),
+            "owner": "github.com:id:shipyard", "child_token": "GEN-37",
+            "child_issue_id": snapshot["root"]["id"], "parent_token": "GEN-37",
+            "generation": {"plan_revision": snapshot["root"]["plan_revision"],
+                            "description_plan_revision": snapshot["root"]["plan_revision"],
+                            "generation_transition_tip_event_id": None,
+                            "generation_activation_epoch": None,
+                            "generation_authority_origin": "legacy_description"},
+            "generation_proof": {"plan_revision": snapshot["root"]["plan_revision"],
+                                  "generation_transition_tip_event_id": None,
+                                  "generation_activation_epoch": None,
+                                  "generation_authority_origin": "legacy_description"},
+            "parent_comments": [],
+            "child_generation": {"plan_revision": snapshot["root"]["plan_revision"],
+                                  },
+            "projection_frontier": {"material_revision": native_graph["observed_frontier"]["material_revision"], "revision": native_graph["observed_frontier"]["projection_revision"], "root_readback_sha256": native_graph["root_readback_sha256"]},
+            "parent_route": snapshot["authenticated_route"],
+            "child_route": snapshot["authenticated_route"],
+            "projection": {"scope": {"child_ownership": {"GEN-37": "github.com:id:shipyard"}, "repositories": [{"slug": "github.com/acme/shipyard", "provider_repository_id": "shipyard", "identity_resolution": {"provider_repository_id": "shipyard", "resolved_slug": "github.com/acme/shipyard", "observed_at": "2026-09-02T00:00:00Z", "evidence": [{"kind": "authenticated_provider_readback", "authenticated": True, "provider_repository_id": "shipyard", "resolved_slug": "github.com/acme/shipyard"}]}}]}, "projection_revision": native_graph["observed_frontier"]["projection_revision"]},
+        }
+        snapshot["inherited_dependency_graph"] = native_graph
+        result = MODULE.compact_context(
+            snapshot, "GEN-37", max_bytes=24576, max_items=300,
+            require_projection_authority=True, require_dependency_graph=True,
+            trusted_inherited_authority=copy.deepcopy(snapshot["inherited_authority"]),
+        )
+        self.assertEqual(result["context_schema"]["envelope"], "fixed_frontier_authority_v1")
+        receipt = result["inherited_authority"]
+        self.assertEqual(receipt["owner"], "github.com:id:shipyard")
+        self.assertIsNone(receipt["generation"]["generation_activation_epoch"])
+        self.assertEqual(receipt["child_generation"]["plan_revision"], snapshot["root"]["plan_revision"])
+        self.assertEqual(receipt["projection_frontier"]["revision"], native_graph["observed_frontier"]["projection_revision"])
+
+    def test_inherited_dependency_tamper_controls_fail_closed(self):
+        base = self.snapshot()
+        base["inherited_authority"] = {
+            "source": base.get("source"), "owner": "github.com:id:shipyard",
+            "generation": {"plan_revision": base["root"]["plan_revision"]},
+            "projection_frontier": {"material_revision": 3, "revision": 4,
+                                    "root_readback_sha256": "a" * 64},
+            "parent_route": {"workspace_id": "w", "team_id": "t", "project_id": "p", "root_issue_id": "parent"},
+        }
+        graph = {"route": base["inherited_authority"]["parent_route"],
+                 "plan_revision": base["root"]["plan_revision"],
+                 "observed_frontier": {"material_revision": 3, "projection_revision": 4,
+                                        "graph_revision": 0, "graph_sha256": "b" * 64},
+                 "root_readback_sha256": "a" * 64}
+        for field, value in (("material_revision", 9), ("projection_revision", 9)):
+            tampered = copy.deepcopy(base); tampered["inherited_dependency_graph"] = copy.deepcopy(graph)
+            tampered["inherited_dependency_graph"]["observed_frontier"][field] = value
+            with self.assertRaises(MODULE.ResumeError):
+                MODULE.validate_snapshot(tampered, "GEN-37", require_dependency_graph=True)
+        tampered = copy.deepcopy(base); tampered["inherited_dependency_graph"] = {**graph, "root_readback_sha256": "c" * 64}
+        with self.assertRaises(MODULE.ResumeError):
+            MODULE.validate_snapshot(tampered, "GEN-37", require_dependency_graph=True)
+
+    def test_inherited_dependency_parent_route_shape_fails_closed(self):
+        for route in (None, "not-a-route"):
+            with self.subTest(route=route), self.assertRaisesRegex(
+                MODULE.ResumeError, "inherited_dependency_parent_route_missing"
+            ):
+                MODULE._validated_inherited_parent_route({"parent_route": route})
+
+    def test_inherited_authority_receipt_mutations_fail_closed(self):
+        child, parent = self.inherited_snapshots()
+        receipt = MODULE.inherited_child_authority(
+            child, parent, child_token="GEN-94", child_issue_id="child-id",
+            parent_comments=[],
+        )
+        snapshot = {
+            "root": {"id": "child-id", "identifier": "GEN-94", "plan_revision": "a" * 64},
+            "children": [], "material_events": [], "material_event_revision": 3,
+            "projection_events": [], "projection_history": [], "projection_quarantined": [],
+            "projection_unresolved_quarantine": [], "projection_revision": 30,
+            "source": copy.deepcopy(receipt["source"]),
+            "authenticated_source": copy.deepcopy(receipt["source"]),
+            "authenticated_route": copy.deepcopy(receipt["child_route"]),
+            "inherited_authority": receipt,
+        }
+        mutations = {
+            "owner": lambda r: r.update(owner="forged"),
+            "child_token": lambda r: r.update(child_token="GEN-91"),
+            "child_issue_id": lambda r: r.update(child_issue_id="other"),
+            "parent_token": lambda r: r.update(parent_token="GEN-91"),
+            "parent_route": lambda r: r.update(parent_route=None),
+            "child_route": lambda r: r.update(child_route={**r["child_route"], "project_id": "other"}),
+            "generation": lambda r: r["generation"].update(plan_revision="b" * 64),
+            "generation_tip": lambda r: r["generation"].update(generation_transition_tip_event_id="forged-tip"),
+            "frontier": lambda r: r["projection_frontier"].update(revision=31),
+        }
+        for field, mutate in mutations.items():
+            with self.subTest(field=field):
+                forged = copy.deepcopy(snapshot)
+                mutate(forged["inherited_authority"])
+                with self.assertRaises(MODULE.ResumeError):
+                    MODULE.validate_snapshot(forged, "GEN-94")
+        forged = copy.deepcopy(snapshot)
+        forged["root"]["parent"] = {"id": "forged", "identifier": "GEN-37"}
+        with self.assertRaises(MODULE.ResumeError):
+            MODULE.validate_snapshot(forged, "GEN-94")
+
+    def test_inherited_authority_requires_independent_anchor(self):
+        child, parent = self.inherited_snapshots()
+        receipt = MODULE.inherited_child_authority(
+            child, parent, child_token="GEN-94", child_issue_id="child-id",
+            parent_comments=[],
+        )
+        snapshot = {"root": {**child["root"], "id": "child-id", "url": "https://linear/GEN-94", "revision": 0, "status": "In Progress", "next_action": "test"},
+                    "children": [], "material_events": [],
+                    "projection_events": [], "projection_history": [],
+                    "projection_quarantined": [], "projection_unresolved_quarantine": [],
+                    "projection_revision": 0, "material_event_revision": 0,
+                    "source": receipt["source"], "authenticated_source": receipt["source"],
+                    "authenticated_route": receipt["child_route"],
+                    "inherited_authority": receipt}
+        with self.assertRaisesRegex(MODULE.ResumeError, "trusted_inherited_authority_missing"):
+            MODULE.validate_snapshot(snapshot, "GEN-94", require_projection_authority=True)
+        forged = copy.deepcopy(receipt)
+        forged["owner"] = "github.com:id:forged"
+        with self.assertRaisesRegex(MODULE.ResumeError, "inherited_authority_anchor_mismatch"):
+            MODULE.validate_snapshot(
+                {**snapshot, "inherited_authority": forged}, "GEN-94",
+                require_projection_authority=True,
+                trusted_inherited_authority=receipt,
+            )
+
+    def test_inherited_authority_malformed_parent_scope_and_missing_source_fail_closed(self):
+        child, parent = self.inherited_snapshots()
+        for malformed in ([], {"child_ownership": []}):
+            broken = copy.deepcopy(parent); broken["scope"] = malformed
+            with self.assertRaises(MODULE.ResumeError):
+                MODULE.inherited_child_authority(
+                    child, broken, child_token="GEN-94", child_issue_id="child-id",
+                    parent_comments=[],
+                )
+        receipt = MODULE.inherited_child_authority(
+            child, parent, child_token="GEN-94", child_issue_id="child-id",
+            parent_comments=[],
+        )
+        snapshot = {"root": {**child["root"], "id": "child-id", "url": "https://linear/GEN-94", "revision": 0, "status": "In Progress", "next_action": "test"}, "children": [], "material_events": [], "projection_events": [], "projection_history": [], "projection_quarantined": [], "projection_unresolved_quarantine": [], "projection_revision": 0, "material_event_revision": 0, "authenticated_route": receipt["child_route"], "authenticated_source": receipt["source"], "inherited_dependency_graph": {}, "inherited_authority": receipt}
+        with self.assertRaisesRegex(MODULE.ResumeError, "inherited_authority_source_mismatch"):
+            with mock.patch.object(MODULE, "select_plan_generation", return_value={
+                "plan_revision": "a" * 64, "transition_tip_event_id": None,
+                "activation_epoch": 0, "authority_origin": "legacy_description",
+            }):
+                MODULE.validate_snapshot({**snapshot, "source": None}, "GEN-94", require_projection_authority=True, trusted_inherited_authority=receipt)
+        for malformed in ("child", [], {"tip": "forged"}):
+            forged = copy.deepcopy(receipt)
+            forged["child_generation"] = malformed
+            with self.assertRaises(MODULE.ResumeError):
+                MODULE.validate_snapshot(
+                    {**snapshot, "inherited_authority": forged}, "GEN-94",
+                    trusted_inherited_authority=receipt,
+                )
+        for malformed in (None, "source", []):
+            with self.assertRaises(MODULE.ResumeError):
+                MODULE.validate_snapshot(
+                    {**snapshot, "authenticated_source": malformed}, "GEN-94",
+                    trusted_inherited_authority=receipt,
+                )
+
     def test_checkpoint_fence_uses_ordered_position_not_stale_writer_revision(self):
         prefix = {
             "event_id": "progress-1", "workstream_id": "GEN-37", "kind": "progress",
@@ -2486,6 +2889,139 @@ class ResumeTests(unittest.TestCase):
         constructor.assert_called_once_with(
             client, team_id="team", workspace_id="workspace", project_id="project"
         )
+
+    def test_live_cli_inherited_child_binds_authenticated_route_and_parent_authority(self):
+        source = {"identity": "https://example.test/plan", "sha256": "a" * 64}
+        parent_route = {"workspace_id": "workspace", "team_id": "team",
+                        "project_id": "project", "root_issue_id": "parent-id"}
+        child_route = {**parent_route, "root_issue_id": "child-id"}
+        child_snapshot = {"root": {"id": "child-id", "identifier": "GEN-94",
+                                   "parent": {"id": "parent-id", "identifier": "GEN-37"},
+                                   "plan_revision": "a" * 64,
+                                   "generation_transition_tip_event_id": "child-tip",
+                                   "generation_activation_epoch": 2,
+                                   "generation_authority_origin": "legacy_description",
+                                   "description": "child prose"},
+                         "children": [], "decisions": [], "provenance": []}
+        parent_snapshot = {"root": {"id": "parent-id", "identifier": "GEN-37",
+                                    "plan_revision": "a" * 64,
+                                    "generation_transition_tip_event_id": "parent-tip",
+                                    "generation_activation_epoch": 7,
+                                    "generation_authority_origin": "generation_transition",
+                                    "description": "Canonical plan: " + source["identity"]},
+                           "source": source,
+                           "scope": {"child_ownership": {"GEN-94": "github.com:id:shipyard"},
+                                     "repositories": [{"provider_repository_id": "shipyard",
+                                                        "slug": "github.com/acme/shipyard",
+                                                        "identity_resolution": {
+                                                            "provider_repository_id": "shipyard",
+                                                            "resolved_slug": "github.com/acme/shipyard",
+                                                            "observed_at": "2026-09-02T00:00:00Z",
+                                                            "evidence": [{"kind": "authenticated_provider_readback",
+                                                                          "authenticated": True,
+                                                                          "provider_repository_id": "shipyard",
+                                                                          "resolved_slug": "github.com/acme/shipyard"}],
+                                                        }}]},
+                           "projection_revision": 30,
+                           }
+        child_transport, parent_transport = mock.Mock(), mock.Mock()
+        child_transport.snapshot_for_root.return_value = copy.deepcopy(child_snapshot)
+        parent_transport.snapshot_for_root.return_value = copy.deepcopy(parent_snapshot)
+        comments = mock.Mock()
+        comments.comments.return_value = []
+        comment_factory = lambda client, issue_id, **kwargs: comments
+        generation = {"plan_revision": "a" * 64, "description_plan_revision": "a" * 64,
+                      "transition_tip_event_id": "parent-tip", "activation_epoch": 7,
+                      "authority_origin": "generation_transition", "predecessor_plan_revision": None}
+        dependency = mock.Mock()
+        dependency.read_authorized_graph.return_value = {"relations": [], "revision": 0,
+                                                         "plan_revision": "a" * 64,
+                                                         "observed_frontier": {"material_revision": 0,
+                                                                                "projection_revision": 30,
+                                                                                "graph_revision": 0,
+                                                                                "graph_sha256": hashlib.sha256(b"[]").hexdigest()},
+                                                         "sha256": hashlib.sha256(b"[]").hexdigest(),
+                                                         "root_readback_sha256": "x"}
+        dependency_constructor = mock.Mock(return_value=dependency)
+        captured = {}
+        validated = {}
+        material_calls = {"count": 0}
+        def validate_parent(snapshot, token, **kwargs):
+            validated["token"] = token
+            validated["kwargs"] = kwargs
+            return snapshot
+        def compact(snapshot, *args, **kwargs):
+            captured["snapshot"] = snapshot
+            return {"authority": "full", "source": snapshot.get("source")}
+        def material_history(snapshot, *args, **kwargs):
+            material_calls["count"] += 1
+            result = {**snapshot, "source": source,
+                      "authenticated_source": kwargs.get("authenticated_source"),
+                      "projection_revision": (30 if len(args) > 1 and args[1] == "GEN-37" else 0), "material_event_revision": (
+                          3 if len(args) > 1 and args[1] == "GEN-37" else 0)}
+            if material_calls["count"] == 6:
+                result["projection_events"] = [{"kind": "scope", "key": "root"}]
+            return result
+        with mock.patch.object(MODULE, "resolve_linear_route", return_value=(None, None)), \
+             mock.patch.object(MODULE, "resolve_authenticated_issue_route",
+                               side_effect=lambda client, token, route: child_route if token == "GEN-94" else parent_route), \
+             mock.patch.object(MODULE, "HttpGraphQLClient", return_value=mock.Mock()), \
+             mock.patch.object(MODULE, "LinearGraphQLTransport",
+                               side_effect=[child_transport, parent_transport,
+                                            child_transport, parent_transport]), \
+             mock.patch.object(MODULE, "LinearCommentEventAdapter", side_effect=comment_factory), \
+             mock.patch.object(MODULE, "load_linear_api_key", return_value="secret"), \
+             mock.patch.object(MODULE, "select_plan_generation", return_value=generation), \
+             mock.patch.object(MODULE, "bind_active_plan_generation", side_effect=lambda snapshot, *a, **k: snapshot), \
+             mock.patch.object(MODULE, "reduce_projection_comments", return_value=SimpleNamespace(snapshot={})), \
+             mock.patch.object(MODULE, "add_live_child_material_history", side_effect=lambda snapshot, **kwargs: snapshot), \
+             mock.patch.object(MODULE, "add_material_history", side_effect=material_history), \
+             mock.patch.object(MODULE, "plan_payload", return_value={"source": {**source, "bytes": 123}}), \
+             mock.patch.object(MODULE, "validate_snapshot", side_effect=validate_parent), \
+             mock.patch.object(MODULE, "LinearChildDependencyAdapter", dependency_constructor), \
+             mock.patch.object(MODULE, "compact_context", side_effect=compact), \
+             mock.patch.object(MODULE.sys, "argv", ["workstream_resume.py", "GEN-94"]), \
+             mock.patch.object(MODULE.sys, "stdout", io.StringIO()):
+            self.assertEqual(MODULE.main(), 0)
+            self.assertEqual(MODULE.main(), 2)
+        self.assertEqual(captured["snapshot"]["source"], source)
+        self.assertEqual(captured["snapshot"]["root"]["description"], "child prose")
+        self.assertEqual(captured["snapshot"]["root"]["generation_transition_tip_event_id"], "parent-tip")
+        self.assertEqual(captured["snapshot"]["inherited_authority"]["child_generation"]["plan_revision"], "a" * 64)
+        self.assertNotIn("projection_events", captured["snapshot"])
+        self.assertEqual(captured["snapshot"]["inherited_authority"]["owner"],
+                         "github.com:id:shipyard")
+        self.assertEqual(captured["snapshot"]["inherited_authority"]["projection_frontier"]["material_revision"], 3)
+        self.assertEqual(validated["token"], "GEN-37")
+        self.assertTrue(validated["kwargs"]["require_projection_authority"])
+        dependency_constructor.assert_has_calls([mock.call(
+            mock.ANY, workspace_id="workspace", team_id="team", project_id="project",
+            root_issue_id="parent-id", root_identifier="GEN-37", plan_revision="a" * 64,
+        ), mock.call(
+            mock.ANY, workspace_id="workspace", team_id="team", project_id="project",
+            root_issue_id="parent-id", root_identifier="GEN-37", plan_revision="a" * 64,
+        )])
+
+    def test_live_cli_inherited_child_route_mismatch_is_rejected(self):
+        child, parent = self.inherited_snapshots()
+        child_transport, parent_transport = mock.Mock(), mock.Mock()
+        child_transport.snapshot_for_root.return_value = child
+        parent_transport.snapshot_for_root.return_value = parent
+        wrong_child_route = {"workspace_id": "workspace", "team_id": "team",
+                             "project_id": "wrong", "root_issue_id": "child-id"}
+        parent_route = parent["authenticated_route"]
+        comments = mock.Mock(); comments.comments.return_value = []
+        with mock.patch.object(MODULE, "resolve_linear_route", return_value=(None, None)), \
+             mock.patch.object(MODULE, "resolve_authenticated_issue_route", side_effect=lambda client, token, route: wrong_child_route if token == "GEN-94" else parent_route), \
+             mock.patch.object(MODULE, "HttpGraphQLClient", return_value=mock.Mock()), \
+             mock.patch.object(MODULE, "LinearGraphQLTransport", side_effect=[child_transport, parent_transport]), \
+             mock.patch.object(MODULE, "LinearCommentEventAdapter", return_value=comments), \
+             mock.patch.object(MODULE, "select_plan_generation", return_value={"plan_revision": "a" * 64}), \
+             mock.patch.object(MODULE, "bind_active_plan_generation", side_effect=lambda snapshot, *a, **k: snapshot), \
+             mock.patch.object(MODULE, "reduce_projection_comments", return_value=SimpleNamespace(snapshot={})), \
+             mock.patch.object(MODULE, "load_linear_api_key", return_value="secret"), \
+             mock.patch.object(MODULE.sys, "argv", ["workstream_resume.py", "GEN-94"]):
+            self.assertEqual(MODULE.main(), 2)
 
     def test_repeated_live_full_resume_is_read_only_and_authenticates_source_first(self):
         graph = self.snapshot()

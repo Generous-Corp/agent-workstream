@@ -58,7 +58,7 @@ from workstream_child_closure import (
 from workstream_child_dependencies import (
     ChildDependencyError, LinearChildDependencyAdapter,
     dependency_root_readback_sha256,
-    validate_authorized_dependency_graph_surface,
+    validate_authorized_dependency_graph_surface, validate_dependency_graph_summary,
 )
 from workstream_scope import (
     repository_key, ScopeError, validate_relations, validate_scope,
@@ -79,11 +79,170 @@ MATERIAL_OBLIGATION_KEYS = {
     "requirement", "requirements", "blocker", "blockers",
     "followup", "followups", "decision", "decisions",
 }
+
+
+def inherited_child_authority(
+    child_snapshot: dict[str, Any], parent_snapshot: dict[str, Any],
+    *, child_token: str, child_issue_id: str,
+    parent_comments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Bind a child to its authenticated parent's source and ownership."""
+    child = child_snapshot.get("root") or {}
+    parent = parent_snapshot.get("root") or {}
+    parent_ref = child.get("parent") or {}
+    if (
+        child.get("id") != child_issue_id
+        or str(child.get("identifier", "")).upper() != child_token.upper()
+        or parent_ref.get("id") != parent.get("id")
+        or str(parent_ref.get("identifier", "")).upper()
+        != str(parent.get("identifier", "")).upper()
+    ):
+        raise ResumeError("inherited_child_parent_mismatch")
+    source = parent_snapshot.get("source")
+    scope = parent_snapshot.get("scope")
+    if not isinstance(scope, dict) or not isinstance(scope.get("child_ownership"), dict):
+        raise ResumeError("inherited_child_owner_missing")
+    owner = scope["child_ownership"].get(child_token.upper())
+    parent_route = parent_snapshot.get("authenticated_route")
+    child_route = child_snapshot.get("authenticated_route")
+    if not isinstance(source, dict) or not source.get("identity") or not source.get("sha256"):
+        raise ResumeError("inherited_child_source_missing")
+    if not isinstance(parent_route, dict) or not parent_route.get("root_issue_id"):
+        raise ResumeError("inherited_child_parent_route_missing")
+    if parent_route.get("root_issue_id") != parent.get("id"):
+        raise ResumeError("inherited_child_parent_route_mismatch")
+    if (
+        not isinstance(child_route, dict)
+        or child_route.get("root_issue_id") != child_issue_id
+        or any(child_route.get(field) != parent_route.get(field)
+               for field in ("workspace_id", "team_id", "project_id"))
+    ):
+        raise ResumeError("inherited_child_route_mismatch")
+    if not isinstance(owner, str) or not owner.strip():
+        raise ResumeError(f"inherited_child_owner_missing:{child_token.upper()}")
+    repositories = scope.get("repositories") or []
+    if not isinstance(repositories, list) or not repositories:
+        raise ResumeError("inherited_child_owner_repository_missing")
+    if owner not in {
+        repository_key(item) for item in repositories if isinstance(item, dict)
+    }:
+        raise ResumeError("inherited_child_owner_mismatch")
+    authenticated_source = parent_snapshot.get("authenticated_source")
+    if authenticated_source is not None:
+        try:
+            if canonical_authenticated_source(authenticated_source) != canonical_authenticated_source(source):
+                raise ResumeError("inherited_child_source_mismatch")
+        except ValueError as error:
+            raise ResumeError("inherited_child_source_mismatch") from error
+    material_revision = parent_snapshot.get("material_event_revision")
+    projection_revision = parent_snapshot.get("projection_revision")
+    if (not isinstance(material_revision, int) or material_revision < 0
+            or not isinstance(projection_revision, int) or projection_revision < 0):
+        raise ResumeError("inherited_child_projection_frontier_missing")
+    child_plan = child.get("plan_revision")
+    parent_plan = parent.get("plan_revision")
+    if not isinstance(child_plan, str) or not child_plan:
+        raise ResumeError("inherited_child_generation_missing")
+    if not isinstance(parent_plan, str) or not parent_plan:
+        raise ResumeError("inherited_child_generation_missing")
+    parent_generation = select_plan_generation(
+            parent_comments, workstream_id=str(parent.get("identifier", "")).upper(),
+            description_plan_revision=parent.get("description_plan_revision"),
+            authenticated_route=parent_route, include_predecessor=True,
+        )
+    if any(
+        parent_generation.get(key) != parent.get(root_key)
+        for key, root_key in (("plan_revision", "plan_revision"),
+                              ("transition_tip_event_id", "generation_transition_tip_event_id"),
+                              ("activation_epoch", "generation_activation_epoch"),
+                              ("authority_origin", "generation_authority_origin"))
+        if parent_generation.get(key) is not None
+    ):
+        raise ResumeError("inherited_child_generation_mismatch")
+    if parent_plan != source.get("sha256"):
+        raise ResumeError("inherited_child_generation_source_mismatch")
+    disposition = None
+    if child_plan and child_plan != parent_plan:
+        if not (
+            parent.get("generation_authority_origin") == "generation_transition"
+            and child.get("generation_authority_origin") == "legacy_description"
+            and isinstance(parent_generation, dict)
+            and parent_generation.get("predecessor_plan_revision") == child_plan
+        ):
+            raise ResumeError("inherited_child_plan_revision_mismatch")
+        disposition = "older_generation_safety_tail"
+    return {
+        "source": deepcopy(source),
+        "generation": {
+            key: parent.get(key) for key in (
+                "plan_revision", "description_plan_revision",
+                "generation_transition_tip_event_id", "generation_activation_epoch",
+                "generation_authority_origin",
+            )
+        } | {"predecessor_plan_revision": parent_generation.get("predecessor_plan_revision")},
+        "generation_proof": {
+            key: parent.get(key) for key in (
+                "plan_revision", "generation_transition_tip_event_id",
+                "generation_activation_epoch", "generation_authority_origin",
+            )
+        },
+        "parent_comments": deepcopy(parent_comments),
+        "projection_frontier": {
+            "material_revision": parent_snapshot.get("material_event_revision"),
+            "revision": projection_revision,
+            "root_readback_sha256": dependency_root_readback_sha256(parent),
+            "scope_event_id": parent_snapshot.get("scope_event_id"),
+        },
+        "owner": owner,
+        "parent_route": deepcopy(parent_route),
+        "child_route": deepcopy(child_route),
+        "child_issue_id": child_issue_id,
+        "child_token": child_token.upper(),
+        "parent_token": str(parent.get("identifier", "")).upper(),
+        "child_generation": {
+            "plan_revision": child.get("plan_revision"),
+        },
+        "disposition": disposition,
+        "projection": {
+            key: deepcopy(parent_snapshot.get(key)) for key in (
+                "projection_events", "projection_history", "projection_quarantined",
+                "projection_unresolved_quarantine", "quarantine_disposition",
+                "projection_recovery", "projection_revision", "scope", "source",
+                "authenticated_source",
+            ) if key in parent_snapshot
+        },
+        "parent_projection_events": deepcopy(parent_snapshot.get("projection_events", [])),
+    }
+
+
+def require_empty_inherited_child_projection(snapshot: dict[str, Any]) -> None:
+    """Standalone children may not carry an independent projection stream."""
+    local_artifacts = (
+        "projection_events", "projection_history", "projection_quarantined",
+        "projection_unresolved_quarantine", "quarantine_disposition",
+        "projection_recovery",
+    )
+    if any(snapshot.get(field) for field in local_artifacts) or snapshot.get(
+        "projection_revision"
+    ) not in (None, 0):
+        raise ResumeError("inherited_child_local_projection_conflict")
 RAW_TRANSCRIPT_KEYS = {"raw_transcript", "transcript"}
 
 
 class ResumeError(ValueError):
     pass
+
+
+def _validated_inherited_parent_route(inherited: dict[str, Any]) -> dict[str, Any]:
+    """Return a complete authenticated parent route or fail closed."""
+    route = inherited.get("parent_route")
+    required = ("workspace_id", "team_id", "project_id", "root_issue_id")
+    if not isinstance(route, dict) or any(
+        not isinstance(route.get(key), str) or not route.get(key).strip()
+        for key in required
+    ):
+        raise ResumeError("inherited_dependency_parent_route_missing")
+    return route
 
 
 def apply_generation_execution_status(
@@ -1392,6 +1551,7 @@ def validate_snapshot(
     require_dependency_graph: bool | None = None,
     expected_missing_terminal_closures: frozenset[str] = frozenset(),
     authorized_prepared_transition_event_id: str | None = None,
+    trusted_inherited_authority: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if require_dependency_graph is None:
         require_dependency_graph = require_projection_authority
@@ -1850,8 +2010,178 @@ def validate_snapshot(
                     "disposition_checkpoint_stale_reconcile_required"
                 )
     dependency_graph = snapshot.get("dependency_graph")
-    if require_dependency_graph and dependency_graph is None:
+    inherited_dependency_graph = snapshot.get("inherited_dependency_graph")
+    inherited = snapshot.get("inherited_authority")
+    if inherited is not None:
+        if not isinstance(inherited, dict):
+            raise ResumeError("invalid_inherited_authority")
+        if require_projection_authority and trusted_inherited_authority is None:
+            raise ResumeError("trusted_inherited_authority_missing")
+        if trusted_inherited_authority is not None and json.dumps(
+            inherited, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ) != json.dumps(
+            trusted_inherited_authority, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")
+        ):
+            raise ResumeError("inherited_authority_anchor_mismatch")
+        if require_projection_authority and snapshot.get("inherited_dependency_graph") is None:
+            raise ResumeError("inherited_dependency_graph_missing")
+        required = ("source", "owner", "child_token", "child_issue_id",
+                    "parent_token", "parent_route", "child_route",
+                    "generation", "projection_frontier")
+        if any(key not in inherited for key in required):
+            raise ResumeError("inherited_authority_incomplete")
+        if (str(inherited["child_token"]).upper() != identifier.upper()
+                or inherited["child_issue_id"] != root.get("id")):
+            raise ResumeError("inherited_child_identity_mismatch")
+        parent_route = _validated_inherited_parent_route(inherited)
+        parent_ref = root.get("parent") or {}
+        if (parent_ref.get("id") != parent_route["root_issue_id"]
+                or str(parent_ref.get("identifier", "")).upper()
+                != str(inherited["parent_token"]).upper()):
+            raise ResumeError("inherited_child_parent_mismatch")
+        child_route = inherited["child_route"]
+        if not isinstance(child_route, dict) or set(child_route) != route_fields:
+            raise ResumeError("inherited_child_route_mismatch")
+        if authenticated_route is not None and child_route != authenticated_route:
+            raise ResumeError("inherited_child_route_mismatch")
+        if child_route.get("root_issue_id") != root.get("id"):
+            raise ResumeError("inherited_child_route_mismatch")
+        if any(parent_route.get(field) != child_route.get(field)
+               for field in ("workspace_id", "team_id", "project_id")):
+            raise ResumeError("inherited_child_route_mismatch")
+        if not isinstance(inherited["parent_token"], str) or not inherited["parent_token"].strip():
+            raise ResumeError("inherited_authority_incomplete")
+        generation = inherited["generation"]
+        if not isinstance(generation, dict):
+            raise ResumeError("inherited_child_generation_mismatch")
+        parent_comments = inherited.get("parent_comments")
+        if not isinstance(parent_comments, list):
+            raise ResumeError("inherited_child_generation_mismatch")
+        try:
+            selected = select_plan_generation(
+                parent_comments, workstream_id=str(inherited["parent_token"]).upper(),
+                description_plan_revision=generation.get("description_plan_revision"),
+                authenticated_route=parent_route, include_predecessor=True,
+            )
+        except Exception as error:
+            raise ResumeError("inherited_child_generation_mismatch") from error
+        for selected_key, generation_key in (
+            ("plan_revision", "plan_revision"),
+            ("transition_tip_event_id", "generation_transition_tip_event_id"),
+            ("activation_epoch", "generation_activation_epoch"),
+            ("authority_origin", "generation_authority_origin"),
+        ):
+            if selected.get(selected_key) != generation.get(generation_key):
+                raise ResumeError("inherited_child_generation_mismatch")
+        if (generation.get("generation_authority_origin") == "generation_transition"
+                and generation.get("generation_transition_tip_event_id")
+                not in {event.get("event_id") for event in inherited.get("parent_projection_events", [])
+                        if isinstance(event, dict)}):
+            raise ResumeError("inherited_child_generation_mismatch")
+        generation_proof = inherited.get("generation_proof")
+        if not isinstance(generation_proof, dict):
+            raise ResumeError("inherited_child_generation_mismatch")
+        for field in ("plan_revision", "generation_transition_tip_event_id",
+                      "generation_activation_epoch", "generation_authority_origin"):
+            if generation.get(field) != generation_proof.get(field):
+                raise ResumeError("inherited_child_generation_mismatch")
+        frontier = inherited["projection_frontier"]
+        if (not isinstance(generation, dict)
+                or not isinstance(generation.get("plan_revision"), str)
+                or generation["plan_revision"] != root.get("plan_revision")):
+            raise ResumeError("inherited_child_generation_mismatch")
+        if (not isinstance(frontier, dict)
+                or not isinstance(frontier.get("material_revision"), int)
+                or frontier["material_revision"] < 0
+                or not isinstance(frontier.get("revision"), int)
+                or frontier["revision"] < 0
+                or not isinstance(frontier.get("root_readback_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", frontier["root_readback_sha256"])):
+            raise ResumeError("inherited_authority_frontier_mismatch")
+        source = inherited["source"]
+        if not isinstance(source, dict) or not source.get("identity") or not source.get("sha256"):
+            raise ResumeError("inherited_authority_source_mismatch")
+        try:
+            if (not isinstance(snapshot.get("source"), dict)
+                    or not isinstance(snapshot.get("authenticated_source"), dict)
+                    or canonical_authenticated_source(snapshot.get("source")) != canonical_authenticated_source(source)
+                    or canonical_authenticated_source(snapshot.get("authenticated_source")) != canonical_authenticated_source(source)):
+                raise ResumeError("inherited_authority_source_mismatch")
+        except (ValueError, TypeError, AttributeError) as error:
+            raise ResumeError("inherited_authority_source_mismatch") from error
+        owner = inherited["owner"]
+        if not isinstance(owner, str) or not owner.strip():
+            raise ResumeError("inherited_authority_owner_mismatch")
+        inherited_projection = inherited.get("projection")
+        if not isinstance(inherited_projection, dict):
+            raise ResumeError("inherited_authority_owner_mismatch")
+        inherited_scope = inherited_projection.get("scope")
+        if not isinstance(inherited_scope, dict):
+            raise ResumeError("inherited_authority_owner_mismatch")
+        child_ownership = inherited_scope.get("child_ownership")
+        if not isinstance(child_ownership, dict):
+            raise ResumeError("inherited_authority_owner_mismatch")
+        mapped = child_ownership.get(identifier.upper())
+        repositories = inherited_scope.get("repositories")
+        if not isinstance(repositories, list) or not repositories:
+            raise ResumeError("inherited_authority_owner_mismatch")
+        try:
+            catalog = {repository_key(item) for item in repositories if isinstance(item, dict)}
+        except (ScopeError, ValueError) as error:
+            raise ResumeError("inherited_authority_owner_mismatch") from error
+        if mapped != owner or owner not in catalog:
+            raise ResumeError("inherited_authority_owner_mismatch")
+        if inherited.get("disposition") not in (None, "older_generation_safety_tail"):
+            raise ResumeError("inherited_authority_disposition_mismatch")
+        child_generation = inherited.get("child_generation")
+        if not isinstance(child_generation, dict) or set(child_generation) != {"plan_revision"}:
+            raise ResumeError("inherited_authority_generation_mismatch")
+        child_plan = child_generation.get("plan_revision")
+        expected_disposition = (
+            "older_generation_safety_tail"
+            if child_plan and child_plan != generation.get("plan_revision")
+            and generation.get("generation_authority_origin") == "generation_transition"
+            and generation.get("predecessor_plan_revision") == child_plan
+            else None
+        )
+        if inherited.get("disposition") != expected_disposition:
+            raise ResumeError("inherited_authority_disposition_mismatch")
+        if inherited_projection.get("projection_revision") not in (None, frontier["revision"]):
+            raise ResumeError("inherited_authority_frontier_mismatch")
+        if "projection_events" in inherited_projection and inherited_projection.get("projection_events") != inherited.get("parent_projection_events", []):
+            raise ResumeError("inherited_authority_projection_mismatch")
+    if require_dependency_graph and dependency_graph is None and inherited_dependency_graph is None:
         raise ResumeError("authenticated_dependency_graph_missing")
+    if inherited_dependency_graph is not None:
+        inherited = snapshot.get("inherited_authority") or {}
+        if not isinstance(inherited_dependency_graph, dict):
+            raise ResumeError("invalid_inherited_dependency_graph")
+        if inherited_dependency_graph.get("route") != inherited.get("parent_route"):
+            raise ResumeError("inherited_dependency_route_mismatch")
+        if inherited_dependency_graph.get("plan_revision") != (inherited.get("generation") or {}).get("plan_revision"):
+            raise ResumeError("inherited_dependency_generation_mismatch")
+        frontier = inherited.get("projection_frontier") or {}
+        parent_route = _validated_inherited_parent_route(inherited)
+        parent_token = inherited.get("parent_token")
+        if not isinstance(parent_token, str) or not parent_token.strip():
+            raise ResumeError("inherited_dependency_parent_route_missing")
+        try:
+            inherited_dependency_graph = validate_authorized_dependency_graph_surface(
+                inherited_dependency_graph,
+                inherited.get("parent_projection_events", []),
+                authority={**parent_route, "root_identifier": parent_token},
+                plan_revision=(inherited.get("generation") or {}).get("plan_revision"),
+                expected_frontier={
+                    "material_revision": frontier.get("material_revision"),
+                    "projection_revision": frontier.get("revision"),
+                    "graph_revision": inherited_dependency_graph["observed_frontier"]["graph_revision"],
+                    "graph_sha256": inherited_dependency_graph["observed_frontier"]["graph_sha256"],
+                },
+                expected_root_readback_sha256=frontier.get("root_readback_sha256"),
+            )
+        except (ChildDependencyError, KeyError) as error:
+            raise ResumeError("inherited_dependency_graph_invalid") from error
     if dependency_graph is not None:
         if not isinstance(authenticated_route, dict):
             raise ResumeError("dependency_graph_authenticated_route_missing")
@@ -1894,7 +2224,11 @@ def validate_snapshot(
                         raise ResumeError(f"projection_route_mismatch:{field}")
         source = snapshot.get("source")
         if source is not None:
-            if not isinstance(source, dict) or source.get("sha256") != root["plan_revision"]:
+            inherited = snapshot.get("inherited_authority") or {}
+            tail = inherited.get("disposition") == "older_generation_safety_tail"
+            if not isinstance(source, dict) or (
+                source.get("sha256") != root["plan_revision"] and not tail
+            ):
                 raise ResumeError("projection_source_plan_mismatch")
             authenticated_source = snapshot.get("authenticated_source")
             if authenticated_source is not None:
@@ -2092,10 +2426,17 @@ def validate_snapshot(
     except (ChildDependencyError, ChoiceError, ScopeError) as error:
         raise ResumeError(str(error)) from error
     if require_projection_authority:
-        if not projection_events:
+        inherited = snapshot.get("inherited_authority")
+        if not projection_events and not isinstance(inherited, dict):
             raise ResumeError("projection_authority_absent")
         if snapshot.get("authenticated_source") is None:
             raise ResumeError("projection_source_bytes_unverified")
+        if isinstance(inherited, dict):
+            if not inherited.get("source") or not inherited.get("owner"):
+                raise ResumeError("inherited_authority_incomplete")
+            frontier = inherited.get("projection_frontier")
+            if not isinstance(frontier, dict) or not isinstance(frontier.get("revision"), int):
+                raise ResumeError("inherited_authority_frontier_missing")
     repairs = snapshot.get("material_semantic_repairs", [])
     raw_material_events = snapshot.get("raw_material_events", material_events)
     if not isinstance(repairs, list) or not isinstance(raw_material_events, list):
@@ -2113,6 +2454,7 @@ def validate_snapshot(
             "latest_checkpoint": latest_checkpoint,
             "checkpoint_recovery": checkpoint_recovery,
             "source": snapshot.get("source"),
+            "inherited_authority": snapshot.get("inherited_authority"),
             "disposition": snapshot.get("disposition"),
             "projection_events": projection_events,
             "projection_history": projection_history,
@@ -2126,6 +2468,7 @@ def validate_snapshot(
             "lifecycle_recovery": lifecycle_recovery,
             "authenticated_route": authenticated_route,
             "dependency_graph": dependency_graph,
+            "inherited_dependency_graph": inherited_dependency_graph,
             "authenticated_source": snapshot.get("authenticated_source")}
 
 
@@ -2329,7 +2672,9 @@ def _bounded_authority_envelope(
         # Keep its already-validated semantic surface in every executable
         # representation; consumers must hydrate before mutation, but should
         # never mistake an omitted graph for an empty graph.
-        "child_dependency_graph": deepcopy(context.get("dependency_graph")),
+        "child_dependency_graph": deepcopy(
+            context.get("dependency_graph") or context.get("inherited_dependency_graph")
+        ),
         "checkpoint": _bounded_semantic(
             context.get("latest_checkpoint"), text_limit=text_limit,
         ),
@@ -2346,6 +2691,7 @@ def _bounded_authority_envelope(
         "surface_availability", "projection_revision", "projection_recovery",
         "lifecycle_recovery", "projection_quarantine", "authenticated_route",
         "authenticated_source", "history", "resume_authority",
+        "inherited_authority",
     )
     deferred_names = sorted(
         set(context) - set(keep) - {"deferred_audit_detail"}
@@ -2465,7 +2811,7 @@ def _fixed_frontier_authority_envelope(
         brief(field(item, "type", "kind")),
         brief(field(field(item, "target"), "identifier", "issue_id", "id")),
     ] for item in context.get("relations", [])]
-    dependency_graph = context.get("dependency_graph") or {}
+    dependency_graph = context.get("dependency_graph") or context.get("inherited_dependency_graph") or {}
     child_dependencies = [[
         field(item, "id"),
         field(field(item, "blocker"), "identifier", "issue_id"),
@@ -2495,6 +2841,7 @@ def _fixed_frontier_authority_envelope(
     }
     checkpoint_brief = brief(context.get("latest_checkpoint"))
     disposition_brief = brief(context.get("disposition"))
+    inherited = context.get("inherited_authority")
     route_brief = {
         key: brief(value)
         for key, value in (context.get("authenticated_route") or {}).items()
@@ -2554,6 +2901,19 @@ def _fixed_frontier_authority_envelope(
         },
         "authenticated_route": route_brief,
         "authenticated_source": source_brief,
+        "inherited_authority": (
+            {
+                "owner": inherited.get("owner"),
+                "child_token": brief(inherited.get("child_token")),
+                "child_issue_id": brief(inherited.get("child_issue_id")),
+                "generation": inherited.get("generation"),
+                "child_generation": {"plan_revision": (inherited.get("child_generation") or {}).get("plan_revision")},
+                "projection_frontier": inherited.get("projection_frontier"),
+                "parent_route": deepcopy(inherited.get("parent_route")),
+                "child_route": deepcopy(inherited.get("child_route")),
+                "disposition": inherited.get("disposition"),
+            } if isinstance(inherited, dict) else None
+        ),
         # Compact fields may be abbreviated for display.  These immutable
         # digests keep the complete authority binding available to consumers
         # without re-expanding the envelope beyond its byte budget.
@@ -2592,7 +2952,10 @@ def _fixed_frontier_authority_envelope(
                 "decisions": ".decisions[<row>]",
                 "choices": ".choice_events[<row>]",
                 "dependencies": ".relations[<row>]",
-                "child_dependency_graph": ".dependency_graph",
+                "child_dependency_graph": (
+                    ".inherited_dependency_graph" if context.get("inherited_dependency_graph") is not None
+                    else ".dependency_graph"
+                ),
                 "checkpoint": ".latest_checkpoint",
                 "disposition": ".disposition",
             },
@@ -2619,6 +2982,7 @@ def compact_context(
     require_dependency_graph: bool | None = None,
     expected_missing_terminal_closures: frozenset[str] = frozenset(),
     authorized_prepared_transition_event_id: str | None = None,
+    trusted_inherited_authority: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_token = extract_token(token)
     clean = validate_snapshot(
@@ -2629,6 +2993,7 @@ def compact_context(
         authorized_prepared_transition_event_id=(
             authorized_prepared_transition_event_id
         ),
+        trusted_inherited_authority=trusted_inherited_authority,
     )
     root = clean["root"]
     project = root.get("project")
@@ -2863,6 +3228,21 @@ def compact_context(
         ),
         "deferred_audit_detail": {"state": "none"},
     }
+    if clean.get("inherited_dependency_graph") is not None:
+        context["inherited_dependency_graph"] = clean["inherited_dependency_graph"]
+    if isinstance(clean.get("inherited_authority"), dict):
+        inherited = clean["inherited_authority"]
+        context["inherited_authority"] = {
+            "owner": inherited.get("owner"),
+            "child_token": inherited.get("child_token"),
+            "child_issue_id": inherited.get("child_issue_id"),
+            "generation": deepcopy(inherited.get("generation")),
+            "child_generation": {"plan_revision": (inherited.get("child_generation") or {}).get("plan_revision")},
+            "projection_frontier": deepcopy(inherited.get("projection_frontier")),
+            "parent_route": deepcopy(inherited.get("parent_route")),
+            "child_route": deepcopy(inherited.get("child_route")),
+            "disposition": inherited.get("disposition"),
+        }
     if include_history:
         context["material_events"] = clean["material_events"]
         context["raw_material_events"] = clean["raw_material_events"]
@@ -2895,8 +3275,8 @@ def compact_context(
             context.get("projection_unresolved_quarantine", []),
         )
     ) + len(clean["provenance"]) + (
-        len((clean["dependency_graph"] or {}).get("relations", []))
-        + len((clean["dependency_graph"] or {}).get("authorization_batches", []))
+        len((clean["dependency_graph"] or clean.get("inherited_dependency_graph") or {}).get("relations", []))
+        + len((clean["dependency_graph"] or clean.get("inherited_dependency_graph") or {}).get("authorization_batches", []))
     )
     if max_items < 0 or item_count > max_items:
         raise ResumeError(f"resume_context_over_item_budget:{item_count}>{max_items}")
@@ -3027,6 +3407,7 @@ def main() -> int:
     try:
         token = extract_token(args.token)
         authenticated_source = None
+        inherited_authority = None
         if args.snapshot is not None and not args.inspection_only:
             raise ResumeError("snapshot_input_requires_inspection_only")
         if args.snapshot is None:
@@ -3053,6 +3434,81 @@ def main() -> int:
             live_graph_snapshot = transport.snapshot_for_root(
                 token, include_child_comments=True, include_description=True,
             )
+            # The transport snapshot is intentionally route-neutral; bind the
+            # route that was just authenticated before inherited-child checks.
+            live_graph_snapshot["authenticated_route"] = route
+            inherited_authority = None
+            parent_ref = (live_graph_snapshot["root"].get("parent") or {})
+            if parent_ref:
+                parent_token = str(parent_ref.get("identifier", "")).upper()
+                if not parent_token:
+                    raise ResumeError("inherited_child_parent_missing")
+                parent_route = resolve_authenticated_issue_route(
+                    client, parent_token, route,
+                )
+                parent_transport = LinearGraphQLTransport(
+                    client,
+                    team_id=parent_route["team_id"],
+                    workspace_id=parent_route.get("workspace_id"),
+                    project_id=parent_route.get("project_id"),
+                )
+                parent_snapshot = parent_transport.snapshot_for_root(
+                    parent_token, include_child_comments=True,
+                    include_description=True,
+                )
+                parent_comments = LinearCommentEventAdapter(
+                    client, issue_id=parent_token,
+                    team_id=parent_route["team_id"],
+                    workspace_id=parent_route.get("workspace_id"),
+                    project_id=parent_route.get("project_id"),
+                ).comments()
+                parent_generation = select_plan_generation(
+                    parent_comments, workstream_id=parent_token,
+                    description_plan_revision=parent_snapshot["root"]["plan_revision"],
+                    authenticated_route=parent_route,
+                    include_predecessor=True,
+                )
+                parent_snapshot = bind_active_plan_generation(
+                    parent_snapshot, parent_comments,
+                    workstream_id=parent_token, selected=parent_generation,
+                    authenticated_route=parent_route,
+                )
+                parent_projection = reduce_projection_comments(
+                    parent_comments, workstream_id=parent_token,
+                    expected_plan_revision=parent_snapshot["root"]["plan_revision"],
+                    authenticated_route=parent_route,
+                )
+                parent_snapshot.update(parent_projection.snapshot)
+                parent_snapshot["authenticated_route"] = parent_route
+                parent_source = parent_snapshot.get("source") or {}
+                parent_identity = parent_source.get("identity") or parent_source.get("url")
+                if not parent_identity:
+                    raise ResumeError("inherited_child_source_missing")
+                parent_authenticated_source = plan_payload(
+                    parent_identity, parent_identity,
+                )["source"]
+                parent_snapshot = add_material_history(
+                    parent_snapshot, parent_comments, parent_token,
+                    authenticated_route=parent_route,
+                    authenticated_source=parent_authenticated_source,
+                )
+                if not isinstance(parent_snapshot.get("material_event_revision"), int):
+                    raise ResumeError("inherited_child_parent_material_frontier_missing")
+                inherited_authority = inherited_child_authority(
+                    live_graph_snapshot, parent_snapshot,
+                    child_token=token, child_issue_id=route["root_issue_id"],
+                    parent_comments=parent_comments,
+                )
+                # Authenticate parent bytes before validating its complete
+                # projection authority; transport snapshots may omit this
+                # field until the source loader is invoked.
+                if canonical_authenticated_source(parent_snapshot["authenticated_source"]) != canonical_authenticated_source(inherited_authority["source"]):
+                    raise ResumeError("inherited_child_source_mismatch")
+                validate_snapshot(
+                    parent_snapshot, parent_token,
+                    require_projection_authority=True,
+                    require_dependency_graph=False,
+                )
             # The canonical-plan label is also part of the authenticated native
             # root readback used by dependency and lifecycle fences. Read it
             # without removing it from the shared snapshot.
@@ -3075,12 +3531,17 @@ def main() -> int:
                 live_graph_snapshot, comments, workstream_id=token,
                 selected=generation, authenticated_route=route,
             )
+            # Standalone children execute under the authenticated parent
+            # generation; retain child-local generation for diagnostics.
+            execution_generation = (
+                parent_generation if inherited_authority is not None else generation
+            )
             from workstream_linear_projection import (
                 child_mutation_authorizations_from_comments,
             )
             mutation_authorizations = child_mutation_authorizations_from_comments(
                 comments, workstream_id=token,
-                description_plan_revision=generation[
+                description_plan_revision=execution_generation[
                     "description_plan_revision"
                 ], authenticated_route=route,
             )
@@ -3140,7 +3601,10 @@ def main() -> int:
             )
             snapshot = json.loads(raw)
         if not args.inspection_only:
-            projected_source = snapshot.get("source") or {}
+            projected_source = (
+                inherited_authority["source"]
+                if inherited_authority is not None else snapshot.get("source") or {}
+            )
             projected_identity = projected_source.get("identity") or projected_source.get("url")
             source_location = args.plan_source or projected_identity
             if not source_location:
@@ -3148,6 +3612,8 @@ def main() -> int:
             authenticated_source = plan_payload(
                 source_location, args.plan_identity or projected_identity
             )["source"]
+            if inherited_authority is not None and canonical_authenticated_source(authenticated_source) != canonical_authenticated_source(inherited_authority["source"]):
+                raise ResumeError("inherited_child_source_mismatch")
             if args.snapshot is None:
                 snapshot = add_material_history(
                     live_graph_snapshot, comments, token, authenticated_route=route,
@@ -3157,12 +3623,13 @@ def main() -> int:
                     ),
                 )
                 freshness = plan_generation_freshness(
-                    token=token,
-                    description=root_description,
+                    token=(parent_ref.get("identifier") if inherited_authority is not None else token),
+                    description=(parent_snapshot["root"].get("description", "")
+                                 if inherited_authority is not None else root_description),
                     active_source=authenticated_source,
-                    comments=comments,
-                    authenticated_route=route,
-                    generation=generation,
+                    comments=(parent_comments if inherited_authority is not None else comments),
+                    authenticated_route=(parent_route if inherited_authority is not None else route),
+                    generation=(parent_generation if inherited_authority is not None else generation),
                 )
                 if freshness is not None:
                     freshness["authenticated_route"] = route
@@ -3186,28 +3653,50 @@ def main() -> int:
                     )
                     sys.stdout.write(_default_output_text(freshness))
                     return 0
-                snapshot["dependency_graph"] = LinearChildDependencyAdapter(
+                dependency_route = parent_route if inherited_authority is not None else route
+                dependency_token = parent_token if inherited_authority is not None else token
+                dependency_root = parent_snapshot["root"] if inherited_authority is not None else snapshot["root"]
+                dependency_result = LinearChildDependencyAdapter(
                     client,
-                    workspace_id=route["workspace_id"],
-                    team_id=route["team_id"],
-                    project_id=route["project_id"],
-                    root_issue_id=route["root_issue_id"],
-                    root_identifier=token,
-                    plan_revision=generation["plan_revision"],
+                    workspace_id=dependency_route["workspace_id"],
+                    team_id=dependency_route["team_id"],
+                    project_id=dependency_route["project_id"],
+                    root_issue_id=dependency_route["root_issue_id"],
+                    root_identifier=dependency_token,
+                    plan_revision=execution_generation["plan_revision"],
                 ).read_authorized_graph(
-                    expected_material_revision=snapshot["material_event_revision"],
-                    expected_projection_revision=snapshot["projection_revision"],
+                    expected_material_revision=(parent_snapshot.get("material_event_revision", snapshot["material_event_revision"]) if inherited_authority is not None else snapshot["material_event_revision"]),
+                    expected_projection_revision=(parent_snapshot.get("projection_revision", snapshot["projection_revision"]) if inherited_authority is not None else snapshot["projection_revision"]),
                     expected_root_readback_sha256=(
-                        dependency_root_readback_sha256(snapshot["root"])
+                        dependency_root_readback_sha256(dependency_root)
                     ),
                 )
+                if inherited_authority is not None:
+                    snapshot["inherited_dependency_graph"] = dependency_result
+                else:
+                    snapshot["dependency_graph"] = dependency_result
             else:
                 snapshot["authenticated_source"] = authenticated_source
+            if inherited_authority is not None:
+                require_empty_inherited_child_projection(snapshot)
+                # A standalone child has no local projection stream.  Join the
+                # already validated parent frontier explicitly while retaining
+                # all child-native prose/status and route identity.
+                snapshot["source"] = deepcopy(inherited_authority["source"])
+                snapshot["authenticated_source"] = deepcopy(authenticated_source)
+                snapshot["authenticated_route"] = deepcopy(route)
+                snapshot["inherited_authority"] = deepcopy(inherited_authority)
+                for field, value in inherited_authority["generation"].items():
+                    if value is not None:
+                        snapshot["root"][field] = deepcopy(value)
+                if inherited_authority.get("disposition"):
+                    snapshot["disposition"] = inherited_authority["disposition"]
         output = compact_context(
             snapshot, token, args.max_bytes, args.max_items,
             require_projection_authority=not args.inspection_only,
             require_dependency_graph=not args.inspection_only,
             include_history=args.include_history,
+            trusted_inherited_authority=inherited_authority,
         )
     except (
         OSError, json.JSONDecodeError, ResumeError, LinearTransportError,

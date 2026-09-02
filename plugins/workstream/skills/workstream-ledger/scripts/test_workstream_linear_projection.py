@@ -8980,6 +8980,15 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(replay["writes"], [])
         self.assertEqual(len(fixture["client"].comments), after_first_write)
 
+    def test_generation_selector_opt_in_returns_validated_transition_predecessor(self):
+        fixture = self.generation_checkpoint_ownership_repair_fixture()
+        selected = select_plan_generation(
+            fixture["client"].comments, workstream_id="GEN-37",
+            description_plan_revision="b" * 64,
+            authenticated_route=AUTHORITY, include_predecessor=True,
+        )
+        self.assertEqual(selected["predecessor_plan_revision"], "b" * 64)
+
     def test_generation_checkpoint_wrong_plan_fence_refuses_zero_write(self):
         fixture = self.generation_checkpoint_ownership_repair_fixture()
         before = len(fixture["client"].comments)

@@ -2884,6 +2884,7 @@ def select_plan_generation(
     comments: list[dict[str, Any]], *, workstream_id: str,
     description_plan_revision: str | None,
     authenticated_route: dict[str, str] | None = None,
+    include_predecessor: bool = False,
 ) -> dict[str, Any]:
     """Select the append-only authority tip, preserving description-only roots."""
     material_revision = reduce_event_comments(
@@ -2924,13 +2925,16 @@ def select_plan_generation(
     if not controls:
         if not isinstance(description_plan_revision, str) or not description_plan_revision:
             raise LinearProjectionError("generation_description_plan_missing_bootstrap_required")
-        return {
+        result = {
             "plan_revision": description_plan_revision,
             "description_plan_revision": description_plan_revision,
             "transition_tip_event_id": None,
             "activation_epoch": None,
             "authority_origin": "legacy_description",
         }
+        if include_predecessor:
+            result["predecessor_plan_revision"] = None
+        return result
 
     plan_revisions = {
         frontier["plan_revision"]
@@ -3071,13 +3075,19 @@ def select_plan_generation(
         previous = event
 
     tip = ordered[-1]
-    return {
+    result = {
         "plan_revision": tip["value"]["to"]["plan_revision"],
         "description_plan_revision": description_plan_revision,
         "transition_tip_event_id": tip["event_id"],
         "activation_epoch": tip["value"]["activation_epoch"],
         "authority_origin": tip["kind"],
     }
+    if include_predecessor:
+        result["predecessor_plan_revision"] = (
+            tip["value"]["from"]["plan_revision"]
+            if tip["kind"] == "generation_transition" else None
+        )
+    return result
 
 
 def bind_active_plan_generation(
