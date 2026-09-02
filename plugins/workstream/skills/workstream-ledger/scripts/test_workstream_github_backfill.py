@@ -97,6 +97,37 @@ class FakeOpener:
         )
 
 
+class PageShiftOpener(FakeOpener):
+    """Move a failed check behind page one between complete traversals."""
+
+    def __init__(self):
+        super().__init__()
+        self.check_requests = 0
+
+    def __call__(self, request, *, timeout):
+        if "/pulls/" in request.full_url:
+            return super().__call__(request, timeout=timeout)
+        self.requests.append((request, timeout))
+        self.check_requests += 1
+        page = int(urllib.parse.parse_qs(
+            urllib.parse.urlparse(request.full_url).query
+        )["page"][0])
+        if self.check_requests <= 2:
+            batch = (
+                [check(f"old-{item}", check_id=item) for item in range(1, 101)]
+                if page == 1 else [check("new-tail", check_id=102)]
+            )
+        else:
+            batch = (
+                [check(f"old-{item}", check_id=item) for item in range(2, 101)]
+                + [check("failed", conclusion="failure", check_id=101)]
+                if page == 1 else [check("new-tail", check_id=102)]
+            )
+        return Response(
+            {"total_count": 101, "check_runs": batch}, url=request.full_url,
+        )
+
+
 class GitHubBackfillReceiptTests(unittest.TestCase):
     def reader(self, opener, **kwargs):
         return GitHubBackfillReceiptReader("secret-token", opener=opener, **kwargs)
@@ -135,7 +166,7 @@ class GitHubBackfillReceiptTests(unittest.TestCase):
             receipt["provider_receipt_sha256"], hashlib.sha256(canonical(unsigned)).hexdigest(),
         )
         self.assertEqual(validate_github_backfill_receipt(receipt), receipt)
-        self.assertEqual(len(opener.requests), 3)
+        self.assertEqual(len(opener.requests), 5)
         for request, _timeout in opener.requests:
             self.assertEqual(urllib.parse.urlparse(request.full_url).hostname, "api.github.com")
             self.assertEqual(request.get_header("Authorization"), "Bearer secret-token")
@@ -146,6 +177,12 @@ class GitHubBackfillReceiptTests(unittest.TestCase):
             GitHubBackfillReceiptError, "github_checks_changed_during_read",
         ):
             self.read(FakeOpener(pages=[[duplicate], [deepcopy(duplicate)]]))
+
+    def test_nonduplicating_page_shift_cannot_hide_failed_check(self):
+        with self.assertRaisesRegex(
+            GitHubBackfillReceiptError, "github_checks_unsuccessful",
+        ):
+            self.read(PageShiftOpener())
 
     def test_repository_identity_coordinate_and_pr_number_fail_closed(self):
         cases = [

@@ -399,8 +399,11 @@ class GitHubBackfillReceiptReader:
             raise GitHubBackfillReceiptError("github_response_malformed")
         return payload
 
-    def _read_checks(self, repository: str, expected_head: str) -> list[dict[str, Any]]:
+    def _read_checks_once(
+        self, repository: str, expected_head: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         observed: list[dict[str, Any]] = []
+        provider_snapshot: list[dict[str, Any]] = []
         observed_ids: set[int] = set()
         expected_total: int | None = None
         for page in range(1, self.max_pages + 1):
@@ -459,6 +462,14 @@ class GitHubBackfillReceiptReader:
                     "conclusion": "success",
                     "details_url": details_url,
                 })
+                provider_snapshot.append({
+                    "id": check_id,
+                    "name": name,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "details_url": details_url,
+                    "head_sha": expected_head,
+                })
             if len(observed) > total:
                 raise GitHubBackfillReceiptError("github_checks_changed_during_read")
             if len(observed) == total:
@@ -467,7 +478,19 @@ class GitHubBackfillReceiptReader:
             raise GitHubBackfillReceiptError("github_checks_pagination_exceeded")
         if expected_total is None or expected_total == 0 or len(observed) != expected_total:
             raise GitHubBackfillReceiptError("github_checks_empty_or_incomplete")
-        return _canonical_checks(observed)
+        provider_snapshot.sort(key=lambda item: item["id"])
+        return _canonical_checks(observed), provider_snapshot
+
+    def _read_checks(self, repository: str, expected_head: str) -> list[dict[str, Any]]:
+        first_checks, first_snapshot = self._read_checks_once(
+            repository, expected_head,
+        )
+        second_checks, second_snapshot = self._read_checks_once(
+            repository, expected_head,
+        )
+        if first_snapshot != second_snapshot or first_checks != second_checks:
+            raise GitHubBackfillReceiptError("github_checks_changed_during_read")
+        return second_checks
 
     def read(
         self,
