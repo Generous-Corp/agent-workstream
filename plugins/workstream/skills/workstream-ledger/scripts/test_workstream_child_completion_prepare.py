@@ -122,7 +122,8 @@ def snapshot(*, terminal=False):
     }
 
 
-def state(*, include_evidence=False, source_value=None, scope_value=None):
+def state(*, include_evidence=False, include_closure=False,
+          source_value=None, scope_value=None):
     authority = dict(ROUTE)
     scope_value = scope_value or snapshot()["scope"]
     source_value = source_value or SOURCE
@@ -134,6 +135,17 @@ def state(*, include_evidence=False, source_value=None, scope_value=None):
     ]
     if include_evidence:
         values.append(("evidence_contract", "child-completion", evidence_contract()))
+    if include_closure:
+        prepared = prepare_child_completion(
+            snapshot(terminal=True), state(include_evidence=True),
+            root_token="GEN-91", child_token="GEN-92",
+            evidence_contract=evidence_contract(), authenticated_source=SOURCE,
+            authenticated_route=ROUTE,
+        )
+        closure = next(item["value"] for item in
+                       prepared["projection_manifest"]["projection"]
+                       if item["kind"] == "child_closure")
+        values.append(("child_closure", "GEN-92", closure))
     events = []
     for revision, (kind, key, value) in enumerate(values):
         events.append(build_projection_event(
@@ -187,6 +199,14 @@ class ChildCompletionPrepareTests(unittest.TestCase):
             if item["kind"] == "child_closure"
         ]
         self.assertEqual(closures[0]["key"], "GEN-92")
+
+    def test_active_exact_closure_is_complete_control_state(self):
+        result = self.call(
+            snapshot(terminal=True),
+            state(include_evidence=True, include_closure=True),
+        )
+        self.assertEqual(result["operation_status"], "complete")
+        self.assertNotIn("terminal_child_repairs", result["projection_manifest"])
 
     def test_refuses_wrong_owner(self):
         contract = evidence_contract()

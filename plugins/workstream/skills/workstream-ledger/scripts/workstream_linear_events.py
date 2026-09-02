@@ -165,6 +165,10 @@ def encode_ledger_reservation(reservation: dict[str, Any]) -> str:
         "plan_revision", "projection_revision", "projection_frontier_ids",
         "frontier_ids", "authority", "intent_event", "intent_sha256",
     }
+    if isinstance(reservation, dict) and reservation.get("intent_kind") == (
+        "child_completion_projection"
+    ):
+        required.add("intent_fences")
     if (
         not isinstance(reservation, dict)
         or set(reservation) != required
@@ -187,7 +191,7 @@ def encode_ledger_reservation(reservation: dict[str, Any]) -> str:
         )
         or reservation["intent_kind"] not in {
             "repository_identity_projection", "repository_identity_history_seal",
-            "child_mutation_projection",
+            "child_mutation_projection", "child_completion_projection",
         }
         or not re.fullmatch(
             r"wsp_[0-9a-f]{32}", str(
@@ -197,6 +201,10 @@ def encode_ledger_reservation(reservation: dict[str, Any]) -> str:
         or not re.fullmatch(r"[0-9a-f]{64}", reservation["plan_revision"])
         or not re.fullmatch(r"[0-9a-f]{64}", str(reservation.get("intent_sha256", "")))
         or not isinstance(reservation.get("intent_event"), dict)
+        or (
+            reservation.get("intent_kind") == "child_completion_projection"
+            and not isinstance(reservation.get("intent_fences"), dict)
+        )
         or not isinstance(reservation.get("authority"), dict)
         or not isinstance(reservation.get("frontier_ids"), list)
         or reservation["frontier_ids"] != sorted(set(reservation["frontier_ids"]))
@@ -238,6 +246,13 @@ def encode_ledger_reservation(reservation: dict[str, Any]) -> str:
             and (
                 intent["kind"] != "child_mutation_authorization"
                 or intent["key"] != intent["value"].get("proposal_id")
+            )
+        )
+        or (
+            reservation["intent_kind"] == "child_completion_projection"
+            and (
+                intent["kind"] != "child_closure"
+                or intent["key"] != intent["value"].get("child_identifier")
             )
         )
         or hashlib.sha256(json.dumps(

@@ -72,13 +72,13 @@ KINDS = {
     "quarantine_disposition", "child_closure",
     "child_extension_authorization", "child_dependency_authorization",
     "child_mutation_authorization", "existing_child_origin_seal",
-    "identity_history_seal",
+    "identity_history_seal", "writer_fleet_gate",
     "generation_genesis", "generation_candidate_seal", "generation_transition",
     "generation_abort",
 }
 SINGLETON_KINDS = {
     "scope", "source", "disposition", "lifecycle", "cas_activation",
-    "quarantine_disposition",
+    "quarantine_disposition", "writer_fleet_gate",
 }
 TOMBSTONE = {"_projection_tombstone": True}
 AUTHORITY_FIELDS = {"workspace_id", "team_id", "project_id", "root_issue_id"}
@@ -719,6 +719,55 @@ def validate_projection_event(event: dict[str, Any]) -> None:
             )
         ):
             raise LinearProjectionError("invalid_generation_abort")
+    if event["kind"] == "writer_fleet_gate" and (
+        schema_version != 2 or tombstone
+        or event["key"] != "root"
+        or set(value) != {
+            "schema_version", "minimum_writer_version",
+            "legacy_writer_count", "plan_revision", "observed_at", "writers",
+        }
+        or value.get("schema_version") != 1
+        or re.fullmatch(r"\d+\.\d+\.\d+", str(
+            value.get("minimum_writer_version", "")
+        )) is None
+        or value.get("legacy_writer_count") != 0
+        or value.get("plan_revision") != event["plan_revision"]
+        or not isinstance(value.get("observed_at"), str)
+        or not value["observed_at"]
+        or not isinstance(value.get("writers"), list)
+        or not value["writers"]
+        or any(
+            not isinstance(writer, dict)
+            or set(writer) != {
+                "writer_id", "machine_id", "version", "source_commit",
+                "source_tree_sha256", "observed_at",
+            }
+            or not all(
+                isinstance(writer.get(field), str) and writer[field]
+                for field in ("writer_id", "machine_id", "observed_at")
+            )
+            or re.fullmatch(r"\d+\.\d+\.\d+", str(
+                writer.get("version", "")
+            )) is None
+            or re.fullmatch(
+                r"[0-9a-f]{40}", str(writer.get("source_commit", ""))
+            ) is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(writer.get("source_tree_sha256", ""))
+            ) is None
+            for writer in value["writers"]
+        )
+        or [writer["writer_id"] for writer in value["writers"]]
+        != sorted({writer["writer_id"] for writer in value["writers"]})
+        or len({writer["machine_id"] for writer in value["writers"]})
+        != len(value["writers"])
+        or any(
+            tuple(map(int, writer["version"].split(".")))
+            < tuple(map(int, value["minimum_writer_version"].split(".")))
+            for writer in value["writers"]
+        )
+    ):
+        raise LinearProjectionError("invalid_writer_fleet_gate")
     if event["kind"] in {
         "generation_genesis", "generation_candidate_seal", "generation_transition",
     }:

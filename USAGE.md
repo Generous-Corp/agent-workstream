@@ -287,8 +287,9 @@ GEN-123 --child GEN-124 --evidence-contract evidence.json --plan-source
 ./PLAN.md --plan-identity <URL>`. It performs authenticated reads only and
 returns a complete `projection_manifest`: first evidence-only, then
 `native_transition_required` until Linear reports the child completed, then an
-exact terminal-repair manifest. Feed each nonempty manifest through the normal
-projection preview/apply pair and rerun the prepare command between phases.
+exact terminal-repair manifest. Apply only the `evidence_projection_required`
+and `closure_projection_required` manifests; `native_transition_required` and
+`complete` are control states. Rerun the prepare command between phases.
 
 Before a reviewed generation activation, two native root mutations have a
 supported, separately fenced front door. Preview `workstreamctl root-transition
