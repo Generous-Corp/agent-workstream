@@ -567,6 +567,13 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.79 makes literal `resume this session` deterministic: only an exact
+namespaced terminal binding or strict final ` · TEAM-#` suffix can select the
+handle. Shared cmux/HerdR provenance detection, pre-mutation title fences, and
+an atomic readback-validated local binding prevent concurrent renames from
+creating successor authority, while optional adapter loss after full recovery
+does not erase authenticated Linear authority.
+
 Version 0.4.78 accepts an authenticated direct-child handle for resume and audit,
 but derives all execution authority from its actual root. The child survives as
 a validated focus selector, including bounded hydration routes; nonexistent,

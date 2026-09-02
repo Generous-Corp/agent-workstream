@@ -103,9 +103,10 @@ class WorkstreamTabTests(unittest.TestCase):
         self.assertEqual(result["status"], "updated")
         self.assertEqual(result["title"], "Linear · GEN-37")
         self.assertEqual([call[1] for call in fake.calls], [
-            "ping", "identify", "list-pane-surfaces", "rename-tab", "list-pane-surfaces",
+            "ping", "identify", "list-pane-surfaces", "list-pane-surfaces",
+            "rename-tab", "list-pane-surfaces",
         ])
-        self.assertEqual(fake.calls[3][-1], "Linear · GEN-37")
+        self.assertEqual(fake.calls[4][-1], "Linear · GEN-37")
 
     def test_surface_id_precedes_workspace_valued_legacy_tab_id(self):
         fake = FakeCmux("Linear", resolve_target="surface:7")
@@ -189,7 +190,7 @@ class WorkstreamTabTests(unittest.TestCase):
             automatic_title="~/Code/pulp",
         )
         self.assertEqual(generated["title"], "Linear Integration · GEN-37")
-        self.assertEqual(fake.calls[3][-1], "Linear Integration · GEN-37")
+        self.assertEqual(fake.calls[4][-1], "Linear Integration · GEN-37")
 
         _, custom = self.apply(
             "My project", project_name="Linear Integration",
@@ -213,11 +214,25 @@ class WorkstreamTabTests(unittest.TestCase):
                 self.assertEqual(result["reason"], error)
                 self.assertNotIn("rename-tab", [call[1] for call in fake.calls])
 
-    def test_same_token_is_a_zero_mutation_noop(self):
-        fake, result = self.apply("Linear · gen-37")
+    def test_same_canonical_token_is_a_zero_mutation_noop(self):
+        fake, result = self.apply("Linear · GEN-37")
         self.assertEqual(result["status"], "unchanged")
-        self.assertEqual(result["title"], "Linear · gen-37")
+        self.assertEqual(result["title"], "Linear · GEN-37")
         self.assertNotIn("rename-tab", [call[1] for call in fake.calls])
+
+    def test_lowercase_or_embedded_token_refuses_as_noncanonical(self):
+        for title in ("Linear · gen-37", "Investigate GEN-37 now"):
+            with self.subTest(title=title):
+                fake = FakeCmux(title)
+                with self.assertRaisesRegex(
+                    tab.TabTitleError,
+                    "title_contains_noncanonical_workstream_token",
+                ):
+                    tab.apply_title(
+                        "GEN-37", target="surface:7", runner=fake,
+                        which=lambda _: "/opt/cmux",
+                    )
+                self.assertNotIn("rename-tab", [call[1] for call in fake.calls])
 
     def test_conflicting_or_duplicate_token_fails_before_mutation(self):
         for title in ("Linear · GEN-38", "GEN-37 / GEN-37", "GEN-37 / GEN-38"):
@@ -382,7 +397,7 @@ class WorkstreamTabTests(unittest.TestCase):
                 which=lambda _: "/opt/cmux",
             )
 
-    def test_post_rename_readback_unavailable_remains_fatal(self):
+    def test_concurrent_cmux_rename_is_fenced_before_overwrite(self):
         fake = FakeCmux("Linear")
         reads = 0
 
@@ -391,6 +406,44 @@ class WorkstreamTabTests(unittest.TestCase):
             if argv[1] == "list-pane-surfaces":
                 reads += 1
                 if reads == 2:
+                    fake.title = "Human renamed this tab"
+            return fake(argv, **kwargs)
+
+        with self.assertRaisesRegex(tab.TabTitleError, "cmux_title_changed"):
+            tab.apply_title(
+                "GEN-37", target="surface:7", expected_title="Linear",
+                runner=runner, which=lambda _: "/opt/cmux",
+            )
+        self.assertEqual(fake.title, "Human renamed this tab")
+        self.assertNotIn("rename-tab", [call[1] for call in fake.calls])
+
+    def test_terminal_manager_detection_is_shared_and_ambiguous_fails(self):
+        herdr_without_flag = self.herdr_env()
+        herdr_without_flag.pop("HERDR_ENV")
+        result = tab.apply_title(
+            "GEN-37", environ=herdr_without_flag, runner=FakeHerdr(),
+            which=lambda _: None,
+        )
+        self.assertEqual(result["manager"], "herdr")
+
+        ambiguous = dict(herdr_without_flag, CMUX_SURFACE_ID="surface:7")
+        with self.assertRaisesRegex(
+            tab.TabTitleError, "terminal_context_ambiguous",
+        ):
+            tab.apply_title(
+                "GEN-37", environ=ambiguous, runner=FakeHerdr(),
+                which=lambda _: None,
+            )
+
+    def test_post_rename_readback_unavailable_remains_fatal(self):
+        fake = FakeCmux("Linear")
+        reads = 0
+
+        def runner(argv, **kwargs):
+            nonlocal reads
+            if argv[1] == "list-pane-surfaces":
+                reads += 1
+                if reads == 3:
                     return subprocess.CompletedProcess(
                         argv, 1, "", "socket stopped",
                     )
@@ -421,7 +474,8 @@ class WorkstreamTabTests(unittest.TestCase):
         self.assertEqual(result["manager"], "herdr")
         self.assertEqual(result["title"], "Linear · GEN-37")
         self.assertEqual([call[1:3] for call in fake.calls], [
-            ["tab", "get"], ["tab", "rename"], ["tab", "get"],
+            ["tab", "get"], ["tab", "get"], ["tab", "rename"],
+            ["tab", "get"],
         ])
 
     def test_herdr_same_token_is_noop_and_conflict_refuses(self):
@@ -454,7 +508,8 @@ class WorkstreamTabTests(unittest.TestCase):
                 )
                 self.assertEqual(result["title"], "Linear Integration · GEN-37")
                 self.assertEqual([call[1:3] for call in fake.calls], [
-                    ["tab", "get"], ["tab", "rename"], ["tab", "get"],
+                    ["tab", "get"], ["tab", "get"], ["tab", "rename"],
+                    ["tab", "get"],
                 ])
 
     def test_herdr_missing_or_stale_generated_provenance_is_optional_noop(self):

@@ -15,9 +15,13 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
 
+SEPARATOR = " · "
 TOKEN = re.compile(r"^[A-Z][A-Z0-9]*-\d+$")
 TOKEN_IN_TITLE = re.compile(r"(?<![A-Z0-9])([A-Z][A-Z0-9]*-\d+)(?![A-Z0-9])", re.I)
-SEPARATOR = " · "
+CANONICAL_TITLE = re.compile(
+    rf"^(?P<label>.*\S){re.escape(SEPARATOR)}"
+    r"(?P<token>[A-Z][A-Z0-9]*-\d+)$"
+)
 TIMEOUT_SECONDS = 3
 MAX_PROJECT_LABEL_LENGTH = 120
 MAX_ANCESTOR_DEPTH = 8
@@ -47,6 +51,31 @@ def canonical_token(value: str) -> str:
 
 def tokens_in_title(title: str) -> list[str]:
     return [match.upper() for match in TOKEN_IN_TITLE.findall(title)]
+
+
+def canonical_title_token(title: str) -> str | None:
+    """Return only an exact, uppercase final `` · TEAM-#`` suffix."""
+    match = CANONICAL_TITLE.fullmatch(title)
+    return match.group("token") if match else None
+
+
+def terminal_manager(environ: Mapping[str, str]) -> str | None:
+    """Detect one terminal adapter from the same provenance fields everywhere."""
+    herdr_present = environ.get("HERDR_ENV") == "1" or any(
+        environ.get(key) for key in (
+            "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_SOCKET_PATH",
+        )
+    )
+    cmux_present = any(environ.get(key) for key in (
+        "CMUX_SURFACE_ID", "CMUX_WORKSPACE_ID", "CMUX_SOCKET_PATH",
+    ))
+    if herdr_present and cmux_present:
+        raise TabTitleError("terminal_context_ambiguous")
+    if herdr_present:
+        return "herdr"
+    if cmux_present:
+        return "cmux"
+    return None
 
 
 def project_label(value: str | None) -> str:
@@ -79,7 +108,10 @@ def validate_transition(
     )
     if after != expected:
         raise TabTitleError("existing_title_not_preserved")
-    if tokens_in_title(after) != [token]:
+    if (
+        tokens_in_title(after) != [token]
+        or canonical_title_token(after) != token
+    ):
         raise TabTitleError("noncanonical_title_transition")
 
 
@@ -88,11 +120,14 @@ def plan_title(
     automatic_title: str | None = None,
 ) -> tuple[str, str]:
     found = tokens_in_title(before)
-    if any(value != token for value in found):
-        raise TabTitleError("workstream_tab_conflict")
     if len(found) > 1:
         raise TabTitleError("duplicate_workstream_token")
-    if found == [token]:
+    suffix_token = canonical_title_token(before)
+    if found and suffix_token is None:
+        raise TabTitleError("title_contains_noncanonical_workstream_token")
+    if any(value != token for value in found):
+        raise TabTitleError("workstream_tab_conflict")
+    if suffix_token == token:
         return "unchanged", before
     generated = not before.strip() or automatic_title is not None
     after = (
@@ -302,7 +337,7 @@ def _herdr_tab(
 def _apply_herdr_title(
     token: str, *, environ: Mapping[str, str], runner: Runner,
     which: Callable[[str], str | None], project_name: str | None,
-    automatic_title: str | None,
+    automatic_title: str | None, expected_title: str | None,
 ) -> dict[str, Any]:
     tab_id = environ.get("HERDR_TAB_ID")
     workspace_id = environ.get("HERDR_WORKSPACE_ID")
@@ -333,6 +368,8 @@ def _apply_herdr_title(
             "status": "unavailable", "reason": "herdr_target_unresolved",
             "token": token, "manager": "herdr",
         }
+    if expected_title is not None and before_tab["label"] != expected_title:
+        raise TabTitleError("herdr_title_changed")
     status, after, unavailable_reason = _adapter_title_plan(
         before_tab["label"], token, project_name=project_name,
         automatic_title=automatic_title,
@@ -344,6 +381,12 @@ def _apply_herdr_title(
         }
     assert after is not None
     if status == "updated":
+        fenced_tab = _herdr_tab(
+            herdr, tab_id, workspace_id, runner, environ,
+            allow_unavailable=False,
+        )
+        if fenced_tab is None or fenced_tab["label"] != before_tab["label"]:
+            raise TabTitleError("herdr_title_changed")
         _run(
             runner, [herdr, "tab", "rename", tab_id, after],
             environment=environ,
@@ -366,14 +409,17 @@ def _apply_herdr_title(
 def apply_title(
     token_value: str, *, target: str | None = None,
     project_name: str | None = None, automatic_title: str | None = None,
+    expected_title: str | None = None,
     environ: Mapping[str, str] = os.environ, runner: Runner = subprocess.run,
     which: Callable[[str], str | None] = shutil.which,
 ) -> dict[str, Any]:
     token = canonical_token(token_value)
-    if environ.get("HERDR_ENV") == "1":
+    manager = terminal_manager(environ)
+    if manager == "herdr":
         return _apply_herdr_title(
             token, environ=environ, runner=runner, which=which,
             project_name=project_name, automatic_title=automatic_title,
+            expected_title=expected_title,
         )
     # Surface identity is authoritative; CMUX_TAB_ID is a legacy alias and can
     # contain a workspace UUID in some runtimes. Never let it shadow a surface.
@@ -422,6 +468,8 @@ def apply_title(
             "status": "unavailable", "reason": "cmux_target_unresolved",
             "token": token,
         }
+    if expected_title is not None and before != expected_title:
+        raise TabTitleError("cmux_title_changed")
     status, after, unavailable_reason = _adapter_title_plan(
         before, token, project_name=project_name,
         automatic_title=automatic_title,
@@ -433,6 +481,11 @@ def apply_title(
         }
     assert after is not None
     if status == "updated":
+        fenced_before = _read_title(
+            cmux, context, runner, environment=environ,
+        )
+        if fenced_before != before:
+            raise TabTitleError("cmux_title_changed")
         _run(runner, [
             cmux, "rename-tab", "--surface", context.surface,
             "--workspace", context.workspace, "--window", context.window,

@@ -65,18 +65,12 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _terminal_identity(environ: Mapping[str, str]) -> dict[str, str] | None:
-    herdr_present = environ.get("HERDR_ENV") == "1" or any(
-        environ.get(key) for key in (
-            "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_SOCKET_PATH",
-        )
-    )
-    cmux_present = any(environ.get(key) for key in (
-        "CMUX_SURFACE_ID", "CMUX_WORKSPACE_ID", "CMUX_SOCKET_PATH",
-    ))
-    if herdr_present and cmux_present:
-        raise ThisSessionError("session_context_ambiguous")
-    if herdr_present:
+def _terminal_identity(environ: Mapping[str, str]) -> dict[str, Any] | None:
+    try:
+        manager = workstream_tab.terminal_manager(environ)
+    except workstream_tab.TabTitleError as error:
+        raise ThisSessionError("session_context_ambiguous") from error
+    if manager == "herdr":
         target = _identity(environ.get("HERDR_TAB_ID"), "HERDR_TAB_ID")
         workspace = _identity(
             environ.get("HERDR_WORKSPACE_ID"), "HERDR_WORKSPACE_ID",
@@ -84,12 +78,14 @@ def _terminal_identity(environ: Mapping[str, str]) -> dict[str, str] | None:
         endpoint = _identity(
             environ.get("HERDR_SOCKET_PATH"), "HERDR_SOCKET_PATH",
         )
+        provenance = {"socket_path": endpoint}
         return {
             "manager": "herdr", "target_id": target,
             "workspace_id": workspace,
-            "namespace_sha256": _namespace("herdr", {"socket_path": endpoint}),
+            "terminal_provenance": provenance,
+            "namespace_sha256": _namespace("herdr", provenance),
         }
-    if cmux_present:
+    if manager == "cmux":
         target = _identity(environ.get("CMUX_SURFACE_ID"), "CMUX_SURFACE_ID")
         workspace = _identity(
             environ.get("CMUX_WORKSPACE_ID"), "CMUX_WORKSPACE_ID",
@@ -216,7 +212,7 @@ def _bounded_ancestor_pids() -> list[int]:
 def _resolve_cmux_ancestor_identity(
     prefix: Sequence[str], provenance: dict[str, str],
     environ: Mapping[str, str], runner: Runner, pid_chain: Sequence[int] | None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     pairs = set()
     pids = _bounded_ancestor_pids() if pid_chain is None else pid_chain
     for pid in pids:
@@ -241,6 +237,8 @@ def _resolve_cmux_ancestor_identity(
     return {
         "manager": "cmux", "workspace_id": workspace, "target_id": surface,
         "cmux_socket_path": provenance["socket_path"],
+        "terminal_provenance": dict(provenance),
+        "namespace_sha256": _namespace("cmux", provenance),
     }
 
 
@@ -403,6 +401,7 @@ def resolve_this_session(
             cmux_prefix, provenance = _discover_cmux_instance(
                 cmux, environ, runner, socket_candidates,
             )
+        identity["terminal_provenance"] = dict(provenance)
         identity["namespace_sha256"] = _namespace("cmux", provenance)
     title = (
         _herdr_title(identity, environ, runner, which)
@@ -414,9 +413,11 @@ def resolve_this_session(
     title_tokens = workstream_tab.tokens_in_title(title)
     if len(title_tokens) > 1:
         raise ThisSessionError("session_title_workstream_ambiguous")
+    title_token = workstream_tab.canonical_title_token(title)
+    if title_tokens and title_token is None:
+        raise ThisSessionError("session_title_workstream_noncanonical")
     binding = _read_binding(binding_path or state_path(environ), identity)
     bound_token = binding.get("workstream_id") if binding else None
-    title_token = title_tokens[0] if title_tokens else None
     if bound_token is not None:
         bound_token = workstream_tab.canonical_token(bound_token)
         if title_token is not None and title_token != bound_token:
@@ -476,7 +477,7 @@ def _connect(path: Path) -> sqlite3.Connection:
 
 def record_successor_binding(
     path: Path, resolution: dict[str, Any], *, environ: Mapping[str, str],
-    created_at: str,
+    created_at: str, validate_terminal: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     provider, session_id = _provider_session(environ)
     created_at = _identity(created_at, "created_at")
@@ -500,6 +501,10 @@ def record_successor_binding(
                 (prior[3],),
             ).fetchone()[0] != 1:
                 raise ThisSessionError("session_binding_history_incomplete")
+            if validate_terminal is not None:
+                # Keep the terminal readback inside the same immediate
+                # transaction that decides whether this binding is current.
+                validate_terminal()
             connection.commit()
             return {
                 "status": "unchanged", "event_id": prior[3],
@@ -545,6 +550,10 @@ def record_successor_binding(
             "current_event_id=excluded.current_event_id,updated_at=excluded.updated_at",
             (*key, token, provider, session_id, event_id, created_at),
         )
+        if validate_terminal is not None:
+            # A failed external readback rolls back both the staged event and
+            # current-row update, so a title race cannot leave local authority.
+            validate_terminal()
         connection.commit()
         return {
             "status": "bound", "event_id": event_id, "provider": provider,
@@ -578,8 +587,9 @@ def resume_this_session(
         environ=environ, runner=terminal_runner, which=which, binding_path=path,
     )
     fenced_fields = (
-        "manager", "namespace_sha256", "workspace_id", "target_id",
-        "workstream_id", "candidate_source", "observed_title", "prior_binding",
+        "manager", "terminal_provenance", "namespace_sha256",
+        "workspace_id", "target_id", "workstream_id", "candidate_source",
+        "observed_title", "prior_binding",
     )
     if any(
         final_resolution.get(field) != resolution.get(field)
@@ -604,22 +614,23 @@ def resume_this_session(
         raise ThisSessionError("workstream_resume_invalid_output") from error
     if not isinstance(context, dict) or context.get("resume_authority") != "full":
         raise ThisSessionError("workstream_resume_authority_not_full")
-    post_resolution = resolve_this_session(
-        environ=environ, runner=terminal_runner, which=which, binding_path=path,
-    )
-    if any(
-        post_resolution.get(field) != resolution.get(field)
-        for field in fenced_fields
-    ):
-        raise ThisSessionError("session_context_changed")
-    resolution = post_resolution
+    binding: dict[str, Any] = {
+        "status": "unavailable", "reason": "terminal_binding_not_attempted",
+    }
+    tab_result: dict[str, Any] = {
+        "status": "unavailable", "reason": "terminal_adapter_not_attempted",
+    }
     try:
-        binding = record_successor_binding(
-            path, resolution, environ=environ, created_at=created_at or utc_now(),
+        post_resolution = resolve_this_session(
+            environ=environ, runner=terminal_runner, which=which,
+            binding_path=path,
         )
-    except (OSError, sqlite3.Error) as error:
-        binding = {"status": "unavailable", "reason": type(error).__name__}
-    try:
+        if any(
+            post_resolution.get(field) != resolution.get(field)
+            for field in fenced_fields
+        ):
+            raise ThisSessionError("session_context_changed")
+        resolution = post_resolution
         adapter_environ = dict(environ)
         target = None
         if resolution["manager"] == "cmux":
@@ -630,11 +641,70 @@ def resume_this_session(
         tab_result = workstream_tab.apply_title(
             resolution["workstream_id"],
             target=target, project_name=context.get("project_name"),
+            expected_title=resolution["observed_title"],
             environ=adapter_environ,
             runner=terminal_runner, which=which,
         )
+        if tab_result.get("status") not in {"updated", "unchanged"}:
+            binding = {
+                "status": "unavailable",
+                "reason": "terminal_adapter_unavailable",
+            }
+        else:
+            bound_resolution = resolve_this_session(
+                environ=environ, runner=terminal_runner, which=which,
+                binding_path=path,
+            )
+            binding_fence_fields = (
+                "manager", "terminal_provenance", "namespace_sha256",
+                "workspace_id", "target_id", "workstream_id",
+                "candidate_source", "observed_title", "prior_binding",
+            )
+            if (
+                bound_resolution.get("manager") != resolution.get("manager")
+                or bound_resolution.get("terminal_provenance")
+                != resolution.get("terminal_provenance")
+                or bound_resolution.get("namespace_sha256")
+                != resolution.get("namespace_sha256")
+                or bound_resolution.get("workspace_id")
+                != resolution.get("workspace_id")
+                or bound_resolution.get("target_id")
+                != resolution.get("target_id")
+                or bound_resolution.get("workstream_id")
+                != resolution.get("workstream_id")
+                or bound_resolution.get("prior_binding")
+                != resolution.get("prior_binding")
+                or bound_resolution.get("observed_title")
+                != tab_result.get("title")
+            ):
+                raise ThisSessionError("session_context_changed")
+
+            def validate_terminal() -> None:
+                observed = resolve_this_session(
+                    environ=environ, runner=terminal_runner, which=which,
+                    binding_path=path,
+                )
+                if any(
+                    observed.get(field) != bound_resolution.get(field)
+                    for field in binding_fence_fields
+                ):
+                    raise ThisSessionError("session_context_changed")
+
+            binding = record_successor_binding(
+                path, bound_resolution, environ=environ,
+                created_at=created_at or utc_now(),
+                validate_terminal=validate_terminal,
+            )
     except workstream_tab.TabTitleError as error:
         tab_result = {"status": "unavailable", "reason": str(error)}
+        binding = {
+            "status": "unavailable", "reason": "terminal_title_unverified",
+        }
+    except ThisSessionError as error:
+        tab_result = {"status": "unavailable", "reason": str(error)}
+        binding = {"status": "unavailable", "reason": str(error)}
+    except (OSError, sqlite3.Error) as error:
+        binding = {"status": "unavailable", "reason": type(error).__name__}
     context["this_session_resolution"] = {
         key: resolution[key] for key in (
             "manager", "namespace_sha256", "workspace_id", "target_id",

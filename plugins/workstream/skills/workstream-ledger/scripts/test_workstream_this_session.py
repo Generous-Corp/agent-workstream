@@ -191,6 +191,66 @@ class ThisSessionTests(unittest.TestCase):
         self.assertEqual(result["resume_binding"]["predecessor_provider_session_id"], "old")
         self.assertEqual(len(calls), 1)
 
+    def test_bound_generic_human_title_is_preserved_and_suffixed(self):
+        env = self.cmux_env("surface-pulp")
+        fake = FakeCmux("pulp", surface="surface-pulp")
+        self.seed(fake, env=env)
+        result = session.resume_this_session(
+            environ=env, runner=full_resume_runner([]), terminal_runner=fake,
+            which=lambda _: "/opt/cmux", binding_path=self.db,
+            resume_script=Path("resume.py"),
+            created_at="2026-09-01T01:00:00Z",
+        )
+        self.assertEqual(result["resume_authority"], "full")
+        self.assertEqual(result["tab_binding"]["title"], "pulp · GEN-37")
+        self.assertEqual(result["resume_binding"]["writes_performed"], 1)
+
+    def test_generic_title_without_exact_binding_refuses_before_resume(self):
+        for title in ("Linear", "pulp"):
+            with self.subTest(title=title):
+                calls = []
+                with self.assertRaisesRegex(
+                    session.ThisSessionError, "session_workstream_unresolved",
+                ):
+                    session.resume_this_session(
+                        environ=self.cmux_env(),
+                        runner=full_resume_runner(calls),
+                        terminal_runner=FakeCmux(title),
+                        which=lambda _: "/opt/cmux", binding_path=self.db,
+                        resume_script=Path("resume.py"),
+                    )
+                self.assertEqual(calls, [])
+                self.assertFalse(self.db.exists())
+
+    def test_arbitrary_issue_like_prose_is_not_a_session_handle(self):
+        for title in ("Investigate GEN-37 before launch", "GEN-37"):
+            with self.subTest(title=title):
+                with self.assertRaisesRegex(
+                    session.ThisSessionError,
+                    "session_title_workstream_noncanonical",
+                ):
+                    session.resolve_this_session(
+                        environ=self.cmux_env(), runner=FakeCmux(title),
+                        which=lambda _: "/opt/cmux", binding_path=self.db,
+                    )
+
+    def test_strict_suffix_can_bootstrap_on_another_machine_namespace(self):
+        env = self.cmux_env(
+            "surface-m5", socket="/tmp/m5-cmux.sock", session_id="m5-new",
+        )
+        result = session.resume_this_session(
+            environ=env, runner=full_resume_runner([]),
+            terminal_runner=FakeCmux("Spectr · GEN-37", surface="surface-m5"),
+            which=lambda _: "/opt/cmux", binding_path=self.db,
+            resume_script=Path("resume.py"),
+            created_at="2026-09-01T01:00:00Z",
+        )
+        self.assertEqual(result["resume_authority"], "full")
+        self.assertEqual(
+            result["this_session_resolution"]["candidate_source"], "title",
+        )
+        self.assertEqual(result["resume_binding"]["writes_performed"], 1)
+
     def test_replacement_surface_title_only_resumes_binds_and_repeats_without_writes(self):
         env = self.cmux_env("211BECC6-4E03-4C8A-A0FE-B04E89590B77")
         fake = FakeCmux("Spectr · GEN-37", surface=env["CMUX_SURFACE_ID"])
@@ -379,6 +439,10 @@ class ThisSessionTests(unittest.TestCase):
         self.assertEqual(result["tab_binding"], {
             "status": "unavailable", "reason": "cmux_command_failed",
         })
+        self.assertEqual(result["resume_binding"], {
+            "status": "unavailable", "reason": "terminal_title_unverified",
+        })
+        self.assertFalse(self.db.exists())
 
     def test_herdr_socket_namespace_separates_same_public_ids(self):
         fake = FakeHerdr("Linear · GEN-37")
@@ -391,6 +455,30 @@ class ThisSessionTests(unittest.TestCase):
             which=lambda _: None, binding_path=self.db,
         )
         self.assertNotEqual(first["namespace_sha256"], second["namespace_sha256"])
+
+    def test_herdr_provenance_without_flag_is_used_by_resolver_and_adapter(self):
+        env = self.herdr_env("/tmp/herdr-m5.sock")
+        del env["HERDR_ENV"]
+        fake = FakeHerdr("Linear · GEN-37")
+        result = session.resume_this_session(
+            environ=env, runner=full_resume_runner([]), terminal_runner=fake,
+            which=lambda _: None, binding_path=self.db,
+            resume_script=Path("resume.py"),
+            created_at="2026-09-01T01:00:00Z",
+        )
+        self.assertEqual(result["resume_authority"], "full")
+        self.assertEqual(result["this_session_resolution"]["manager"], "herdr")
+        self.assertEqual(result["tab_binding"]["manager"], "herdr")
+
+    def test_mixed_cmux_and_herdr_provenance_refuses(self):
+        env = dict(self.herdr_env(), CMUX_SURFACE_ID="surface-old")
+        with self.assertRaisesRegex(
+            session.ThisSessionError, "session_context_ambiguous",
+        ):
+            session.resolve_this_session(
+                environ=env, runner=FakeHerdr(), which=lambda _: None,
+                binding_path=self.db,
+            )
 
     def test_cmux_socket_namespace_separates_same_public_ids(self):
         first = session.resolve_this_session(
@@ -573,7 +661,7 @@ class ThisSessionTests(unittest.TestCase):
                         binding_path=self.db,
                     )
 
-    def test_title_change_during_authenticated_resume_refuses_before_local_mutation(self):
+    def test_title_change_during_authenticated_resume_preserves_full_authority_without_binding(self):
         state = {"value": self.resolution()}
         process_calls = []
 
@@ -588,16 +676,19 @@ class ThisSessionTests(unittest.TestCase):
             }), "")
 
         with mock.patch.object(session, "resolve_this_session", side_effect=resolved):
-            with self.assertRaisesRegex(session.ThisSessionError,
-                                        "session_context_changed"):
-                session.resume_this_session(
-                    environ=self.cmux_env(), runner=resume_runner,
-                    binding_path=self.db, resume_script=Path("resume.py"),
-                )
+            result = session.resume_this_session(
+                environ=self.cmux_env(), runner=resume_runner,
+                binding_path=self.db, resume_script=Path("resume.py"),
+            )
+        self.assertEqual(result["resume_authority"], "full")
+        self.assertEqual(
+            result["resume_binding"]["reason"], "session_context_changed",
+        )
+        self.assertEqual(result["tab_binding"]["status"], "unavailable")
         self.assertEqual(len(process_calls), 1)
         self.assertFalse(self.db.exists())
 
-    def test_binding_change_during_authenticated_resume_refuses_before_local_mutation(self):
+    def test_binding_change_during_authenticated_resume_preserves_full_authority_without_mutation(self):
         binding = {
             "workstream_id": "GEN-37", "provider": "codex",
             "provider_session_id": "old", "event_id": "wsb_old",
@@ -619,14 +710,87 @@ class ThisSessionTests(unittest.TestCase):
             }), "")
 
         with mock.patch.object(session, "resolve_this_session", side_effect=resolved):
-            with self.assertRaisesRegex(session.ThisSessionError,
-                                        "session_context_changed"):
-                session.resume_this_session(
-                    environ=self.cmux_env(), runner=resume_runner,
-                    binding_path=self.db, resume_script=Path("resume.py"),
-                )
+            result = session.resume_this_session(
+                environ=self.cmux_env(), runner=resume_runner,
+                binding_path=self.db, resume_script=Path("resume.py"),
+            )
+        self.assertEqual(result["resume_authority"], "full")
+        self.assertEqual(
+            result["resume_binding"]["reason"], "session_context_changed",
+        )
         self.assertEqual(len(process_calls), 1)
         self.assertFalse(self.db.exists())
+
+    def test_concurrent_title_change_rolls_back_atomic_new_binding(self):
+        env = self.cmux_env("surface-race")
+        fake = FakeCmux("Spectr · GEN-37", surface="surface-race")
+        surface_reads = 0
+
+        def terminal_runner(argv, **kwargs):
+            nonlocal surface_reads
+            if "rpc" in argv and argv[argv.index("rpc") + 1] == "surface.list":
+                surface_reads += 1
+                # The fifth resolution is the validator inside the immediate
+                # SQLite transaction, after the candidate row is staged.
+                if surface_reads == 5:
+                    fake.title = "Other · GEN-38"
+            return fake(argv, **kwargs)
+
+        process_calls = []
+        result = session.resume_this_session(
+            environ=env, runner=full_resume_runner(process_calls),
+            terminal_runner=terminal_runner, which=lambda _: "/opt/cmux",
+            binding_path=self.db, resume_script=Path("resume.py"),
+            created_at="2026-09-01T01:00:00Z",
+        )
+        self.assertEqual(result["resume_authority"], "full")
+        self.assertEqual(
+            result["resume_binding"]["reason"], "session_context_changed",
+        )
+        self.assertEqual(len(process_calls), 1)
+        connection = sqlite3.connect(self.db)
+        self.assertEqual(connection.execute(
+            "SELECT count(*) FROM terminal_binding_events_v1"
+        ).fetchone()[0], 0)
+        self.assertEqual(connection.execute(
+            "SELECT count(*) FROM terminal_bindings_v1"
+        ).fetchone()[0], 0)
+        connection.close()
+
+    def test_concurrent_human_rename_never_overwrites_or_advances_successor(self):
+        env = self.cmux_env("surface-human-race")
+        fake = FakeCmux("Linear", surface="surface-human-race")
+        self.seed(fake, env=env)
+        title_reads = 0
+
+        def terminal_runner(argv, **kwargs):
+            nonlocal title_reads
+            if "list-pane-surfaces" in argv:
+                title_reads += 1
+                if title_reads == 2:
+                    fake.title = "Human renamed this tab"
+            return fake(argv, **kwargs)
+
+        result = session.resume_this_session(
+            environ=env, runner=full_resume_runner([]),
+            terminal_runner=terminal_runner, which=lambda _: "/opt/cmux",
+            binding_path=self.db, resume_script=Path("resume.py"),
+            created_at="2026-09-01T01:00:00Z",
+        )
+        self.assertEqual(result["resume_authority"], "full")
+        self.assertEqual(result["tab_binding"]["reason"], "cmux_title_changed")
+        self.assertEqual(fake.title, "Human renamed this tab")
+        self.assertNotIn("rename-tab", [
+            call[1] for call in fake.calls if len(call) > 1
+        ])
+        connection = sqlite3.connect(self.db)
+        self.assertEqual(connection.execute(
+            "SELECT count(*) FROM terminal_binding_events_v1"
+        ).fetchone()[0], 1)
+        self.assertEqual(connection.execute(
+            "SELECT provider_session_id FROM terminal_bindings_v1"
+        ).fetchone()[0], "old")
+        connection.close()
 
 
 if __name__ == "__main__":
