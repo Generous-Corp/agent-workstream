@@ -6117,9 +6117,28 @@ class ProjectionTests(unittest.TestCase):
             and event["value"].get("owning_child") == "GEN-70"
         )
         old_head = evidence["value"]["exact_head"]
+        scope_anchor = next(
+            event for event in events
+            if (event["kind"], event["key"]) == ("scope", "root")
+        )
+        disposition_anchor = next(
+            event for event in events
+            if (event["kind"], event["key"]) == ("disposition", "root")
+        )
         evidence["value"]["nonprimary_backfill_authority"] = {
             "repository_key": evidence["value"]["repository_key"],
-            "to_exact_head": old_head,
+            "from_exact_head": old_head, "to_exact_head": old_head,
+            "from_scope_event_id": scope_anchor["event_id"],
+            "from_scope_value_sha256": canonical_digest(scope_anchor["value"]),
+            "from_disposition_event_id": disposition_anchor["event_id"],
+            "from_disposition_value_sha256": canonical_digest(disposition_anchor["value"]),
+            "input_frontier_sha256": "c" * 64,
+            "provider_repository_id": strict["scope"]["repositories"][0][
+                "provider_repository_id"
+            ],
+            "pull_request_number": 522,
+            "merge_sha": "d" * 40,
+            "checks_sha256": "e" * 64,
         }
         closure = next(
             event for event in events
@@ -6139,8 +6158,31 @@ class ProjectionTests(unittest.TestCase):
         )
         primary["exact_head"] = new_head
         self.assertTrue(
-            closure_bound_historical_evidence(events, current_scope)
+            closure_bound_historical_evidence(
+                events, current_scope, projection_history=events,
+            )
         )
+        for field, forged in (
+            ("provider_repository_id", "WRONG_PROVIDER"),
+            ("from_scope_value_sha256", "f" * 64),
+            ("checks_sha256", "f" * 64),
+            ("merge_sha", "f" * 40),
+            ("pull_request_number", -1),
+        ):
+            mutated = deepcopy(events)
+            mutated_evidence = next(
+                event for event in mutated
+                if event["kind"] == "evidence_contract"
+                and event["value"].get("owning_child") == "GEN-70"
+            )
+            mutated_evidence["value"]["nonprimary_backfill_authority"][field] = forged
+            with self.assertRaisesRegex(
+                ProjectionHistoryError,
+                r"closure_history_(repository|evidence_set)_mismatch:GEN-70",
+            ):
+                closure_bound_historical_evidence(
+                    mutated, current_scope, projection_history=mutated,
+                )
         evidence["value"]["nonprimary_backfill_authority"][
             "repository_key"
         ] = "github.com:id:forged"
@@ -6148,7 +6190,9 @@ class ProjectionTests(unittest.TestCase):
             ProjectionHistoryError,
             r"closure_history_(repository|evidence_set)_mismatch:GEN-70",
         ):
-            closure_bound_historical_evidence(events, current_scope)
+            closure_bound_historical_evidence(
+                events, current_scope, projection_history=events,
+            )
 
     def test_current_head_closure_cannot_precede_its_evidence(self):
         _client, _adapter, _source, _graph, strict, _new_head = (

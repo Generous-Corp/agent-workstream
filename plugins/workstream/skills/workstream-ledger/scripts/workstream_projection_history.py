@@ -285,11 +285,82 @@ def closure_bound_historical_evidence(
                     "nonprimary_backfill_authority"
                 )
                 if isinstance(backfill, dict):
-                    authority = {
-                        "child_identifier": event["value"].get("owning_child"),
-                        "repository_key": backfill.get("repository_key"),
-                        "exact_head": backfill.get("to_exact_head"),
+                    required = {
+                        "repository_key", "from_exact_head", "to_exact_head",
+                        "from_scope_event_id", "from_scope_value_sha256",
+                        "from_disposition_event_id",
+                        "from_disposition_value_sha256",
+                        "input_frontier_sha256", "provider_repository_id",
+                        "pull_request_number", "merge_sha", "checks_sha256",
                     }
+                    repository = next((
+                        item for item in current_scope.get("repositories", [])
+                        if repository_key(item) == backfill.get("repository_key")
+                    ), None)
+                    history_events = [
+                        *projection_events,
+                        *(projection_history or []),
+                    ]
+                    anchors = {
+                        (event.get("kind"), event.get("event_id")): event
+                        for event in history_events
+                    }
+                    scope_anchor = anchors.get((
+                        "scope", backfill.get("from_scope_event_id")
+                    ))
+                    disposition_anchor = anchors.get((
+                        "disposition", backfill.get("from_disposition_event_id")
+                    ))
+                    valid = (
+                        set(backfill) == required
+                        and isinstance(event["value"].get("owning_child"), str)
+                        and isinstance(backfill.get("repository_key"), str)
+                        and isinstance(backfill.get("provider_repository_id"), str)
+                        and repository is not None
+                        and repository.get("provider_repository_id")
+                        == backfill.get("provider_repository_id")
+                        and repository.get("exact_head")
+                        == backfill.get("from_exact_head")
+                        and scope_anchor is not None
+                        and disposition_anchor is not None
+                        and _digest(scope_anchor.get("value"))
+                        == backfill.get("from_scope_value_sha256")
+                        and _digest(disposition_anchor.get("value"))
+                        == backfill.get("from_disposition_value_sha256")
+                        and backfill.get("to_exact_head")
+                        == event["value"].get("exact_head")
+                        and isinstance(backfill.get("pull_request_number"), int)
+                        and not isinstance(backfill.get("pull_request_number"), bool)
+                        and backfill["pull_request_number"] > 0
+                        and all(
+                            isinstance(backfill.get(field), str)
+                            and bool(backfill[field])
+                            for field in (
+                                "from_scope_event_id",
+                                "from_disposition_event_id",
+                            )
+                        )
+                        and all(
+                            isinstance(backfill.get(field), str)
+                            and bool(backfill[field])
+                            and len(backfill[field]) == width
+                            and all(c in "0123456789abcdef" for c in backfill[field])
+                            for field, width in (
+                                ("from_exact_head", 40), ("to_exact_head", 40),
+                                ("merge_sha", 40),
+                                ("from_scope_value_sha256", 64),
+                                ("from_disposition_value_sha256", 64),
+                                ("input_frontier_sha256", 64),
+                                ("checks_sha256", 64),
+                            )
+                        )
+                    )
+                    if valid:
+                        authority = {
+                            "child_identifier": event["value"]["owning_child"],
+                            "repository_key": backfill["repository_key"],
+                            "exact_head": backfill["to_exact_head"],
+                        }
             if authority is not None:
                 carried[event["event_id"]] = authority
     return _closure_bound_single_generation(
