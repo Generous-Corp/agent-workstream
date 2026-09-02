@@ -567,6 +567,12 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.70 accepts the bounded fixed-frontier resume envelope as a
+fully-bound ordinary-resume oracle, including its compact checkpoint receipt,
+while retaining legacy validation and the 24 KiB output fence. It also refuses
+same-frontier successor checkpoints during preview rather than discovering the
+non-monotonic revision only after a write.
+
 Version 0.4.69 writes schema-v7 activation reservations with both the full
 observed graph digest and a schema-v2 material digest that excludes only the
 provider-owned root `updatedAt` field. Reservation, seal, finalization, and

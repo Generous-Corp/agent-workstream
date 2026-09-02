@@ -17,11 +17,185 @@ from workstream_linear_checkpoints import (
 from workstream_generation import strict_candidate_loader
 from workstream_resume import ResumeError
 from workstream_root_transition import RootTransitionError
+import workstream_resume as resume_cli
 import workstream_root_checkpoint as checkpoint_cli
 import test_workstream_generation_transition as fixture
 
 
 class RootCheckpointTests(unittest.TestCase):
+    def test_real_run_accepts_and_replays_multi_checkpoint_fixed_envelope(self):
+        token = "GEN-37"
+        route = {
+            **fixture.AUTHORITY,
+            "root_issue_id": fixture.AUTHORITY["root_issue_id"],
+        }
+        client = fixture.FakeClient()
+        plan = tempfile.NamedTemporaryFile("w+", suffix=".md")
+        self.addCleanup(plan.close)
+        plan.write("# multi-checkpoint fixed-envelope fixture\n")
+        plan.flush()
+        digest = hashlib.sha256(
+            b"# multi-checkpoint fixed-envelope fixture\n"
+        ).hexdigest()
+        source = {"identity": plan.name, "sha256": digest}
+        client.description = f"Plan revision: {digest}\nNext action: Continue"
+        fixture.project_full(client, digest, identity=plan.name)
+        material = LinearCommentEventAdapter(
+            client, issue_id=token, plan_revision=digest, **route,
+        )
+
+        def command(boundary: int, session: str, created_at: str) -> list[str]:
+            return [
+                token, "--boundary-id", f"material-{boundary}",
+                "--created-at", created_at, "--agent", "codex",
+                "--provider", "openai", "--session-id", session,
+                "--machine", "M5", "--worktree-state", "safe",
+                "--worktree-path", "/tmp/gen37", "--worktree-branch", "gen37",
+                "--worktree-head", "e" * 40, "--exact-head", "e" * 40,
+                "--before-status", "In Progress", "--after-status", "In Progress",
+                "--next-action", "Continue",
+            ]
+
+        with patch.object(fixture, "WORKSTREAM", token), patch.object(
+            checkpoint_cli, "_client_and_route", return_value=(client, route),
+        ):
+            for revision in range(10):
+                material.apply(Delta(
+                    f"material-{revision}", token, "requirement",
+                    f"requirement-{revision}", {"requirement": f"keep-{revision}"},
+                    revision, f"t-{revision:03d}",
+                ))
+            predecessor_command = command(
+                10, "session-1", "2026-09-01T06:30:00Z",
+            )
+            predecessor_preview = checkpoint_cli.run(predecessor_command)
+            predecessor_resume = {
+                "resume_authority": "full", "workstream_id": token,
+                "plan_revision": digest, "source": source,
+                "authenticated_route": route,
+                "dependency_graph": {"route": route, "plan_revision": digest},
+                "latest_checkpoint": {
+                    "checkpoint_event_id": predecessor_preview["checkpoint"]["event_id"],
+                    "root_revision": 10,
+                    "acknowledgement": {
+                        "remote_id": predecessor_preview["deterministic_slot_id"],
+                    },
+                },
+            }
+            with patch.object(
+                checkpoint_cli, "_ordinary_resume", return_value=predecessor_resume,
+            ):
+                predecessor = checkpoint_cli.run([
+                    *predecessor_command, "--apply",
+                    "--expected-material-revision", "10",
+                    "--expected-preview-sha256",
+                    predecessor_preview["preview_sha256"],
+                ])
+            self.assertEqual(predecessor["resume_authority"], "full")
+
+            for revision in range(10, 20):
+                material.apply(Delta(
+                    f"material-{revision}", token, "requirement",
+                    f"requirement-{revision}", {"requirement": f"keep-{revision}"},
+                    revision, f"t-{revision:03d}",
+                ))
+            successor_command = command(
+                20, "session-2", "2026-09-01T06:31:00Z",
+            )
+            successor_preview = checkpoint_cli.run(successor_command)
+
+            def live_fixed_envelope(*_args, **_kwargs):
+                linear = checkpoint_cli.LinearGraphQLTransport(
+                    client, workspace_id=route["workspace_id"],
+                    team_id=route["team_id"], project_id=route["project_id"],
+                )
+                graph = linear.snapshot_for_root(
+                    token, include_description=True, include_child_comments=True,
+                )
+                graph.pop("child_comments", None)
+                comments = checkpoint_cli.LinearProjectionAdapter(
+                    client, issue_id=token, workstream_id=token,
+                    plan_revision=digest, **route,
+                )._comments()
+                joined = resume_cli.add_material_history(
+                    graph, comments, token, authenticated_route=route,
+                    authenticated_source=source,
+                )
+                full = resume_cli.compact_context(
+                    joined, token, max_bytes=2_147_483_647,
+                    max_items=2_147_483_647,
+                    require_projection_authority=True,
+                    require_dependency_graph=False,
+                )
+                # Keep cardinality within the production 100-item contract but
+                # force the exact context handed to the fixed-envelope producer
+                # beyond the ordinary 24 KiB byte budget.
+                full["decisions"] = [{
+                    "id": "D-oversized", "status": "accepted",
+                    "next_action": "review-" + ("x" * (30 * 1024)),
+                }]
+                self.assertGreater(
+                    len(resume_cli._default_output_bytes(full)), 24 * 1024,
+                )
+                checkpoint_adapter = LinearCheckpointAdapter(
+                    client, issue_id=token, workstream_id=token,
+                    workspace_id=route["workspace_id"],
+                    team_id=route["team_id"], project_id=route["project_id"],
+                )
+                normalized_tip = checkpoint_adapter._recover_checkpoint_generations(
+                    checkpoint_adapter._state(),
+                )[digest]
+                self.assertEqual(
+                    len(normalized_tip["provenance_chain"]), 2,
+                )
+                envelope = resume_cli._fixed_frontier_authority_envelope(
+                    full, token=token,
+                    binding_checkpoint=normalized_tip,
+                )
+                envelope["deferred_audit_detail"].update({
+                    "original_context_bytes": len(
+                        resume_cli._default_output_bytes(full)
+                    ),
+                    "audit_route": {"launcher": "fixture"},
+                    "full_history_route": {"launcher": "fixture"},
+                })
+                encoded = resume_cli._default_output_bytes(envelope)
+                self.assertLessEqual(len(encoded), 24 * 1024)
+                self.assertEqual(
+                    envelope["context_schema"]["envelope"],
+                    "fixed_frontier_authority_v1",
+                )
+                return subprocess.CompletedProcess(
+                    [], 0, stdout=resume_cli._default_output_text(envelope),
+                    stderr="",
+                )
+
+            writes_before = len(client.mutations)
+            with patch.object(
+                checkpoint_cli.subprocess, "run", side_effect=live_fixed_envelope,
+            ):
+                successor = checkpoint_cli.run([
+                    *successor_command, "--apply",
+                    "--expected-material-revision", "20",
+                    "--expected-preview-sha256", successor_preview["preview_sha256"],
+                ])
+            self.assertEqual(successor["resume_authority"], "full")
+            self.assertEqual(len(client.mutations), writes_before + 2)
+
+            writes_before_replay = len(client.mutations)
+            replay_preview = checkpoint_cli.run(successor_command)
+            with patch.object(
+                checkpoint_cli.subprocess, "run", side_effect=live_fixed_envelope,
+            ):
+                replay = checkpoint_cli.run([
+                    *successor_command, "--apply",
+                    "--expected-material-revision", "20",
+                    "--expected-preview-sha256", replay_preview["preview_sha256"],
+                ])
+            self.assertEqual(replay["resume_authority"], "full")
+            self.assertEqual(replay["writes_performed"], 0)
+            self.assertEqual(len(client.mutations), writes_before_replay)
+
     def test_gen14_sized_legacy_root_checkpoints_resumes_and_replays(self):
         token = "GEN-14"
         route = {
@@ -554,6 +728,174 @@ class RootCheckpointTests(unittest.TestCase):
             checkpoint_cli._ordinary_resume(
                 "GEN-14", args=args, route=route, source=source,
             )
+
+    def test_ordinary_resume_accepts_bound_fixed_frontier_checkpoint(self):
+        route = fixture.AUTHORITY
+        source = {"identity": "/tmp/plan.md", "sha256": "b" * 64}
+        args = checkpoint_cli.parser().parse_args([
+            "GEN-37", "--created-at", "2026-09-01T06:30:00Z", "--agent", "codex",
+            "--provider", "openai", "--session-id", "s", "--machine", "M5",
+            "--worktree-state", "safe", "--before-status", "In Progress",
+            "--after-status", "In Progress", "--next-action", "Continue",
+        ])
+        expected = {"checkpoint_event_id": "cp-1", "root_revision": 58,
+                    "workstream_id": "GEN-37", "plan_revision": source["sha256"],
+                    "status": {"before": "In Progress", "after": "In Progress"},
+                    "exact_head": None, "evidence": [], "blocker": None,
+                    "next_action": "Continue", "worktree": {"state": "safe"},
+                    "acknowledgement": {"state": "remote_acknowledged",
+                        "remote_id": "remote-cp-1", "applied_revision": 58},
+                    "provenance_chain": []}
+        payload = {
+            "context_schema": {"name": "agent-workstream.resume-context", "version": 2,
+                "representation": "compact_validated", "envelope": "fixed_frontier_authority_v1"},
+            "resume_authority": "full", "workstream_id": "GEN-37",
+            "plan_revision": source["sha256"], "authenticated_source": source,
+            "authenticated_route": route,
+            "authority_binding": {
+                "route_sha256": checkpoint_cli._digest(route),
+                "source_sha256": checkpoint_cli._digest(source),
+                "checkpoint_sha256": checkpoint_cli._digest({
+                    "workstream_id": "GEN-37", "checkpoint_event_id": "cp-1",
+                    "root_revision": 58, "plan_revision": source["sha256"],
+                    "status": expected["status"], "exact_head": None,
+                    "evidence": [], "blocker": None, "next_action": "Continue",
+                    "worktree": {"state": "safe"}, "acknowledgement": {
+                        "state": "remote_acknowledged",
+                        "remote_id": "remote-cp-1", "applied_revision": 58,
+                    }, "provenance_chain": [],
+                }),
+            },
+            "authority_scope": {
+                "history_validation": "complete_authenticated",
+                "execution_frontier": "complete_digest_bound_excerpts",
+                "item_count": 1, "omitted_items_claimed_executable": False,
+                "truncated_cell_count": 1,
+                "truncated_cell_marker": "~#<sha256-prefix>",
+                "truncated_cell_rule": "hydrate selected source row before action",
+            },
+            "execution_frontier": {
+                "root": {"status": None, "next": None, "blocker": None},
+                "children": [], "obligations": [],
+                "decisions": [], "choices": [], "dependencies": [],
+                "child_dependency_graph": {"authority": {}, "relations": []},
+                "columns": {
+                    "children": [], "obligations": [], "decisions": [],
+                    "choices": [], "dependencies": [],
+                    "child_dependency_graph.relations": [],
+                },
+                "disposition": None, "checkpoint": "~#deadbeef",
+            },
+            "deferred_audit_detail": {
+                "state": "fixed_frontier_authority_envelope",
+                "hydration_required_before_action": True,
+                "algorithm": "fixed-six-slot-frontier-v1", "fields": [],
+                "fields_sha256": "0" * 64, "full_context_sha256": "1" * 64,
+                "hydration_selectors": {}, "obligation_selector_rules": {},
+                "hydration_recipe": "hydrate", "original_context_bytes": 30_000,
+                "audit_route": {}, "full_history_route": {},
+            },
+        }
+        completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(payload), stderr="")
+        with patch.object(checkpoint_cli.subprocess, "run", return_value=completed):
+            self.assertEqual(
+                checkpoint_cli._ordinary_resume(
+                    "GEN-37", args=args, route=route, source=source,
+                    expected_checkpoint=expected, expected_remote_id="remote-cp-1",
+                ), payload,
+            )
+        payload["authority_binding"]["checkpoint_sha256"] = "0" * 64
+        completed.stdout = json.dumps(payload)
+        with patch.object(checkpoint_cli.subprocess, "run", return_value=completed), self.assertRaisesRegex(
+            Exception, "checkpoint_mismatch",
+        ):
+            checkpoint_cli._ordinary_resume(
+                "GEN-37", args=args, route=route, source=source,
+                expected_checkpoint=expected, expected_remote_id="remote-cp-1",
+            )
+
+    def test_ordinary_resume_rejects_malformed_fixed_frontier_shapes(self):
+        route = fixture.AUTHORITY
+        source = {"identity": "/tmp/plan.md", "sha256": "b" * 64}
+        args = checkpoint_cli.parser().parse_args([
+            "GEN-37", "--created-at", "2026-09-01T06:30:00Z", "--agent", "codex",
+            "--provider", "openai", "--session-id", "s", "--machine", "M5",
+            "--worktree-state", "safe", "--before-status", "In Progress",
+            "--after-status", "In Progress", "--next-action", "Continue",
+        ])
+        base = {
+            "context_schema": {"name": "agent-workstream.resume-context", "version": 2,
+                "representation": "compact_validated", "envelope": "fixed_frontier_authority_v1"},
+            "resume_authority": "full", "workstream_id": "GEN-37",
+            "plan_revision": source["sha256"], "authenticated_source": source,
+            "authenticated_route": route,
+            "authority_binding": {
+                "route_sha256": checkpoint_cli._digest(route),
+                "source_sha256": checkpoint_cli._digest(source),
+                "checkpoint_sha256": checkpoint_cli._digest(None),
+            },
+            "authority_scope": {
+                "history_validation": "complete_authenticated",
+                "execution_frontier": "complete_digest_bound_excerpts",
+                "item_count": 1, "omitted_items_claimed_executable": False,
+                "truncated_cell_count": 1,
+                "truncated_cell_marker": "~#<sha256-prefix>",
+                "truncated_cell_rule": "hydrate selected source row before action",
+            },
+            "execution_frontier": {
+                "root": {"status": None, "next": None, "blocker": None},
+                "children": [], "obligations": [],
+                "decisions": [], "choices": [], "dependencies": [],
+                "child_dependency_graph": {"authority": {}, "relations": []},
+                "columns": {
+                    "children": [], "obligations": [], "decisions": [],
+                    "choices": [], "dependencies": [],
+                    "child_dependency_graph.relations": [],
+                },
+                "checkpoint": "~#deadbeef", "disposition": None,
+            },
+            "deferred_audit_detail": {
+                "state": "fixed_frontier_authority_envelope",
+                "hydration_required_before_action": True,
+                "algorithm": "fixed-six-slot-frontier-v1", "fields": [],
+                "fields_sha256": "0" * 64, "full_context_sha256": "1" * 64,
+                "hydration_selectors": {}, "obligation_selector_rules": {},
+                "hydration_recipe": "hydrate", "original_context_bytes": 30_000,
+                "audit_route": {}, "full_history_route": {},
+            },
+        }
+        cases = []
+        malformed = deepcopy(base); malformed["context_schema"] = "bad"; cases.append(malformed)
+        malformed = deepcopy(base); malformed["authority_binding"]["extra"] = 1; cases.append(malformed)
+        malformed = deepcopy(base); malformed["authority_binding"]["route_sha256"] = "0" * 64; cases.append(malformed)
+        malformed = deepcopy(base); malformed["authority_binding"]["source_sha256"] = "0" * 64; cases.append(malformed)
+        malformed = deepcopy(base); malformed["execution_frontier"]["checkpoint"] = "garbage"; cases.append(malformed)
+        malformed = deepcopy(base); malformed.pop("deferred_audit_detail"); cases.append(malformed)
+        malformed = deepcopy(base); malformed["execution_frontier"].pop("obligations"); cases.append(malformed)
+        malformed = deepcopy(base); malformed["authority_scope"]["item_count"] = True; cases.append(malformed)
+        malformed = deepcopy(base); malformed["authority_scope"]["item_count"] = 0; cases.append(malformed)
+        malformed = deepcopy(base); malformed["execution_frontier"]["extra"] = 1; cases.append(malformed)
+        for payload in cases:
+            completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(payload), stderr="")
+            with patch.object(checkpoint_cli.subprocess, "run", return_value=completed), self.assertRaisesRegex(
+                Exception, "ordinary_resume_not_bounded_full",
+            ):
+                checkpoint_cli._ordinary_resume(
+                    "GEN-37", args=args, route=route, source=source,
+                )
+        for payload in (None, []):
+            completed = subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps(payload), stderr="",
+            )
+            with patch.object(
+                checkpoint_cli.subprocess, "run", return_value=completed,
+            ), self.assertRaisesRegex(
+                checkpoint_cli.LinearTransportError,
+                "checkpoint_ordinary_resume_invalid_json",
+            ):
+                checkpoint_cli._ordinary_resume(
+                    "GEN-37", args=args, route=route, source=source,
+                )
 
 
 if __name__ == "__main__":

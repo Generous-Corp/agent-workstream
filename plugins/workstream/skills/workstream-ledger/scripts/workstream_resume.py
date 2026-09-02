@@ -20,7 +20,9 @@ import sys
 from typing import Any
 
 from workstream_config import load_linear_api_key, resolve_linear_route
-from workstream_checkpoint import CheckpointError, recover_latest, validate_checkpoint
+from workstream_checkpoint import (
+    CheckpointError, canonical_authority_tip, recover_latest, validate_checkpoint,
+)
 from workstream_linear import (
     HttpGraphQLClient, LinearGraphQLTransport,
     LinearTransportError,
@@ -2366,6 +2368,7 @@ def _bounded_authority_envelope(
 
 def _fixed_frontier_authority_envelope(
     context: dict[str, Any], *, token: str,
+    binding_checkpoint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Hard-bound the complete <=100-item execution frontier.
 
@@ -2539,6 +2542,25 @@ def _fixed_frontier_authority_envelope(
         },
         "authenticated_route": route_brief,
         "authenticated_source": source_brief,
+        # Compact fields may be abbreviated for display.  These immutable
+        # digests keep the complete authority binding available to consumers
+        # without re-expanding the envelope beyond its byte budget.
+        "authority_binding": {
+            "route_sha256": hashlib.sha256(json.dumps(
+                context.get("authenticated_route"), ensure_ascii=False,
+                sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest(),
+            "source_sha256": hashlib.sha256(json.dumps(
+                context.get("authenticated_source"), ensure_ascii=False,
+                sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest(),
+            "checkpoint_sha256": hashlib.sha256(json.dumps(
+                canonical_authority_tip(binding_checkpoint)
+                if binding_checkpoint is not None
+                else None,
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest(),
+        },
         "deferred_audit_detail": {
             "state": "fixed_frontier_authority_envelope",
             "hydration_required_before_action": True,
@@ -2944,6 +2966,7 @@ def compact_context(
         if len(encoded) > max_bytes:
             candidate = _fixed_frontier_authority_envelope(
                 context, token=normalized_token,
+                binding_checkpoint=clean.get("latest_checkpoint"),
             )
             candidate["deferred_audit_detail"]["original_context_bytes"] = (
                 original_bytes

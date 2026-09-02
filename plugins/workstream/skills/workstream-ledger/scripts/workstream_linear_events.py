@@ -1185,8 +1185,26 @@ class LinearCommentEventAdapter:
         # event transport's query, capability, and boundary-slot helpers.
         from workstream_linear_checkpoints import reduce_checkpoint_comments
 
+        selected_checkpoints = None
+        from workstream_generation import generation_controls, selected_activation_checkpoints
+        from workstream_linear_projection import select_plan_generation
+        if generation_controls(comments):
+            if self._observed_authority is None:
+                raise LinearEventError("comment_slot_authority_incomplete")
+            selected = select_plan_generation(
+                comments, workstream_id=self.issue_id,
+                description_plan_revision=None,
+                authenticated_route=self._observed_authority,
+            )
+            selected_checkpoints = selected_activation_checkpoints(
+                comments, workstream_id=self.issue_id,
+                transition_event_id=selected["transition_tip_event_id"],
+                active_plan_revision=selected["plan_revision"],
+                authenticated_route=self._observed_authority,
+            )
         checkpoints = reduce_checkpoint_comments(
-            comments, workstream_id=self.issue_id
+            comments, workstream_id=self.issue_id,
+            selected_activation_checkpoints=selected_checkpoints,
         )
         return events, checkpoints, comments
 

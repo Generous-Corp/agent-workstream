@@ -256,3 +256,20 @@ def recover_latest(
     except KeyError as error:
         # Checkpoints exist, but none belong to the caller's expected plan.
         raise CheckpointError("plan_sync_required") from error
+
+
+def canonical_authority_tip(tip: dict[str, Any]) -> dict[str, Any]:
+    """Return the single canonical, digest-bound normalized checkpoint tip.
+
+    ``recover_generations`` is the authority-producing path.  Keeping this
+    small helper explicit prevents compact display envelopes from becoming a
+    second (and weaker) digest format.
+    """
+    required = {
+        "workstream_id", "checkpoint_event_id", "root_revision",
+        "plan_revision", "status", "exact_head", "evidence", "blocker",
+        "next_action", "worktree", "acknowledgement", "provenance_chain",
+    }
+    if not isinstance(tip, dict) or set(tip) != required:
+        raise CheckpointError("invalid_normalized_checkpoint_tip")
+    return deepcopy(tip)
