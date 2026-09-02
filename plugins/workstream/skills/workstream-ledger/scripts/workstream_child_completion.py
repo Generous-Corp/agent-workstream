@@ -116,8 +116,9 @@ def _validate_pending_finalizer(
     child_id = fences.get("child_issue_id")
     child = next((item for item in snapshot.get("children", [])
                   if item.get("id") == child_id), None)
-    if child is None or _digest(_native_child(child)) != _digest(
-        fences.get("native_child_after")
+    if child is None or not _post_child_valid(
+        _native_child(child), fences.get("native_child_before") or {},
+        fences.get("completed_state") or {},
     ):
         raise ChildCompletionError("child_completion_recovery_child_drift")
     slot = ledger_boundary_slot_id(
@@ -154,6 +155,18 @@ def _validate_pending_finalizer(
     if any(event["event_id"] == reservation["intent_event"]["event_id"]
            for event in state.events):
         raise ChildCompletionError("child_completion_recovery_already_finalized")
+    if _eligible_fleet_gate(
+        state, plan_revision=reservation["plan_revision"]
+    ) != frontiers.get("fleet_gate"):
+        raise ChildCompletionError("child_completion_recovery_fleet_gate_drift")
+    if _digest(snapshot.get("dependency_graph")) \
+            != frontiers.get("dependency_graph_sha256"):
+        raise ChildCompletionError("child_completion_recovery_dependency_drift")
+    if _digest({
+        "relations": snapshot.get("relations"),
+        "relation_targets": snapshot.get("relation_targets"),
+    }) != frontiers.get("resolved_relations_sha256"):
+        raise ChildCompletionError("child_completion_recovery_relation_drift")
 
 
 def _eligible_fleet_gate(

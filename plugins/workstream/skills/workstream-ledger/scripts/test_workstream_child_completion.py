@@ -5,7 +5,7 @@ import unittest
 
 from workstream_child_completion import (
     ChildCompletionError, apply_child_completion,
-    build_child_completion_transaction,
+    build_child_completion_transaction, _post_child_valid,
 )
 from workstream_linear_projection import build_projection_event
 import test_workstream_child_completion_prepare as fixture
@@ -185,6 +185,19 @@ class ChildCompletionTests(unittest.TestCase):
         self.assertEqual(native["state"]["type"], "started")
         self.assertIn("native_root_sha256", tx["frontiers"])
         self.assertIn("dependency_graph_sha256", tx["frontiers"])
+
+    def test_post_native_clock_may_change_while_preserved_fields_match(self):
+        tx = transaction()
+        before = tx["native_child_before"]
+        after = deepcopy(before)
+        after["state"] = {"id": "done", "name": "Done", "type": "completed"}
+        after["state_id"] = "done"
+        after["status"] = "Done"
+        after["status_type"] = "completed"
+        after["updatedAt"] = "after"
+        self.assertTrue(_post_child_valid(
+            after, before, tx["completed_state"],
+        ))
 
 
 if __name__ == "__main__":
