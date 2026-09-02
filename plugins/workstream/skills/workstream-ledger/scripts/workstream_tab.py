@@ -141,12 +141,18 @@ def _json_result(result: subprocess.CompletedProcess[str] | None, error: str) ->
     return value
 
 
-def _surface_context(cmux: str, target: str, runner: Runner) -> SurfaceContext | None:
-    if _run(runner, [cmux, "ping"], allow_unavailable=True) is None:
+def _surface_context(
+    cmux: str, target: str, runner: Runner, *,
+    environment: Mapping[str, str] | None = None,
+) -> SurfaceContext | None:
+    if _run(
+        runner, [cmux, "ping"], allow_unavailable=True,
+        environment=environment,
+    ) is None:
         return None
     result = _run(
         runner, [cmux, "identify", "--surface", target, "--json"],
-        allow_unavailable=True,
+        allow_unavailable=True, environment=environment,
     )
     if result is None:
         raise TabTitleError("cmux_target_unresolved")
@@ -168,11 +174,12 @@ def _surface_context(cmux: str, target: str, runner: Runner) -> SurfaceContext |
 def _read_title(
     cmux: str, context: SurfaceContext, runner: Runner, *,
     allow_unavailable: bool = False,
+    environment: Mapping[str, str] | None = None,
 ) -> str | None:
     result = _run(runner, [
         cmux, "list-pane-surfaces", "--pane", context.pane,
         "--workspace", context.workspace, "--window", context.window, "--json",
-    ], allow_unavailable=allow_unavailable)
+    ], allow_unavailable=allow_unavailable, environment=environment)
     if result is None:
         return None
     value = _json_result(result, "invalid_cmux_surface_response")
@@ -322,7 +329,9 @@ def apply_title(
     if not cmux:
         return {"status": "unavailable", "reason": "cmux_cli_unavailable", "token": token}
     try:
-        context = _surface_context(cmux, target, runner)
+        context = _surface_context(
+            cmux, target, runner, environment=environ,
+        )
     except TabTitleError as error:
         if str(error) == "cmux_target_unresolved":
             return {
@@ -332,7 +341,9 @@ def apply_title(
         raise
     if context is None:
         return {"status": "unavailable", "reason": "cmux_unavailable", "token": token}
-    before = _read_title(cmux, context, runner, allow_unavailable=True)
+    before = _read_title(
+        cmux, context, runner, allow_unavailable=True, environment=environ,
+    )
     if before is None:
         return {
             "status": "unavailable", "reason": "cmux_target_unresolved",
@@ -353,8 +364,10 @@ def apply_title(
             cmux, "rename-tab", "--surface", context.surface,
             "--workspace", context.workspace, "--window", context.window,
             "--", after,
-        ])
-        observed = _read_title(cmux, context, runner)
+        ], environment=environ)
+        observed = _read_title(
+            cmux, context, runner, environment=environ,
+        )
         if observed != after:
             raise TabTitleError("cmux_title_readback_mismatch")
     return {

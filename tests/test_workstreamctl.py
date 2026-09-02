@@ -119,6 +119,14 @@ class WorkstreamCtlTests(unittest.TestCase):
             [MODULE.sys.executable, str(script), "activate", "GEN-37", "--help"],
         )
 
+    def test_this_session_dispatches_exact_terminal_resume(self):
+        with mock.patch.object(MODULE.os, "execv") as execute:
+            MODULE.main(["resume-this-session"])
+        script = MODULE.SCRIPTS / "workstream_this_session.py"
+        execute.assert_called_once_with(
+            MODULE.sys.executable, [MODULE.sys.executable, str(script)],
+        )
+
     def test_generation_dispatches_handle_only_continuation(self):
         argv = [
             "generation", "continue", "GEN-37",

@@ -4,6 +4,11 @@ Agent Workstream is intentionally a thin, local-first ledger and agent-workflow
 plugin. Installing it adds skills and deterministic tools; it does not silently
 install hooks, MCP servers, monitors, daemons, or background workers.
 
+The optional `resume this session` helper is invoked by an agent, reads one
+exact namespaced cmux/HerdR target (or cmux's bounded controlling-TTY result),
+and stores only a local successor binding after full Linear recovery. It is not
+a monitor, scheduler, or ambient hook.
+
 ## Why keep the plugin thin?
 
 This keeps installation portable across agent clients, avoids ambient execution

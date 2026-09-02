@@ -47,6 +47,15 @@ Resume GEN-123. Reconcile the durable graph with live repository and landing
 state before editing, then continue the recorded next action.
 ```
 
+When the exact cmux or HerdR tab already carries a single token or namespaced
+binding, the shorter request `Resume this session` runs the same authoritative
+resume once. Complete injected terminal identity is preferred; cmux may instead
+use its bounded controlling-TTY ancestor resolver. Missing, conflicting, or
+ambiguous identity refuses with a request for the explicit token—never a focus,
+cwd, chat, or memory guess. A successful resume records the new provider
+session as an idempotent local successor and preserves or appends the tab token.
+This convenience installs no hook or background process.
+
 If you use [cmux](https://cmux.com/), the token can also be carried in a tab
 title and passed into a successor session. This is optional integration: without
 cmux, paste the same token or Linear URL into any new agent or terminal. Durable
@@ -89,6 +98,7 @@ so any change after review refuses before writing.
 | Start from a plan | `Start a tracked workstream for ./PLAN.md.` |
 | Start from a durable plan URL | `Start a tracked workstream for <URL>.` |
 | Resume elsewhere | `Resume GEN-123 and reconcile live state before continuing.` |
+| Resume the exact tab | `Resume this session.` |
 | Change the work | `Record this new requirement in GEN-123 and continue.` |
 | Inspect progress | `Show status, blockers, and changes since the last checkpoint for GEN-123.` |
 | Agent/session handoff | `Checkpoint GEN-123 with exact location, head, evidence, and next action.` |
@@ -140,6 +150,9 @@ plugins/workstream/bin/workstreamctl intake ./PLAN.md \
 
 # Resolve one live root with full authority, fetching its projected plan bytes.
 plugins/workstream/bin/workstreamctl resume GEN-123
+
+# Resolve the exact current cmux/HerdR tab, then run the same resume once.
+plugins/workstream/bin/workstreamctl resume-this-session
 
 # For a private checkout, override only the fetch location.
 plugins/workstream/bin/workstreamctl resume GEN-123 \

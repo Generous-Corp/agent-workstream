@@ -60,13 +60,16 @@ Typical requests are:
 Start a tracked workstream for this plan.
 What changed in ABC-123 since the last checkpoint?
 Resume ABC-123 and reconcile it with live repository state.
+Resume this session.
 Adversarially check whether ABC-123 can close.
 ```
 
 [cmux](https://cmux.com/) and [Herdr](https://herdr.dev/docs/) are optional.
 When either manages the current tab, Agent Workstream can carry the stable token
-in its title. Without a supported session manager, resume from the same Linear
-token or URL; only the display convenience is skipped.
+in its title. `Resume this session` uses only the exact namespaced tab binding
+or a single title token (with a bounded, focus-independent cmux TTY resolver)
+before running normal authenticated resume. Without exact terminal identity or
+a supported manager, paste the Linear token or URL; no cwd/chat guess occurs.
 
 ## Roadmap
 
