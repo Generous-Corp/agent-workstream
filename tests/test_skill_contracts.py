@@ -201,7 +201,7 @@ class SkillContractTests(unittest.TestCase):
         resume = self.resume_skill()
         ledger = self.skill()
         flat = " ".join(resume.split())
-        self.assertLess(len(resume.encode()), 5500)
+        self.assertLess(len(resume.encode()), 6000)
         self.assertLessEqual(len(resume.splitlines()), 90)
         self.assertIn("existing workstream handle", resume)
         self.assertIn("after workstream-resume has returned", ledger)
@@ -219,12 +219,23 @@ class SkillContractTests(unittest.TestCase):
         codex = json.loads((plugin / ".codex-plugin/plugin.json").read_text())
         claude = json.loads((plugin / ".claude-plugin/plugin.json").read_text())
         self.assertEqual(codex["version"], claude["version"])
-        self.assertEqual(codex["version"], "0.4.71")
+        self.assertEqual(codex["version"], "0.4.72")
         shim = plugin / "skills/workstream-resume/scripts/workstream_resume.py"
         target = plugin / "skills/workstream-ledger/scripts/workstream_resume.py"
         self.assertTrue(shim.is_file())
         self.assertTrue(target.is_file())
         self.assertTrue((plugin / "skills/workstream-resume/scripts/workstream_tab.py").is_file())
+        self.assertTrue((plugin / "skills/workstream-resume/scripts/workstream_this_session.py").is_file())
+
+    def test_literal_this_session_contract_is_fail_closed_and_nonambient(self):
+        resume = " ".join(self.resume_skill().split())
+        self.assertIn("For literal `resume this session`", resume)
+        self.assertIn("scripts/workstream_this_session.py", resume)
+        self.assertIn("never focus, cwd, chat, or memory", resume)
+        self.assertIn("ordinary resume runs once", resume)
+        self.assertIn("must return `full`", resume)
+        self.assertIn("adapter failure cannot downgrade", resume)
+        self.assertIn("installs no hook", resume)
 
     def test_resume_shim_forwards_exact_argv_and_missing_target_refuses(self):
         source = (
@@ -277,6 +288,25 @@ class SkillContractTests(unittest.TestCase):
             self.assertEqual(
                 json.loads(forwarded.stdout), [str(target.resolve()), *args],
             )
+
+    def test_this_session_shim_forwards_without_guessing_an_argument(self):
+        source = (
+            Path(__file__).parents[1]
+            / "plugins/workstream/skills/workstream-resume/scripts/workstream_this_session.py"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            skills = Path(directory) / "skills"
+            shim = skills / "workstream-resume/scripts/workstream_this_session.py"
+            shim.parent.mkdir(parents=True)
+            shim.write_bytes(source.read_bytes())
+            target = skills / "workstream-ledger/scripts/workstream_this_session.py"
+            target.parent.mkdir(parents=True)
+            target.write_text("import json, sys; print(json.dumps(sys.argv))\n")
+            forwarded = subprocess.run(
+                [sys.executable, str(shim)], capture_output=True, text=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(forwarded.stdout), [str(target.resolve())])
 
 
 if __name__ == "__main__":

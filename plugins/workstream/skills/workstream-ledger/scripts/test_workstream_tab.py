@@ -21,9 +21,11 @@ class FakeCmux:
         self.title = title
         self.accept_rename = accept_rename
         self.calls = []
+        self.options = []
 
     def __call__(self, argv, **kwargs):
         self.calls.append(argv)
+        self.options.append(kwargs)
         if argv[1] == "ping":
             output = "pong"
         elif argv[1] == "identify":
@@ -97,6 +99,23 @@ class WorkstreamTabTests(unittest.TestCase):
             "ping", "identify", "list-pane-surfaces", "rename-tab", "list-pane-surfaces",
         ])
         self.assertEqual(fake.calls[3][-1], "Linear · GEN-37")
+
+    def test_cmux_commands_inherit_the_exact_socket_namespace(self):
+        fake = FakeCmux("Linear · GEN-37")
+        environment = {
+            "CMUX_SURFACE_ID": "surface:7",
+            "CMUX_SOCKET_PATH": "/tmp/cmux-exact.sock",
+        }
+        result = tab.apply_title(
+            "GEN-37", target="surface:7", environ=environment, runner=fake,
+            which=lambda _: "/opt/cmux",
+        )
+        self.assertEqual(result["status"], "unchanged")
+        self.assertTrue(fake.options)
+        self.assertTrue(all(
+            options["env"]["CMUX_SOCKET_PATH"] == "/tmp/cmux-exact.sock"
+            for options in fake.options
+        ))
 
     def test_unnamed_title_becomes_project_label_and_token(self):
         _, result = self.apply("   ", project_name="Linear Integration")
