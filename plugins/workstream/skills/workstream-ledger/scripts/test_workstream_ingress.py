@@ -373,6 +373,89 @@ class WorkstreamIngressTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["context_url"], "https://linear/ABC-12")
 
+    def test_remote_binding_accepts_current_emitter_and_ignores_malformed_tail(self):
+        capture = capture_payload(workstream_id=None)
+        binding = {
+            "schema_version": 1, "event_id": "e1",
+            "bound_at": "2026-08-14T02:00:00Z", "workstream_id": "ABC-12",
+            "context_url": "https://linear/ABC-12",
+        }
+        malformed_tail = {
+            "event_id": "e1", "workstream_id": {}, "context_url": [],
+        }
+        comments = [
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture)},
+            {"body": MODULE.comment_body(MODULE.BIND_MARKER, binding)},
+            {"body": MODULE.comment_body(MODULE.BIND_MARKER, malformed_tail)},
+        ]
+        with mock.patch.object(MODULE, "gh", side_effect=[
+            [{"number": 7, "url": "i", "title": "ingress"}], [comments],
+        ]):
+            events = MODULE.remote_events("o/r", "ABC-12")
+        self.assertEqual([event["event_id"] for event in events], ["e1"])
+        self.assertEqual(events[0]["context_url"], "https://linear/ABC-12")
+
+        with mock.patch.object(MODULE, "gh", return_value=[comments]):
+            state = MODULE.remote_event_state("o/r", 7, "e1")
+        self.assertEqual(state["capture"]["workstream_id"], "ABC-12")
+        self.assertEqual(
+            state["capture"]["context_url"], "https://linear/ABC-12",
+        )
+
+    def test_remote_binding_quarantines_invalid_routing_without_hiding_capture(self):
+        capture = capture_payload(context_url="https://linear/ABC-12")
+        invalid = [
+            {"event_id": "e1", "workstream_id": {}, "context_url": []},
+            {"event_id": "e1", "workstream_id": "bad", "context_url": "hidden"},
+            {"event_id": "e1", "workstream_id": "ABC-13", "context_url": ""},
+            {"event_id": "e1", "workstream_id": "ABC-13",
+             "context_url": "x" * (MODULE.MAX_BINDING_CONTEXT_BYTES + 1)},
+            {"schema_version": True, "event_id": "e1",
+             "bound_at": "2026-08-14T02:00:00Z", "workstream_id": "ABC-13",
+             "context_url": "https://linear/ABC-13"},
+            {"schema_version": 1, "event_id": "e1",
+             "bound_at": "not-a-time", "workstream_id": "ABC-13",
+             "context_url": "https://linear/ABC-13"},
+            {"schema_version": 1, "event_id": "e1",
+             "unbound_at": "2026-08-14T02:00:00Z", "workstream_id": "ABC-13",
+             "context_url": "https://linear/ABC-13"},
+        ]
+        comments = [
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture)},
+            *[
+                {"body": MODULE.comment_body(MODULE.BIND_MARKER, item)}
+                for item in invalid
+            ],
+        ]
+        with mock.patch.object(MODULE, "gh", side_effect=[
+            [{"number": 7, "url": "i", "title": "ingress"}], [comments],
+        ]):
+            events = MODULE.remote_events("o/r", "ABC-12")
+        self.assertEqual([event["event_id"] for event in events], ["e1"])
+        self.assertEqual(events[0]["workstream_id"], "ABC-12")
+
+    def test_remote_binding_accepts_current_unbind_emitter(self):
+        capture = capture_payload(workstream_id=None)
+        binding = {
+            "schema_version": 1, "event_id": "e1",
+            "bound_at": "2026-08-14T02:00:00Z", "workstream_id": "ABC-12",
+            "context_url": "https://linear/ABC-12",
+        }
+        unbinding = {
+            "schema_version": 1, "event_id": "e1",
+            "unbound_at": "2026-08-14T03:00:00Z", "workstream_id": None,
+            "context_url": None,
+        }
+        comments = [
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture)},
+            {"body": MODULE.comment_body(MODULE.BIND_MARKER, binding)},
+            {"body": MODULE.comment_body(MODULE.BIND_MARKER, unbinding)},
+        ]
+        with mock.patch.object(MODULE, "gh", side_effect=[
+            [{"number": 7, "url": "i", "title": "ingress"}], [comments],
+        ]):
+            self.assertEqual(MODULE.remote_events("o/r", "ABC-12"), [])
+
     def test_remote_unbind_supersedes_a_wrong_binding(self):
         capture = capture_payload(workstream_id=None)
         binding = {"event_id": "e1", "workstream_id": "ABC-12", "context_url": "https://linear/ABC-12"}

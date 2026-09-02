@@ -31,6 +31,7 @@ MAX_PROMPT_BYTES = 16 * 1024
 TRUNCATION_SUFFIX = "\n[TRUNCATED]"
 # The local outbox stores this value in a SQLite signed INTEGER.
 MAX_REDACTIONS = (1 << 63) - 1
+MAX_BINDING_CONTEXT_BYTES = 4096
 DEFAULT_RETENTION_DAYS = 30
 DEFAULT_REMOTE_RETENTION_DAYS = 90
 DEFAULT_MAX_LOCAL_BYTES = 50 * 1024 * 1024
@@ -750,6 +751,16 @@ def _payload_without_time(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if key != "processed_at"}
 
 
+def _is_utc_z_timestamp(value: Any) -> bool:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except (ValueError, OverflowError):
+        return False
+    return parsed.utcoffset() == timedelta(0)
+
+
 def _is_exact_capture_payload(payload: Any) -> bool:
     """Accept only the immutable shape emitted by ``upload_event``."""
     if not isinstance(payload, dict) or set(payload) != {
@@ -759,11 +770,7 @@ def _is_exact_capture_payload(payload: Any) -> bool:
     }:
         return False
     captured_at = payload.get("captured_at")
-    if not isinstance(captured_at, str) or not captured_at.endswith("Z"):
-        return False
-    try:
-        captured_time = datetime.fromisoformat(captured_at[:-1] + "+00:00")
-    except ValueError:
+    if not _is_utc_z_timestamp(captured_at):
         return False
     prompt = payload.get("prompt")
     if not isinstance(prompt, str):
@@ -810,7 +817,7 @@ def _is_exact_capture_payload(payload: Any) -> bool:
         and isinstance(payload.get("event_id"), str)
         and bool(payload["event_id"])
         and len(payload["event_id"].encode("utf-8")) <= 256
-        and captured_time.utcoffset() == timedelta(0)
+        and _is_utc_z_timestamp(captured_at)
         and isinstance(payload.get("provider"), str)
         and bool(payload["provider"])
         and all(
@@ -830,6 +837,56 @@ def _is_exact_capture_payload(payload: Any) -> bool:
         )
         and isinstance(prompt, str)
     )
+
+
+def _is_exact_binding_payload(payload: Any) -> bool:
+    """Accept historical bindings and the exact current bind/unbind emitters."""
+    if not isinstance(payload, dict):
+        return False
+    common = {"event_id", "workstream_id", "context_url"}
+    keys = set(payload)
+    legacy = keys == common
+    bound = keys == common | {"schema_version", "bound_at"}
+    unbound = keys == common | {"schema_version", "unbound_at"}
+    if not (legacy or bound or unbound):
+        return False
+    event_id = payload.get("event_id")
+    try:
+        event_id_valid = (
+            isinstance(event_id, str)
+            and bool(event_id)
+            and len(event_id.encode("utf-8")) <= 256
+        )
+    except UnicodeEncodeError:
+        event_id_valid = False
+    if not event_id_valid:
+        return False
+    if not legacy and (
+        type(payload.get("schema_version")) is not int
+        or payload["schema_version"] != SCHEMA_VERSION
+    ):
+        return False
+    workstream_id = payload.get("workstream_id")
+    context_url = payload.get("context_url")
+    if workstream_id is None:
+        return (
+            context_url is None
+            and (legacy or unbound)
+            and (legacy or _is_utc_z_timestamp(payload.get("unbound_at")))
+        )
+    if not (
+        isinstance(workstream_id, str)
+        and re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", workstream_id) is not None
+        and (legacy or bound)
+        and (legacy or _is_utc_z_timestamp(payload.get("bound_at")))
+        and isinstance(context_url, str)
+        and bool(context_url)
+    ):
+        return False
+    try:
+        return len(context_url.encode("utf-8")) <= MAX_BINDING_CONTEXT_BYTES
+    except UnicodeEncodeError:
+        return False
 
 
 def _is_exact_legacy_processed_hint(payload: Any) -> bool:
@@ -899,7 +956,14 @@ def reduce_ingress_comments(
             if not isinstance(item, dict):
                 break
             if item.get("event_id") == event_id:
-                if marker != CAPTURE_MARKER or _is_exact_capture_payload(item):
+                valid = (
+                    _is_exact_capture_payload(item)
+                    if marker == CAPTURE_MARKER
+                    else _is_exact_binding_payload(item)
+                    if marker == BIND_MARKER
+                    else True
+                )
+                if valid:
                     target.append(item)
             break
 
@@ -1216,15 +1280,9 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
                 continue
             item = parse_comment(comment.get("body", ""), BIND_MARKER)
             if item is not None:
-                if not isinstance(item, dict):
+                if not _is_exact_binding_payload(item):
                     continue
-                event_id = item.get("event_id")
-                if (
-                    not isinstance(event_id, str)
-                    or not event_id
-                    or len(event_id.encode("utf-8")) > 256
-                ):
-                    continue
+                event_id = item["event_id"]
                 bind_route(event_id, issue_number)
                 bindings[event_id] = item
     for event_id, binding in bindings.items():
