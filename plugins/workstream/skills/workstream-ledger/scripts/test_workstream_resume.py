@@ -141,6 +141,9 @@ class ResumeTests(unittest.TestCase):
         }), mock.patch(
             "workstream_generation.pending_generation_reservations",
             return_value=[reservation],
+        ), mock.patch(
+            "workstream_generation.validate_prepared_generation_transition",
+            return_value=None,
         ):
             result = MODULE.plan_generation_freshness(
                 token="GEN-37", description=f"Canonical plan: {canonical}",
@@ -183,18 +186,14 @@ class ResumeTests(unittest.TestCase):
         }
 
         def surface(prepared):
-            token = (
-                f"generation:{reservation['reservation_id']}:"
-                f"{reservation['reservation_sha256']}"
-            )
             with mock.patch.object(MODULE, "plan_payload", return_value={
                 "source": {"identity": canonical, "sha256": "b" * 64},
             }), mock.patch(
                 "workstream_generation.pending_generation_reservations",
                 return_value=[reservation],
             ), mock.patch(
-                "workstream_generation.generation_ledger_frontier_tokens",
-                return_value=[token] if prepared else [],
+                "workstream_generation.validate_prepared_generation_transition",
+                return_value={"event_id": "wsp_" + "9" * 32} if prepared else None,
             ):
                 return MODULE.plan_generation_freshness(
                     token="GEN-37",

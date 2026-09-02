@@ -567,6 +567,12 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.76 authenticates generation-transition tokens as part of the shared
+ledger serialization frontier. If response-loss retries left several canonical
+copies of the exact same intent along one deterministic collision chain, the
+reducer treats them as one pending reservation and reuses the first slot.
+Different intent, material frontier, or collision lineage remains quarantined.
+
 Version 0.4.70 accepts the bounded fixed-frontier resume envelope as a
 fully-bound ordinary-resume oracle, including its compact checkpoint receipt,
 while retaining legacy validation and the 24 KiB output fence. It also refuses

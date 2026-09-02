@@ -2037,38 +2037,402 @@ def generation_abort_slot_id(
     )
 
 
-def generation_ledger_frontier_tokens(
-    comments: list[dict[str, Any]], *, workstream_id: str,
-) -> list[str]:
-    """Separate upgraded active writers from quarantined legacy successors."""
-    from workstream_linear_projection import (
-        PROJECTION_PREFIX, PROJECTION_RE,
+def _reservation_generation_frontier(
+    comments: list[dict[str, Any]], *, reservation: dict[str, Any],
+    plan_revision: str, projection_revision: int,
+    authenticated_predecessor_control_ids: frozenset[str],
+    activation_checkpoint: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Rebuild the exact reservation-time frontier from immutable prefixes."""
+    state = reduce_projection_comments(
+        comments, workstream_id=reservation["workstream_id"],
+        expected_plan_revision=plan_revision,
+        authenticated_route=reservation["authority"],
     )
-
-    tokens: set[str] = set()
+    frontier = _generation_frontier(
+        state, comments, plan_revision=plan_revision,
+        projection_revision=projection_revision,
+        material_revision=reservation["material_revision"],
+        authorized_activation_event_ids=authenticated_predecessor_control_ids,
+    )
+    from workstream_linear_checkpoints import reduce_checkpoint_comments
+    checkpoints = {
+        item["event_id"]: item["plan_revision"]
+        for item in reduce_checkpoint_comments(
+            comments, workstream_id=reservation["workstream_id"],
+        ).checkpoints
+    }
+    checkpoint_ids = sorted(
+        event_id for event_id in reservation["checkpoint_event_ids"]
+        if checkpoints.get(event_id) == plan_revision
+    )
     for comment in comments:
         body = comment.get("body") or ""
         if not isinstance(body, str) or PROJECTION_PREFIX not in body:
             continue
         matches = PROJECTION_RE.findall(body)
         if len(matches) != 1 or body.count(PROJECTION_PREFIX) != 1:
+            raise WorkstreamGenerationError("malformed_projection_marker")
+        control = decode_projection_receipt(comment, matches[0])
+        if control["event_id"] not in authenticated_predecessor_control_ids:
             continue
-        try:
-            event = decode_projection_receipt(comment, matches[0])
-        except LinearTransportError:
-            continue
-        if (
-            event["workstream_id"] == workstream_id
-            and event["kind"] in {"generation_genesis", "generation_transition"}
-            and comment.get("id") == projection_slot_id(
-                workstream_id, event["plan_revision"],
-                event["expected_revision"], event["authority"],
+        carried = control.get("value", {}).get("activation_checkpoint")
+        if carried is not None and carried["plan_revision"] == plan_revision:
+            checkpoint_ids = sorted(set([
+                *checkpoint_ids, carried["event_id"],
+            ]))
+    if (
+        activation_checkpoint is not None
+        and activation_checkpoint["plan_revision"] == plan_revision
+    ):
+        checkpoint_ids = sorted(set([
+            *checkpoint_ids, activation_checkpoint["event_id"],
+        ]))
+    frontier["checkpoint_event_ids"] = checkpoint_ids
+    frontier["checkpoint_events_sha256"] = _digest(checkpoint_ids)
+    return frontier
+
+
+def _assert_generation_control_reservation_binding(
+    comments: list[dict[str, Any]], *, event: dict[str, Any],
+    reservation: dict[str, Any], authenticated_route: dict[str, str],
+    authenticated_predecessor_control_ids: frozenset[str],
+) -> bool:
+    """Authenticate every reservation-controlled byte of one active control.
+
+    Returns false only for legacy schema-3 transitions whose activation
+    checkpoint was not stored in their schema-2 reservation. Schema-2 controls
+    remain compatible because every field other than the selected post-seal
+    digest is reconstructed from their exact immutable reservation and chain.
+    """
+    value = event["value"]
+    common = (
+        event["authority"] == authenticated_route
+        and event["created_at"] == reservation["created_at"]
+        and event["plan_revision"] == reservation["from_plan_revision"]
+        and event["expected_revision"]
+        == reservation["from_projection_revision"]
+        and value["reservation_id"] == reservation["reservation_id"]
+        and value["reservation_sha256"] == reservation["reservation_sha256"]
+        and value["source"] == reservation["source"]
+        and value["graph_frontier_sha256"]
+        == _reservation_graph_sha256(reservation)
+        and value["retirement"] == reservation["retirement"]
+        and value["previous_control_event_id"]
+        == reservation["previous_control_event_id"]
+        and value["activation_epoch"] == reservation["activation_epoch"]
+    )
+    if not common:
+        raise WorkstreamGenerationError(
+            "generation_ledger_frontier_reservation_binding_mismatch"
+        )
+
+    expected_from = _reservation_generation_frontier(
+        comments, reservation=reservation,
+        plan_revision=reservation["from_plan_revision"],
+        projection_revision=reservation["from_projection_revision"],
+        authenticated_predecessor_control_ids=(
+            authenticated_predecessor_control_ids
+        ),
+        activation_checkpoint=None,
+    )
+    if event["kind"] == "generation_genesis":
+        expected_value = {
+            "schema_version": 2,
+            "reservation_id": reservation["reservation_id"],
+            "reservation_sha256": reservation["reservation_sha256"],
+            "from": expected_from, "to": expected_from,
+            "source": deepcopy(reservation["source"]),
+            "graph_frontier_sha256": _reservation_graph_sha256(reservation),
+            "candidate_resume_sha256": reservation[
+                "candidate_resume_sha256"
+            ],
+            "retirement": deepcopy(reservation["retirement"]),
+            "previous_control_event_id": reservation[
+                "previous_control_event_id"
+            ],
+            "activation_epoch": reservation["activation_epoch"],
+            "candidate_seal_event_id": None,
+            "candidate_seal_sha256": None,
+        }
+        expected = build_projection_event(
+            workstream_id=reservation["workstream_id"],
+            kind="generation_genesis", key="root", value=expected_value,
+            plan_revision=reservation["from_plan_revision"],
+            expected_revision=reservation["from_projection_revision"],
+            created_at=reservation["created_at"], authority=authenticated_route,
+        )
+        if reservation["mode"] != "bootstrap" or event != expected:
+            raise WorkstreamGenerationError(
+                "generation_ledger_frontier_reservation_binding_mismatch"
             )
+        return True
+
+    control_schema = value.get("schema_version")
+    reservation_schema = reservation.get("schema_version")
+    if reservation_schema in {4, 5, 6, 7} and control_schema != 4:
+        raise WorkstreamGenerationError(
+            "generation_ledger_frontier_reservation_binding_mismatch"
+        )
+    if control_schema not in {2, 4}:
+        if control_schema != 3:
+            raise WorkstreamGenerationError(
+                "generation_ledger_frontier_reservation_binding_mismatch"
+            )
+    current_activation = (
+        value.get("activation_checkpoint")
+        if control_schema in {3, 4} else None
+    )
+    expected_to_before = _reservation_generation_frontier(
+        comments, reservation=reservation,
+        plan_revision=reservation["to_plan_revision"],
+        projection_revision=reservation["to_projection_revision"],
+        authenticated_predecessor_control_ids=(
+            authenticated_predecessor_control_ids
+        ),
+        activation_checkpoint=current_activation,
+    )
+    seal_value = {
+        "schema_version": 2,
+        "reservation_id": reservation["reservation_id"],
+        "reservation_sha256": reservation["reservation_sha256"],
+        "from": expected_from, "to": expected_to_before,
+        "source": deepcopy(reservation["source"]),
+        "graph_frontier_sha256": _reservation_graph_sha256(reservation),
+        "candidate_resume_sha256": reservation["candidate_resume_sha256"],
+        "retirement": deepcopy(reservation["retirement"]),
+        "previous_control_event_id": reservation[
+            "previous_control_event_id"
+        ],
+        "activation_epoch": reservation["activation_epoch"],
+    }
+    expected_seal = build_projection_event(
+        workstream_id=reservation["workstream_id"],
+        kind="generation_candidate_seal", key=reservation["reservation_id"],
+        value=seal_value, plan_revision=reservation["to_plan_revision"],
+        expected_revision=reservation["to_projection_revision"],
+        created_at=reservation["created_at"], authority=authenticated_route,
+    )
+    to_state = reduce_projection_comments(
+        comments, workstream_id=reservation["workstream_id"],
+        expected_plan_revision=reservation["to_plan_revision"],
+        authenticated_route=authenticated_route,
+    )
+    seals = [
+        item for item in to_state.events
+        if item["kind"] == "generation_candidate_seal"
+        and item["key"] == reservation["reservation_id"]
+    ]
+    if len(seals) != 1 or seals[0] != expected_seal:
+        raise WorkstreamGenerationError(
+            "generation_ledger_frontier_reservation_binding_mismatch"
+        )
+    expected_to = _reservation_generation_frontier(
+        comments, reservation=reservation,
+        plan_revision=reservation["to_plan_revision"],
+        projection_revision=reservation["to_projection_revision"] + 1,
+        authenticated_predecessor_control_ids=(
+            authenticated_predecessor_control_ids
+        ),
+        activation_checkpoint=current_activation,
+    )
+    expected_value: dict[str, Any] = {
+        **seal_value,
+        "to": expected_to,
+        # The post-seal digest is bound as part of the exact transition by its
+        # authenticated finalization; every field derivable from the durable
+        # reservation is rebuilt here instead of copied from the control.
+        "candidate_resume_sha256": value["candidate_resume_sha256"],
+        "candidate_seal_event_id": expected_seal["event_id"],
+        "candidate_seal_sha256": _digest(expected_seal),
+    }
+    if control_schema == 4:
+        expected_value.update({
+            "schema_version": 4,
+            "activation_checkpoint": deepcopy(reservation.get(
+                "activation_checkpoint"
+            )),
+            "activation_checkpoint_sha256": (
+                _digest(reservation["activation_checkpoint"])
+                if reservation.get("activation_checkpoint") is not None else None
+            ),
+            "native_root_sha256": reservation["native_root_sha256"],
+        })
+    elif control_schema == 3:
+        expected_value.update({
+            "schema_version": 3,
+            "activation_checkpoint": deepcopy(current_activation),
+            "activation_checkpoint_sha256": _digest(current_activation),
+        })
+    expected = build_projection_event(
+        workstream_id=reservation["workstream_id"],
+        kind="generation_transition", key="root", value=expected_value,
+        plan_revision=reservation["from_plan_revision"],
+        expected_revision=reservation["from_projection_revision"],
+        created_at=reservation["created_at"], authority=authenticated_route,
+    )
+    if reservation["mode"] != "activate" or event != expected:
+        raise WorkstreamGenerationError(
+            "generation_ledger_frontier_reservation_binding_mismatch"
+        )
+    if control_schema in {2, 3}:
+        # Schema 3 is fully authenticated as selected predecessor authority,
+        # including its embedded checkpoint, but cannot mint its own token
+        # because that checkpoint was absent from its schema-2 reservation.
+        if control_schema == 3:
+            return False
+        return True
+    finalizations = [
+        item for item in reduce_generation_finalizations(
+            comments, workstream_id=reservation["workstream_id"],
+            authenticated_route=authenticated_route,
+        )
+        if item["transition_event_id"] == event["event_id"]
+    ]
+    if len(finalizations) != 1 or finalizations[0]["transition_sha256"] != _digest(event):
+        raise WorkstreamGenerationError(
+            "generation_ledger_frontier_finalization_missing"
+        )
+    return True
+
+
+def generation_ledger_frontier_tokens(
+    comments: list[dict[str, Any]], *, workstream_id: str,
+    authenticated_route: dict[str, str], current_plan_revision: str | None,
+) -> list[str]:
+    """Return only reservation tokens on the authenticated active chain.
+
+    A deterministic projection slot proves where a comment was written, not
+    that the control is selected generation authority. Derive ledger tokens
+    only after the ordinary selector proves one exact active chain, then bind
+    every member to its route-authenticated generation reservation (and, for
+    schema-v4 transitions, its durable finalization).
+    """
+    from workstream_linear_projection import (
+        PROJECTION_PREFIX, PROJECTION_RE,
+    )
+    has_generation_control = False
+    for comment in comments:
+        body = comment.get("body") or ""
+        if not isinstance(body, str) or PROJECTION_PREFIX not in body:
+            continue
+        matches = PROJECTION_RE.findall(body)
+        if len(matches) != 1 or body.count(PROJECTION_PREFIX) != 1:
+            raise WorkstreamGenerationError("malformed_projection_marker")
+        event = decode_projection_receipt(comment, matches[0])
+        if event["kind"] in {
+            "generation_genesis", "generation_transition",
+        }:
+            has_generation_control = True
+    if not has_generation_control:
+        return []
+
+    selected = select_plan_generation(
+        comments, workstream_id=workstream_id,
+        description_plan_revision=current_plan_revision,
+        authenticated_route=authenticated_route,
+    )
+    if selected["authority_origin"] == "legacy_description":
+        return []
+
+    finalized = finalized_generation_transition_ids(
+        comments, workstream_id=workstream_id,
+        authenticated_route=authenticated_route,
+    )
+    controls: list[dict[str, Any]] = []
+    for comment in comments:
+        body = comment.get("body") or ""
+        if not isinstance(body, str) or PROJECTION_PREFIX not in body:
+            continue
+        matches = PROJECTION_RE.findall(body)
+        if len(matches) != 1 or body.count(PROJECTION_PREFIX) != 1:
+            raise WorkstreamGenerationError("malformed_projection_marker")
+        event = decode_projection_receipt(comment, matches[0])
+        if event["kind"] not in {
+            "generation_genesis", "generation_transition",
+        }:
+            continue
+        if event["workstream_id"] != workstream_id:
+            raise WorkstreamGenerationError(
+                "generation_ledger_frontier_workstream_mismatch"
+            )
+        if event["authority"] != authenticated_route:
+            raise WorkstreamGenerationError(
+                "generation_ledger_frontier_route_mismatch"
+            )
+        if comment.get("id") != projection_slot_id(
+            workstream_id, event["plan_revision"],
+            event["expected_revision"], authenticated_route,
         ):
-            tokens.add(
-                f"generation:{event['value']['reservation_id']}:"
-                f"{event['value']['reservation_sha256']}"
+            raise WorkstreamGenerationError(
+                "generation_ledger_frontier_slot_mismatch"
             )
+        if (
+            event["kind"] == "generation_transition"
+            and event["value"].get("schema_version") == 4
+            and event["event_id"] not in finalized
+        ):
+            # A prepared transition is intentionally inert until finalization.
+            continue
+        controls.append(event)
+
+    by_id = {event["event_id"]: event for event in controls}
+    tip_id = selected["transition_tip_event_id"]
+    if tip_id not in by_id:
+        raise WorkstreamGenerationError(
+            "generation_ledger_frontier_selected_tip_missing"
+        )
+    chain: list[dict[str, Any]] = []
+    current = by_id[tip_id]
+    seen: set[str] = set()
+    while True:
+        if current["event_id"] in seen:
+            raise WorkstreamGenerationError(
+                "generation_ledger_frontier_chain_cycle"
+            )
+        seen.add(current["event_id"])
+        chain.append(current)
+        previous = current["value"]["previous_control_event_id"]
+        if previous is None:
+            break
+        if previous not in by_id:
+            raise WorkstreamGenerationError(
+                "generation_ledger_frontier_chain_incomplete"
+            )
+        current = by_id[previous]
+    if seen != set(by_id):
+        raise WorkstreamGenerationError(
+            "generation_ledger_frontier_off_chain_control"
+        )
+
+    reservations = {
+        (item["reservation_id"], item["reservation_sha256"]): item
+        for item in reduce_generation_reservations(
+            comments, workstream_id=workstream_id,
+            authenticated_route=authenticated_route,
+        )
+    }
+    tokens: list[str] = []
+    authenticated_control_ids: set[str] = set()
+    for event in reversed(chain):
+        key = (
+            event["value"]["reservation_id"],
+            event["value"]["reservation_sha256"],
+        )
+        reservation = reservations.get(key)
+        if reservation is None:
+            raise WorkstreamGenerationError(
+                "generation_ledger_frontier_reservation_missing"
+            )
+        if _assert_generation_control_reservation_binding(
+            comments, event=event, reservation=reservation,
+            authenticated_route=authenticated_route,
+            authenticated_predecessor_control_ids=frozenset(
+                authenticated_control_ids
+            ),
+        ):
+            tokens.append(f"generation:{key[0]}:{key[1]}")
+        authenticated_control_ids.add(event["event_id"])
     return sorted(tokens)
 
 
@@ -4015,12 +4379,11 @@ class GenerationTransport:
         )
         if not pending:
             raise WorkstreamGenerationError("generation_abort_after_activation")
-        prepared_token = (
-            f"generation:{reservation_id}:{reservation_sha256}"
-        )
-        if prepared_token in generation_ledger_frontier_tokens(
+        if validate_prepared_generation_transition(
             comments, workstream_id=self.workstream_id,
-        ):
+            authority=self.authority, reservation=reservation,
+            required=False,
+        ) is not None:
             raise WorkstreamGenerationError(
                 "generation_abort_after_preparation_replay_required"
             )

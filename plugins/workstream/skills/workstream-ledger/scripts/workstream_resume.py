@@ -131,7 +131,8 @@ def plan_generation_freshness(
         )
     live_source = plan_payload(canonical, canonical)["source"]
     from workstream_generation import (
-        generation_ledger_frontier_tokens, pending_generation_reservations,
+        pending_generation_reservations,
+        validate_prepared_generation_transition,
     )
 
     pending = pending_generation_reservations(
@@ -151,9 +152,14 @@ def plan_generation_freshness(
         and not isinstance(generation.get("activation_epoch"), bool)
         and generation["activation_epoch"] >= 0
     )
-    prepared_tokens = set(generation_ledger_frontier_tokens(
-        comments, workstream_id=token,
-    ))
+    prepared_tokens = {
+        f"generation:{item['reservation_id']}:{item['reservation_sha256']}"
+        for item in pending
+        if validate_prepared_generation_transition(
+            comments, workstream_id=token, authority=authenticated_route,
+            reservation=item, required=False,
+        ) is not None
+    }
     if live_source["sha256"] == active_sha256 and not pending:
         return None
     reservations = []
