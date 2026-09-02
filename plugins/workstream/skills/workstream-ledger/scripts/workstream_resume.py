@@ -2549,20 +2549,12 @@ def _fixed_frontier_authority_envelope(
     }
     checkpoint_brief = brief(context.get("latest_checkpoint"))
     disposition_brief = brief(context.get("disposition"))
-    route_brief = {
-        key: brief(value)
-        for key, value in (context.get("authenticated_route") or {}).items()
-    }
+    exact_route = deepcopy(context.get("authenticated_route") or {})
     raw_source = context.get("authenticated_source")
     canonical_source = (
         canonical_authenticated_source(raw_source)
         if raw_source is not None else None
     )
-    source_brief = {
-        key: brief(value)
-        for key, value in (context.get("authenticated_source") or {}).items()
-        if key in {"identity", "sha256"}
-    }
     result = {
         "context_schema": {
             "name": "agent-workstream.resume-context", "version": 2,
@@ -2574,7 +2566,10 @@ def _fixed_frontier_authority_envelope(
         # optional terminal adapter when the existing title is unnamed or
         # manager-generated.  Never infer it from cwd, repository, or title.
         "project_name": context.get("project_name"),
-        "context_url": brief(context.get("context_url")),
+        # These already-validated authority selectors must remain
+        # usable verbatim. A digest or display abbreviation cannot open the
+        # Linear root, route a hydration read, or authenticate plan bytes.
+        "context_url": context.get("context_url"),
         "plan_revision": context.get("plan_revision"),
         "root_revision": context.get("root_revision"),
         "material_event_revision": context.get("material_event_revision"),
@@ -2610,11 +2605,10 @@ def _fixed_frontier_authority_envelope(
             "checkpoint": checkpoint_brief,
             "disposition": disposition_brief,
         },
-        "authenticated_route": route_brief,
-        "authenticated_source": source_brief,
-        # Compact fields may be abbreviated for display.  These immutable
-        # digests keep the complete authority binding available to consumers
-        # without re-expanding the envelope beyond its byte budget.
+        "authenticated_route": exact_route,
+        "authenticated_source": canonical_source or {},
+        # Bulk frontier cells may be abbreviated for display. These digests
+        # additionally bind the exact authority selectors preserved above.
         "authority_binding": {
             "route_sha256": hashlib.sha256(json.dumps(
                 context.get("authenticated_route"), ensure_ascii=False,

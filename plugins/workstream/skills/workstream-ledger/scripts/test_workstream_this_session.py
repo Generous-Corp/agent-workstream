@@ -759,6 +759,45 @@ class ThisSessionTests(unittest.TestCase):
         self.assertIsNone(result["resume_binding"]["provider_session_id"])
         self.assertEqual(result["resume_binding"]["writes_performed"], 1)
 
+    def test_dual_provider_sessions_refuse_anonymous_genesis_before_db_write(self):
+        with self.assertRaisesRegex(
+            session.ThisSessionError,
+            "session_context_ambiguous:provider_session",
+        ):
+            session.record_successor_binding(
+                self.db, self.resolution(), environ={
+                    "CODEX_SESSION_ID": "codex-session",
+                    "CLAUDE_SESSION_ID": "claude-session",
+                }, created_at="2026-09-01T00:00:00Z",
+            )
+        self.assertFalse(self.db.exists())
+
+    def test_dual_provider_sessions_cannot_advance_existing_binding(self):
+        env = self.cmux_env("surface-dual-provider")
+        fake = FakeCmux("Linear", surface="surface-dual-provider")
+        self.seed(fake, env=env, provider_session="known-session")
+        resolution = session.resolve_this_session(
+            environ=env, runner=fake, which=lambda _: "/opt/cmux",
+            binding_path=self.db,
+        )
+        connection = sqlite3.connect(self.db)
+        before = tuple(connection.iterdump())
+        connection.close()
+        with self.assertRaisesRegex(
+            session.ThisSessionError,
+            "session_context_ambiguous:provider_session",
+        ):
+            session.record_successor_binding(
+                self.db, resolution, environ=dict(
+                    env, CODEX_SESSION_ID="codex-session",
+                    CLAUDE_SESSION_ID="claude-session",
+                ), created_at="2026-09-01T01:00:00Z",
+            )
+        connection = sqlite3.connect(self.db)
+        after = tuple(connection.iterdump())
+        connection.close()
+        self.assertEqual(after, before)
+
     def test_missing_current_session_never_erases_known_provider_binding(self):
         env = self.cmux_env("surface-no-provider-session")
         del env["CODEX_SESSION_ID"]

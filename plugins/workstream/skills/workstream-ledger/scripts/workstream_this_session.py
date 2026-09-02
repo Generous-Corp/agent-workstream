@@ -782,7 +782,9 @@ def _provider_session(environ: Mapping[str, str]) -> tuple[str | None, str | Non
         ("claude", environ.get("CLAUDE_SESSION_ID")),
     ]
     present = [(provider, value) for provider, value in candidates if value]
-    if len(present) != 1:
+    if len(present) > 1:
+        raise ThisSessionError("session_context_ambiguous:provider_session")
+    if not present:
         return None, None
     return present[0][0], _identity(present[0][1], f"{present[0][0]}_session_id")
 

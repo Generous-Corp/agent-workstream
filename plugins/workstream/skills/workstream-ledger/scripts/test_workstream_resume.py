@@ -467,8 +467,8 @@ class ResumeTests(unittest.TestCase):
         }
         return snapshot
 
-    def full_authority_snapshot(self, snapshot):
-        route = {
+    def full_authority_snapshot(self, snapshot, route=None):
+        route = route or {
             "workspace_id": "workspace", "team_id": "team",
             "project_id": "project",
             "root_issue_id": "33333333-3333-4333-8333-333333333333",
@@ -2035,13 +2035,19 @@ class ResumeTests(unittest.TestCase):
                 } for step in range(8)],
             },
         } for index in range(96)]
-        snapshot = self.live_snapshot(snapshot, {
-            "workspace_id": "workspace", "team_id": "team",
-            "project_id": "project",
-            "root_issue_id": "33333333-3333-4333-8333-333333333333",
-        })
+        exact_route = {
+            "workspace_id": "11111111-1111-4111-8111-111111111111",
+            "team_id": "22222222-2222-4222-8222-222222222222",
+            "project_id": "33333333-3333-4333-8333-333333333333",
+            "root_issue_id": "44444444-4444-4444-8444-444444444444",
+        }
+        snapshot["root"]["url"] = (
+            "https://linear.app/generous-corp/issue/GEN-37/"
+            "agent-workstream-continuity"
+        )
+        snapshot = self.live_snapshot(snapshot, exact_route)
         snapshot["root"]["project"]["name"] = "Linear Integration"
-        snapshot = self.full_authority_snapshot(snapshot)
+        snapshot = self.full_authority_snapshot(snapshot, route=exact_route)
         requested_focus = {
             "kind": "owned_child", "identifier": "GEN-38",
             "issue_id": "child-0",
@@ -2065,6 +2071,12 @@ class ResumeTests(unittest.TestCase):
         encoded = MODULE._default_output_bytes(context)
         self.assertLessEqual(len(encoded), MODULE.DEFAULT_RESUME_MAX_BYTES)
         self.assertEqual(context["resume_authority"], "full")
+        self.assertEqual(context["context_url"], snapshot["root"]["url"])
+        self.assertEqual(context["authenticated_route"], exact_route)
+        self.assertEqual(
+            context["authenticated_source"],
+            snapshot["authenticated_source"],
+        )
         self.assertEqual(context["project_name"], "Linear Integration")
         self.assertEqual(context["requested_focus"], requested_focus)
         self.assertEqual(unbounded["requested_focus"], requested_focus)

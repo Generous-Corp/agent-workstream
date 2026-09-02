@@ -236,6 +236,38 @@ class WorkstreamTabTests(unittest.TestCase):
             for options in fake.options
         ))
 
+    def test_absolute_bundled_cmux_is_used_and_relative_path_is_never_executed(self):
+        fake = FakeCmux("Linear · GEN-37")
+        result = tab.apply_title(
+            "GEN-37", environ={
+                "CMUX_SURFACE_ID": "surface:7",
+                "CMUX_BUNDLED_CLI_PATH": "/Applications/cmux.app/bin/cmux",
+            }, runner=fake, which=lambda _: None,
+        )
+        self.assertEqual(result["status"], "unchanged")
+        self.assertTrue(fake.calls)
+        self.assertTrue(all(
+            call[0] == "/Applications/cmux.app/bin/cmux"
+            for call in fake.calls
+        ))
+
+        called = False
+
+        def forbidden(*args, **kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError("relative bundled path must not execute")
+
+        result = tab.apply_title(
+            "GEN-37", environ={
+                "CMUX_SURFACE_ID": "surface:7",
+                "CMUX_BUNDLED_CLI_PATH": "relative/cmux",
+            }, runner=forbidden, which=lambda _: None,
+        )
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["reason"], "cmux_cli_unavailable")
+        self.assertFalse(called)
+
     def test_unnamed_title_becomes_project_label_and_token(self):
         _, result = self.apply("   ", project_name="Linear Integration")
         self.assertEqual(result["title"], "Linear Integration · GEN-37")

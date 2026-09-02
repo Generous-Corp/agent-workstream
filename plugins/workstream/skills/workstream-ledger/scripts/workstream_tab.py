@@ -549,7 +549,12 @@ def apply_title(
         "CMUX_SURFACE_ID", "CMUX_TAB_ID", "CMUX_WORKSPACE_ID", "CMUX_SOCKET_PATH",
     )):
         return {"status": "unavailable", "reason": "not_in_cmux_surface", "token": token}
-    cmux = which("cmux")
+    injected_cmux = environ.get("CMUX_BUNDLED_CLI_PATH")
+    cmux = (
+        injected_cmux
+        if isinstance(injected_cmux, str) and os.path.isabs(injected_cmux)
+        else which("cmux")
+    )
     if not cmux:
         return {"status": "unavailable", "reason": "cmux_cli_unavailable", "token": token}
     if not target:
