@@ -567,6 +567,11 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.80 surfaces one bounded machine-readable refusal reason when
+literal `resume this session` cannot recover full authority, and authenticates
+exceptional non-primary terminal evidence against a stable exact GitHub
+provider snapshot before append-only replay and closure repair.
+
 Version 0.4.79 makes literal `resume this session` deterministic: only an exact
 namespaced terminal binding or strict final ` · TEAM-#` suffix can select the
 handle. Shared cmux/HerdR provenance detection, pre-mutation title fences, and
