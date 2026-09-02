@@ -261,12 +261,54 @@ def encode_ledger_reservation(reservation: dict[str, Any]) -> str:
     return body
 
 
+def _ledger_collision_token(comment: dict[str, Any]) -> str:
+    return "collision:" + hashlib.sha256(json.dumps(
+        [comment.get("id"), comment.get("body")], ensure_ascii=False,
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def _reservation_collision_chain_valid(
+    reservation: dict[str, Any], remote_id: str,
+    comments_by_id: dict[str, dict[str, Any]],
+) -> bool:
+    base = [value for value in reservation["frontier_ids"]
+            if not value.startswith("collision:")]
+    collisions = {value for value in reservation["frontier_ids"]
+                  if value.startswith("collision:")}
+    frontier = sorted(base)
+    while collisions:
+        slot_id = ledger_boundary_slot_id(
+            reservation["workstream_id"], reservation["material_revision"],
+            frontier, reservation["authority"],
+        )
+        occupant = comments_by_id.get(slot_id)
+        if not isinstance(occupant, dict):
+            return False
+        token = _ledger_collision_token(occupant)
+        if token not in collisions:
+            return False
+        collisions.remove(token)
+        frontier = sorted([*frontier, token])
+    return ledger_boundary_slot_id(
+        reservation["workstream_id"], reservation["material_revision"],
+        frontier, reservation["authority"],
+    ) == remote_id
+
+
+def _reservation_retry_core(reservation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value for key, value in reservation.items()
+        if key != "frontier_ids"
+    }
+
+
 def reduce_ledger_reservations(
     comments: list[dict[str, Any]], *, workstream_id: str,
+    refuse_unproven_collision_chain: bool = False,
 ) -> list[tuple[dict[str, Any], str]]:
-    """Return proven-shaped reservations, quarantining malformed/duplicate intent."""
-    observed: dict[str, tuple[dict[str, Any], str]] = {}
-    conflicted: set[str] = set()
+    """Return shaped reservations, folding only exact collision-chain retries."""
+    candidates: dict[str, list[tuple[dict[str, Any], str]]] = {}
     for comment in comments:
         body = comment.get("body") or ""
         if not isinstance(body, str):
@@ -312,11 +354,57 @@ def reduce_ledger_reservations(
         )
         if not isinstance(remote_id, str) or remote_id != expected_remote_id:
             continue
-        if event_id in observed or event_id in conflicted:
-            observed.pop(event_id, None)
-            conflicted.add(event_id)
+        candidates.setdefault(event_id, []).append((reservation, remote_id))
+    comments_by_id = {
+        comment.get("id"): comment for comment in comments
+        if isinstance(comment.get("id"), str)
+    }
+    observed: dict[str, tuple[dict[str, Any], str]] = {}
+    for event_id, group in candidates.items():
+        if not all(_reservation_collision_chain_valid(
+            item, remote_id, comments_by_id,
+        ) for item, remote_id in group):
+            # Collision tokens are predecessor proofs, not decoration. This
+            # applies equally to a lone surviving successor after its original
+            # reservation was deleted and to an intact retry group.
+            if refuse_unproven_collision_chain:
+                raise LinearEventError(
+                    "ledger_reservation_collision_chain_unproven"
+                )
             continue
-        observed[event_id] = (reservation, remote_id)
+        if len(group) == 1:
+            observed[event_id] = group[0]
+            continue
+        cores = {
+            json.dumps(
+                _reservation_retry_core(item), ensure_ascii=False,
+                sort_keys=True, separators=(",", ":"),
+            )
+            for item, _remote_id in group
+        }
+        bases = {
+            tuple(value for value in item["frontier_ids"]
+                  if not value.startswith("collision:"))
+            for item, _remote_id in group
+        }
+        ordered = sorted(group, key=lambda pair: (
+            sum(value.startswith("collision:")
+                for value in pair[0]["frontier_ids"]), pair[1],
+        ))
+        collision_counts = [
+            sum(value.startswith("collision:")
+                for value in item["frontier_ids"])
+            for item, _remote_id in ordered
+        ]
+        if (
+            len(cores) != 1 or len(bases) != 1
+            or len(collision_counts) != len(set(collision_counts))
+        ):
+            continue
+        # A response-loss retry may have collision-chained past the exact same
+        # still-pending intent.  Preserve the first reservation as authority;
+        # later canonical copies carry no new intent and remain append-only.
+        observed[event_id] = ordered[0]
     return sorted(observed.values(), key=lambda item: (
         item[0]["material_revision"], item[0]["intent_event"]["event_id"],
     ))
@@ -340,6 +428,8 @@ def ledger_serialization_frontier(
           for item, _remote_id in reservations),
         *generation_ledger_frontier_tokens(
             comments, workstream_id=workstream_id,
+            authenticated_route=authenticated_route,
+            current_plan_revision=current_plan_revision,
         ),
     ])
     by_id = {
@@ -353,10 +443,7 @@ def ledger_serialization_frontier(
         occupant = by_id.get(slot_id)
         if occupant is None:
             return frontier
-        collision = "collision:" + hashlib.sha256(json.dumps(
-            [occupant.get("id"), occupant.get("body")], ensure_ascii=False,
-            sort_keys=True, separators=(",", ":"),
-        ).encode("utf-8")).hexdigest()
+        collision = _ledger_collision_token(occupant)
         if collision in frontier:
             raise LinearEventError("ledger_boundary_collision_cycle")
         frontier = sorted([*frontier, collision])
@@ -384,6 +471,12 @@ def _proven_ledger_reservations(
         f"reservation:{item['intent_event']['event_id']}:{item['intent_sha256']}"
         for item, _remote_id in reduced
     }
+    from workstream_generation import generation_ledger_frontier_tokens
+    generation_tokens = set(generation_ledger_frontier_tokens(
+        comments, workstream_id=workstream_id,
+        authenticated_route=authenticated_route,
+        current_plan_revision=current_plan_revision,
+    ))
     by_id = {comment.get("id"): comment for comment in comments}
     proven: list[tuple[dict[str, Any], str]] = []
     for item, remote_id in reduced:
@@ -403,9 +496,8 @@ def _proven_ledger_reservations(
         ]
         base = [value for value in item["frontier_ids"]
                 if not value.startswith("collision:")]
-        collisions = {value for value in item["frontier_ids"]
-                      if value.startswith("collision:")}
         stored_checkpoints = {value for value in base if value in checkpoint_ids}
+        stored_generation = {value for value in base if value in generation_tokens}
         completed = any(event == item["intent_event"] for event in state.events)
         if (
             len(state.events) < item["projection_revision"]
@@ -413,34 +505,17 @@ def _proven_ledger_reservations(
             or item["plan_revision"] != current_plan_revision
             or (not completed and stored_checkpoints != checkpoint_ids)
             or (completed and not stored_checkpoints.issubset(checkpoint_ids))
-            or any(value not in checkpoint_ids and value not in reservation_tokens
-                   for value in base)
+            or (not completed and stored_generation != generation_tokens)
+            or (completed and not stored_generation.issubset(generation_tokens))
+            or any(
+                value not in checkpoint_ids
+                and value not in reservation_tokens
+                and value not in generation_tokens
+                for value in base
+            )
         ):
             continue
-        frontier = sorted(base)
-        valid_chain = True
-        while collisions:
-            slot_id = ledger_boundary_slot_id(
-                workstream_id, item["material_revision"], frontier,
-                authenticated_route,
-            )
-            occupant = by_id.get(slot_id)
-            if not isinstance(occupant, dict):
-                valid_chain = False
-                break
-            token = "collision:" + hashlib.sha256(json.dumps(
-                [occupant.get("id"), occupant.get("body")], ensure_ascii=False,
-                sort_keys=True, separators=(",", ":"),
-            ).encode("utf-8")).hexdigest()
-            if token not in collisions:
-                valid_chain = False
-                break
-            collisions.remove(token)
-            frontier = sorted([*frontier, token])
-        if not valid_chain or ledger_boundary_slot_id(
-            workstream_id, item["material_revision"], frontier,
-            authenticated_route,
-        ) != remote_id:
+        if not _reservation_collision_chain_valid(item, remote_id, by_id):
             continue
         proven.append((item, remote_id))
     return proven

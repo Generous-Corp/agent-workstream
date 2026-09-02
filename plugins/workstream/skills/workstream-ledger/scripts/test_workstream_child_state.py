@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -14,10 +15,18 @@ import workstream_child_checkpoint
 import workstream_child_event
 import workstream_child_proposal_activate
 from workstream_linear import LinearTransportError
-from workstream_linear_events import assert_no_pending_ledger_reservation
+from workstream_linear_events import (
+    assert_no_pending_ledger_reservation,
+    encode_ledger_reservation, ledger_boundary_slot_id,
+    reduce_ledger_reservations, SERIALIZATION_PREFIX, SERIALIZATION_RE,
+)
+from workstream_generation import (
+    _digest, build_retirement_proof, encode_generation_reservation,
+    generation_ledger_frontier_tokens,
+)
 from workstream_linear_projection import (
-    build_projection_event, encode_projection_comment, LinearProjectionAdapter,
-    projection_slot_id,
+    _generation_frontier, build_projection_event, encode_projection_comment,
+    LinearProjectionAdapter, projection_slot_id, reduce_projection_comments,
     TOMBSTONE,
 )
 from workstream_resume import add_child_material_history, compact_context
@@ -29,6 +38,105 @@ CHILD_ID = "07104fd8-924f-40d8-b7e2-fe2f87f76657"
 ROUTE = {
     "workspace_id": "workspace", "team_id": "team", "project_id": "project",
 }
+
+
+def decode_reservation(body):
+    encoded = SERIALIZATION_RE.findall(body)[0]
+    return json.loads(base64.urlsafe_b64decode(
+        encoded + "=" * (-len(encoded) % 4)
+    ))["reservation"]
+
+
+def install_active_generation(client):
+    """Install a real reservation-backed genesis like the live GEN-37 root."""
+    authority = {**ROUTE, "root_issue_id": ROOT_ID}
+    provenance = build_projection_event(
+        workstream_id="GEN-37", kind="provenance", key="generation",
+        value={"agent": "codex", "machine": "M5", "session_id": "fixture"},
+        plan_revision=PLAN, expected_revision=3,
+        created_at="2026-08-30T00:00:03Z", authority=authority,
+    )
+    disposition = build_projection_event(
+        workstream_id="GEN-37", kind="disposition", key="root",
+        value={"disposition": "attach", "remote_head": "e" * 40,
+               "recovered_from_checkpoint": None},
+        plan_revision=PLAN, expected_revision=4,
+        created_at="2026-08-30T00:00:04Z", authority=authority,
+    )
+    for event in (provenance, disposition):
+        client.root_comments.append({
+            "id": projection_slot_id(
+                event["workstream_id"], event["plan_revision"],
+                event["expected_revision"], event["authority"],
+            ),
+            "body": encode_projection_comment(event),
+            "createdAt": event["created_at"], "updatedAt": event["created_at"],
+        })
+    state = reduce_projection_comments(
+        client.root_comments, workstream_id="GEN-37",
+        expected_plan_revision=PLAN, authenticated_route=authority,
+    )
+    frontier = _generation_frontier(
+        state, client.root_comments, plan_revision=PLAN,
+        projection_revision=5, material_revision=0,
+    )
+    retirement = build_retirement_proof(
+        predecessor_plan_revision=PLAN,
+        retired_at="2026-08-30T00:00:05Z", retired_writer_epoch=0,
+        provenance_event_ids=[provenance["event_id"]], checkpoint_event_ids=[],
+    )
+    unsigned = {
+        "schema_version": 2, "workstream_id": "GEN-37",
+        "authority": authority, "mode": "bootstrap",
+        "from_plan_revision": PLAN, "to_plan_revision": PLAN,
+        "activation_epoch": 0, "previous_control_event_id": None,
+        "source": {"identity": "https://example.test/plan", "sha256": PLAN},
+        "material_revision": 0, "checkpoint_event_ids": [],
+        "ledger_frontier": [], "from_projection_revision": 5,
+        "to_projection_revision": 5, "graph_frontier_sha256": "b" * 64,
+        "candidate_resume_sha256": "c" * 64,
+        "retirement": retirement, "created_at": "2026-08-30T00:00:05Z",
+    }
+    reservation = {
+        **unsigned, "reservation_id": "wsgr_" + _digest(unsigned)[:32],
+    }
+    reservation_sha256 = _digest(reservation)
+    client.root_comments.append({
+        "id": ledger_boundary_slot_id("GEN-37", 0, [], authority),
+        "body": encode_generation_reservation(reservation),
+        "createdAt": reservation["created_at"],
+        "updatedAt": reservation["created_at"],
+    })
+    genesis = build_projection_event(
+        workstream_id="GEN-37", kind="generation_genesis", key="root",
+        value={
+            "schema_version": 2,
+            "reservation_id": reservation["reservation_id"],
+            "reservation_sha256": reservation_sha256,
+            "from": frontier, "to": frontier,
+            "source": reservation["source"],
+            "graph_frontier_sha256": reservation["graph_frontier_sha256"],
+            "candidate_resume_sha256": reservation["candidate_resume_sha256"],
+            "retirement": retirement, "previous_control_event_id": None,
+            "activation_epoch": 0, "candidate_seal_event_id": None,
+            "candidate_seal_sha256": None,
+        },
+        plan_revision=PLAN, expected_revision=5,
+        created_at=reservation["created_at"], authority=authority,
+    )
+    client.root_comments.append({
+        "id": projection_slot_id(
+            "GEN-37", PLAN, genesis["expected_revision"], authority,
+        ),
+        "body": encode_projection_comment(genesis),
+        "createdAt": genesis["created_at"], "updatedAt": genesis["created_at"],
+    })
+    token = f"generation:{reservation['reservation_id']}:{reservation_sha256}"
+    assert generation_ledger_frontier_tokens(
+        client.root_comments, workstream_id="GEN-37",
+        authenticated_route=authority, current_plan_revision=PLAN,
+    ) == [token]
+    return token
 
 
 class FakeChildStateClient:
@@ -537,6 +645,201 @@ class WorkstreamChildStateTests(unittest.TestCase):
         self.assertEqual(replay["authorization"]["disposition"], "existing")
         self.assertEqual(len(client.root_comments), root_writes)
         self.assertEqual(len(client.child_comments), child_writes)
+
+    def test_generation_frontier_duplicate_reservations_recover_exact_child_event(self):
+        client = FakeChildStateClient()
+        install_active_generation(client)
+        generation_fixture_comments = len(client.root_comments)
+        args = [
+            *self.common(), "--kind", "progress", "--source", "system",
+            "--expected-revision", "0", "--created-at",
+            "2026-09-02T03:48:00Z", "--event-id",
+            "wsc_gen94_m3_reverse_canary_20260901", "--payload-json",
+            '{"next_action":"GEN-94 M3 reverse canary verified"}',
+        ]
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch, mock.patch(
+            "workstream_linear_events._proven_ledger_reservations",
+            return_value=[],
+        ):
+            for _attempt in range(2):
+                with self.assertRaisesRegex(
+                    LinearTransportError,
+                    "child_mutation_serialization_slot_lost_reload_required",
+                ):
+                    workstream_child_event.run(
+                        args, client_factory=lambda _token: client,
+                    )
+
+        reservations = [
+            comment for comment in client.root_comments
+            if SERIALIZATION_PREFIX in comment["body"]
+        ]
+        self.assertEqual(len(reservations), 2)
+        self.assertEqual(client.child_comments, [])
+        decoded = [decode_reservation(item["body"]) for item in reservations]
+        self.assertEqual(len({
+            item["intent_event"]["event_id"] for item in decoded
+        }), 1)
+        self.assertEqual(len({
+            item["intent_event"]["value"]["proposal_id"] for item in decoded
+        }), 1)
+        self.assertEqual(
+            [sum(token.startswith("collision:") for token in item["frontier_ids"])
+             for item in decoded],
+            [0, 1],
+        )
+        self.assertEqual(len(reduce_ledger_reservations(
+            client.root_comments, workstream_id="GEN-37",
+        )), 1)
+        without_predecessor = [
+            comment for comment in client.root_comments
+            if comment["id"] != reservations[0]["id"]
+        ]
+        self.assertEqual(reduce_ledger_reservations(
+            without_predecessor, workstream_id="GEN-37",
+        ), [])
+        random_collision = deepcopy(decoded[1])
+        random_collision["frontier_ids"] = sorted([
+            value if not value.startswith("collision:")
+            else "collision:" + "f" * 64
+            for value in random_collision["frontier_ids"]
+        ])
+        random_collision_comment = {
+            "id": ledger_boundary_slot_id(
+                random_collision["workstream_id"],
+                random_collision["material_revision"],
+                random_collision["frontier_ids"],
+                random_collision["authority"],
+            ),
+            "body": encode_ledger_reservation(random_collision),
+        }
+        random_collision_comments = [
+            comment for comment in client.root_comments
+            if comment["id"] not in {item["id"] for item in reservations}
+        ] + [reservations[0], random_collision_comment]
+        self.assertEqual(reduce_ledger_reservations(
+            random_collision_comments, workstream_id="GEN-37",
+        ), [])
+
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch:
+            recovered = workstream_child_event.run(
+                args, client_factory=lambda _token: client,
+            )
+            root_writes = len(client.root_comments)
+            child_writes = len(client.child_comments)
+            replay = workstream_child_event.run(
+                args, client_factory=lambda _token: client,
+            )
+
+        self.assertEqual(len([
+            comment for comment in client.root_comments
+            if SERIALIZATION_PREFIX in comment["body"]
+        ]), 2)
+        self.assertEqual(
+            root_writes,
+            generation_fixture_comments + len(reservations) + 1,
+        )
+        self.assertEqual(child_writes, 1)
+        self.assertEqual(len(client.root_comments), root_writes)
+        self.assertEqual(len(client.child_comments), child_writes)
+        self.assertEqual(recovered["receipt"], replay["receipt"])
+        self.assertEqual(recovered["receipt"]["revision"], 1)
+        self.assertEqual(recovered["proposal"]["disposition"], "created")
+        self.assertEqual(recovered["authorization"]["disposition"], "created")
+        self.assertEqual(replay["authorization"]["disposition"], "existing")
+        assert_no_pending_ledger_reservation(
+            client.root_comments, workstream_id="GEN-37",
+            authenticated_route={**ROUTE, "root_issue_id": ROOT_ID},
+            current_plan_revision=PLAN,
+        )
+
+        snapshot = {
+            "root": {
+                "identifier": "GEN-37", "plan_revision": PLAN,
+                "url": "https://linear.test/GEN-37", "revision": 0,
+                "status": "In Progress", "status_type": "started",
+                "next_action": "root action",
+            },
+            "children": [{
+                "id": CHILD_ID, "identifier": "GEN-38", "title": "Child",
+                "url": "https://linear.test/GEN-38", "status": "In Progress",
+                "status_type": "started", "next_action": "issue action",
+                "parent": {"id": ROOT_ID}, "project": {"id": "project"},
+                "team": {"id": "team", "organization": {"id": "workspace"}},
+            }],
+        }
+        enriched = add_child_material_history(
+            snapshot, {"GEN-38": deepcopy(client.child_comments)},
+            authenticated_route={**ROUTE, "root_issue_id": ROOT_ID},
+            root_comments=deepcopy(client.root_comments),
+        )
+        resumed = compact_context(enriched, "GEN-37")
+        self.assertEqual(resumed["children"][0]["material_event_revision"], 1)
+        self.assertEqual(
+            resumed["children"][0]["next_action"],
+            "GEN-94 M3 reverse canary verified",
+        )
+        self.assertNotIn("pending_child_proposals", resumed["children"][0])
+        from test_workstream_resume import ResumeTests
+        authority_snapshot = ResumeTests().snapshot()
+        authority_snapshot["children"] = [deepcopy(enriched["children"][0])]
+        authority_snapshot["decisions"] = []
+        authority_snapshot["provenance"] = []
+        authority_snapshot = ResumeTests().full_authority_snapshot(
+            authority_snapshot
+        )
+        authority_snapshot["children"][0]["parent"] = {
+            "id": authority_snapshot["authenticated_route"]["root_issue_id"],
+            "identifier": "GEN-37",
+        }
+        authority_snapshot["children"][0]["team"] = {
+            "id": "team", "organization": {"id": "workspace"},
+        }
+        authority_snapshot["children"][0]["project"] = {"id": "project"}
+        authority_context = compact_context(
+            authority_snapshot, "GEN-37", require_projection_authority=True,
+        )
+        self.assertEqual(authority_context["resume_authority"], "full")
+        self.assertEqual(
+            authority_context["children"][0]["next_action"],
+            "GEN-94 M3 reverse canary verified",
+        )
+
+    def test_duplicate_reservation_material_divergence_is_quarantined(self):
+        client = FakeChildStateClient()
+        args = [
+            *self.common(), "--kind", "progress", "--source", "system",
+            "--expected-revision", "0", "--created-at", "now",
+            "--payload-json", '{"next_action":"recover"}',
+        ]
+        route_patch, auth_patch = self.patches()
+        with route_patch, auth_patch, mock.patch(
+            "workstream_linear_events._proven_ledger_reservations",
+            return_value=[],
+        ), self.assertRaisesRegex(
+            LinearTransportError,
+            "child_mutation_serialization_slot_lost_reload_required",
+        ):
+            workstream_child_event.run(args, client_factory=lambda _token: client)
+        first_comment = next(
+            item for item in client.root_comments
+            if SERIALIZATION_PREFIX in item["body"]
+        )
+        first = decode_reservation(first_comment["body"])
+        divergent = {**deepcopy(first), "material_revision": 1}
+        divergent_id = ledger_boundary_slot_id(
+            divergent["workstream_id"], divergent["material_revision"],
+            divergent["frontier_ids"], divergent["authority"],
+        )
+        comments = [*client.root_comments, {
+            "id": divergent_id, "body": encode_ledger_reservation(divergent),
+            "createdAt": "later", "updatedAt": "later",
+        }]
+        self.assertEqual(
+            reduce_ledger_reservations(comments, workstream_id="GEN-37"), [],
+        )
 
     def test_inactive_target_projection_classifies_predecessor_proposal(self):
         client = FakeChildStateClient()

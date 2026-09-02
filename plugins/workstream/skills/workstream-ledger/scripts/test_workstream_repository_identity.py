@@ -782,6 +782,50 @@ class RepositoryIdentityWriterTests(unittest.TestCase):
         self.assertEqual(client.reservation_count, 1)
         self.assertEqual(client.write_count, 1)
 
+    def test_crash_replay_never_trusts_lone_collision_successor(self):
+        adapter, client, event = special_adapter_with_scope(
+            LostProjectionCreateAfterReservationClient(),
+        )
+        uncertain = apply(adapter, event)
+        self.assertEqual(uncertain["disposition"], "landed_unconfirmed")
+        stored = reduce_ledger_reservations(
+            client.comments, workstream_id="GEN-37",
+        )
+        self.assertEqual(len(stored), 1)
+        reservation, remote_id = stored[0]
+        predecessor = next(
+            item for item in client.comments if item["id"] == remote_id
+        )
+        collision = "collision:" + hashlib.sha256(json.dumps(
+            [predecessor.get("id"), predecessor.get("body")],
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        successor = deepcopy(reservation)
+        successor["frontier_ids"] = sorted([
+            *successor["frontier_ids"], collision,
+        ])
+        successor_id = ledger_boundary_slot_id(
+            "GEN-37", successor["material_revision"],
+            successor["frontier_ids"], successor["authority"],
+        )
+        client.comments = [
+            item for item in client.comments if item["id"] != remote_id
+        ] + [{
+            "id": successor_id, "body": encode_ledger_reservation(successor),
+            "createdAt": "2026-08-29T12:01:00Z",
+            "updatedAt": "2026-08-29T12:01:00Z",
+        }]
+        self.assertEqual(reduce_ledger_reservations(
+            client.comments, workstream_id="GEN-37",
+        ), [])
+
+        completed = apply(adapter, event)
+        self.assertEqual(completed["disposition"], "created")
+        self.assertEqual(client.write_count, 1)
+        self.assertEqual(len(reduce_ledger_reservations(
+            client.comments, workstream_id="GEN-37",
+        )), 1)
+
     def test_successor_after_acknowledged_identity_readback_is_not_false_refusal(self):
         adapter, client, event = special_adapter_with_scope(
             SuccessorAfterIdentityReadbackClient(),

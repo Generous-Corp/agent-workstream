@@ -203,9 +203,16 @@ def _stored_intent(
     expected: dict[str, Any],
 ) -> dict[str, Any] | None:
     matches = []
-    for reservation, _remote_id in reduce_ledger_reservations(
-        comments, workstream_id=adapter.workstream_id,
-    ):
+    try:
+        reservations = reduce_ledger_reservations(
+            comments, workstream_id=adapter.workstream_id,
+            refuse_unproven_collision_chain=True,
+        )
+    except LinearEventError as error:
+        raise RepositoryIdentityError(
+            "repository_material_reservation_frontier_unproven"
+        ) from error
+    for reservation, _remote_id in reservations:
         event = reservation.get("intent_event") or {}
         value = event.get("value") or {}
         if (

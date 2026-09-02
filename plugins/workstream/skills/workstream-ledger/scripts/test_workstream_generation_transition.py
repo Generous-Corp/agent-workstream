@@ -23,6 +23,7 @@ from workstream_generation import (
     validate_activation_operator_contract,
     encode_generation_reservation,
     encode_generation_finalization, generation_finalization_slot_id,
+    generation_ledger_frontier_tokens,
     generation_graph_clock_custody,
     native_root_activation_proof,
     pending_generation_reservations, reduce_generation_checkpoint_comments,
@@ -43,7 +44,9 @@ from workstream_linear_checkpoints import (
     encode_checkpoint_comment, LinearCheckpointAdapter, reduce_checkpoint_comments,
 )
 from workstream_linear_projection import (
-    _decode_projection, build_projection_event, encode_projection_comment,
+    _decode_projection, _generation_frontier, build_projection_event,
+    encode_projection_comment,
+    decode_projection_receipt,
     LinearProjectionAdapter,
     LinearProjectionError, PROJECTION_PREFIX, PROJECTION_RE,
     projection_slot_id, reduce_projection_comments, select_plan_generation,
@@ -390,6 +393,461 @@ class GraphClockLoader(Loader):
 
 
 class GenerationTransitionTests(unittest.TestCase):
+    def test_mixed_schema_carried_checkpoint_generation_tokens(self):
+        project_full(self.client, NEW)
+        activation = self.activation_checkpoint()
+        schema3_transport = GenerationTransport(
+            self.client, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
+            authority=AUTHORITY,
+            candidate_loader=ActivationCheckpointLoader(
+                self.client, activation,
+            ),
+            legacy_description_plan_revision=OLD,
+        )
+        first = schema3_transport.activate(
+            target_plan_revision=NEW, created_at="schema3",
+            retirement=self.retirement(), activation_checkpoint=activation,
+            remote_head="e" * 40,
+        )
+        first_event = next(
+            event for event in adapter(self.client, OLD).state().events
+            if event["event_id"] == first["event_id"]
+        )
+        self.assertEqual(first_event["value"]["schema_version"], 3)
+
+        project_full(self.client, LATER)
+        fenced = self.native_fenced_transport()
+        retirement = self.retirement(NEW, 1)
+        preview = fenced.preview_activate(
+            target_plan_revision=LATER, created_at="schema4",
+            retirement=retirement,
+        )
+        second = fenced.activate(
+            target_plan_revision=LATER, created_at="schema4",
+            retirement=retirement,
+            expected_native_root_sha256=preview[
+                "native_root_activation_proof"
+            ]["sha256"],
+        )
+        reservations = reduce_generation_reservations(
+            self.client.comments, workstream_id=WORKSTREAM,
+            authenticated_route=AUTHORITY,
+        )
+        second_reservation = next(
+            item for item in reservations
+            if item["to_plan_revision"] == LATER
+        )
+        second_token = (
+            f"generation:{second_reservation['reservation_id']}:"
+            f"{second_reservation['reservation_sha256']}"
+        )
+        tokens = generation_ledger_frontier_tokens(
+            self.client.comments, workstream_id=WORKSTREAM,
+            authenticated_route=AUTHORITY, current_plan_revision=LATER,
+        )
+        self.assertEqual(tokens, [second_token])
+
+        schema4_comment = next(
+            item for item in self.client.comments
+            if PROJECTION_PREFIX in item["body"]
+            and decode_projection_receipt(
+                item, PROJECTION_RE.findall(item["body"])[0],
+            )["event_id"] == second["event_id"]
+        )
+        schema4_event = decode_projection_receipt(
+            schema4_comment, PROJECTION_RE.findall(schema4_comment["body"])[0],
+        )
+
+        def replace_schema4(mutator):
+            value = deepcopy(schema4_event["value"])
+            mutator(value)
+            forged = build_projection_event(
+                workstream_id=WORKSTREAM, kind="generation_transition",
+                key="root", value=value, plan_revision=NEW,
+                expected_revision=schema4_event["expected_revision"],
+                created_at=schema4_event["created_at"], authority=AUTHORITY,
+            )
+            return [
+                ({**deepcopy(item), "body": encode_projection_comment(forged)}
+                 if item["id"] == schema4_comment["id"] else deepcopy(item))
+                for item in self.client.comments
+            ]
+
+        def omit_carried(value):
+            value["from"]["checkpoint_event_ids"] = []
+            value["from"]["checkpoint_events_sha256"] = _digest([])
+
+        with self.assertRaises(LinearTransportError):
+            generation_ledger_frontier_tokens(
+                replace_schema4(omit_carried), workstream_id=WORKSTREAM,
+                authenticated_route=AUTHORITY,
+                current_plan_revision=LATER,
+            )
+
+        with self.assertRaises(LinearTransportError):
+            generation_ledger_frontier_tokens(
+                replace_schema4(
+                    lambda value: value.update(previous_control_event_id=None)
+                ),
+                workstream_id=WORKSTREAM, authenticated_route=AUTHORITY,
+                current_plan_revision=LATER,
+            )
+
+        schema3_comment = next(
+            item for item in self.client.comments
+            if PROJECTION_PREFIX in item["body"]
+            and decode_projection_receipt(
+                item, PROJECTION_RE.findall(item["body"])[0],
+            )["event_id"] == first["event_id"]
+        )
+        schema3_event = decode_projection_receipt(
+            schema3_comment, PROJECTION_RE.findall(schema3_comment["body"])[0],
+        )
+        changed_checkpoint = deepcopy(schema3_event["value"])
+        forged_activation = self.activation_checkpoint(
+            boundary_id="forged-carried-checkpoint",
+        )
+        changed_checkpoint["activation_checkpoint"] = forged_activation
+        changed_checkpoint["activation_checkpoint_sha256"] = _digest(
+            changed_checkpoint["activation_checkpoint"]
+        )
+        changed_checkpoint["to"]["checkpoint_event_ids"] = [
+            changed_checkpoint["activation_checkpoint"]["event_id"]
+        ]
+        changed_checkpoint["to"]["checkpoint_events_sha256"] = _digest(
+            changed_checkpoint["to"]["checkpoint_event_ids"]
+        )
+        forged_schema3 = build_projection_event(
+            workstream_id=WORKSTREAM, kind="generation_transition", key="root",
+            value=changed_checkpoint, plan_revision=OLD,
+            expected_revision=schema3_event["expected_revision"],
+            created_at=schema3_event["created_at"], authority=AUTHORITY,
+        )
+        forged_carry_comments = [
+            ({**deepcopy(item), "body": encode_projection_comment(
+                forged_schema3
+            )} if item["id"] == schema3_comment["id"] else deepcopy(item))
+            for item in self.client.comments
+        ]
+        with self.assertRaises(LinearTransportError):
+            generation_ledger_frontier_tokens(
+                forged_carry_comments, workstream_id=WORKSTREAM,
+                authenticated_route=AUTHORITY,
+                current_plan_revision=LATER,
+            )
+
+    def test_ledger_generation_tokens_require_authenticated_selected_chain(self):
+        bootstrap = GenerationTransport(
+            self.client, issue_id=WORKSTREAM, workstream_id=WORKSTREAM,
+            authority=AUTHORITY, candidate_loader=self.loader,
+            legacy_description_plan_revision=None,
+        )
+        bootstrap.bootstrap(target_plan_revision=OLD, created_at="bootstrap")
+        reservations = reduce_generation_reservations(
+            self.client.comments, workstream_id=WORKSTREAM,
+            authenticated_route=AUTHORITY,
+        )
+        self.assertEqual(len(reservations), 1)
+        reservation = reservations[0]
+        active_token = (
+            f"generation:{reservation['reservation_id']}:"
+            f"{reservation['reservation_sha256']}"
+        )
+        self.assertEqual(generation_ledger_frontier_tokens(
+            self.client.comments, workstream_id=WORKSTREAM,
+            authenticated_route=AUTHORITY, current_plan_revision=OLD,
+        ), [active_token])
+
+        genesis_comment = next(
+            item for item in self.client.comments
+            if PROJECTION_PREFIX in item["body"]
+            and decode_projection_receipt(
+                item, PROJECTION_RE.findall(item["body"])[0],
+            )["kind"] == "generation_genesis"
+        )
+        genesis = decode_projection_receipt(
+            genesis_comment, PROJECTION_RE.findall(genesis_comment["body"])[0],
+        )
+
+        def mutated_genesis(mutator):
+            value = deepcopy(genesis["value"])
+            mutator(value)
+            forged = build_projection_event(
+                workstream_id=WORKSTREAM, kind="generation_genesis", key="root",
+                value=value, plan_revision=OLD,
+                expected_revision=genesis["expected_revision"],
+                created_at=genesis["created_at"], authority=AUTHORITY,
+            )
+            return [
+                ({**deepcopy(item), "body": encode_projection_comment(forged)}
+                 if item["id"] == genesis_comment["id"] else deepcopy(item))
+                for item in self.client.comments
+            ]
+
+        divergent_controls = {
+            "graph": lambda value: value.update(
+                graph_frontier_sha256="8" * 64,
+            ),
+            "candidate": lambda value: value.update(
+                candidate_resume_sha256="7" * 64,
+            ),
+            "retirement": lambda value: value.update(retirement={
+                **value["retirement"],
+                "retired_at": "different-reviewed-time",
+                "declaration_sha256": _digest({
+                    **{
+                        key: item for key, item in value["retirement"].items()
+                        if key != "declaration_sha256"
+                    },
+                    "retired_at": "different-reviewed-time",
+                }),
+            }),
+            "source_identity_same_sha": lambda value: (
+                value["source"].update(identity="https://other.test/same-plan"),
+                value["from"].update(
+                    source_identity="https://other.test/same-plan",
+                ),
+                value["to"].update(
+                    source_identity="https://other.test/same-plan",
+                ),
+            ),
+            "material_frontier": lambda value: (
+                value["from"].update(material_revision=1),
+                value["to"].update(material_revision=1),
+            ),
+            "projection_frontier": lambda value: (
+                value["from"].update(projection_events_sha256="6" * 64),
+                value["to"].update(projection_events_sha256="6" * 64),
+            ),
+        }
+        for name, mutate in divergent_controls.items():
+            with self.subTest(divergent_control=name), self.assertRaises(
+                LinearTransportError,
+            ):
+                generation_ledger_frontier_tokens(
+                    mutated_genesis(mutate), workstream_id=WORKSTREAM,
+                    authenticated_route=AUTHORITY,
+                    current_plan_revision=OLD,
+                )
+
+        wrong_binding = deepcopy(genesis)
+        wrong_binding["value"]["reservation_sha256"] = "9" * 64
+        wrong_binding = build_projection_event(
+            workstream_id=WORKSTREAM, kind="generation_genesis", key="root",
+            value=wrong_binding["value"], plan_revision=OLD,
+            expected_revision=genesis["expected_revision"],
+            created_at=genesis["created_at"], authority=AUTHORITY,
+        )
+        wrong_chain_comments = [
+            ({
+                **item,
+                "body": encode_projection_comment(wrong_binding),
+            } if item["id"] == genesis_comment["id"] else deepcopy(item))
+            for item in self.client.comments
+        ]
+        with self.assertRaisesRegex(
+            WorkstreamGenerationError,
+            "generation_ledger_frontier_reservation_missing",
+        ):
+            generation_ledger_frontier_tokens(
+                wrong_chain_comments, workstream_id=WORKSTREAM,
+                authenticated_route=AUTHORITY, current_plan_revision=OLD,
+            )
+
+        current_state = adapter(self.client, OLD).state()
+        forged_frontier = _generation_frontier(
+            current_state, self.client.comments, plan_revision=OLD,
+            projection_revision=current_state.revision, material_revision=0,
+        )
+        off_chain_value = deepcopy(genesis["value"])
+        off_chain_value["from"] = forged_frontier
+        off_chain_value["to"] = forged_frontier
+        off_chain = build_projection_event(
+            workstream_id=WORKSTREAM, kind="generation_genesis", key="root",
+            value=off_chain_value, plan_revision=OLD,
+            expected_revision=current_state.revision,
+            created_at="forged-off-chain", authority=AUTHORITY,
+        )
+        off_chain_comments = [*deepcopy(self.client.comments), {
+            "id": projection_slot_id(
+                WORKSTREAM, OLD, off_chain["expected_revision"], AUTHORITY,
+            ),
+            "body": encode_projection_comment(off_chain),
+        }]
+        with self.assertRaisesRegex(
+            LinearTransportError,
+            "projection_concurrent_conflict|generation_control_root_ambiguous",
+        ):
+            generation_ledger_frontier_tokens(
+                off_chain_comments, workstream_id=WORKSTREAM,
+                authenticated_route=AUTHORITY, current_plan_revision=OLD,
+            )
+
+        wrong_route = {**AUTHORITY, "project_id": "other-project"}
+        cross_route = build_projection_event(
+            workstream_id=WORKSTREAM, kind="generation_genesis", key="root",
+            value=deepcopy(off_chain_value), plan_revision=OLD,
+            expected_revision=current_state.revision,
+            created_at="forged-cross-route", authority=wrong_route,
+        )
+        cross_route_comments = [*deepcopy(self.client.comments), {
+            "id": projection_slot_id(
+                WORKSTREAM, OLD, cross_route["expected_revision"], wrong_route,
+            ),
+            "body": encode_projection_comment(cross_route),
+        }]
+        with self.assertRaises(LinearTransportError):
+            generation_ledger_frontier_tokens(
+                cross_route_comments, workstream_id=WORKSTREAM,
+                authenticated_route=AUTHORITY, current_plan_revision=OLD,
+            )
+
+        # A schema-v4 transition is inert until its exact finalization exists.
+        project_full(self.client, NEW)
+        fenced = self.native_fenced_transport()
+        retirement = self.retirement(OLD, 1)
+        preview = fenced.preview_activate(
+            target_plan_revision=NEW, created_at="native-fenced",
+            retirement=retirement,
+        )
+        fenced.activate(
+            target_plan_revision=NEW, created_at="native-fenced",
+            retirement=retirement,
+            expected_native_root_sha256=preview[
+                "native_root_activation_proof"
+            ]["sha256"],
+        )
+        active_comments = deepcopy(self.client.comments)
+        without_finalization = [
+            deepcopy(item) for item in active_comments
+            if "workstream-generation-finalization" not in item["body"]
+        ]
+        self.assertEqual(generation_ledger_frontier_tokens(
+            without_finalization, workstream_id=WORKSTREAM,
+            authenticated_route=AUTHORITY, current_plan_revision=OLD,
+        ), [active_token])
+
+        transition_comment = next(
+            item for item in active_comments
+            if PROJECTION_PREFIX in item["body"]
+            and decode_projection_receipt(
+                item, PROJECTION_RE.findall(item["body"])[0],
+            )["kind"] == "generation_transition"
+        )
+        transition = decode_projection_receipt(
+            transition_comment,
+            PROJECTION_RE.findall(transition_comment["body"])[0],
+        )
+        finalization_comment = next(
+            item for item in active_comments
+            if "workstream-generation-finalization" in item["body"]
+        )
+        finalization = reduce_generation_finalizations(
+            active_comments, workstream_id=WORKSTREAM,
+            authenticated_route=AUTHORITY,
+        )[0]
+
+        def forged_finalized_transition(mutator):
+            value = deepcopy(transition["value"])
+            mutator(value)
+            forged = build_projection_event(
+                workstream_id=WORKSTREAM, kind="generation_transition",
+                key="root", value=value, plan_revision=transition[
+                    "plan_revision"
+                ], expected_revision=transition["expected_revision"],
+                created_at=transition["created_at"], authority=AUTHORITY,
+            )
+            unsigned = {
+                key: deepcopy(item) for key, item in finalization.items()
+                if key not in {"finalization_id", "remote_id"}
+            }
+            unsigned.update({
+                "transition_event_id": forged["event_id"],
+                "transition_sha256": _digest(forged),
+                "native_root_sha256": value["native_root_sha256"],
+            })
+            forged_finalization = {
+                **unsigned,
+                "finalization_id": "wsgf_" + _digest(unsigned)[:32],
+            }
+            result = []
+            for item in active_comments:
+                if item["id"] == transition_comment["id"]:
+                    result.append({
+                        **deepcopy(item),
+                        "body": encode_projection_comment(forged),
+                    })
+                elif item["id"] == finalization_comment["id"]:
+                    result.append({
+                        "id": generation_finalization_slot_id(
+                            forged_finalization
+                        ),
+                        "body": encode_generation_finalization(
+                            forged_finalization
+                        ),
+                    })
+                else:
+                    result.append(deepcopy(item))
+            return result
+
+        with self.assertRaisesRegex(
+            LinearTransportError,
+            "generation_ledger_frontier_reservation_binding_mismatch",
+        ):
+            generation_ledger_frontier_tokens(
+                forged_finalized_transition(
+                    lambda value: value.update(native_root_sha256="5" * 64)
+                ),
+                workstream_id=WORKSTREAM, authenticated_route=AUTHORITY,
+                current_plan_revision=NEW,
+            )
+
+        activation = self.activation_checkpoint()
+
+        def add_divergent_checkpoint(value):
+            value["activation_checkpoint"] = activation
+            value["activation_checkpoint_sha256"] = _digest(activation)
+            value["to"]["checkpoint_event_ids"] = [activation["event_id"]]
+            value["to"]["checkpoint_events_sha256"] = _digest(
+                value["to"]["checkpoint_event_ids"]
+            )
+
+        with self.assertRaises(LinearTransportError):
+            generation_ledger_frontier_tokens(
+                forged_finalized_transition(add_divergent_checkpoint),
+                workstream_id=WORKSTREAM, authenticated_route=AUTHORITY,
+                current_plan_revision=NEW,
+            )
+
+        downgraded = deepcopy(transition["value"])
+        for field in (
+            "activation_checkpoint", "activation_checkpoint_sha256",
+            "native_root_sha256",
+        ):
+            downgraded.pop(field)
+        downgraded["schema_version"] = 2
+        legacy_transition = build_projection_event(
+            workstream_id=WORKSTREAM, kind="generation_transition", key="root",
+            value=downgraded, plan_revision=transition["plan_revision"],
+            expected_revision=transition["expected_revision"],
+            created_at=transition["created_at"], authority=AUTHORITY,
+        )
+        legacy_comments = [
+            ({**deepcopy(item), "body": encode_projection_comment(
+                legacy_transition
+            )} if item["id"] == transition_comment["id"] else deepcopy(item))
+            for item in active_comments
+            if item["id"] != finalization_comment["id"]
+        ]
+        with self.assertRaisesRegex(
+            LinearTransportError,
+            "generation_ledger_frontier_reservation_binding_mismatch",
+        ):
+            generation_ledger_frontier_tokens(
+                legacy_comments, workstream_id=WORKSTREAM,
+                authenticated_route=AUTHORITY, current_plan_revision=NEW,
+            )
+
     def test_schema7_material_graph_excludes_only_root_updated_at(self):
         original = {
             "root": {"title": "Root", "updatedAt": "one"},
