@@ -80,7 +80,7 @@ def _one_child(snapshot: dict[str, Any], child_token: str) -> dict[str, Any]:
 def _validate_contract_owner(
     contract: dict[str, Any], *, child_token: str, plan_revision: str,
     scope: dict[str, Any],
-) -> None:
+) -> dict[str, Any]:
     errors = evidence_errors(contract)
     if errors:
         raise ChildCompletionPrepareError(
@@ -100,12 +100,57 @@ def _validate_contract_owner(
     if len(repositories) != 1:
         raise ChildCompletionPrepareError("evidence_contract_repository_ambiguous")
     repository = repositories[0]
-    if (
-        repository.get("exact_head") != contract.get("exact_head")
-        or canonical_repository(str(repository.get("slug", "")))
-        != contract.get("repository")
+    if canonical_repository(str(repository.get("slug", ""))) != contract.get(
+        "repository"
     ):
         raise ChildCompletionPrepareError("evidence_contract_repository_mismatch")
+    return repository
+
+
+def _scope_head_conflicts(
+    active: dict[tuple[str, str], dict[str, Any]], *, repository_key: str,
+    exact_head: str,
+) -> list[str]:
+    closed_children = {
+        key for (kind, key), _event in active.items()
+        if kind == "child_closure"
+    }
+    return sorted({
+        str(value.get("owning_child"))
+        for (kind, _key), event in active.items()
+        if kind == "evidence_contract"
+        and isinstance((value := event.get("value")), dict)
+        and value.get("repository_key") == repository_key
+        and value.get("exact_head") != exact_head
+        and value.get("owning_child") not in closed_children
+    })
+
+
+def _scope_head_manifest(
+    state: Any, *, scope: dict[str, Any], repository_key_value: str,
+    exact_head: str,
+) -> dict[str, Any]:
+    replacement = deepcopy(scope)
+    matches = [
+        repository for repository in replacement.get("repositories", [])
+        if repository_key(repository) == repository_key_value
+    ]
+    if len(matches) != 1:
+        raise ChildCompletionPrepareError("evidence_contract_repository_ambiguous")
+    matches[0]["exact_head"] = exact_head
+    desired = _desired_active_projection(state)
+    scope_items = [
+        item for item in desired
+        if item.get("kind") == "scope" and item.get("key") == "root"
+    ]
+    if len(scope_items) != 1:
+        raise ChildCompletionPrepareError("active_projection_scope_missing")
+    scope_items[0]["value"] = replacement
+    return {
+        "projection": desired,
+        "retirements": [],
+        **projection_review_contract(state),
+    }
 
 
 def prepare_child_completion(
@@ -149,10 +194,43 @@ def prepare_child_completion(
         != authenticated_route["workspace_id"]
     ):
         raise ChildCompletionPrepareError("child_native_route_mismatch")
-    _validate_contract_owner(
+    repository = _validate_contract_owner(
         evidence_contract, child_token=child_token,
         plan_revision=str(plan_revision), scope=scope,
     )
+
+    contract_head = str(evidence_contract["exact_head"])
+    if repository.get("exact_head") != contract_head:
+        conflicts = _scope_head_conflicts(
+            active, repository_key=str(evidence_contract["repository_key"]),
+            exact_head=contract_head,
+        )
+        if conflicts:
+            raise ChildCompletionPrepareError(
+                "scope_head_blocked_by_unclosed_evidence:" + ",".join(conflicts)
+            )
+        manifest = _scope_head_manifest(
+            state, scope=scope,
+            repository_key_value=str(evidence_contract["repository_key"]),
+            exact_head=contract_head,
+        )
+        status_type = str(child.get("status_type") or "").lower()
+        if not status_type and isinstance(child.get("state"), dict):
+            status_type = str(child["state"].get("type") or "").lower()
+        return {
+            "schema_version": 1,
+            "operation_status": "scope_head_projection_required",
+            "root_workstream_id": root_token,
+            "child_workstream_id": child_token,
+            "child_issue_id": child.get("id"),
+            "plan_revision": plan_revision,
+            "native_state": {
+                "id": child.get("state_id") or (child.get("state") or {}).get("id"),
+                "name": child.get("status") or (child.get("state") or {}).get("name"),
+                "type": status_type,
+            },
+            "projection_manifest": manifest,
+        }
 
     missing_closures = _completed_owned_missing_closures(snapshot, scope, active)
     if missing_closures - {child_token}:

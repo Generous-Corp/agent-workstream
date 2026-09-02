@@ -881,12 +881,23 @@ workstreamctl child-completion-prepare GEN-123 --child GEN-124 \
   --plan-identity <canonical-url> > child-completion.json
 ```
 
-This command is read-only. Only `evidence_projection_required` and
-`closure_projection_required` return an applicable `projection_manifest` for
-the normal `projection` preview/apply pair. It emits an evidence-only phase when
-the contract is not active, `native_transition_required` while the child is
-open, and a fenced `terminal_child_repairs` phase only after authenticated
-native readback says the child is completed. `native_transition_required` and
+This command is read-only. `scope_head_projection_required`,
+`evidence_projection_required`, and `closure_projection_required` return an
+applicable `projection_manifest` for the normal `projection` preview/apply
+pair. If the
+contract's exact head differs from the active scope, immutable repository
+identity and child ownership are validated first. Prepare then refuses while
+any active evidence contract for an unclosed child on that repository binds a
+different head. Otherwise it returns `scope_head_projection_required` with a
+complete scope-only replacement manifest: every other active projection value
+and every unrelated scope field is preserved, and only the matching
+repository's `exact_head` changes. An older contract whose child already has an
+active closure does not block the next head, which permits closing one child
+before advancing the shared repository for another. Apply the reviewed scope
+manifest and rerun prepare; it then emits the evidence-only phase when the
+contract is not active, `native_transition_required` while the child is open,
+and a fenced `terminal_child_repairs` phase only after authenticated native
+readback says the child is completed. `native_transition_required` and
 `complete` are control states, not manifests to apply. Rerun it after each
 phase; never copy a closure forward or infer completion from the evidence file.
 

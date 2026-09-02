@@ -12,6 +12,7 @@ from workstream_projection import projection_review_contract
 
 PLAN = "a" * 64
 HEAD = "b" * 40
+NEXT_HEAD = "c" * 40
 ROOT_ID = "33333333-3333-4333-8333-333333333333"
 CHILD_ID = "44444444-4444-4444-8444-444444444444"
 ROUTE = {
@@ -40,29 +41,29 @@ REPOSITORY = {
 REPOSITORY_KEY = "github.com:id:R_repo"
 
 
-def receipt(kind):
+def receipt(kind, *, exact_head=HEAD):
     return {
         "kind": kind, "passed": True, "proof": f"{kind} passed",
-        "repository_key": REPOSITORY_KEY, "exact_head": HEAD,
+        "repository_key": REPOSITORY_KEY, "exact_head": exact_head,
     }
 
 
-def evidence_contract():
+def evidence_contract(*, exact_head=HEAD, repository="github.com/example/repo"):
     na = lambda reason: {"status": "not_applicable", "reason": reason}
     return {
         "slice_id": "child-completion", "owning_child": "GEN-92",
-        "repository": "github.com/example/repo",
+        "repository": repository,
         "repository_key": REPOSITORY_KEY,
-        "plan_revision": PLAN, "exact_head": HEAD,
+        "plan_revision": PLAN, "exact_head": exact_head,
         "layers": {
             "architecture": {
                 "status": "required", "owned_seam": "completion",
                 "trust_boundary": "Linear", "allowed_side_effects": [],
-                "receipts": [receipt("review")],
+                "receipts": [receipt("review", exact_head=exact_head)],
             },
             "logic": {
                 "status": "required", "methods": ["unit"],
-                "receipts": [receipt("test")],
+                "receipts": [receipt("test", exact_head=exact_head)],
             },
             "component": na("Covered by logic"),
             "adapter": na("No adapter"),
@@ -71,7 +72,7 @@ def evidence_contract():
             "operational": na("No deployment"),
             "negative_control": {
                 "status": "required", "failure_detected": True,
-                "receipts": [receipt("negative")],
+                "receipts": [receipt("negative", exact_head=exact_head)],
             },
         },
     }
@@ -160,12 +161,93 @@ def state(*, include_evidence=False, include_closure=False,
 
 
 class ChildCompletionPrepareTests(unittest.TestCase):
-    def call(self, snap, projection):
+    def call(self, snap, projection, *, contract=None):
         return prepare_child_completion(
             snap, projection, root_token="GEN-91", child_token="GEN-92",
-            evidence_contract=evidence_contract(),
+            evidence_contract=contract or evidence_contract(),
             authenticated_source=SOURCE, authenticated_route=ROUTE,
         )
+
+    def test_stale_scope_emits_safe_scope_head_advance(self):
+        contract = evidence_contract(exact_head=NEXT_HEAD)
+        result = self.call(snapshot(), state(), contract=contract)
+        self.assertEqual(
+            result["operation_status"], "scope_head_projection_required",
+        )
+        manifest = result["projection_manifest"]
+        self.assertEqual(manifest["retirements"], [])
+        self.assertNotIn("terminal_child_repairs", manifest)
+        scope_item = next(
+            item for item in manifest["projection"]
+            if (item["kind"], item["key"]) == ("scope", "root")
+        )
+        self.assertEqual(
+            scope_item["value"]["repositories"][0]["exact_head"], NEXT_HEAD,
+        )
+        for key, value in projection_review_contract(state()).items():
+            self.assertEqual(manifest[key], value)
+
+    def test_scope_head_advance_preserves_every_unrelated_field(self):
+        original_scope = snapshot()["scope"]
+        original_scope["extension"] = {"opaque": ["preserve", {"exactly": True}]}
+        original_scope["repositories"][0]["evidence"] = [
+            {"kind": "opaque", "value": {"nested": [1, 2, 3]}},
+        ]
+        projection = state(scope_value=original_scope)
+        result = self.call(
+            snapshot(), projection,
+            contract=evidence_contract(exact_head=NEXT_HEAD),
+        )
+        actual = result["projection_manifest"]["projection"]
+        expected = [
+            {"kind": kind, "key": key, "value": event["value"]}
+            for (kind, key), event in sorted(
+                ((event["kind"], event["key"]), event)
+                for event in projection.events
+            )
+            if kind != "disposition"
+        ]
+        expected_scope = next(
+            item for item in expected
+            if (item["kind"], item["key"]) == ("scope", "root")
+        )
+        expected_scope["value"] = dict(expected_scope["value"])
+        expected_scope["value"]["repositories"] = [
+            dict(repository)
+            for repository in expected_scope["value"]["repositories"]
+        ]
+        expected_scope["value"]["repositories"][0]["exact_head"] = NEXT_HEAD
+        self.assertEqual(actual, expected)
+        self.assertEqual(original_scope["repositories"][0]["exact_head"], HEAD)
+
+    def test_scope_head_advance_refuses_unclosed_old_head_evidence(self):
+        with self.assertRaisesRegex(
+            ChildCompletionPrepareError,
+            "scope_head_blocked_by_unclosed_evidence:GEN-92",
+        ):
+            self.call(
+                snapshot(), state(include_evidence=True),
+                contract=evidence_contract(exact_head=NEXT_HEAD),
+            )
+
+    def test_scope_head_advance_allows_closed_old_head_evidence(self):
+        result = self.call(
+            snapshot(terminal=True),
+            state(include_evidence=True, include_closure=True),
+            contract=evidence_contract(exact_head=NEXT_HEAD),
+        )
+        self.assertEqual(
+            result["operation_status"], "scope_head_projection_required",
+        )
+
+    def test_scope_head_exact_replay_advances_to_evidence_phase(self):
+        scope = snapshot()["scope"]
+        scope["repositories"][0]["exact_head"] = NEXT_HEAD
+        result = self.call(
+            snapshot(), state(scope_value=scope),
+            contract=evidence_contract(exact_head=NEXT_HEAD),
+        )
+        self.assertEqual(result["operation_status"], "evidence_projection_required")
 
     def test_emits_evidence_only_when_contract_is_not_active(self):
         result = self.call(snapshot(), state())
@@ -209,7 +291,7 @@ class ChildCompletionPrepareTests(unittest.TestCase):
         self.assertNotIn("terminal_child_repairs", result["projection_manifest"])
 
     def test_refuses_wrong_owner(self):
-        contract = evidence_contract()
+        contract = evidence_contract(exact_head=NEXT_HEAD)
         contract["repository_key"] = "github.com:id:R_other"
         for layer in contract["layers"].values():
             for item in layer.get("receipts", []):
@@ -221,6 +303,18 @@ class ChildCompletionPrepareTests(unittest.TestCase):
                 snapshot(), state(), root_token="GEN-91",
                 child_token="GEN-92", evidence_contract=contract,
                 authenticated_source=SOURCE, authenticated_route=ROUTE,
+            )
+
+    def test_refuses_wrong_repository_before_scope_head_advance(self):
+        with self.assertRaisesRegex(
+            ChildCompletionPrepareError, "evidence_contract_repository_mismatch",
+        ):
+            self.call(
+                snapshot(), state(),
+                contract=evidence_contract(
+                    exact_head=NEXT_HEAD,
+                    repository="github.com/example/different",
+                ),
             )
 
     def test_refuses_wrong_parent(self):
