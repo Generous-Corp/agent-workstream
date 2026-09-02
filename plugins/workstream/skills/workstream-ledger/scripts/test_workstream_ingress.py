@@ -2,6 +2,7 @@
 
 import argparse
 import gc
+import hashlib
 import importlib.util
 import io
 import json
@@ -24,9 +25,11 @@ SPEC.loader.exec_module(MODULE)
 
 def capture_payload(
     event_id="e1", *, workstream_id="ABC-12", prompt="prompt",
-    prompt_sha256="a" * 64, captured_at="2026-08-14T01:00:00Z",
-    context_url=None,
+    prompt_sha256=None, captured_at="2026-08-14T01:00:00Z",
+    context_url=None, redactions=0, truncated=False,
 ):
+    if prompt_sha256 is None:
+        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     return {
         "schema_version": 1,
         "event_id": event_id,
@@ -41,8 +44,8 @@ def capture_payload(
         "context_url": context_url,
         "prompt": prompt,
         "prompt_sha256": prompt_sha256,
-        "redactions": 0,
-        "truncated": False,
+        "redactions": redactions,
+        "truncated": truncated,
     }
 
 
@@ -165,7 +168,7 @@ class WorkstreamIngressTests(unittest.TestCase):
 
     def test_remote_recovery_refuses_conflicting_duplicate_capture(self):
         first = capture_payload(prompt="first")
-        conflicting = capture_payload(prompt="second", prompt_sha256="b" * 64)
+        conflicting = capture_payload(prompt="second")
         comments = [
             {"id": 1, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, first)},
             {"id": 2, "body": MODULE.comment_body(
@@ -212,12 +215,57 @@ class WorkstreamIngressTests(unittest.TestCase):
             "e-early", "e-late",
         ])
 
+    def test_capture_integrity_matches_genuine_emitter_shapes(self):
+        self.assertTrue(MODULE._is_exact_capture_payload(capture_payload()))
+
+        raw_redacted = "Authorization: Bearer topsecret"
+        prompt, redactions, truncated = MODULE.redact_prompt(raw_redacted)
+        self.assertTrue(MODULE._is_exact_capture_payload(capture_payload(
+            prompt=prompt,
+            prompt_sha256=hashlib.sha256(raw_redacted.encode("utf-8")).hexdigest(),
+            redactions=redactions,
+            truncated=truncated,
+        )))
+
+        raw_truncated = "x" * (MODULE.MAX_PROMPT_BYTES + 1)
+        prompt, redactions, truncated = MODULE.redact_prompt(raw_truncated)
+        self.assertTrue(truncated)
+        self.assertTrue(MODULE._is_exact_capture_payload(capture_payload(
+            prompt=prompt,
+            prompt_sha256=hashlib.sha256(raw_truncated.encode("utf-8")).hexdigest(),
+            redactions=redactions,
+            truncated=truncated,
+        )))
+
+    def test_capture_integrity_quarantines_oversize_stale_and_inconsistent_fields(self):
+        invalid = [
+            capture_payload(prompt="x" * (MODULE.MAX_PROMPT_BYTES + 1)),
+            capture_payload(prompt_sha256="0" * 64),
+            capture_payload(redactions=True),
+            capture_payload(redactions=-1),
+            capture_payload(redactions=MODULE.MAX_REDACTIONS + 1),
+            capture_payload(redactions=1),
+            capture_payload(truncated=1),
+            capture_payload(truncated=True),
+            capture_payload(
+                prompt="x" * (MODULE.MAX_PROMPT_BYTES + 1) + MODULE.TRUNCATION_SUFFIX,
+                truncated=True,
+            ),
+        ]
+        self.assertTrue(all(
+            not MODULE._is_exact_capture_payload(payload) for payload in invalid
+        ))
+
     def test_remote_recovery_refuses_malformed_transport_envelopes(self):
-        for issues in (None, {}, "not-issues", [None]):
+        for issues in (None, {}, "not-issues", [None], [1]):
             with self.subTest(kind="issues", issues=issues), mock.patch.object(
                 MODULE, "gh", return_value=issues,
             ), self.assertRaisesRegex(ValueError, "ingress_issues_envelope_invalid"):
                 MODULE.remote_events("o/r", "ABC-12")
+
+        with mock.patch.object(MODULE, "gh", return_value=[{}]), \
+             self.assertRaisesRegex(ValueError, "ingress_issue_route_invalid"):
+            MODULE.remote_events("o/r", "ABC-12")
 
         issue_list = [{"number": 7, "url": "i", "title": "ingress"}]
         for pages in (None, {}, "not-comments"):
@@ -232,6 +280,44 @@ class WorkstreamIngressTests(unittest.TestCase):
             issue_list, [[], {}],
         ]), self.assertRaisesRegex(ValueError, "ingress_comment_pages_invalid:7"):
             MODULE.remote_events("o/r", "ABC-12")
+
+        for pages in ([None], [{}], [1], [[None]], [[{}]]):
+            with self.subTest(kind="comment-items", pages=pages), mock.patch.object(
+                MODULE, "gh", side_effect=[issue_list, pages],
+            ), self.assertRaisesRegex(ValueError, "ingress_comment_items_invalid:7"):
+                MODULE.remote_events("o/r", "ABC-12")
+
+    def test_remote_event_state_uses_the_same_transport_envelope_validation(self):
+        for pages in (None, {}, [None], [{}], [1], [[None]], [[{}]]):
+            expected = (
+                "ingress_comments_envelope_invalid:7"
+                if not isinstance(pages, list)
+                else "ingress_comment_items_invalid:7"
+            )
+            with self.subTest(pages=pages), mock.patch.object(
+                MODULE, "gh", return_value=pages,
+            ), self.assertRaisesRegex(ValueError, expected):
+                MODULE.remote_event_state("o/r", 7, "e1")
+
+        malformed_json = (
+            MODULE.CAPTURE_MARKER + "\n```json\n{not-json\n```"
+        )
+        with mock.patch.object(MODULE, "gh", return_value=[[
+            {"body": malformed_json},
+        ]]):
+            state = MODULE.remote_event_state("o/r", 7, "e1")
+        self.assertEqual(state, {
+            "capture": None, "promotion": None, "processed": None,
+        })
+
+        valid = capture_payload()
+        malformed = {**valid, "captured_at": 1}
+        with mock.patch.object(MODULE, "gh", return_value=[[
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, malformed)},
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, valid)},
+        ]]):
+            state = MODULE.remote_event_state("o/r", 7, "e1")
+        self.assertEqual(state["capture"], valid)
 
     def test_remote_recovery_refuses_non_object_promotion_as_schema(self):
         for promotion in ([], ["not", "a", "promotion"], "not-a-promotion", {}):
@@ -1073,6 +1159,7 @@ class ClassificationAuthorityTests(unittest.TestCase):
         other_capture = {
             **self.capture, "event_id": "wsi_other",
             "captured_at": "2026-08-29T01:02:00Z", "prompt": "Still open",
+            "prompt_sha256": hashlib.sha256(b"Still open").hexdigest(),
         }
         first = self.payload("no-material-delta")
         conflicting_actor = self.payload("no-material-delta")
@@ -1154,6 +1241,7 @@ class LegacyProcessedCompatibilityTests(unittest.TestCase):
 
     @staticmethod
     def capture(event_id, *, session_id="session-a", workstream_id="GEN-37"):
+        prompt = f"Prompt for {event_id}"
         return {
             "schema_version": 1,
             "event_id": event_id,
@@ -1166,8 +1254,8 @@ class LegacyProcessedCompatibilityTests(unittest.TestCase):
             "cwd": "/repo",
             "workstream_id": workstream_id,
             "context_url": "https://linear.app/generous/issue/GEN-37/x",
-            "prompt": f"Prompt for {event_id}",
-            "prompt_sha256": "a" * 64,
+            "prompt": prompt,
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             "redactions": 0,
             "truncated": False,
         }
@@ -1576,7 +1664,8 @@ class ManagedPromotionTests(unittest.TestCase):
         self.request.write_text(json.dumps({
             "schema_version": 1,
             "ingress": {"repo": "private/ingress", "remote_issue": 7,
-                        "event_id": "wsi_raw", "prompt_sha256": "a" * 64},
+                        "event_id": "wsi_raw",
+                        "prompt_sha256": self.capture["prompt_sha256"]},
             "authority": {
                 "workspace_id": "11111111-1111-4111-8111-111111111111",
                 "team_id": "22222222-2222-4222-8222-222222222222",

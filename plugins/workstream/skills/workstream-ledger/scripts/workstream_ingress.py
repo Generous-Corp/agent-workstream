@@ -28,6 +28,9 @@ from workstream_linear_events import (
 SCHEMA_VERSION = 1
 LABEL = "workstream-ingress"
 MAX_PROMPT_BYTES = 16 * 1024
+TRUNCATION_SUFFIX = "\n[TRUNCATED]"
+# The local outbox stores this value in a SQLite signed INTEGER.
+MAX_REDACTIONS = (1 << 63) - 1
 DEFAULT_RETENTION_DAYS = 30
 DEFAULT_REMOTE_RETENTION_DAYS = 90
 DEFAULT_MAX_LOCAL_BYTES = 50 * 1024 * 1024
@@ -308,7 +311,7 @@ def redact_text(text: str, *, max_bytes: int) -> tuple[str, int, bool]:
     encoded = value.encode("utf-8")
     truncated = len(encoded) > max_bytes
     if truncated:
-        value = encoded[:max_bytes].decode("utf-8", errors="ignore") + "\n[TRUNCATED]"
+        value = encoded[:max_bytes].decode("utf-8", errors="ignore") + TRUNCATION_SUFFIX
     return value, redactions, truncated
 
 
@@ -762,6 +765,42 @@ def _is_exact_capture_payload(payload: Any) -> bool:
         captured_time = datetime.fromisoformat(captured_at[:-1] + "+00:00")
     except ValueError:
         return False
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str):
+        return False
+    try:
+        prompt_bytes = prompt.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    redactions = payload.get("redactions")
+    truncated = payload.get("truncated")
+    if (
+        type(redactions) is not int
+        or not 0 <= redactions <= MAX_REDACTIONS
+        or type(truncated) is not bool
+    ):
+        return False
+    if truncated:
+        if not prompt.endswith(TRUNCATION_SUFFIX):
+            return False
+        retained = prompt[:-len(TRUNCATION_SUFFIX)]
+        if len(retained.encode("utf-8")) > MAX_PROMPT_BYTES:
+            return False
+    elif len(prompt_bytes) > MAX_PROMPT_BYTES:
+        return False
+    elif redactions > prompt.count("[REDACTED]"):
+        return False
+    prompt_sha256 = payload.get("prompt_sha256")
+    if (
+        not isinstance(prompt_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", prompt_sha256) is None
+        or (
+            redactions == 0
+            and not truncated
+            and hashlib.sha256(prompt_bytes).hexdigest() != prompt_sha256
+        )
+    ):
+        return False
     nullable_strings = (
         "session_id", "turn_id", "surface_id", "workspace_id", "context_url",
     )
@@ -789,12 +828,7 @@ def _is_exact_capture_payload(payload: Any) -> bool:
                 is not None
             )
         )
-        and isinstance(payload.get("prompt"), str)
-        and isinstance(payload.get("prompt_sha256"), str)
-        and re.fullmatch(r"[0-9a-f]{64}", payload["prompt_sha256"]) is not None
-        and type(payload.get("redactions")) is int
-        and payload["redactions"] >= 0
-        and type(payload.get("truncated")) is bool
+        and isinstance(prompt, str)
     )
 
 
@@ -848,6 +882,8 @@ def reduce_ingress_comments(
     processed: list[dict[str, Any]] = []
     bindings: list[dict[str, Any]] = []
     for comment in comments:
+        if not isinstance(comment, dict):
+            raise ValueError("ingress_comment_item_invalid")
         body = comment.get("body", "")
         if not isinstance(body, str):
             raise ValueError("ingress_comment_body_invalid")
@@ -856,9 +892,16 @@ def reduce_ingress_comments(
             (PROCESSED_MARKER, processed), (BIND_MARKER, bindings),
         ):
             item = parse_comment(body, marker)
-            if isinstance(item, dict) and item.get("event_id") == event_id:
-                target.append(item)
+            if item is None:
+                continue
+            if marker == PROMOTION_MARKER and not isinstance(item, dict):
+                raise ValueError("promotion_marker_schema_invalid")
+            if not isinstance(item, dict):
                 break
+            if item.get("event_id") == event_id:
+                if marker != CAPTURE_MARKER or _is_exact_capture_payload(item):
+                    target.append(item)
+            break
 
     def one_logical(items: list[dict[str, Any]], name: str, *, ignore_time: bool = False):
         if not items:
@@ -922,13 +965,31 @@ def reduce_ingress_comments(
     return {"capture": capture, "promotion": promotion, "processed": disposition}
 
 
+def normalize_remote_comments(pages: Any, issue: int) -> list[dict[str, Any]]:
+    """Validate one GitHub comments transport envelope without false-empty recovery."""
+    if not isinstance(pages, list):
+        raise ValueError(f"ingress_comments_envelope_invalid:{issue}")
+    if pages and isinstance(pages[0], list):
+        if any(not isinstance(page, list) for page in pages):
+            raise ValueError(f"ingress_comment_pages_invalid:{issue}")
+        raw_comments = [comment for page in pages for comment in page]
+    else:
+        raw_comments = pages
+    comments = [
+        comment for comment in raw_comments
+        if isinstance(comment, dict) and isinstance(comment.get("body"), str)
+    ]
+    if raw_comments and not comments:
+        raise ValueError(f"ingress_comment_items_invalid:{issue}")
+    return comments
+
+
 def remote_issue_comments(repo: str, issue: int) -> list[dict[str, Any]]:
+    canonical_ingress_route(repo, issue)
     pages = gh([
         "api", "--paginate", "--slurp", f"repos/{repo}/issues/{issue}/comments?per_page=100",
     ], timeout=20)
-    if not pages:
-        return []
-    return [comment for page in pages for comment in page] if isinstance(pages[0], list) else pages
+    return normalize_remote_comments(pages, issue)
 
 
 def remote_event_state(repo: str, issue: int, event_id: str) -> dict[str, Any]:
@@ -1107,21 +1168,7 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
             "api", "--paginate", "--slurp",
             f"repos/{repo}/issues/{issue_number}/comments?per_page=100",
         ], timeout=20)
-        if not isinstance(pages, list):
-            raise ValueError(f"ingress_comments_envelope_invalid:{issue_number}")
-        if pages and isinstance(pages[0], list):
-            if any(not isinstance(page, list) for page in pages):
-                raise ValueError(f"ingress_comment_pages_invalid:{issue_number}")
-            raw_comments = [
-                comment for page in pages for comment in page
-            ]
-        else:
-            raw_comments = pages
-        comments = [
-            comment for comment in raw_comments
-            if isinstance(comment, dict)
-            and isinstance(comment.get("body", ""), str)
-        ]
+        comments = normalize_remote_comments(pages, issue_number)
         comments_by_issue[issue_number] = comments
         for comment in comments:
             item = parse_comment(comment.get("body", ""), CAPTURE_MARKER)
