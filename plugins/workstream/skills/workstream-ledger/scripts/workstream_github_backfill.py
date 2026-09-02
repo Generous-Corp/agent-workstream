@@ -401,7 +401,7 @@ class GitHubBackfillReceiptReader:
 
     def _read_checks(self, repository: str, expected_head: str) -> list[dict[str, Any]]:
         observed: list[dict[str, Any]] = []
-        observed_ids: set[str] = set()
+        observed_ids: set[int] = set()
         expected_total: int | None = None
         for page in range(1, self.max_pages + 1):
             query = urllib.parse.urlencode({"filter": "all", "per_page": 100, "page": page})
@@ -432,15 +432,15 @@ class GitHubBackfillReceiptReader:
                     raise GitHubBackfillReceiptError("github_checks_response_malformed")
                 check_id = item.get("id")
                 if (
-                    not isinstance(check_id, (int, str))
+                    not isinstance(check_id, int)
                     or isinstance(check_id, bool)
-                    or not str(check_id)
-                    or str(check_id) in observed_ids
+                    or check_id <= 0
+                    or check_id in observed_ids
                 ):
                     raise GitHubBackfillReceiptError(
                         "github_checks_changed_during_read"
                     )
-                observed_ids.add(str(check_id))
+                observed_ids.add(check_id)
                 if item.get("head_sha") != expected_head:
                     raise GitHubBackfillReceiptError("github_check_head_mismatch")
                 if item.get("status") != "completed" or item.get("conclusion") != "success":

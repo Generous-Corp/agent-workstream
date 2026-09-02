@@ -65,7 +65,10 @@ def check(
     check_id=None,
 ):
     return {
-        "id": name if check_id is None else check_id,
+        "id": (
+            int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big")
+            if check_id is None else check_id
+        ),
         "name": name,
         "status": status,
         "conclusion": conclusion,
@@ -193,6 +196,8 @@ class GitHubBackfillReceiptTests(unittest.TestCase):
              "github_checks_unsuccessful"),
             ([check("unit", conclusion="failure")], "github_checks_unsuccessful"),
             ([check("unit", head="c" * 40)], "github_check_head_mismatch"),
+            ([check("unit", check_id=0)], "github_checks_changed_during_read"),
+            ([check("unit", check_id="1")], "github_checks_changed_during_read"),
         ]
         for checks, code in failures:
             with self.subTest(code=code):
