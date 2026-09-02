@@ -22,6 +22,30 @@ assert SPEC.loader
 SPEC.loader.exec_module(MODULE)
 
 
+def capture_payload(
+    event_id="e1", *, workstream_id="ABC-12", prompt="prompt",
+    prompt_sha256="a" * 64, captured_at="2026-08-14T01:00:00Z",
+    context_url=None,
+):
+    return {
+        "schema_version": 1,
+        "event_id": event_id,
+        "captured_at": captured_at,
+        "provider": "codex",
+        "session_id": "session-a",
+        "turn_id": f"turn-{event_id}",
+        "surface_id": "surface-1",
+        "workspace_id": "workspace-1",
+        "cwd": "/repo",
+        "workstream_id": workstream_id,
+        "context_url": context_url,
+        "prompt": prompt,
+        "prompt_sha256": prompt_sha256,
+        "redactions": 0,
+        "truncated": False,
+    }
+
+
 class WorkstreamIngressTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -120,7 +144,7 @@ class WorkstreamIngressTests(unittest.TestCase):
         self.assertIsNotNone(row[1])
 
     def test_remote_recovery_deduplicates_but_keeps_mutable_classification_open(self):
-        capture = {"event_id": "e1", "captured_at": "2026-08-14T01:00:00Z", "workstream_id": "ABC-12"}
+        capture = capture_payload()
         processed = {
             "schema_version": 2, "event_id": "e1", "processed_at": "2026-08-14T02:00:00Z",
             "disposition": "no-material-delta", "promoted_issue": None,
@@ -136,10 +160,121 @@ class WorkstreamIngressTests(unittest.TestCase):
         ]):
             events = MODULE.remote_events("o/r", "ABC-12")
         self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["remote_url"], "u1")
         self.assertFalse(events[0]["classification_hint"]["authoritative"])
 
+    def test_remote_recovery_refuses_conflicting_duplicate_capture(self):
+        first = capture_payload(prompt="first")
+        conflicting = capture_payload(prompt="second", prompt_sha256="b" * 64)
+        comments = [
+            {"id": 1, "body": MODULE.comment_body(MODULE.CAPTURE_MARKER, first)},
+            {"id": 2, "body": MODULE.comment_body(
+                MODULE.CAPTURE_MARKER, conflicting)},
+        ]
+        with mock.patch.object(MODULE, "gh", side_effect=[
+            [{"number": 7, "url": "i", "title": "ingress"}], [comments],
+        ]), self.assertRaisesRegex(ValueError, "conflicting_capture:e1"):
+            MODULE.remote_events("o/r", "ABC-12")
+
+    def test_remote_recovery_quarantines_malformed_captures_before_keys_or_sort(self):
+        early = capture_payload("e-early", captured_at="2026-08-14T00:00:00Z")
+        late = capture_payload("e-late", captured_at="2026-08-14T02:00:00Z")
+        malformed = [
+            {**late, "captured_at": 1},
+            {**late, "event_id": []},
+            {**late, "prompt": {}},
+            {**late, "prompt_sha256": []},
+            {**late, "redactions": {}},
+            {**late, "truncated": []},
+            {**late, "session_id": {}},
+            {**late, "unexpected": "field"},
+            {key: value for key, value in late.items() if key != "provider"},
+            ["not", "an", "object"],
+        ]
+        comments = [
+            {"body": body} for body in (None, 1, [], {})
+        ] + [
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, item)}
+            for item in [*malformed, late, early]
+        ] + [
+            {"body": MODULE.comment_body(MODULE.BIND_MARKER, item)}
+            for item in ([], ["not", "a", "binding"], "not-a-binding", {})
+        ] + [
+            {"body": MODULE.comment_body(MODULE.PROCESSED_MARKER, item)}
+            for item in ([], ["not", "processed"], "not-processed", {})
+        ]
+        comments.insert(0, ["not", "a", "comment"])
+        with mock.patch.object(MODULE, "gh", side_effect=[
+            [{"number": 7, "url": "i", "title": "ingress"}], [comments],
+        ]):
+            events = MODULE.remote_events("o/r", "ABC-12")
+        self.assertEqual([event["event_id"] for event in events], [
+            "e-early", "e-late",
+        ])
+
+    def test_remote_recovery_refuses_malformed_transport_envelopes(self):
+        for issues in (None, {}, "not-issues", [None]):
+            with self.subTest(kind="issues", issues=issues), mock.patch.object(
+                MODULE, "gh", return_value=issues,
+            ), self.assertRaisesRegex(ValueError, "ingress_issues_envelope_invalid"):
+                MODULE.remote_events("o/r", "ABC-12")
+
+        issue_list = [{"number": 7, "url": "i", "title": "ingress"}]
+        for pages in (None, {}, "not-comments"):
+            with self.subTest(kind="comments", pages=pages), mock.patch.object(
+                MODULE, "gh", side_effect=[issue_list, pages],
+            ), self.assertRaisesRegex(
+                ValueError, "ingress_comments_envelope_invalid:7",
+            ):
+                MODULE.remote_events("o/r", "ABC-12")
+
+        with mock.patch.object(MODULE, "gh", side_effect=[
+            issue_list, [[], {}],
+        ]), self.assertRaisesRegex(ValueError, "ingress_comment_pages_invalid:7"):
+            MODULE.remote_events("o/r", "ABC-12")
+
+    def test_remote_recovery_refuses_non_object_promotion_as_schema(self):
+        for promotion in ([], ["not", "a", "promotion"], "not-a-promotion", {}):
+            comments = [{"body": MODULE.comment_body(
+                MODULE.PROMOTION_MARKER, promotion)}]
+            with self.subTest(promotion=promotion), mock.patch.object(
+                MODULE, "gh", side_effect=[
+                    [{"number": 7, "url": "i", "title": "ingress"}], [comments],
+                ],
+            ), self.assertRaisesRegex(ValueError, "promotion_marker_schema_invalid"):
+                MODULE.remote_events("o/r", "ABC-12")
+
+    def test_remote_recovery_quarantines_unhashable_binding_event_id(self):
+        capture = capture_payload()
+        comments = [
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture)},
+            {"body": MODULE.comment_body(MODULE.BIND_MARKER, {
+                "event_id": [], "workstream_id": "ABC-12", "context_url": None,
+            })},
+        ]
+        with mock.patch.object(MODULE, "gh", side_effect=[
+            [{"number": 7, "url": "i", "title": "ingress"}], [comments],
+        ]):
+            events = MODULE.remote_events("o/r", "ABC-12")
+        self.assertEqual([event["event_id"] for event in events], ["e1"])
+
+    def test_remote_recovery_refuses_unhashable_promotion_event_id_as_schema(self):
+        promotion = {
+            "schema_version": 2, "event_id": [], "prompt_sha256": "a" * 64,
+            "workstream_id": "ABC-12", "plan_revision": "b" * 64,
+            "authority": {}, "ingress_route": {}, "expected_material_revision": 0,
+            "changes": [], "source_captured_at": "2026-08-14T01:00:00Z",
+            "promotion_id": "wsp_bad",
+        }
+        comments = [{"body": MODULE.comment_body(
+            MODULE.PROMOTION_MARKER, promotion)}]
+        with mock.patch.object(MODULE, "gh", side_effect=[
+            [{"number": 7, "url": "i", "title": "ingress"}], [comments],
+        ]), self.assertRaisesRegex(ValueError, "promotion_marker_event_id_invalid"):
+            MODULE.remote_events("o/r", "ABC-12")
+
     def test_remote_binding_promotes_an_initially_unbound_event(self):
-        capture = {"event_id": "e1", "captured_at": "2026-08-14T01:00:00Z", "workstream_id": None}
+        capture = capture_payload(workstream_id=None)
         binding = {"event_id": "e1", "workstream_id": "ABC-12", "context_url": "https://linear/ABC-12"}
         comments = [
             {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture), "html_url": "u1"},
@@ -153,7 +288,7 @@ class WorkstreamIngressTests(unittest.TestCase):
         self.assertEqual(events[0]["context_url"], "https://linear/ABC-12")
 
     def test_remote_unbind_supersedes_a_wrong_binding(self):
-        capture = {"event_id": "e1", "captured_at": "2026-08-14T01:00:00Z", "workstream_id": None}
+        capture = capture_payload(workstream_id=None)
         binding = {"event_id": "e1", "workstream_id": "ABC-12", "context_url": "https://linear/ABC-12"}
         unbinding = {"event_id": "e1", "workstream_id": None, "context_url": None}
         comments = [
@@ -855,12 +990,10 @@ class ClassificationAuthorityTests(unittest.TestCase):
         self.env.start()
         self.repo = "private/ingress"
         self.issue = 7
-        self.capture = {
-            "schema_version": 1, "event_id": "wsi_classify",
-            "captured_at": "2026-08-29T01:00:00Z", "provider": "codex",
-            "session_id": "expired", "workstream_id": "GEN-37",
-            "prompt": "No longer material", "prompt_sha256": "a" * 64,
-        }
+        self.capture = capture_payload(
+            "wsi_classify", workstream_id="GEN-37", prompt="No longer material",
+            captured_at="2026-08-29T01:00:00Z",
+        )
 
     def tearDown(self):
         self.env.stop()
@@ -988,6 +1121,17 @@ class ClassificationAuthorityTests(unittest.TestCase):
             "ambiguous": True,
         })
         self.assertNotIn("classification_hint", events[1])
+
+    def test_unhashable_processed_hint_dispositions_are_quarantined(self):
+        for disposition in ([], {}):
+            with self.subTest(disposition=disposition):
+                payload = self.payload(disposition)
+                events = self.recover(payload)
+                self.assertEqual([event["event_id"] for event in events], [
+                    "wsi_classify",
+                ])
+                self.assertNotIn("classification_hint", events[0])
+                self.assertFalse(MODULE._is_exact_legacy_processed_hint(payload))
 
     def test_process_refuses_to_publish_nonauthoritative_classifications(self):
         for disposition in ("no-material-delta", "superseded"):
@@ -1118,6 +1262,8 @@ class LegacyProcessedCompatibilityTests(unittest.TestCase):
         capture = self.capture("wsi_staged")
         promotion = self.promotion(capture)
         comments = [
+            ["not", "a", "comment"],
+            {"body": None},
             {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture)},
             {"body": MODULE.comment_body(MODULE.PROMOTION_MARKER, promotion)},
             {"body": MODULE.comment_body(
@@ -1418,12 +1564,12 @@ class ManagedPromotionTests(unittest.TestCase):
             "WORKSTREAM_INGRESS_CONFIG": str(self.root / "config.json"),
         }, clear=False)
         self.env.start()
-        self.capture = {
-            "schema_version": 1, "event_id": "wsi_raw", "captured_at": "2026-08-29T01:00:00Z",
-            "provider": "codex", "session_id": "expired", "workstream_id": "GEN-37",
-            "context_url": "https://linear.app/generous/issue/GEN-37/x",
-            "prompt": "Add the missing recovery gate", "prompt_sha256": "a" * 64,
-        }
+        self.capture = capture_payload(
+            "wsi_raw", workstream_id="GEN-37",
+            context_url="https://linear.app/generous/issue/GEN-37/x",
+            prompt="Add the missing recovery gate",
+            captured_at="2026-08-29T01:00:00Z",
+        )
         self.remote = self.Remote(self.capture)
         self.linear = self.Linear()
         self.request = self.root / "promotion.json"

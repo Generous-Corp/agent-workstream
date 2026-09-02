@@ -747,12 +747,64 @@ def _payload_without_time(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if key != "processed_at"}
 
 
+def _is_exact_capture_payload(payload: Any) -> bool:
+    """Accept only the immutable shape emitted by ``upload_event``."""
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version", "event_id", "captured_at", "provider", "session_id",
+        "turn_id", "surface_id", "workspace_id", "cwd", "workstream_id",
+        "context_url", "prompt", "prompt_sha256", "redactions", "truncated",
+    }:
+        return False
+    captured_at = payload.get("captured_at")
+    if not isinstance(captured_at, str) or not captured_at.endswith("Z"):
+        return False
+    try:
+        captured_time = datetime.fromisoformat(captured_at[:-1] + "+00:00")
+    except ValueError:
+        return False
+    nullable_strings = (
+        "session_id", "turn_id", "surface_id", "workspace_id", "context_url",
+    )
+    return (
+        type(payload.get("schema_version")) is int
+        and payload["schema_version"] == SCHEMA_VERSION
+        and isinstance(payload.get("event_id"), str)
+        and bool(payload["event_id"])
+        and len(payload["event_id"].encode("utf-8")) <= 256
+        and captured_time.utcoffset() == timedelta(0)
+        and isinstance(payload.get("provider"), str)
+        and bool(payload["provider"])
+        and all(
+            payload.get(field) is None
+            or (isinstance(payload[field], str) and bool(payload[field]))
+            for field in nullable_strings
+        )
+        and isinstance(payload.get("cwd"), str)
+        and bool(payload["cwd"])
+        and (
+            payload.get("workstream_id") is None
+            or (
+                isinstance(payload["workstream_id"], str)
+                and re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", payload["workstream_id"])
+                is not None
+            )
+        )
+        and isinstance(payload.get("prompt"), str)
+        and isinstance(payload.get("prompt_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", payload["prompt_sha256"]) is not None
+        and type(payload.get("redactions")) is int
+        and payload["redactions"] >= 0
+        and type(payload.get("truncated")) is bool
+    )
+
+
 def _is_exact_legacy_processed_hint(payload: Any) -> bool:
     """Recognize the original five-field marker without granting it authority."""
     if not isinstance(payload, dict) or set(payload) != {
         "schema_version", "event_id", "processed_at", "disposition", "promoted_issue",
     }:
         return False
+    disposition = payload.get("disposition")
     promoted_issue = payload.get("promoted_issue")
     return (
         type(payload.get("schema_version")) is int
@@ -762,8 +814,8 @@ def _is_exact_legacy_processed_hint(payload: Any) -> bool:
         and len(payload["event_id"].encode("utf-8")) <= 256
         and isinstance(payload.get("processed_at"), str)
         and bool(payload["processed_at"])
-        and payload.get("disposition")
-        in {"promoted", "no-material-delta", "superseded"}
+        and isinstance(disposition, str)
+        and disposition in {"promoted", "no-material-delta", "superseded"}
         and (
             promoted_issue is None
             or (
@@ -956,8 +1008,8 @@ def enforce_bound(conn: sqlite3.Connection, config: dict[str, Any]) -> bool:
     return logical_bytes <= maximum
 
 
-def parse_comment(body: str, marker: str) -> dict[str, Any] | None:
-    if not body.startswith(marker):
+def parse_comment(body: Any, marker: str) -> Any | None:
+    if not isinstance(body, str) or not body.startswith(marker):
         return None
     match = re.search(r"```json\n(.*?)\n```", body, re.S)
     if not match:
@@ -974,7 +1026,12 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
         "issue", "list", "--repo", repo, "--state", "all", "--label", LABEL,
         "--limit", "100", "--json", "number,url,title",
     ], timeout=15)
+    if not isinstance(issues, list) or any(
+        not isinstance(issue, dict) for issue in issues
+    ):
+        raise ValueError("ingress_issues_envelope_invalid")
     captures: dict[str, dict[str, Any]] = {}
+    capture_payloads: dict[str, str] = {}
     processed: dict[str, dict[str, Any]] = {}
     mutable_hints: dict[tuple[int, str], dict[str, Any]] = {}
     promotions: dict[str, dict[str, Any]] = {}
@@ -996,9 +1053,13 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
             return
         disposition = item.get("disposition")
         event_id = item.get("event_id")
+        is_classification_disposition = (
+            isinstance(disposition, str)
+            and disposition in {"no-material-delta", "superseded"}
+        )
         if (
             (
-                disposition not in {"no-material-delta", "superseded"}
+                not is_classification_disposition
                 and not _is_exact_legacy_processed_hint(item)
             )
             or not isinstance(event_id, str)
@@ -1046,16 +1107,40 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
             "api", "--paginate", "--slurp",
             f"repos/{repo}/issues/{issue_number}/comments?per_page=100",
         ], timeout=20)
-        comments = [comment for page in pages for comment in page] if pages and isinstance(pages[0], list) else pages
+        if not isinstance(pages, list):
+            raise ValueError(f"ingress_comments_envelope_invalid:{issue_number}")
+        if pages and isinstance(pages[0], list):
+            if any(not isinstance(page, list) for page in pages):
+                raise ValueError(f"ingress_comment_pages_invalid:{issue_number}")
+            raw_comments = [
+                comment for page in pages for comment in page
+            ]
+        else:
+            raw_comments = pages
+        comments = [
+            comment for comment in raw_comments
+            if isinstance(comment, dict)
+            and isinstance(comment.get("body", ""), str)
+        ]
         comments_by_issue[issue_number] = comments
         for comment in comments:
             item = parse_comment(comment.get("body", ""), CAPTURE_MARKER)
-            if item:
-                bind_route(item["event_id"], issue_number)
+            if item is not None:
+                if not _is_exact_capture_payload(item):
+                    continue
+                event_id = item["event_id"]
+                bind_route(event_id, issue_number)
+                serialized = canonical_json(item)
+                previous = capture_payloads.get(event_id)
+                if previous is not None:
+                    if previous != serialized:
+                        raise ValueError(f"conflicting_capture:{event_id}")
+                    continue
                 item["remote_issue"] = issue_number
                 item["remote_repo"] = repo
                 item["remote_url"] = comment.get("html_url")
-                captures[item["event_id"]] = item
+                capture_payloads[event_id] = serialized
+                captures[event_id] = item
                 continue
             item = parse_comment(comment.get("body", ""), PROCESSED_MARKER)
             if item:
@@ -1072,9 +1157,9 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
                 processed[event_id] = item
                 continue
             item = parse_comment(comment.get("body", ""), PROMOTION_MARKER)
-            if item:
-                bind_route(item["event_id"], issue_number)
+            if item is not None:
                 validate_promotion_payload(item)
+                bind_route(item["event_id"], issue_number)
                 if item["ingress_route"] != canonical_ingress_route(canonical_repo, issue_number):
                     raise ValueError(f"promotion_ingress_route_mismatch:{item['event_id']}")
                 previous = promotions.get(item["event_id"])
@@ -1083,9 +1168,18 @@ def remote_events(repo: str, workstream: str | None = None) -> list[dict[str, An
                 promotions[item["event_id"]] = item
                 continue
             item = parse_comment(comment.get("body", ""), BIND_MARKER)
-            if item:
-                bind_route(item["event_id"], issue_number)
-                bindings[item["event_id"]] = item
+            if item is not None:
+                if not isinstance(item, dict):
+                    continue
+                event_id = item.get("event_id")
+                if (
+                    not isinstance(event_id, str)
+                    or not event_id
+                    or len(event_id.encode("utf-8")) > 256
+                ):
+                    continue
+                bind_route(event_id, issue_number)
+                bindings[event_id] = item
     for event_id, binding in bindings.items():
         if event_id in captures:
             captures[event_id]["workstream_id"] = binding.get("workstream_id")
