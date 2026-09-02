@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -57,6 +58,10 @@ from workstream_projection_history import (
     carried_predecessor_evidence_authority,
     closure_bound_historical_evidence, ProjectionHistoryError,
     validated_nonprimary_backfill_authority,
+)
+from workstream_github_backfill import (
+    GitHubBackfillReceiptError, GitHubBackfillReceiptReader,
+    github_token_from_command,
 )
 
 
@@ -904,6 +909,7 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             "from_disposition_event_id", "from_disposition_value_sha256",
             "input_frontier_sha256", "provider_repository_id",
             "pull_request_number", "merge_sha", "checks_sha256",
+            "provider_receipt_sha256",
         }
         if (
             not seeds
@@ -938,6 +944,7 @@ def _reviewed_manifest(manifest: dict[str, Any]) -> tuple[list[dict[str, Any]], 
                 for field in (
                     "from_scope_value_sha256", "from_disposition_value_sha256",
                     "input_frontier_sha256", "checks_sha256",
+                    "provider_receipt_sha256",
                 )
             )
             or not isinstance(nonprimary_backfill.get("pull_request_number"), int)
@@ -2146,6 +2153,7 @@ def prepare_terminal_child_evidence_seeds(
     manifest: dict[str, Any], snapshot: dict[str, Any], state: Any, *,
     remote_head: str | None = None,
     comments: list[dict[str, Any]] | None = None,
+    trusted_nonprimary_backfill_receipt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate an add-only evidence prefix before terminal closure repair."""
     result = deepcopy(manifest)
@@ -2646,7 +2654,7 @@ def prepare_terminal_child_evidence_seeds(
                 if validated_nonprimary_backfill_authority(
                     {"value": contract}, scope_value, list(state.events),
                     list(state.events),
-                    trusted_receipt=nonprimary_backfill,
+                    trusted_receipt=trusted_nonprimary_backfill_receipt,
                 ) is None:
                     raise LinearProjectionError(
                         f"terminal_child_evidence_seed_nonprimary_backfill_contract_invalid:{child_id}:{key}"
@@ -4637,6 +4645,13 @@ def main() -> int:
     )
     parser.add_argument("--config")
     parser.add_argument("--linear-endpoint", default="https://api.linear.app/graphql")
+    github_auth = parser.add_mutually_exclusive_group()
+    github_auth.add_argument("--github-token-command")
+    github_auth.add_argument(
+        "--github-token-env", choices=("GITHUB_TOKEN", "GH_TOKEN"),
+    )
+    parser.add_argument("--github-token-arg", action="append", default=[])
+    parser.add_argument("--github-token-timeout", type=float, default=10.0)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument(
         "--preview", action="store_true",
@@ -4660,6 +4675,8 @@ def main() -> int:
             raise LinearProjectionError(
                 "projection_apply_requires_matching_reviewed_preview"
             )
+        if args.github_token_arg and not args.github_token_command:
+            raise LinearProjectionError("github_token_args_require_command")
         token = extract_token(args.token)
         manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
         authenticated_source = plan_payload(args.plan_source, args.plan_identity)["source"]
@@ -4734,6 +4751,79 @@ def main() -> int:
             generation_selector_plan_revision=generation_selector_plan_revision,
             reread=lambda: dependency_reread(comment_adapter),
         )
+        trusted_nonprimary_backfill_receipt = None
+        nonprimary_backfill = manifest.get(
+            "terminal_child_evidence_seed_nonprimary_backfill"
+        )
+        if nonprimary_backfill is not None:
+            if not isinstance(nonprimary_backfill, dict):
+                raise LinearProjectionError(
+                    "invalid_terminal_child_evidence_seed_nonprimary_backfill"
+                )
+            if not args.github_token_command and not args.github_token_env:
+                raise LinearProjectionError(
+                    "terminal_child_evidence_seed_nonprimary_backfill_github_auth_required"
+                )
+            active_scope_event = _active_heads(projection_state).get(
+                ("scope", "root")
+            )
+            repositories = (
+                active_scope_event or {"value": {}}
+            )["value"].get("repositories", [])
+            matches = [
+                repository for repository in repositories
+                if repository_key(repository)
+                == nonprimary_backfill.get("repository_key")
+            ]
+            if len(matches) != 1:
+                raise LinearProjectionError(
+                    "terminal_child_evidence_seed_nonprimary_backfill_repository_ambiguous"
+                )
+            repository = matches[0]
+            coordinate = str(repository.get("slug", ""))
+            coordinate = coordinate.removeprefix("https://").removeprefix(
+                "github.com/"
+            )
+            try:
+                github_token = (
+                    github_token_from_command(
+                        [args.github_token_command, *args.github_token_arg],
+                        timeout=args.github_token_timeout,
+                    )
+                    if args.github_token_command
+                    else os.environ.get(args.github_token_env or "", "")
+                )
+                trusted_nonprimary_backfill_receipt = (
+                    GitHubBackfillReceiptReader(github_token).read(
+                        repository=coordinate,
+                        provider_repository_id=str(
+                            nonprimary_backfill.get("provider_repository_id", "")
+                        ),
+                        pull_request_number=nonprimary_backfill.get(
+                            "pull_request_number"
+                        ),
+                        expected_head=str(
+                            nonprimary_backfill.get("to_exact_head", "")
+                        ),
+                        expected_merge_sha=str(
+                            nonprimary_backfill.get("merge_sha", "")
+                        ),
+                    )
+                )
+            except GitHubBackfillReceiptError as error:
+                raise LinearProjectionError(
+                    "terminal_child_evidence_seed_nonprimary_backfill_"
+                    f"{error.code}"
+                ) from error
+            for field in ("checks_sha256", "provider_receipt_sha256"):
+                observed = nonprimary_backfill.get(field)
+                authenticated = trusted_nonprimary_backfill_receipt[field]
+                if observed is not None and observed != authenticated:
+                    raise LinearProjectionError(
+                        "terminal_child_evidence_seed_nonprimary_backfill_"
+                        f"{field}_mismatch"
+                    )
+                nonprimary_backfill[field] = authenticated
         # A seed batch may have committed a canonical prefix before the client
         # died or lost its response. Normalize the reviewed contract through
         # the seed prefix validator before generic inactive-source sync compares
@@ -4742,6 +4832,9 @@ def main() -> int:
             manifest = prepare_terminal_child_evidence_seeds(
                 manifest, graph, projection_state, remote_head=args.remote_head,
                 comments=comments,
+                trusted_nonprimary_backfill_receipt=(
+                    trusted_nonprimary_backfill_receipt
+                ),
             )
         # A closure batch has the same crash-recovery requirement as an
         # evidence seed batch: its canonical prefix (including a completed
@@ -4778,6 +4871,9 @@ def main() -> int:
         manifest = prepare_terminal_child_evidence_seeds(
             manifest, graph, projection_state, remote_head=args.remote_head,
             comments=comments,
+            trusted_nonprimary_backfill_receipt=(
+                trusted_nonprimary_backfill_receipt
+            ),
         )
         manifest = prepare_terminal_child_repairs(
             manifest, graph, projection_state,

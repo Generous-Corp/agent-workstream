@@ -9,6 +9,9 @@ import re
 from typing import Any
 
 from workstream_evidence import evidence_errors
+from workstream_github_backfill import (
+    GitHubBackfillReceiptError, validate_github_backfill_receipt,
+)
 from workstream_scope import repository_key, ScopeError, validate_scope
 
 
@@ -40,22 +43,63 @@ def validated_nonprimary_backfill_authority(
         "from_disposition_event_id", "from_disposition_value_sha256",
         "input_frontier_sha256", "provider_repository_id",
         "pull_request_number", "merge_sha", "checks_sha256",
+        "provider_receipt_sha256",
     }
     if not isinstance(receipt, dict) or set(receipt) != fields:
         return None
+    repository = next((
+        item for item in current_scope.get("repositories", [])
+        if repository_key(item) == receipt.get("repository_key")
+    ), None)
     # Provider/PR/check/merge claims are not authenticated by syntax or by a
-    # copy carried in a not-yet-admitted child contract.  Preparation must
-    # therefore supply the independently reviewed receipt.  Ordinary replay
-    # may instead consume the exact event already present in the caller's
-    # authenticated append-only projection history; all contextual anchors
-    # and repository fences below are still revalidated.
-    trusted_for_admission = (
-        isinstance(trusted_receipt, dict) and trusted_receipt == receipt
+    # copy carried in a not-yet-admitted child contract. Admission therefore
+    # requires the distinct typed receipt returned by the authenticated
+    # provider reader. Ordinary replay may instead consume the exact event
+    # already present in reducer-authenticated append-only history.
+    provider_fields = {
+        "schema_version", "provider", "repository",
+        "provider_repository_id", "pull_request_number", "pr_head",
+        "merged", "merged_at", "merge_sha", "checks", "checks_sha256",
+        "provider_receipt_sha256",
+    }
+    try:
+        authenticated_provider_receipt = validate_github_backfill_receipt(
+            trusted_receipt,
+        )
+    except GitHubBackfillReceiptError:
+        authenticated_provider_receipt = None
+    checks = authenticated_provider_receipt.get("checks") if isinstance(
+        authenticated_provider_receipt, dict
+    ) else None
+    repository_slug = str((repository or {}).get("slug", ""))
+    repository_coordinate = (
+        repository_slug.removeprefix("https://").removeprefix("github.com/")
+    ).lower()
+    trusted_for_admission = bool(
+        isinstance(authenticated_provider_receipt, dict)
+        and set(authenticated_provider_receipt) == provider_fields
+        and authenticated_provider_receipt.get("repository") == repository_coordinate
+        and authenticated_provider_receipt.get("provider_repository_id")
+        == receipt.get("provider_repository_id")
+        and authenticated_provider_receipt.get("pull_request_number")
+        == receipt.get("pull_request_number")
+        and authenticated_provider_receipt.get("pr_head")
+        == receipt.get("to_exact_head")
+        and authenticated_provider_receipt.get("merge_sha")
+        == receipt.get("merge_sha")
+        and _digest(checks) == receipt.get("checks_sha256")
+        and authenticated_provider_receipt.get("checks_sha256")
+        == receipt.get("checks_sha256")
+        and authenticated_provider_receipt.get("provider_receipt_sha256")
+        == receipt.get("provider_receipt_sha256")
     )
     event_id = event.get("event_id") if isinstance(event, dict) else None
+    # Deliberately ignore projection_events here: that is the candidate active
+    # set being evaluated.  Persistence authority comes only from the complete
+    # history returned by the authenticated projection reducer.
     persisted_candidates = [
         item
-        for item in [*(projection_events or []), *(projection_history or [])]
+        for item in (projection_history or [])
         if isinstance(item, dict)
         and isinstance(event_id, str)
         and event_id
@@ -66,10 +110,6 @@ def validated_nonprimary_backfill_authority(
     )
     if not trusted_for_admission and not replaying_admitted_event:
         return None
-    repository = next((
-        item for item in current_scope.get("repositories", [])
-        if repository_key(item) == receipt.get("repository_key")
-    ), None)
     anchors = {
         (item.get("kind"), item.get("event_id")): item
         for item in [*(projection_events or []), *(projection_history or [])]
@@ -101,6 +141,7 @@ def validated_nonprimary_backfill_authority(
         and oid(receipt["from_disposition_value_sha256"], {64})
         and oid(receipt["input_frontier_sha256"], {64})
         and oid(receipt["checks_sha256"], {64})
+        and oid(receipt["provider_receipt_sha256"], {64})
         and isinstance(receipt["pull_request_number"], int)
         and not isinstance(receipt["pull_request_number"], bool)
         and receipt["pull_request_number"] > 0

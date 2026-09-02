@@ -89,6 +89,27 @@ AUTHORITY = {
 }
 
 
+def github_backfill_receipt(
+    *, repository: str, provider_repository_id: str, pull_request_number: int,
+    pr_head: str, merge_sha: str,
+) -> dict:
+    checks = [{
+        "name": "required", "status": "completed", "conclusion": "success",
+        "details_url": "https://github.com/acme/repo/actions/runs/1",
+    }]
+    receipt = {
+        "schema_version": 1, "provider": "github",
+        "repository": repository.lower(),
+        "provider_repository_id": provider_repository_id,
+        "pull_request_number": pull_request_number, "pr_head": pr_head,
+        "merged": True, "merged_at": "2026-08-31T18:00:00Z",
+        "merge_sha": merge_sha, "checks": checks,
+        "checks_sha256": canonical_digest(checks),
+    }
+    receipt["provider_receipt_sha256"] = canonical_digest(receipt)
+    return receipt
+
+
 def compact_context(*args, **kwargs):
     """Exercise pre-graph projection fixtures through the legacy constructor."""
     kwargs.setdefault("require_dependency_graph", False)
@@ -5809,10 +5830,29 @@ class ProjectionTests(unittest.TestCase):
             "pull_request_number": 522,
             "merge_sha": "6" * 40,
             "checks_sha256": "7" * 64,
+            "provider_receipt_sha256": "8" * 64,
         }
+        provider_receipt = github_backfill_receipt(
+            repository="generous-corp/secondary",
+            provider_repository_id="R_secondary", pull_request_number=522,
+            pr_head=new_head, merge_sha="6" * 40,
+        )
+        backfill["checks_sha256"] = provider_receipt["checks_sha256"]
+        backfill["provider_receipt_sha256"] = provider_receipt[
+            "provider_receipt_sha256"
+        ]
         manifest["terminal_child_evidence_seed_nonprimary_backfill"] = backfill
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_evidence_seed_nonprimary_backfill_contract_invalid",
+        ):
+            prepare_terminal_child_evidence_seeds(
+                manifest, graph, adapter.state(),
+                remote_head=disposition_event["value"]["remote_head"],
+            )
         prepared = prepare_terminal_child_evidence_seeds(
             manifest, graph, adapter.state(), remote_head=disposition_event["value"]["remote_head"],
+            trusted_nonprimary_backfill_receipt=provider_receipt,
         )
         self.assertEqual(
             prepared["terminal_child_evidence_seed_nonprimary_backfill"], backfill,
@@ -5825,6 +5865,7 @@ class ProjectionTests(unittest.TestCase):
         ):
             prepare_terminal_child_evidence_seeds(
                 forged, graph, adapter.state(), remote_head=disposition_event["value"]["remote_head"],
+                trusted_nonprimary_backfill_receipt=provider_receipt,
             )
         forged_provider = deepcopy(manifest)
         forged_provider["terminal_child_evidence_seed_nonprimary_backfill"][
@@ -5837,6 +5878,7 @@ class ProjectionTests(unittest.TestCase):
             prepare_terminal_child_evidence_seeds(
                 forged_provider, graph, adapter.state(),
                 remote_head=disposition_event["value"]["remote_head"],
+                trusted_nonprimary_backfill_receipt=provider_receipt,
             )
 
     def test_terminal_seed_head_transition_secondary_owner_negatives(self):
@@ -6143,10 +6185,20 @@ class ProjectionTests(unittest.TestCase):
             "pull_request_number": 522,
             "merge_sha": "d" * 40,
             "checks_sha256": "e" * 64,
+            "provider_receipt_sha256": "a" * 64,
         }
-        trusted_receipt = deepcopy(
-            evidence["value"]["nonprimary_backfill_authority"]
+        repository = strict["scope"]["repositories"][0]
+        trusted_receipt = github_backfill_receipt(
+            repository=repository["slug"].removeprefix("github.com/"),
+            provider_repository_id=repository["provider_repository_id"],
+            pull_request_number=522, pr_head=new_head, merge_sha="d" * 40,
         )
+        evidence["value"]["nonprimary_backfill_authority"].update({
+            "checks_sha256": trusted_receipt["checks_sha256"],
+            "provider_receipt_sha256": trusted_receipt[
+                "provider_receipt_sha256"
+            ],
+        })
         closure = next(
             event for event in events
             if (event["kind"], event["key"]) == ("child_closure", "GEN-70")
@@ -6192,6 +6244,12 @@ class ProjectionTests(unittest.TestCase):
             ),
             authority,
             "an exact authenticated history event must replay after admission",
+        )
+        self.assertIsNone(
+            workstream_projection.validated_nonprimary_backfill_authority(
+                evidence, current_scope, events, [],
+            ),
+            "the candidate active set cannot self-admit as persisted history",
         )
         self.assertIn(
             evidence["event_id"],

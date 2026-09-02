@@ -900,11 +900,13 @@ its terminal evidence was projected, a reviewed
 `terminal_child_evidence_seed_nonprimary_backfill` may bind the old scope and
 disposition events to one exact new evidence head. The caller must first
 authenticate the repository ID, PR number and exact head, merged disposition
-and merge SHA, and required-check result through the repository provider; the
-projection client does not contact or impersonate that provider. Store
-`checks_sha256` as the SHA-256 of the caller's retained canonical JSON check
-receipt (sorted object keys and a deterministic check-record order). The seed
-write requires that reviewed receipt and the current input frontier. Later
+and merge SHA, and required-check result through the repository provider. The
+projection command enforces this exceptional path through its bounded
+`--github-token-command` or explicit token-environment adapter; it accepts only
+`api.github.com`, the exact repository identity and coordinate, merged PR/head
+and merge SHA, and a nonempty all-successful exact-head check-run set. Store
+`checks_sha256` and `provider_receipt_sha256` from that canonical typed receipt.
+The seed write requires the authenticated receipt and current input frontier. Later
 repair and resume trust only the exact admitted append-only evidence event and
 revalidate its scope/disposition digests, repository identity, owner, and old
 and new heads. A copied but unadmitted receipt, changed history event, ambiguous
@@ -1154,10 +1156,10 @@ their reviewed event and value digest. It never retires an omitted key. A late
 key or changed head requires reload and review before any append. The command
 computes the concrete attach/successor disposition against the reviewed
 `--remote-head` and rereads the complete comment stream before reporting
-success. It does not itself authenticate Git hosting or refs: the caller must
-obtain that head through an authenticated repository read before reviewing the
-manifest, and must not describe the CLI argument alone as live remote
-verification.
+success. The ordinary `--remote-head` argument is still caller-authenticated;
+the exceptional non-primary terminal-evidence backfill is the narrow exception
+and requires the command's typed GitHub receipt adapter. Do not describe any
+other CLI head argument alone as live remote verification.
 Projection synchronization treats a labeled `Canonical plan: <URL>` line on
 the existing root issue as the source identity. Exactly one distinct URL is
 required before any write; zero or multiple candidates refuse with a concrete
