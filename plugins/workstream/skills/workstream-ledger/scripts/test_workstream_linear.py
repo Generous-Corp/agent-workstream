@@ -450,6 +450,10 @@ class LinearTransportTests(unittest.TestCase):
             "state": {"name": "In Progress", "type": "started"},
             "parent": None,
             "project": {"id": "project"},
+            "comments": {
+                "nodes": [],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            },
             "team": {
                 "id": "team", "organization": {"id": "workspace"},
             },
@@ -1655,6 +1659,10 @@ class LinearTransportTests(unittest.TestCase):
             "parent": {"id": "root-id", "identifier": "GEN-37"},
             "team": {"id": "team", "organization": {"id": "workspace"}},
             "project": {"id": "project"},
+            "comments": {
+                "nodes": [],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            },
         }
         client = mock.Mock()
         client.execute.return_value = {"issue": {
@@ -1678,7 +1686,7 @@ class LinearTransportTests(unittest.TestCase):
         self.assertEqual(snapshot["children"][0]["status_type"], "completed")
         self.assertEqual(snapshot["children"][0]["state_id"], "state-done")
         self.assertEqual(snapshot["children"][0]["assignee"]["id"], "assignee-daniel")
-        self.assertEqual(snapshot["child_comments"], {})
+        self.assertEqual(snapshot["child_comments"], {"GEN-43": []})
 
     def test_repeated_intake_preserves_existing_mutable_next_action(self):
         fake = FakeClient()
