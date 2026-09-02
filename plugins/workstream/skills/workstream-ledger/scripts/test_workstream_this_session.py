@@ -1469,6 +1469,69 @@ class ThisSessionTests(unittest.TestCase):
         self.assertFalse(self.db.exists())
         self.assertEqual(len(calls), 1)
 
+    def test_resume_refusal_surfaces_one_bounded_machine_reason(self):
+        fake = FakeCmux("Linear · GEN-37")
+
+        def refused(argv, **_kwargs):
+            return subprocess.CompletedProcess(
+                argv, 2, "",
+                "workstream resume refused: "
+                "completed_owned_child_closure_missing:GEN-91\n",
+            )
+
+        with self.assertRaisesRegex(
+            session.ThisSessionError,
+            "workstream_resume_refused:"
+            "completed_owned_child_closure_missing:GEN-91",
+        ):
+            session.resume_this_session(
+                environ=self.cmux_env(), runner=refused,
+                terminal_runner=fake, which=lambda _: "/opt/cmux",
+                binding_path=self.db, resume_script=Path("resume.py"),
+            )
+        self.assertFalse(self.db.exists())
+        self.assertNotIn("rename-tab", [item for call in fake.calls for item in call])
+
+        self.assertEqual(
+            session._resume_refusal_reason(
+                "workstream resume refused: resume_context_over_budget:46879>24576\n"
+            ),
+            "resume_context_over_budget:46879>24576",
+        )
+        self.assertEqual(
+            session._resume_refusal_reason(
+                "workstream resume refused: resume_context_over_item_budget:300>256\n"
+            ),
+            "resume_context_over_item_budget:300>256",
+        )
+
+    def test_resume_refusal_does_not_forward_arbitrary_stderr(self):
+        fake = FakeCmux("Linear · GEN-37")
+
+        def refused(argv, **_kwargs):
+            return subprocess.CompletedProcess(
+                argv, 2, "", "secret=value\nsecond line\n",
+            )
+
+        with self.assertRaisesRegex(
+            session.ThisSessionError, "workstream_resume_refused:2",
+        ) as observed:
+            session.resume_this_session(
+                environ=self.cmux_env(), runner=refused,
+                terminal_runner=fake, which=lambda _: "/opt/cmux",
+                binding_path=self.db, resume_script=Path("resume.py"),
+            )
+        self.assertNotIn("secret", str(observed.exception))
+        self.assertFalse(self.db.exists())
+        self.assertNotIn("rename-tab", [item for call in fake.calls for item in call])
+        for unsafe in (
+            "workstream resume refused: secret=ghp_ABC123\n",
+            "workstream resume refused: projection_error:ghp_ABC123\n",
+            "workstream resume refused: completed_owned_child_closure_missing:GEN-0\n",
+        ):
+            with self.subTest(unsafe=unsafe):
+                self.assertIsNone(session._resume_refusal_reason(unsafe))
+
     def test_title_change_between_resolution_and_resume_refuses_without_mutation(self):
         initial = self.resolution()
         changed = self.resolution(title="Renamed · GEN-37")
