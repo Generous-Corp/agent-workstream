@@ -10,7 +10,8 @@ from typing import Any
 
 from workstream_evidence import evidence_errors
 from workstream_github_backfill import (
-    GitHubBackfillReceiptError, validate_github_backfill_receipt,
+    GitHubBackfillReceiptError, VerifiedGitHubBackfillReceipt,
+    validate_github_backfill_receipt,
 )
 from workstream_scope import repository_key, ScopeError, validate_scope
 
@@ -32,7 +33,7 @@ def validated_nonprimary_backfill_authority(
     event: dict[str, Any], current_scope: dict[str, Any],
     projection_events: list[dict[str, Any]],
     projection_history: list[dict[str, Any]] | None = None,
-    *, trusted_receipt: dict[str, Any] | None = None,
+    *, trusted_receipt: VerifiedGitHubBackfillReceipt | None = None,
 ) -> dict[str, Any] | None:
     """Validate one complete, context-bound non-primary backfill receipt."""
     value = event.get("value") if isinstance(event, dict) else None
@@ -63,8 +64,10 @@ def validated_nonprimary_backfill_authority(
         "provider_receipt_sha256",
     }
     try:
-        authenticated_provider_receipt = validate_github_backfill_receipt(
-            trusted_receipt,
+        authenticated_provider_receipt = (
+            validate_github_backfill_receipt(trusted_receipt.as_dict())
+            if isinstance(trusted_receipt, VerifiedGitHubBackfillReceipt)
+            else None
         )
     except GitHubBackfillReceiptError:
         authenticated_provider_receipt = None
@@ -94,18 +97,20 @@ def validated_nonprimary_backfill_authority(
         == receipt.get("provider_receipt_sha256")
     )
     event_id = event.get("event_id") if isinstance(event, dict) else None
-    # Deliberately ignore projection_events here: that is the candidate active
-    # set being evaluated.  Persistence authority comes only from the complete
-    # history returned by the authenticated projection reducer.
+    # Both inputs are outputs of the authenticated projection reducer: current
+    # generation events live in projection_events, while predecessor events
+    # live in projection_history. Requiring exact event identity/digest here
+    # permits restart replay without treating an arbitrary nested receipt as
+    # authority.
     persisted_candidates = [
         item
-        for item in (projection_history or [])
+        for item in [*(projection_events or []), *(projection_history or [])]
         if isinstance(item, dict)
         and isinstance(event_id, str)
         and event_id
         and item.get("event_id") == event_id
     ]
-    replaying_admitted_event = bool(persisted_candidates) and all(
+    replaying_admitted_event = bool(event_id and persisted_candidates) and all(
         _digest(item) == _digest(event) for item in persisted_candidates
     )
     if not trusted_for_admission and not replaying_admitted_event:

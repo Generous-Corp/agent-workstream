@@ -63,6 +63,7 @@ from workstream_scope import repository_key
 from workstream_projection_history import (
     closure_bound_historical_evidence, ProjectionHistoryError,
 )
+from workstream_github_backfill import GitHubBackfillReceiptReader
 from workstream_closure import review as closure_review
 from workstream_child_closure import (
     canonical_digest, ChildClosureError, evidence_receipts_sha256,
@@ -89,25 +90,73 @@ AUTHORITY = {
 }
 
 
+class _GitHubReceiptResponse:
+    def __init__(self, payload: dict, url: str):
+        self.payload = json.dumps(payload).encode()
+        self.url = url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self, limit: int) -> bytes:
+        return self.payload[:limit]
+
+    def geturl(self) -> str:
+        return self.url
+
+
+class _GitHubReceiptOpener:
+    def __init__(
+        self, *, repository: str, provider_repository_id: str,
+        pull_request_number: int, pr_head: str, merge_sha: str,
+    ):
+        self.repository = repository
+        self.provider_repository_id = provider_repository_id
+        self.pull_request_number = pull_request_number
+        self.pr_head = pr_head
+        self.merge_sha = merge_sha
+
+    def __call__(self, request, *, timeout):
+        del timeout
+        url = request.full_url
+        if "/pulls/" in url:
+            payload = {
+                "number": self.pull_request_number,
+                "base": {"repo": {
+                    "id": 1, "node_id": self.provider_repository_id,
+                    "full_name": self.repository,
+                }},
+                "head": {"sha": self.pr_head},
+                "merged": True, "merged_at": "2026-08-31T18:00:00Z",
+                "merge_commit_sha": self.merge_sha,
+            }
+        else:
+            payload = {"total_count": 1, "check_runs": [{
+                "id": 1, "name": "required", "head_sha": self.pr_head,
+                "status": "completed", "conclusion": "success",
+                "details_url": "https://github.com/acme/repo/actions/runs/1",
+            }]}
+        return _GitHubReceiptResponse(payload, url)
+
+
 def github_backfill_receipt(
     *, repository: str, provider_repository_id: str, pull_request_number: int,
     pr_head: str, merge_sha: str,
-) -> dict:
-    checks = [{
-        "name": "required", "status": "completed", "conclusion": "success",
-        "details_url": "https://github.com/acme/repo/actions/runs/1",
-    }]
-    receipt = {
-        "schema_version": 1, "provider": "github",
-        "repository": repository.lower(),
-        "provider_repository_id": provider_repository_id,
-        "pull_request_number": pull_request_number, "pr_head": pr_head,
-        "merged": True, "merged_at": "2026-08-31T18:00:00Z",
-        "merge_sha": merge_sha, "checks": checks,
-        "checks_sha256": canonical_digest(checks),
-    }
-    receipt["provider_receipt_sha256"] = canonical_digest(receipt)
-    return receipt
+):
+    return GitHubBackfillReceiptReader(
+        "test-token", opener=_GitHubReceiptOpener(
+            repository=repository, provider_repository_id=provider_repository_id,
+            pull_request_number=pull_request_number, pr_head=pr_head,
+            merge_sha=merge_sha,
+        ),
+    ).read(
+        repository=repository, provider_repository_id=provider_repository_id,
+        pull_request_number=pull_request_number, expected_head=pr_head,
+        expected_merge_sha=merge_sha,
+    )
 
 
 def compact_context(*args, **kwargs):
@@ -5837,8 +5886,9 @@ class ProjectionTests(unittest.TestCase):
             provider_repository_id="R_secondary", pull_request_number=522,
             pr_head=new_head, merge_sha="6" * 40,
         )
-        backfill["checks_sha256"] = provider_receipt["checks_sha256"]
-        backfill["provider_receipt_sha256"] = provider_receipt[
+        provider_payload = provider_receipt.as_dict()
+        backfill["checks_sha256"] = provider_payload["checks_sha256"]
+        backfill["provider_receipt_sha256"] = provider_payload[
             "provider_receipt_sha256"
         ]
         manifest["terminal_child_evidence_seed_nonprimary_backfill"] = backfill
@@ -5849,6 +5899,15 @@ class ProjectionTests(unittest.TestCase):
             prepare_terminal_child_evidence_seeds(
                 manifest, graph, adapter.state(),
                 remote_head=disposition_event["value"]["remote_head"],
+            )
+        with self.assertRaisesRegex(
+            LinearProjectionError,
+            "terminal_child_evidence_seed_nonprimary_backfill_contract_invalid",
+        ):
+            prepare_terminal_child_evidence_seeds(
+                manifest, graph, adapter.state(),
+                remote_head=disposition_event["value"]["remote_head"],
+                trusted_nonprimary_backfill_receipt=provider_payload,
             )
         prepared = prepare_terminal_child_evidence_seeds(
             manifest, graph, adapter.state(), remote_head=disposition_event["value"]["remote_head"],
@@ -5881,6 +5940,109 @@ class ProjectionTests(unittest.TestCase):
                 trusted_nonprimary_backfill_receipt=provider_receipt,
             )
 
+        gen72 = next(
+            child for child in graph["children"]
+            if child["identifier"] == "GEN-72"
+        )
+        gen72.update({
+            "status": "In Progress", "status_type": "started",
+            "next_action": "continue GEN-72",
+        })
+        preview, unresolved = load_material_history_for_projection_reconcile(
+            graph, client.comments, "GEN-37", prepared, adapter,
+            authenticated_route=AUTHORITY, authenticated_source=_source,
+            remote_head=disposition_event["value"]["remote_head"],
+            relation_target_resolver=self.relation_target_resolver,
+        )
+        expected_readback = manifest["terminal_child_evidence_seeds"][0][
+            "expected_child_readback_sha256"
+        ]
+        reconcile_required_projection(
+            adapter, preview, prepared,
+            remote_head=disposition_event["value"]["remote_head"],
+            created_at="2026-08-31T18:30:00Z",
+            authenticated_source=_source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda child_ids: {
+                child_id: expected_readback for child_id in child_ids
+            },
+            projection_input_fence=lambda: backfill["input_frontier_sha256"],
+            legacy_unresolved_relation_heads=unresolved,
+            trusted_nonprimary_backfill_receipt=provider_receipt,
+        )
+        reloaded = adapter.state()
+        persisted = workstream_projection._active_heads(reloaded)[
+            ("evidence_contract", "gen-70-terminal")
+        ]
+        self.assertIsNotNone(
+            workstream_projection.validated_nonprimary_backfill_authority(
+                persisted, scope_event["value"], list(reloaded.events),
+                reloaded.snapshot["projection_history"],
+            ),
+            "an appended and reducer-reloaded receipt retains replay authority",
+        )
+        active_after_seed = workstream_projection._active_heads(reloaded)
+        evidence_head = active_after_seed[(
+            "evidence_contract", "gen-70-terminal",
+        )]
+        repair_manifest = {
+            **reviewed_manifest(adapter, [
+                {"kind": kind, "key": key, "value": deepcopy(event["value"])}
+                for (kind, key), event in sorted(active_after_seed.items())
+                if kind != "disposition"
+            ]),
+            "terminal_child_repairs": [{
+                "child_identifier": "GEN-70",
+                "child_issue_id": manifest["terminal_child_evidence_seeds"][0][
+                    "child_issue_id"
+                ],
+                "expected_child_readback_sha256": expected_readback,
+                "expected_assignee_id": manifest[
+                    "terminal_child_evidence_seeds"
+                ][0]["expected_assignee_id"],
+                "approved_evidence_heads": [{
+                    "key": evidence_head["key"],
+                    "event_id": evidence_head["event_id"],
+                    "value_sha256": canonical_digest(evidence_head["value"]),
+                }],
+            }],
+        }
+        repair_prepared = prepare_terminal_child_repairs(
+            repair_manifest, graph, reloaded,
+        )
+        repair_preview, repair_unresolved = (
+            load_material_history_for_projection_reconcile(
+                graph, client.comments, "GEN-37", repair_prepared, adapter,
+                authenticated_route=AUTHORITY, authenticated_source=_source,
+                remote_head=disposition_event["value"]["remote_head"],
+                relation_target_resolver=self.relation_target_resolver,
+            )
+        )
+        reconcile_required_projection(
+            adapter, repair_preview, repair_prepared,
+            remote_head=disposition_event["value"]["remote_head"],
+            created_at="2026-08-31T18:31:00Z",
+            authenticated_source=_source,
+            relation_target_resolver=self.relation_target_resolver,
+            terminal_child_fence=lambda child_ids: {
+                child_id: expected_readback for child_id in child_ids
+            },
+            legacy_unresolved_relation_heads=repair_unresolved,
+        )
+        final_state = adapter.state()
+        final_active = workstream_projection._active_heads(final_state)
+        closure = final_active[(
+            "child_closure", "GEN-70",
+        )]["value"]
+        self.assertEqual(closure["exact_head"], new_head)
+        self.assertIn(
+            evidence_head["event_id"],
+            closure_bound_historical_evidence(
+                list(final_state.events), final_active[("scope", "root")]["value"],
+                final_state.snapshot["projection_history"],
+            ),
+            "ordinary resume certifies the closed child after reducer reload",
+        )
     def test_terminal_seed_head_transition_secondary_owner_negatives(self):
         (
             client, adapter, _source, graph, _children, manifest, new_head,
@@ -6193,9 +6355,10 @@ class ProjectionTests(unittest.TestCase):
             provider_repository_id=repository["provider_repository_id"],
             pull_request_number=522, pr_head=new_head, merge_sha="d" * 40,
         )
+        trusted_payload = trusted_receipt.as_dict()
         evidence["value"]["nonprimary_backfill_authority"].update({
-            "checks_sha256": trusted_receipt["checks_sha256"],
-            "provider_receipt_sha256": trusted_receipt[
+            "checks_sha256": trusted_payload["checks_sha256"],
+            "provider_receipt_sha256": trusted_payload[
                 "provider_receipt_sha256"
             ],
         })
@@ -6244,12 +6407,6 @@ class ProjectionTests(unittest.TestCase):
             ),
             authority,
             "an exact authenticated history event must replay after admission",
-        )
-        self.assertIsNone(
-            workstream_projection.validated_nonprimary_backfill_authority(
-                evidence, current_scope, events, [],
-            ),
-            "the candidate active set cannot self-admit as persisted history",
         )
         self.assertIn(
             evidence["event_id"],

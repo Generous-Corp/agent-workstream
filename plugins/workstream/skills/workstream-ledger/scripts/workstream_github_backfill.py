@@ -7,6 +7,7 @@ from copy import deepcopy
 from datetime import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import selectors
@@ -27,6 +28,7 @@ _DIGEST = re.compile(r"[0-9a-f]{64}")
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _CHECK_FIELDS = {"name", "status", "conclusion", "details_url"}
 _MAX_TOKEN_BYTES = 8192
+_MAX_TIMEOUT_SECONDS = 60.0
 _SAFE_COMMAND_ENV = {
     "PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT",
     "TMP", "TEMP", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
@@ -53,6 +55,45 @@ class GitHubBackfillReceiptError(RuntimeError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
+
+
+_VERIFIED_RECEIPT_SENTINEL = object()
+
+
+class VerifiedGitHubBackfillReceipt:
+    """Opaque immutable result minted only by an authenticated reader."""
+
+    __slots__ = ("__payload",)
+
+    def __init__(self, receipt: dict[str, Any], *, _sentinel: object | None = None):
+        if _sentinel is not _VERIFIED_RECEIPT_SENTINEL:
+            raise GitHubBackfillReceiptError(
+                "github_verified_receipt_constructor_private"
+            )
+        validated = validate_github_backfill_receipt(receipt)
+        object.__setattr__(
+            self,
+            "_VerifiedGitHubBackfillReceipt__payload",
+            _canonical_bytes(validated),
+        )
+
+    def __init_subclass__(cls, **_kwargs: Any) -> None:
+        raise TypeError("VerifiedGitHubBackfillReceipt cannot be subclassed")
+
+    def __setattr__(self, _name: str, _value: Any) -> None:
+        raise AttributeError("VerifiedGitHubBackfillReceipt is immutable")
+
+    def __delattr__(self, _name: str) -> None:
+        raise AttributeError("VerifiedGitHubBackfillReceipt is immutable")
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a detached structural receipt suitable for persistence."""
+        payload = object.__getattribute__(
+            self, "_VerifiedGitHubBackfillReceipt__payload"
+        )
+        value = json.loads(payload)
+        assert isinstance(value, dict)
+        return value
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
@@ -95,6 +136,8 @@ def github_token_from_command(argv: list[str], *, timeout: float = 10.0) -> str:
         not isinstance(timeout, (int, float))
         or isinstance(timeout, bool)
         or timeout <= 0
+        or timeout > _MAX_TIMEOUT_SECONDS
+        or not math.isfinite(timeout)
     ):
         raise GitHubBackfillReceiptError("github_auth_timeout_invalid")
     environment = {
@@ -282,7 +325,13 @@ class GitHubBackfillReceiptReader:
     ):
         if not isinstance(token, str) or not token:
             raise GitHubBackfillReceiptError("github_auth_unavailable")
-        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
+        if (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or timeout <= 0
+            or timeout > _MAX_TIMEOUT_SECONDS
+            or not math.isfinite(timeout)
+        ):
             raise GitHubBackfillReceiptError("github_timeout_invalid")
         for value, code in (
             (max_pages, "github_page_bound_invalid"),
@@ -352,6 +401,7 @@ class GitHubBackfillReceiptReader:
 
     def _read_checks(self, repository: str, expected_head: str) -> list[dict[str, Any]]:
         observed: list[dict[str, Any]] = []
+        observed_ids: set[str] = set()
         expected_total: int | None = None
         for page in range(1, self.max_pages + 1):
             query = urllib.parse.urlencode({"filter": "all", "per_page": 100, "page": page})
@@ -380,6 +430,17 @@ class GitHubBackfillReceiptReader:
             for item in batch:
                 if not isinstance(item, dict):
                     raise GitHubBackfillReceiptError("github_checks_response_malformed")
+                check_id = item.get("id")
+                if (
+                    not isinstance(check_id, (int, str))
+                    or isinstance(check_id, bool)
+                    or not str(check_id)
+                    or str(check_id) in observed_ids
+                ):
+                    raise GitHubBackfillReceiptError(
+                        "github_checks_changed_during_read"
+                    )
+                observed_ids.add(str(check_id))
                 if item.get("head_sha") != expected_head:
                     raise GitHubBackfillReceiptError("github_check_head_mismatch")
                 if item.get("status") != "completed" or item.get("conclusion") != "success":
@@ -416,7 +477,7 @@ class GitHubBackfillReceiptReader:
         pull_request_number: int,
         expected_head: str,
         expected_merge_sha: str,
-    ) -> dict[str, Any]:
+    ) -> VerifiedGitHubBackfillReceipt:
         """Return a canonical receipt bound to caller-reviewed immutable inputs."""
         if not isinstance(repository, str) or not _REPOSITORY.fullmatch(repository):
             raise GitHubBackfillReceiptError("github_repository_invalid")
@@ -473,12 +534,15 @@ class GitHubBackfillReceiptReader:
             "checks_sha256": _digest(checks),
         }
         receipt["provider_receipt_sha256"] = _digest(receipt)
-        return validate_github_backfill_receipt(receipt)
+        return VerifiedGitHubBackfillReceipt(
+            receipt, _sentinel=_VERIFIED_RECEIPT_SENTINEL,
+        )
 
 
 __all__ = [
     "GitHubBackfillReceiptError",
     "GitHubBackfillReceiptReader",
+    "VerifiedGitHubBackfillReceipt",
     "github_token_from_command",
     "validate_github_backfill_receipt",
 ]

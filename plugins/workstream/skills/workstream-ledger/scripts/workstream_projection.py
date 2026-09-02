@@ -61,7 +61,7 @@ from workstream_projection_history import (
 )
 from workstream_github_backfill import (
     GitHubBackfillReceiptError, GitHubBackfillReceiptReader,
-    github_token_from_command,
+    VerifiedGitHubBackfillReceipt, github_token_from_command,
 )
 
 
@@ -2153,7 +2153,7 @@ def prepare_terminal_child_evidence_seeds(
     manifest: dict[str, Any], snapshot: dict[str, Any], state: Any, *,
     remote_head: str | None = None,
     comments: list[dict[str, Any]] | None = None,
-    trusted_nonprimary_backfill_receipt: dict[str, Any] | None = None,
+    trusted_nonprimary_backfill_receipt: VerifiedGitHubBackfillReceipt | None = None,
 ) -> dict[str, Any]:
     """Validate an add-only evidence prefix before terminal closure repair."""
     result = deepcopy(manifest)
@@ -3740,6 +3740,7 @@ def reconcile_required_projection(
     projection_input_snapshot: dict[str, Any] | None = None,
     expected_projection_input_frontier: str | None = None,
     legacy_unresolved_relation_heads: frozenset[tuple[str, str]] = frozenset(),
+    trusted_nonprimary_backfill_receipt: VerifiedGitHubBackfillReceipt | None = None,
 ) -> dict[str, Any]:
     """Append only missing/changed values and verify the complete current view."""
     if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", remote_head):
@@ -3983,6 +3984,9 @@ def reconcile_required_projection(
             manifest, projection_input_snapshot or snapshot, initial,
             remote_head=remote_head,
             comments=projection_comments,
+            trusted_nonprimary_backfill_receipt=(
+                trusted_nonprimary_backfill_receipt
+            ),
         )
         if prepared_seed_manifest != manifest:
             prepared_body = deepcopy(prepared_seed_manifest)
@@ -4815,9 +4819,10 @@ def main() -> int:
                     "terminal_child_evidence_seed_nonprimary_backfill_"
                     f"{error.code}"
                 ) from error
+            authenticated_receipt = trusted_nonprimary_backfill_receipt.as_dict()
             for field in ("checks_sha256", "provider_receipt_sha256"):
                 observed = nonprimary_backfill.get(field)
-                authenticated = trusted_nonprimary_backfill_receipt[field]
+                authenticated = authenticated_receipt[field]
                 if observed is not None and observed != authenticated:
                     raise LinearProjectionError(
                         "terminal_child_evidence_seed_nonprimary_backfill_"
@@ -4998,6 +5003,9 @@ def main() -> int:
                 expected_projection_input_frontier
             ),
             legacy_unresolved_relation_heads=legacy_unresolved_relation_heads,
+            trusted_nonprimary_backfill_receipt=(
+                trusted_nonprimary_backfill_receipt
+            ),
         )
         preview = {
             "apply": False, "writes_performed": 0,
@@ -5036,6 +5044,9 @@ def main() -> int:
                 expected_projection_input_frontier
             ),
             legacy_unresolved_relation_heads=legacy_unresolved_relation_heads,
+            trusted_nonprimary_backfill_receipt=(
+                trusted_nonprimary_backfill_receipt
+            ),
         )
         result["canonical_description_fence"] = description_fence
         result["reviewed_preview_sha256"] = preview_digest

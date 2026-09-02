@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from workstream_github_backfill import (  # noqa: E402
     GitHubBackfillReceiptError,
     GitHubBackfillReceiptReader,
+    VerifiedGitHubBackfillReceipt,
     github_token_from_command,
     validate_github_backfill_receipt,
 )
@@ -59,8 +60,12 @@ def pr_payload(**updates):
     return payload
 
 
-def check(name, *, status="completed", conclusion="success", head=HEAD):
+def check(
+    name, *, status="completed", conclusion="success", head=HEAD,
+    check_id=None,
+):
     return {
+        "id": name if check_id is None else check_id,
         "name": name,
         "status": status,
         "conclusion": conclusion,
@@ -106,7 +111,9 @@ class GitHubBackfillReceiptTests(unittest.TestCase):
         first = [check(f"z-{number:03}") for number in range(100)]
         second = [check("a-final")]
         opener = FakeOpener(pages=[first, second])
-        receipt = self.read(opener)
+        verified = self.read(opener)
+        self.assertIsInstance(verified, VerifiedGitHubBackfillReceipt)
+        receipt = verified.as_dict()
         self.assertEqual(receipt["repository"], "generous-corp/agent-workstream")
         self.assertEqual(receipt["provider_repository_id"], "R_kgDOExample")
         self.assertEqual(receipt["pull_request_number"], 106)
@@ -129,6 +136,13 @@ class GitHubBackfillReceiptTests(unittest.TestCase):
         for request, _timeout in opener.requests:
             self.assertEqual(urllib.parse.urlparse(request.full_url).hostname, "api.github.com")
             self.assertEqual(request.get_header("Authorization"), "Bearer secret-token")
+
+    def test_duplicate_check_identity_across_pages_refuses(self):
+        duplicate = check("same", check_id=123)
+        with self.assertRaisesRegex(
+            GitHubBackfillReceiptError, "github_checks_changed_during_read",
+        ):
+            self.read(FakeOpener(pages=[[duplicate], [deepcopy(duplicate)]]))
 
     def test_repository_identity_coordinate_and_pr_number_fail_closed(self):
         cases = [
@@ -159,7 +173,7 @@ class GitHubBackfillReceiptTests(unittest.TestCase):
             expected_head=HEAD,
             expected_merge_sha=MERGE,
         )
-        self.assertEqual(numeric["provider_repository_id"], "123456")
+        self.assertEqual(numeric.as_dict()["provider_repository_id"], "123456")
 
     def test_head_and_merge_failures(self):
         failures = [
@@ -202,7 +216,7 @@ class GitHubBackfillReceiptTests(unittest.TestCase):
             self.read(opener, max_response_bytes=64, max_total_bytes=128)
 
     def test_validator_rejects_digest_and_noncanonical_checks(self):
-        receipt = self.read(FakeOpener(pages=[[check("a"), check("b")]]))
+        receipt = self.read(FakeOpener(pages=[[check("a"), check("b")]])).as_dict()
         bad_digest = deepcopy(receipt)
         bad_digest["checks_sha256"] = "0" * 64
         with self.assertRaisesRegex(GitHubBackfillReceiptError, "checks_digest_mismatch"):
@@ -211,6 +225,29 @@ class GitHubBackfillReceiptTests(unittest.TestCase):
         unsorted["checks"].reverse()
         with self.assertRaisesRegex(GitHubBackfillReceiptError, "not_canonical"):
             validate_github_backfill_receipt(unsorted)
+
+    def test_verified_receipt_cannot_be_minted_from_a_plain_dict(self):
+        verified = self.read(FakeOpener())
+        receipt = verified.as_dict()
+        self.assertNotIsInstance(receipt, VerifiedGitHubBackfillReceipt)
+        with self.assertRaisesRegex(
+            GitHubBackfillReceiptError, "verified_receipt_constructor_private",
+        ):
+            VerifiedGitHubBackfillReceipt(receipt)
+        with self.assertRaisesRegex(
+            GitHubBackfillReceiptError, "verified_receipt_constructor_private",
+        ):
+            VerifiedGitHubBackfillReceipt(receipt, _sentinel=object())
+        with self.assertRaisesRegex(AttributeError, "immutable"):
+            verified.receipt = receipt
+        with self.assertRaisesRegex(TypeError, "cannot be subclassed"):
+            class ForgedReceipt(VerifiedGitHubBackfillReceipt):
+                pass
+        detached = verified.as_dict()
+        detached["repository"] = "attacker/repo"
+        self.assertEqual(
+            verified.as_dict()["repository"], "generous-corp/agent-workstream",
+        )
 
     def test_token_command_is_bounded_and_noninteractive(self):
         self.assertEqual(github_token_from_command([
@@ -227,6 +264,21 @@ class GitHubBackfillReceiptTests(unittest.TestCase):
             with self.subTest(code=code):
                 with self.assertRaisesRegex(GitHubBackfillReceiptError, code):
                     github_token_from_command(argv, **kwargs)
+        for invalid_timeout in (float("nan"), float("inf"), 61.0, 10**400):
+            with self.subTest(token_timeout=invalid_timeout), self.assertRaisesRegex(
+                GitHubBackfillReceiptError, "github_auth_timeout_invalid",
+            ):
+                github_token_from_command(
+                    [sys.executable, "-c", "print('token')"],
+                    timeout=invalid_timeout,
+                )
+        for invalid_timeout in (float("nan"), float("inf"), 61.0, 10**400):
+            with self.subTest(reader_timeout=invalid_timeout), self.assertRaisesRegex(
+                GitHubBackfillReceiptError, "github_timeout_invalid",
+            ):
+                GitHubBackfillReceiptReader(
+                    "secret-token", opener=FakeOpener(), timeout=invalid_timeout,
+                )
 
 
 if __name__ == "__main__":
