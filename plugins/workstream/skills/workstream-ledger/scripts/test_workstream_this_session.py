@@ -45,7 +45,12 @@ class FakeCmux:
         if action == "ping":
             return subprocess.CompletedProcess(argv, 0, "pong", "")
         if action == "identify":
-            socket = argv[argv.index("--socket") + 1] if "--socket" in argv else "/tmp/cmux-a.sock"
+            socket = (
+                argv[argv.index("--socket") + 1]
+                if "--socket" in argv else kwargs.get("env", {}).get(
+                    "CMUX_SOCKET_PATH", "/tmp/cmux-a.sock",
+                )
+            )
             value = {
                 "socket_path": socket, "bundle_identifier": "com.cmuxterm.app",
                 "app_bundle_path": "/Applications/cmux.app", "caller": {
@@ -111,16 +116,24 @@ class FakeHerdr:
         return subprocess.CompletedProcess(argv, 0, json.dumps(value), "")
 
 
-def full_resume_runner(calls, *, project="Linear Integration", authority="full",
-                       options=None):
+def full_resume_runner(
+    calls, *, project="Linear Integration", authority="full", options=None,
+    root_token=None, requested_focus=None, authenticated_route=None,
+):
     def run(argv, **kwargs):
         calls.append(argv)
         if options is not None:
             options.append(kwargs)
-        return subprocess.CompletedProcess(argv, 0, json.dumps({
-            "resume_authority": authority, "workstream_id": argv[-1],
+        payload = {
+            "resume_authority": authority,
+            "workstream_id": root_token or argv[-1],
             "project_name": project, "children": [],
-        }), "")
+        }
+        if requested_focus is not None:
+            payload["requested_focus"] = requested_focus
+        if authenticated_route is not None:
+            payload["authenticated_route"] = authenticated_route
+        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
     return run
 
 
@@ -146,6 +159,16 @@ class ThisSessionTests(unittest.TestCase):
             "HERDR_BIN_PATH": "/opt/herdr", "CODEX_SESSION_ID": "new",
         }
 
+    @staticmethod
+    def owned_child(token="GEN-94", root="GEN-37"):
+        return {
+            "kind": "owned_child", "identifier": token,
+            "issue_id": "child-issue-uuid-94",
+            "parent_issue_id": "root-issue-uuid-37",
+            "root_identifier": root, "repository_key": "agent-workstream",
+            "status": "In Progress",
+        }
+
     def seed(self, fake, token="GEN-37", *, env=None, provider_session="old"):
         env = dict(env or self.cmux_env())
         resolution = session.resolve_this_session(
@@ -154,11 +177,13 @@ class ThisSessionTests(unittest.TestCase):
         ) if session.workstream_tab.tokens_in_title(fake.title) else {
             **session._terminal_identity(env), "workstream_id": token,
         }
-        resolution["namespace_sha256"] = session._namespace("cmux", {
+        provenance = {
             "socket_path": env["CMUX_SOCKET_PATH"],
             "bundle_identifier": "com.cmuxterm.app",
             "app_bundle_path": "/Applications/cmux.app",
-        })
+        }
+        resolution["terminal_provenance"] = provenance
+        resolution["namespace_sha256"] = session._namespace("cmux", provenance)
         env["CODEX_SESSION_ID"] = provider_session
         return session.record_successor_binding(
             self.db, resolution, environ=env, created_at="2026-09-01T00:00:00Z",
@@ -166,10 +191,17 @@ class ThisSessionTests(unittest.TestCase):
 
     @staticmethod
     def resolution(*, title="Linear · GEN-37", binding=None):
+        provenance = {
+            "socket_path": "/tmp/cmux-a.sock",
+            "bundle_identifier": "com.cmuxterm.app",
+            "app_bundle_path": "/Applications/cmux.app",
+        }
         return {
-            "manager": "cmux", "namespace_sha256": "a" * 64,
+            "manager": "cmux",
+            "namespace_sha256": session._namespace("cmux", provenance),
             "workspace_id": "workspace-1", "target_id": "surface-old",
             "cmux_socket_path": "/tmp/cmux-a.sock",
+            "terminal_provenance": provenance,
             "workstream_id": "GEN-37", "candidate_source": (
                 "binding_and_title" if binding else "title"
             ), "observed_title": title, "prior_binding": binding,
@@ -204,6 +236,20 @@ class ThisSessionTests(unittest.TestCase):
         self.assertEqual(result["resume_authority"], "full")
         self.assertEqual(result["tab_binding"]["title"], "pulp · GEN-37")
         self.assertEqual(result["resume_binding"]["writes_performed"], 1)
+
+    def test_unknown_title_provenance_is_preserved_not_guessed_automatic(self):
+        env = self.cmux_env("surface-unknown-title-source")
+        fake = FakeCmux("~/Code/pulp", surface="surface-unknown-title-source")
+        self.seed(fake, env=env)
+        result = session.resume_this_session(
+            environ=env, runner=full_resume_runner([]), terminal_runner=fake,
+            which=lambda _: "/opt/cmux", binding_path=self.db,
+            resume_script=Path("resume.py"),
+            created_at="2026-09-01T01:00:00Z",
+        )
+        self.assertEqual(result["resume_authority"], "full")
+        self.assertEqual(fake.title, "~/Code/pulp · GEN-37")
+        self.assertEqual(result["tab_binding"]["status"], "updated")
 
     def test_generic_title_without_exact_binding_refuses_before_resume(self):
         for title in ("Linear", "pulp"):
@@ -250,6 +296,97 @@ class ThisSessionTests(unittest.TestCase):
             result["this_session_resolution"]["candidate_source"], "title",
         )
         self.assertEqual(result["resume_binding"]["writes_performed"], 1)
+
+    def test_full_resume_root_must_match_candidate_before_title_or_binding(self):
+        env = self.cmux_env("surface-root-mismatch")
+        fake = FakeCmux(
+            "Linear · GEN-37", surface="surface-root-mismatch",
+        )
+        calls = []
+        with self.assertRaisesRegex(
+            session.ThisSessionError, "workstream_resume_identity_mismatch",
+        ):
+            session.resume_this_session(
+                environ=env,
+                runner=full_resume_runner(calls, root_token="GEN-38"),
+                terminal_runner=fake, which=lambda _: "/opt/cmux",
+                binding_path=self.db, resume_script=Path("resume.py"),
+            )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(fake.title, "Linear · GEN-37")
+        self.assertNotIn("rename-tab", [
+            call[call.index("rename-tab")] for call in fake.calls
+            if "rename-tab" in call
+        ])
+        self.assertFalse(self.db.exists())
+
+    def test_direct_root_and_owned_child_full_contexts_bind_exact_candidate(self):
+        cases = (
+            ("GEN-37", "GEN-37", None, None),
+            (
+                "GEN-94", "GEN-37", self.owned_child(),
+                # Fixed-frontier output may truncate display-only route fields;
+                # the exact, schema-validated requested focus remains intact.
+                {"root_issue_id": "root-issue-uuid-37…[truncated]"},
+            ),
+        )
+        for candidate, root, focus, route in cases:
+            with self.subTest(candidate=candidate):
+                db = Path(self.temp.name) / f"{candidate}.sqlite3"
+                surface = f"surface-{candidate}"
+                fake = FakeCmux(
+                    f"Linear · {candidate}", surface=surface,
+                )
+                result = session.resume_this_session(
+                    environ=self.cmux_env(surface),
+                    runner=full_resume_runner(
+                        [], root_token=root, requested_focus=focus,
+                        authenticated_route=route,
+                    ),
+                    terminal_runner=fake, which=lambda _: "/opt/cmux",
+                    binding_path=db, resume_script=Path("resume.py"),
+                    created_at="2026-09-01T01:00:00Z",
+                )
+                self.assertEqual(result["resume_authority"], "full")
+                self.assertEqual(
+                    result["this_session_resolution"]["workstream_id"],
+                    candidate,
+                )
+                self.assertEqual(result["resume_binding"]["writes_performed"], 1)
+
+    def test_forged_or_malformed_owned_child_focus_refuses_without_mutation(self):
+        candidate = "GEN-94"
+        invalid = []
+        wrong_root = self.owned_child(root="GEN-38")
+        invalid.append(("GEN-37", wrong_root))
+        extra = dict(self.owned_child(), injected="forged")
+        invalid.append(("GEN-37", extra))
+        blank = dict(self.owned_child(), repository_key=" ")
+        invalid.append(("GEN-37", blank))
+        invalid.append(("GEN-38", None))
+        for index, (root, focus) in enumerate(invalid):
+            with self.subTest(index=index):
+                db = Path(self.temp.name) / f"invalid-{index}.sqlite3"
+                surface = f"surface-invalid-{index}"
+                fake = FakeCmux(
+                    "Linear · GEN-94", surface=surface,
+                )
+                with self.assertRaisesRegex(
+                    session.ThisSessionError,
+                    "workstream_resume_identity_mismatch",
+                ):
+                    session.resume_this_session(
+                        environ=self.cmux_env(surface),
+                        runner=full_resume_runner(
+                            [], root_token=root, requested_focus=focus,
+                        ),
+                        terminal_runner=fake, which=lambda _: "/opt/cmux",
+                        binding_path=db, resume_script=Path("resume.py"),
+                    )
+                self.assertFalse(db.exists())
+                self.assertNotIn("rename-tab", [
+                    part for call in fake.calls for part in call
+                ])
 
     def test_replacement_surface_title_only_resumes_binds_and_repeats_without_writes(self):
         env = self.cmux_env("211BECC6-4E03-4C8A-A0FE-B04E89590B77")
@@ -444,6 +581,146 @@ class ThisSessionTests(unittest.TestCase):
         })
         self.assertFalse(self.db.exists())
 
+    def test_exact_binding_resumes_when_cmux_title_adapter_is_unavailable(self):
+        env = self.cmux_env("surface-bound-unavailable")
+        fake = FakeCmux("Linear", surface="surface-bound-unavailable")
+        self.seed(fake, env=env)
+
+        def terminal_runner(argv, **kwargs):
+            if (
+                "rpc" in argv
+                and argv[argv.index("rpc") + 1] in {
+                    "workspace.list", "surface.list",
+                }
+            ) or "list-pane-surfaces" in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "unavailable")
+            return fake(argv, **kwargs)
+
+        calls = []
+        result = session.resume_this_session(
+            environ=env, runner=full_resume_runner(calls),
+            terminal_runner=terminal_runner, which=lambda _: "/opt/cmux",
+            binding_path=self.db, resume_script=Path("resume.py"),
+        )
+        self.assertEqual(result["resume_authority"], "full")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            result["this_session_resolution"]["candidate_source"], "binding",
+        )
+        self.assertEqual(result["tab_binding"]["status"], "unavailable")
+        self.assertEqual(result["resume_binding"]["status"], "unavailable")
+        self.assertEqual(fake.title, "Linear")
+        connection = sqlite3.connect(self.db)
+        self.assertEqual(connection.execute(
+            "SELECT count(*) FROM terminal_binding_events_v1"
+        ).fetchone()[0], 1)
+        self.assertEqual(connection.execute(
+            "SELECT provider_session_id FROM terminal_bindings_v1"
+        ).fetchone()[0], "old")
+        connection.close()
+
+    def test_fixed_envelope_project_name_labels_unnamed_bound_tab_and_binds(self):
+        env = self.cmux_env("surface-fixed-project")
+        fake = FakeCmux("", surface="surface-fixed-project")
+        self.seed(fake, env=env)
+
+        def fixed_resume(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                "context_schema": {
+                    "envelope": "fixed_frontier_authority_v1",
+                },
+                "resume_authority": "full", "workstream_id": "GEN-37",
+                "project_name": "Linear Integration",
+            }), "")
+
+        result = session.resume_this_session(
+            environ=env, runner=fixed_resume, terminal_runner=fake,
+            which=lambda _: "/opt/cmux", binding_path=self.db,
+            resume_script=Path("resume.py"),
+            created_at="2026-09-01T01:00:00Z",
+        )
+        self.assertEqual(result["resume_authority"], "full")
+        self.assertEqual(fake.title, "Linear Integration · GEN-37")
+        self.assertEqual(result["tab_binding"]["status"], "updated")
+        self.assertEqual(result["resume_binding"]["writes_performed"], 1)
+
+    def test_malformed_project_name_is_optional_after_full_authority(self):
+        env = self.cmux_env("surface-malformed-project")
+        fake = FakeCmux("", surface="surface-malformed-project")
+        self.seed(fake, env=env)
+
+        def malformed_resume(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                "context_schema": {
+                    "envelope": "fixed_frontier_authority_v1",
+                },
+                "resume_authority": "full", "workstream_id": "GEN-37",
+                "project_name": {"forged": "object"},
+            }), "")
+
+        result = session.resume_this_session(
+            environ=env, runner=malformed_resume, terminal_runner=fake,
+            which=lambda _: "/opt/cmux", binding_path=self.db,
+            resume_script=Path("resume.py"),
+        )
+        self.assertEqual(result["resume_authority"], "full")
+        self.assertEqual(result["tab_binding"]["reason"], "invalid_project_name")
+        self.assertEqual(result["resume_binding"]["status"], "unavailable")
+        self.assertEqual(fake.title, "")
+        connection = sqlite3.connect(self.db)
+        self.assertEqual(connection.execute(
+            "SELECT count(*) FROM terminal_binding_events_v1"
+        ).fetchone()[0], 1)
+        connection.close()
+
+    def test_unavailable_cmux_title_without_binding_refuses_before_resume(self):
+        env = self.cmux_env("surface-unbound-unavailable")
+        fake = FakeCmux("Linear", surface="surface-unbound-unavailable")
+
+        def terminal_runner(argv, **kwargs):
+            if "rpc" in argv and argv[argv.index("rpc") + 1] == "workspace.list":
+                return subprocess.CompletedProcess(argv, 1, "", "unavailable")
+            return fake(argv, **kwargs)
+
+        calls = []
+        with self.assertRaisesRegex(
+            session.ThisSessionError,
+            "session_workstream_unresolved:terminal_adapter_unavailable:cmux",
+        ):
+            session.resume_this_session(
+                environ=env, runner=full_resume_runner(calls),
+                terminal_runner=terminal_runner, which=lambda _: "/opt/cmux",
+                binding_path=self.db, resume_script=Path("resume.py"),
+            )
+        self.assertEqual(calls, [])
+        self.assertFalse(self.db.exists())
+
+    def test_exact_herdr_binding_resumes_when_cli_is_unavailable(self):
+        env = self.herdr_env()
+        resolution = {
+            **session._terminal_identity(env), "workstream_id": "GEN-37",
+        }
+        old_env = dict(env, CODEX_SESSION_ID="old")
+        session.record_successor_binding(
+            self.db, resolution, environ=old_env,
+            created_at="2026-09-01T00:00:00Z",
+        )
+
+        def unavailable(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 1, "", "unavailable")
+
+        result = session.resume_this_session(
+            environ=env, runner=full_resume_runner([]),
+            terminal_runner=unavailable, which=lambda _: None,
+            binding_path=self.db, resume_script=Path("resume.py"),
+        )
+        self.assertEqual(result["resume_authority"], "full")
+        self.assertEqual(
+            result["this_session_resolution"]["candidate_source"], "binding",
+        )
+        self.assertEqual(result["tab_binding"]["status"], "unavailable")
+        self.assertEqual(result["resume_binding"]["status"], "unavailable")
+
     def test_herdr_socket_namespace_separates_same_public_ids(self):
         fake = FakeHerdr("Linear · GEN-37")
         first = session.resolve_this_session(
@@ -469,6 +746,10 @@ class ThisSessionTests(unittest.TestCase):
         self.assertEqual(result["resume_authority"], "full")
         self.assertEqual(result["this_session_resolution"]["manager"], "herdr")
         self.assertEqual(result["tab_binding"]["manager"], "herdr")
+        self.assertEqual(
+            result["tab_binding"]["session_namespace_sha256"],
+            result["this_session_resolution"]["namespace_sha256"],
+        )
 
     def test_mixed_cmux_and_herdr_provenance_refuses(self):
         env = dict(self.herdr_env(), CMUX_SURFACE_ID="surface-old")
@@ -493,6 +774,46 @@ class ThisSessionTests(unittest.TestCase):
         )
         self.assertNotEqual(first["namespace_sha256"], second["namespace_sha256"])
 
+    def test_cmux_socket_must_be_canonical_absolute_before_any_probe(self):
+        for socket in ("relative/cmux.sock", "/tmp/dir/../cmux.sock"):
+            with self.subTest(socket=socket):
+                calls = []
+
+                def forbidden(*args, **kwargs):
+                    calls.append(args)
+                    raise AssertionError("relative socket must refuse first")
+
+                with self.assertRaisesRegex(
+                    session.ThisSessionError,
+                    "session_context_invalid:CMUX_SOCKET_PATH",
+                ):
+                    session.resolve_this_session(
+                        environ=self.cmux_env(socket=socket), runner=forbidden,
+                        which=lambda _: "/opt/cmux", binding_path=self.db,
+                    )
+                self.assertEqual(calls, [])
+
+    def test_cmux_live_socket_readback_must_exactly_match_selector(self):
+        env = self.cmux_env(socket="/tmp/cmux-expected.sock")
+        fake = FakeCmux("Linear · GEN-37")
+
+        def mismatched(argv, **kwargs):
+            result = fake(argv, **kwargs)
+            if "identify" in argv:
+                value = json.loads(result.stdout)
+                value["socket_path"] = "/tmp/cmux-other.sock"
+                result.stdout = json.dumps(value)
+            return result
+
+        with self.assertRaisesRegex(
+            session.ThisSessionError, "session_context_mismatch:cmux_socket",
+        ):
+            session.resolve_this_session(
+                environ=env, runner=mismatched, which=lambda _: "/opt/cmux",
+                binding_path=self.db,
+            )
+        self.assertFalse(self.db.exists())
+
     def test_legacy_bare_surface_rows_are_quarantined_not_reused(self):
         connection = sqlite3.connect(self.db)
         connection.execute(
@@ -509,6 +830,145 @@ class ThisSessionTests(unittest.TestCase):
         )
         self.assertEqual(result["workstream_id"], "GEN-37")
         self.assertIsNone(result["prior_binding"])
+
+    def test_missing_or_corrupt_current_binding_event_refuses_before_title_fallback(self):
+        mutations = {
+            "missing": (
+                "DELETE FROM terminal_binding_events_v1", (),
+                "session_binding_history_incomplete",
+            ),
+            "forged_digest": (
+                "UPDATE terminal_binding_events_v1 SET provider_session_id=?",
+                ("forged-session",), "session_binding_event_digest_mismatch",
+            ),
+            "route_drift": (
+                "UPDATE terminal_binding_events_v1 SET target_id=?",
+                ("surface-other",), "session_binding_history_mismatch",
+            ),
+        }
+        for name, (statement, arguments, expected) in mutations.items():
+            with self.subTest(name=name):
+                self.db = Path(self.temp.name) / f"corrupt-{name}.sqlite3"
+                env = self.cmux_env("surface-corrupt")
+                fake = FakeCmux("Linear", surface="surface-corrupt")
+                self.seed(fake, env=env)
+                connection = sqlite3.connect(self.db)
+                connection.execute(statement, arguments)
+                if name == "forged_digest":
+                    connection.execute(
+                        "UPDATE terminal_bindings_v1 "
+                        "SET provider_session_id=?", arguments,
+                    )
+                connection.commit()
+                before = connection.iterdump()
+                before = tuple(before)
+                connection.close()
+                fake.title = "Conflicting title · GEN-38"
+                resume_calls = []
+                with self.assertRaisesRegex(session.ThisSessionError, expected):
+                    session.resume_this_session(
+                        environ=env,
+                        runner=full_resume_runner(resume_calls),
+                        terminal_runner=fake, which=lambda _: "/opt/cmux",
+                        binding_path=self.db, resume_script=Path("resume.py"),
+                    )
+                self.assertEqual(resume_calls, [])
+                self.assertNotIn("rename-tab", [
+                    part for call in fake.calls for part in call
+                ])
+                connection = sqlite3.connect(self.db)
+                after = tuple(connection.iterdump())
+                connection.close()
+                self.assertEqual(after, before)
+
+    def test_duplicate_exact_binding_rows_refuse_instead_of_fetchone_selection(self):
+        env = self.cmux_env("surface-duplicate-binding")
+        fake = FakeCmux(
+            "Linear · GEN-37", surface="surface-duplicate-binding",
+        )
+        resolution = session.resolve_this_session(
+            environ=env, runner=fake, which=lambda _: "/opt/cmux",
+            binding_path=self.db,
+        )
+        connection = sqlite3.connect(self.db)
+        connection.execute(
+            "CREATE TABLE terminal_bindings_v1 ("
+            "manager TEXT, namespace_sha256 TEXT, workspace_id TEXT, "
+            "target_id TEXT, workstream_id TEXT, provider TEXT, "
+            "provider_session_id TEXT, current_event_id TEXT, updated_at TEXT)"
+        )
+        row = (
+            resolution["manager"], resolution["namespace_sha256"],
+            resolution["workspace_id"], resolution["target_id"], "GEN-37",
+            "codex", "old", "wsb_duplicate", "2026-09-01T00:00:00Z",
+        )
+        connection.executemany(
+            "INSERT INTO terminal_bindings_v1 VALUES (?,?,?,?,?,?,?,?,?)",
+            (row, row),
+        )
+        connection.commit()
+        before = tuple(connection.iterdump())
+        connection.close()
+        calls = []
+        with self.assertRaisesRegex(
+            session.ThisSessionError, "session_binding_ambiguous",
+        ):
+            session.resume_this_session(
+                environ=env, runner=full_resume_runner(calls),
+                terminal_runner=fake, which=lambda _: "/opt/cmux",
+                binding_path=self.db, resume_script=Path("resume.py"),
+            )
+        self.assertEqual(calls, [])
+        connection = sqlite3.connect(self.db)
+        after = tuple(connection.iterdump())
+        connection.close()
+        self.assertEqual(after, before)
+
+    def test_record_successor_refuses_corrupt_prior_history_without_writes(self):
+        env = self.cmux_env("surface-corrupt-record")
+        fake = FakeCmux("Linear", surface="surface-corrupt-record")
+        self.seed(fake, env=env)
+        resolution = session.resolve_this_session(
+            environ=env, runner=fake, which=lambda _: "/opt/cmux",
+            binding_path=self.db,
+        )
+        connection = sqlite3.connect(self.db)
+        connection.execute("DELETE FROM terminal_binding_events_v1")
+        connection.commit()
+        before = tuple(connection.iterdump())
+        connection.close()
+        with self.assertRaisesRegex(
+            session.ThisSessionError, "session_binding_history_incomplete",
+        ):
+            session.record_successor_binding(
+                self.db, resolution,
+                environ=dict(env, CODEX_SESSION_ID="successor"),
+                created_at="2026-09-01T03:00:00Z",
+            )
+        connection = sqlite3.connect(self.db)
+        after = tuple(connection.iterdump())
+        connection.close()
+        self.assertEqual(after, before)
+
+    def test_binding_namespace_must_match_full_terminal_provenance(self):
+        env = self.cmux_env("surface-provenance")
+        resolution = session.resolve_this_session(
+            environ=env,
+            runner=FakeCmux(
+                "Linear · GEN-37", surface="surface-provenance",
+            ),
+            which=lambda _: "/opt/cmux", binding_path=self.db,
+        )
+        forged = json.loads(json.dumps(resolution))
+        forged["terminal_provenance"]["bundle_identifier"] = "com.other.cmux"
+        with self.assertRaisesRegex(
+            session.ThisSessionError, "session_binding_provenance_mismatch",
+        ):
+            session.record_successor_binding(
+                self.db, forged, environ=env,
+                created_at="2026-09-01T00:00:00Z",
+            )
+        self.assertFalse(self.db.exists())
 
     def test_workspace_title_is_never_read_or_changed(self):
         fake = FakeCmux("Linear · GEN-37")
@@ -672,7 +1132,8 @@ class ThisSessionTests(unittest.TestCase):
             process_calls.append(argv)
             state["value"] = self.resolution(title="Changed · GEN-37")
             return subprocess.CompletedProcess(argv, 0, json.dumps({
-                "resume_authority": "full", "project_name": "Linear",
+                "resume_authority": "full", "workstream_id": "GEN-37",
+                "project_name": "Linear",
             }), "")
 
         with mock.patch.object(session, "resolve_this_session", side_effect=resolved):
@@ -706,7 +1167,8 @@ class ThisSessionTests(unittest.TestCase):
             changed["event_id"] = "wsb_changed_during_resume"
             state["value"] = self.resolution(binding=changed)
             return subprocess.CompletedProcess(argv, 0, json.dumps({
-                "resume_authority": "full", "project_name": "Linear",
+                "resume_authority": "full", "workstream_id": "GEN-37",
+                "project_name": "Linear",
             }), "")
 
         with mock.patch.object(session, "resolve_this_session", side_effect=resolved):
@@ -791,6 +1253,39 @@ class ThisSessionTests(unittest.TestCase):
             "SELECT provider_session_id FROM terminal_bindings_v1"
         ).fetchone()[0], "old")
         connection.close()
+
+    def test_workspace_move_before_title_apply_cannot_rename_or_bind_new_target(self):
+        env = self.cmux_env("surface-workspace-race")
+        fake = FakeCmux(
+            "Linear · GEN-37", surface="surface-workspace-race",
+            workspace="workspace-1",
+        )
+        apply_started = False
+
+        def terminal_runner(argv, **kwargs):
+            nonlocal apply_started
+            # Resolver calls use the explicit socket prefix; workstream_tab's
+            # first ping marks the later optional title-application boundary.
+            if "ping" in argv:
+                apply_started = True
+            if apply_started and "identify" in argv and "--no-caller" not in argv:
+                fake.caller_workspace = "workspace-2"
+            return fake(argv, **kwargs)
+
+        result = session.resume_this_session(
+            environ=env, runner=full_resume_runner([]),
+            terminal_runner=terminal_runner, which=lambda _: "/opt/cmux",
+            binding_path=self.db, resume_script=Path("resume.py"),
+        )
+        self.assertEqual(result["resume_authority"], "full")
+        self.assertEqual(result["tab_binding"]["reason"], "cmux_workspace_changed")
+        self.assertEqual(
+            result["resume_binding"]["reason"], "terminal_title_unverified",
+        )
+        self.assertNotIn("rename-tab", [
+            part for call in fake.calls for part in call
+        ])
+        self.assertFalse(self.db.exists())
 
 
 if __name__ == "__main__":

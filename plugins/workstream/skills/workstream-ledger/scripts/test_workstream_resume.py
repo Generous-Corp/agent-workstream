@@ -2040,6 +2040,7 @@ class ResumeTests(unittest.TestCase):
             "project_id": "project",
             "root_issue_id": "33333333-3333-4333-8333-333333333333",
         })
+        snapshot["root"]["project"]["name"] = "Linear Integration"
         snapshot = self.full_authority_snapshot(snapshot)
         requested_focus = {
             "kind": "owned_child", "identifier": "GEN-38",
@@ -2064,6 +2065,7 @@ class ResumeTests(unittest.TestCase):
         encoded = MODULE._default_output_bytes(context)
         self.assertLessEqual(len(encoded), MODULE.DEFAULT_RESUME_MAX_BYTES)
         self.assertEqual(context["resume_authority"], "full")
+        self.assertEqual(context["project_name"], "Linear Integration")
         self.assertEqual(context["requested_focus"], requested_focus)
         self.assertEqual(unbounded["requested_focus"], requested_focus)
         self.assertEqual(

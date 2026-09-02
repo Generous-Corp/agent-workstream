@@ -2391,7 +2391,8 @@ def _bounded_authority_envelope(
         ),
     }
     keep = (
-        "context_schema", "workstream_id", "context_url", "plan_revision",
+        "context_schema", "workstream_id", "project_name", "context_url",
+        "plan_revision",
         "description_plan_revision", "generation_transition_tip_event_id",
         "generation_activation_epoch", "generation_authority_origin",
         "quarantined_legacy_writes", "root_revision", "issue_revision",
@@ -2569,6 +2570,10 @@ def _fixed_frontier_authority_envelope(
             "envelope": "fixed_frontier_authority_v1",
         },
         "workstream_id": token,
+        # This already-validated bounded display field is required by the
+        # optional terminal adapter when the existing title is unnamed or
+        # manager-generated.  Never infer it from cwd, repository, or title.
+        "project_name": context.get("project_name"),
         "context_url": brief(context.get("context_url")),
         "plan_revision": context.get("plan_revision"),
         "root_revision": context.get("root_revision"),

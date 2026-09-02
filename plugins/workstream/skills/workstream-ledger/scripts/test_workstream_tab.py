@@ -36,7 +36,13 @@ class FakeCmux:
         elif argv[1] == "ping":
             output = "pong"
         elif argv[1] == "identify":
-            output = json.dumps({"caller": {
+            output = json.dumps({
+                "socket_path": kwargs.get("env", {}).get(
+                    "CMUX_SOCKET_PATH", "/tmp/cmux.sock",
+                ),
+                "bundle_identifier": "com.cmuxterm.app",
+                "app_bundle_path": "/Applications/cmux.app",
+                "caller": {
                 "surface_ref": "surface:7", "pane_ref": "pane:2",
                 "workspace_ref": "workspace:3", "window_ref": "window:1",
             }})
@@ -203,6 +209,7 @@ class WorkstreamTabTests(unittest.TestCase):
             ("pulp", {"project_name": "Linear", "automatic_title": "zsh"},
              "automatic_title_changed"),
             ("", {"project_name": "GEN-37 project"}, "invalid_project_name"),
+            ("", {"project_name": {"forged": "object"}}, "invalid_project_name"),
         ):
             with self.subTest(title=title, error=error):
                 fake = FakeCmux(title)
@@ -416,6 +423,39 @@ class WorkstreamTabTests(unittest.TestCase):
             )
         self.assertEqual(fake.title, "Human renamed this tab")
         self.assertNotIn("rename-tab", [call[1] for call in fake.calls])
+
+    def test_expected_workspace_and_provenance_refuse_before_rename(self):
+        for drift, reason in (
+            ("workspace", "cmux_workspace_changed"),
+            ("provenance", "cmux_provenance_changed"),
+        ):
+            with self.subTest(drift=drift):
+                fake = FakeCmux("Linear")
+
+                def runner(argv, **kwargs):
+                    result = fake(argv, **kwargs)
+                    if argv[1] == "identify":
+                        value = json.loads(result.stdout)
+                        if drift == "workspace":
+                            value["caller"]["workspace_ref"] = "workspace:4"
+                        else:
+                            value["bundle_identifier"] = "com.other.cmux"
+                        result.stdout = json.dumps(value)
+                    return result
+
+                with self.assertRaisesRegex(tab.TabTitleError, reason):
+                    tab.apply_title(
+                        "GEN-37", target="surface:7",
+                        expected_workspace="workspace:3",
+                        expected_provenance={
+                            "socket_path": "/tmp/cmux.sock",
+                            "bundle_identifier": "com.cmuxterm.app",
+                            "app_bundle_path": "/Applications/cmux.app",
+                        },
+                        environ={"CMUX_SOCKET_PATH": "/tmp/cmux.sock"},
+                        runner=runner, which=lambda _: "/opt/cmux",
+                    )
+                self.assertNotIn("rename-tab", [call[1] for call in fake.calls])
 
     def test_terminal_manager_detection_is_shared_and_ambiguous_fails(self):
         herdr_without_flag = self.herdr_env()

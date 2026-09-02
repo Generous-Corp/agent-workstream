@@ -69,10 +69,10 @@ terminal identity:
 python3 "<absolute directory of this SKILL.md>/scripts/workstream_tab.py" GEN-123 --project-name "<exact recovered project_name>"
 ```
 
-Preserve custom title; append the handle once. For a
-manager-generated title, add `--automatic-title` with its exact previously
-observed manager value; never infer it from cwd, shell, or title shape. Missing
-needed provenance or an unavailable/unresolved adapter is an optional no-op,
+Preserve custom title; append the handle once. Unknown titles are preserved;
+only exact `--automatic-title` proves manager generation—never infer it from
+cwd, shell, or title shape. Missing needed
+provenance or an unavailable/unresolved adapter is an optional no-op,
 never silently skipped (report it), and never downgrades
 `resume_authority: full`. Conflicts/readback refusals withhold title success but
 do not erase authority. Visible tabs never grant authority.

@@ -46,11 +46,21 @@ def _identity(value: object, name: str) -> str:
     return value
 
 
+def _absolute_socket_path(value: object, name: str) -> str:
+    """Return one canonical absolute socket path, never a cwd-relative key."""
+    path = _identity(value, name)
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        raise ThisSessionError(f"session_context_invalid:{name}")
+    return path
+
+
 def _namespace(manager: str, endpoint: object) -> str:
-    encoded = json.dumps(endpoint, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(
-        f"agent-workstream-terminal-binding-v1\0{manager}\0{encoded}".encode()
-    ).hexdigest()
+    if not isinstance(endpoint, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in endpoint.items()
+    ):
+        raise ThisSessionError("session_binding_provenance_mismatch")
+    return workstream_tab.terminal_namespace_sha256(manager, endpoint)
 
 
 def state_path(environ: Mapping[str, str]) -> Path:
@@ -75,7 +85,7 @@ def _terminal_identity(environ: Mapping[str, str]) -> dict[str, Any] | None:
         workspace = _identity(
             environ.get("HERDR_WORKSPACE_ID"), "HERDR_WORKSPACE_ID",
         )
-        endpoint = _identity(
+        endpoint = _absolute_socket_path(
             environ.get("HERDR_SOCKET_PATH"), "HERDR_SOCKET_PATH",
         )
         provenance = {"socket_path": endpoint}
@@ -90,12 +100,13 @@ def _terminal_identity(environ: Mapping[str, str]) -> dict[str, Any] | None:
         workspace = _identity(
             environ.get("CMUX_WORKSPACE_ID"), "CMUX_WORKSPACE_ID",
         )
-        endpoint = _identity(
+        endpoint = _absolute_socket_path(
             environ.get("CMUX_SOCKET_PATH"), "CMUX_SOCKET_PATH",
         )
         return {
             "manager": "cmux", "target_id": target,
             "workspace_id": workspace, "cmux_socket_path": endpoint,
+            "terminal_provenance": {"socket_path": endpoint},
         }
     return None
 
@@ -133,10 +144,17 @@ def _cmux_binary(
 
 
 def _cmux_server_provenance(value: dict[str, Any]) -> dict[str, str]:
-    result = {}
-    for field in ("socket_path", "bundle_identifier", "app_bundle_path"):
-        result[field] = _identity(value.get(field), f"cmux_{field}")
-    return result
+    return {
+        "socket_path": _absolute_socket_path(
+            value.get("socket_path"), "cmux_socket_path",
+        ),
+        "bundle_identifier": _identity(
+            value.get("bundle_identifier"), "cmux_bundle_identifier",
+        ),
+        "app_bundle_path": _identity(
+            value.get("app_bundle_path"), "cmux_app_bundle_path",
+        ),
+    }
 
 
 def _default_socket_candidates() -> list[Path]:
@@ -151,7 +169,8 @@ def _discover_cmux_instance(
 ) -> tuple[list[str], dict[str, str]]:
     explicit = environ.get("CMUX_SOCKET_PATH")
     if explicit:
-        prefix = [cmux, "--socket", _identity(explicit, "CMUX_SOCKET_PATH")]
+        explicit = _absolute_socket_path(explicit, "CMUX_SOCKET_PATH")
+        prefix = [cmux, "--socket", explicit]
         value = _run_json(
             runner, [*prefix, "identify", "--no-caller", "--json"],
             environment=environ, reason="session_context_unavailable:cmux_instance",
@@ -255,6 +274,8 @@ def _cmux_title(
                  "--surface", identity["target_id"], "--json"],
         environment=environ, reason="session_target_unresolved:cmux",
     )
+    if _cmux_server_provenance(value) != identity["terminal_provenance"]:
+        raise ThisSessionError("session_context_mismatch:cmux_provenance")
     caller = value.get("caller")
     if not isinstance(caller, dict):
         raise ThisSessionError("session_target_unresolved:cmux")
@@ -321,6 +342,40 @@ def _cmux_title(
     return matches[0]["title"]
 
 
+def _cmux_target_identity(
+    identity: dict[str, Any], environ: Mapping[str, str], runner: Runner,
+    prefix: Sequence[str],
+) -> None:
+    """Authenticate the requested caller target without reading its title."""
+    value = _run_json(
+        runner, [*prefix, "identify", "--workspace", identity["workspace_id"],
+                 "--surface", identity["target_id"], "--json"],
+        environment=environ, reason="session_target_unresolved:cmux",
+    )
+    if _cmux_server_provenance(value) != identity["terminal_provenance"]:
+        raise ThisSessionError("session_context_mismatch:cmux_provenance")
+    caller = value.get("caller")
+    if not isinstance(caller, dict):
+        raise ThisSessionError("session_target_unresolved:cmux")
+    if (
+        identity["target_id"]
+        not in {caller.get("surface_id"), caller.get("surface_ref")}
+        or identity["workspace_id"]
+        not in {caller.get("workspace_id"), caller.get("workspace_ref")}
+        or not any(
+            isinstance(caller.get(field), str) and caller[field]
+            for field in ("pane_id", "pane_ref")
+        )
+    ):
+        raise ThisSessionError("session_target_identity_mismatch:cmux")
+    identity["target_id"] = _identity(
+        caller.get("surface_id"), "cmux_surface_id",
+    )
+    identity["workspace_id"] = _identity(
+        caller.get("workspace_id"), "cmux_workspace_id",
+    )
+
+
 def _herdr_title(
     identity: dict[str, str], environ: Mapping[str, str], runner: Runner,
     which: Callable[[str], str | None],
@@ -345,19 +400,136 @@ def _herdr_title(
     return tab["label"]
 
 
-def _read_binding(path: Path, identity: dict[str, str]) -> dict[str, Any] | None:
+def _validate_binding_identity(identity: dict[str, Any]) -> None:
+    """Prove a binding key is derived from the recorded terminal provenance."""
+    manager = identity.get("manager")
+    expected_fields = (
+        {"socket_path", "bundle_identifier", "app_bundle_path"}
+        if manager == "cmux" else {"socket_path"} if manager == "herdr" else None
+    )
+    provenance = identity.get("terminal_provenance")
+    try:
+        if expected_fields is None or not isinstance(provenance, dict):
+            raise ThisSessionError("session_binding_provenance_mismatch")
+        if set(provenance) != expected_fields:
+            raise ThisSessionError("session_binding_provenance_mismatch")
+        _absolute_socket_path(
+            provenance["socket_path"], f"{manager}_socket_path",
+        )
+        for field in expected_fields - {"socket_path"}:
+            _identity(provenance[field], f"{manager}_{field}")
+        _identity(identity.get("workspace_id"), "binding_workspace_id")
+        _identity(identity.get("target_id"), "binding_target_id")
+        namespace = _identity(
+            identity.get("namespace_sha256"), "binding_namespace_sha256",
+        )
+    except (KeyError, ThisSessionError) as error:
+        raise ThisSessionError("session_binding_provenance_mismatch") from error
+    if (
+        len(namespace) != 64
+        or any(character not in "0123456789abcdef" for character in namespace)
+        or namespace != _namespace(manager, provenance)
+    ):
+        raise ThisSessionError("session_binding_provenance_mismatch")
+
+
+def _validated_binding_row(
+    connection: sqlite3.Connection, row: tuple[Any, ...],
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        token, provider, session_id, event_id, updated_at, namespace = row
+        canonical_token = workstream_tab.canonical_token(token)
+        _identity(event_id, "binding_event_id")
+        _identity(updated_at, "binding_updated_at")
+        namespace = _identity(namespace, "binding_namespace_sha256")
+        if (
+            len(namespace) != 64
+            or any(character not in "0123456789abcdef" for character in namespace)
+            or namespace != identity.get("namespace_sha256")
+        ):
+            raise ThisSessionError("session_binding_history_invalid")
+        if canonical_token != token or provider not in {None, "codex", "claude"}:
+            raise ThisSessionError("session_binding_history_invalid")
+        if (provider is None) != (session_id is None):
+            raise ThisSessionError("session_binding_history_invalid")
+        if session_id is not None:
+            _identity(session_id, "binding_provider_session_id")
+    except (
+        AttributeError, TypeError, ValueError, ThisSessionError,
+        workstream_tab.TabTitleError,
+    ) as error:
+        raise ThisSessionError("session_binding_history_invalid") from error
+    try:
+        events = connection.execute(
+            "SELECT manager,namespace_sha256,workspace_id,target_id,workstream_id,"
+            "provider,provider_session_id,predecessor_event_id,"
+            "predecessor_provider_session_id,created_at "
+            "FROM terminal_binding_events_v1 WHERE event_id=?",
+            (event_id,),
+        ).fetchall()
+    except sqlite3.OperationalError as error:
+        if "no such table: terminal_binding_events_v1" in str(error):
+            raise ThisSessionError("session_binding_history_incomplete") from error
+        raise
+    if len(events) != 1:
+        raise ThisSessionError("session_binding_history_incomplete")
+    event = events[0]
+    expected_prefix = (
+        identity["manager"], namespace, identity["workspace_id"],
+        identity["target_id"], token, provider, session_id,
+    )
+    if event[:7] != expected_prefix or event[9] != updated_at:
+        raise ThisSessionError("session_binding_history_mismatch")
+    try:
+        if event[7] is not None:
+            _identity(event[7], "binding_predecessor_event_id")
+        if event[8] is not None:
+            _identity(event[8], "binding_predecessor_provider_session_id")
+    except ThisSessionError as error:
+        raise ThisSessionError("session_binding_history_invalid") from error
+    payload = {
+        "schema_version": SCHEMA_VERSION, "manager": event[0],
+        "namespace_sha256": event[1], "workspace_id": event[2],
+        "target_id": event[3], "workstream_id": event[4],
+        "provider": event[5], "provider_session_id": event[6],
+        "predecessor_event_id": event[7],
+        "predecessor_provider_session_id": event[8],
+        "created_at": event[9],
+    }
+    expected_event_id = "wsb_" + hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()[:32]
+    if event_id != expected_event_id:
+        raise ThisSessionError("session_binding_event_digest_mismatch")
+    return {
+        "workstream_id": token, "provider": provider,
+        "provider_session_id": session_id, "event_id": event_id,
+        "updated_at": updated_at,
+    }
+
+
+def _read_binding(path: Path, identity: dict[str, Any]) -> dict[str, Any] | None:
+    _validate_binding_identity(identity)
     if not path.is_file():
         return None
     connection = None
     try:
         connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        row = connection.execute(
+        rows = connection.execute(
             "SELECT workstream_id,provider,provider_session_id,current_event_id,"
-            "updated_at FROM terminal_bindings_v1 WHERE manager=? AND namespace_sha256=? "
-            "AND workspace_id=? AND target_id=?",
+            "updated_at,namespace_sha256 FROM terminal_bindings_v1 "
+            "WHERE manager=? AND namespace_sha256=? AND workspace_id=? "
+            "AND target_id=?",
             (identity["manager"], identity["namespace_sha256"],
              identity["workspace_id"], identity["target_id"]),
-        ).fetchone()
+        ).fetchall()
+        if len(rows) > 1:
+            raise ThisSessionError("session_binding_ambiguous")
+        return (
+            None if not rows
+            else _validated_binding_row(connection, rows[0], identity)
+        )
     except sqlite3.OperationalError as error:
         if "no such table: terminal_bindings_v1" in str(error):
             return None
@@ -367,13 +539,6 @@ def _read_binding(path: Path, identity: dict[str, str]) -> dict[str, Any] | None
     finally:
         if connection is not None:
             connection.close()
-    if row is None:
-        return None
-    return {
-        "workstream_id": row[0], "provider": row[1],
-        "provider_session_id": row[2], "event_id": row[3],
-        "updated_at": row[4],
-    }
 
 
 def resolve_this_session(
@@ -385,8 +550,12 @@ def resolve_this_session(
     socket_candidates: Sequence[Path] | None = None,
 ) -> dict[str, Any]:
     """Pure resolution: exact terminal identity plus binding/title, never focus."""
+    path = binding_path or state_path(environ)
     identity = _terminal_identity(environ)
-    cmux_prefix = None
+    cmux_prefix: Sequence[str] | None = None
+    binding = None
+    title = None
+    adapter_error = None
     if identity is None:
         cmux = _cmux_binary(environ, which)
         cmux_prefix, provenance = _discover_cmux_instance(
@@ -403,20 +572,55 @@ def resolve_this_session(
             )
         identity["terminal_provenance"] = dict(provenance)
         identity["namespace_sha256"] = _namespace("cmux", provenance)
-    title = (
-        _herdr_title(identity, environ, runner, which)
-        if identity["manager"] == "herdr"
-        else _cmux_title(
-            identity, environ, runner, which, prefix=cmux_prefix,
-        )
-    )
-    title_tokens = workstream_tab.tokens_in_title(title)
+        # Authenticate the exact server, workspace, surface, and caller before
+        # consulting local state.  Title access is deliberately later so an
+        # exact persisted binding can survive an optional title-adapter outage.
+        _cmux_target_identity(identity, environ, runner, cmux_prefix)
+        binding = _read_binding(path, identity)
+        try:
+            title = _cmux_title(
+                identity, environ, runner, which, prefix=cmux_prefix,
+            )
+            normalized_binding = _read_binding(path, identity)
+            if binding is not None and normalized_binding != binding:
+                raise ThisSessionError("session_binding_changed")
+            binding = normalized_binding
+        except ThisSessionError as error:
+            if str(error).startswith((
+                "session_target_identity_mismatch",
+                "session_context_mismatch",
+                "session_binding_",
+            )):
+                raise
+            if binding is None:
+                raise ThisSessionError(
+                    "session_workstream_unresolved:"
+                    "terminal_adapter_unavailable:cmux"
+                ) from error
+            adapter_error = str(error)
+    else:
+        # HerdR's injected endpoint/workspace/tab tuple is its exact namespace;
+        # the CLI title probe is optional once that tuple has a validated row.
+        binding = _read_binding(path, identity)
+        try:
+            title = _herdr_title(identity, environ, runner, which)
+        except ThisSessionError as error:
+            if str(error).startswith("session_target_identity_mismatch"):
+                raise
+            if binding is None:
+                raise ThisSessionError(
+                    "session_workstream_unresolved:"
+                    "terminal_adapter_unavailable:herdr"
+                ) from error
+            adapter_error = str(error)
+    title_tokens = workstream_tab.tokens_in_title(title) if title is not None else []
     if len(title_tokens) > 1:
         raise ThisSessionError("session_title_workstream_ambiguous")
-    title_token = workstream_tab.canonical_title_token(title)
+    title_token = (
+        workstream_tab.canonical_title_token(title) if title is not None else None
+    )
     if title_tokens and title_token is None:
         raise ThisSessionError("session_title_workstream_noncanonical")
-    binding = _read_binding(binding_path or state_path(environ), identity)
     bound_token = binding.get("workstream_id") if binding else None
     if bound_token is not None:
         bound_token = workstream_tab.canonical_token(bound_token)
@@ -433,7 +637,8 @@ def resolve_this_session(
         )
     return {
         **identity, "workstream_id": token, "candidate_source": source,
-        "observed_title": title, "prior_binding": binding,
+        "observed_title": title, "terminal_adapter_error": adapter_error,
+        "prior_binding": binding,
     }
 
 
@@ -479,6 +684,7 @@ def record_successor_binding(
     path: Path, resolution: dict[str, Any], *, environ: Mapping[str, str],
     created_at: str, validate_terminal: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
+    _validate_binding_identity(resolution)
     provider, session_id = _provider_session(environ)
     created_at = _identity(created_at, "created_at")
     key = tuple(resolution[field] for field in (
@@ -488,36 +694,44 @@ def record_successor_binding(
     connection = _connect(path)
     try:
         connection.execute("BEGIN IMMEDIATE")
-        prior = connection.execute(
-            "SELECT workstream_id,provider,provider_session_id,current_event_id "
+
+        prior_rows = connection.execute(
+            "SELECT workstream_id,provider,provider_session_id,current_event_id,"
+            "updated_at,namespace_sha256 "
             "FROM terminal_bindings_v1 WHERE manager=? AND namespace_sha256=? "
             "AND workspace_id=? AND target_id=?", key,
-        ).fetchone()
-        if prior is not None and prior[0] != token:
+        ).fetchall()
+        if len(prior_rows) > 1:
+            raise ThisSessionError("session_binding_ambiguous")
+        prior = (
+            None if not prior_rows
+            else _validated_binding_row(connection, prior_rows[0], resolution)
+        )
+        if prior is not None and prior["workstream_id"] != token:
             raise ThisSessionError("session_binding_conflict")
-        if prior is not None and prior[1:3] == (provider, session_id):
-            if connection.execute(
-                "SELECT count(*) FROM terminal_binding_events_v1 WHERE event_id=?",
-                (prior[3],),
-            ).fetchone()[0] != 1:
-                raise ThisSessionError("session_binding_history_incomplete")
+        if prior is not None and (
+            prior["provider"], prior["provider_session_id"]
+        ) == (provider, session_id):
             if validate_terminal is not None:
                 # Keep the terminal readback inside the same immediate
                 # transaction that decides whether this binding is current.
                 validate_terminal()
             connection.commit()
             return {
-                "status": "unchanged", "event_id": prior[3],
+                "status": "unchanged", "event_id": prior["event_id"],
                 "provider": provider, "provider_session_id": session_id,
-                "predecessor_provider_session_id": None, "writes_performed": 0,
+                "predecessor_provider_session_id": None,
+                "writes_performed": 0,
             }
         event_payload = {
             "schema_version": SCHEMA_VERSION, "manager": key[0],
             "namespace_sha256": key[1], "workspace_id": key[2],
             "target_id": key[3], "workstream_id": token,
             "provider": provider, "provider_session_id": session_id,
-            "predecessor_event_id": prior[3] if prior else None,
-            "predecessor_provider_session_id": prior[2] if prior else None,
+            "predecessor_event_id": prior["event_id"] if prior else None,
+            "predecessor_provider_session_id": (
+                prior["provider_session_id"] if prior else None
+            ),
             "created_at": created_at,
         }
         event_id = "wsb_" + hashlib.sha256(json.dumps(
@@ -569,6 +783,39 @@ def record_successor_binding(
         connection.close()
 
 
+def validate_resumed_identity(
+    context: dict[str, Any], candidate_token: str,
+) -> None:
+    """Bind a full root response to the exact requested root or owned child."""
+    candidate = workstream_tab.canonical_token(candidate_token)
+    raw_root = context.get("workstream_id")
+    try:
+        root = workstream_tab.canonical_token(raw_root)
+    except (AttributeError, workstream_tab.TabTitleError) as error:
+        raise ThisSessionError("workstream_resume_identity_mismatch") from error
+    focus = context.get("requested_focus")
+    if root == candidate:
+        if raw_root != root or focus is not None:
+            raise ThisSessionError("workstream_resume_identity_mismatch")
+        return
+    focus_fields = {
+        "kind", "identifier", "issue_id", "parent_issue_id",
+        "root_identifier", "repository_key", "status",
+    }
+    if (
+        raw_root != root or not isinstance(focus, dict)
+        or set(focus) != focus_fields or focus.get("kind") != "owned_child"
+        or focus.get("identifier") != candidate
+        or focus.get("root_identifier") != root
+    ):
+        raise ThisSessionError("workstream_resume_identity_mismatch")
+    try:
+        for field in focus_fields - {"kind"}:
+            _identity(focus[field], f"requested_focus_{field}")
+    except ThisSessionError as error:
+        raise ThisSessionError("workstream_resume_identity_mismatch") from error
+
+
 def resume_this_session(
     *, environ: Mapping[str, str] = os.environ,
     runner: Runner = subprocess.run,
@@ -589,7 +836,7 @@ def resume_this_session(
     fenced_fields = (
         "manager", "terminal_provenance", "namespace_sha256",
         "workspace_id", "target_id", "workstream_id", "candidate_source",
-        "observed_title", "prior_binding",
+        "observed_title", "terminal_adapter_error", "prior_binding",
     )
     if any(
         final_resolution.get(field) != resolution.get(field)
@@ -614,6 +861,7 @@ def resume_this_session(
         raise ThisSessionError("workstream_resume_invalid_output") from error
     if not isinstance(context, dict) or context.get("resume_authority") != "full":
         raise ThisSessionError("workstream_resume_authority_not_full")
+    validate_resumed_identity(context, resolution["workstream_id"])
     binding: dict[str, Any] = {
         "status": "unavailable", "reason": "terminal_binding_not_attempted",
     }
@@ -642,6 +890,8 @@ def resume_this_session(
             resolution["workstream_id"],
             target=target, project_name=context.get("project_name"),
             expected_title=resolution["observed_title"],
+            expected_workspace=resolution["workspace_id"],
+            expected_provenance=resolution["terminal_provenance"],
             environ=adapter_environ,
             runner=terminal_runner, which=which,
         )
@@ -658,7 +908,8 @@ def resume_this_session(
             binding_fence_fields = (
                 "manager", "terminal_provenance", "namespace_sha256",
                 "workspace_id", "target_id", "workstream_id",
-                "candidate_source", "observed_title", "prior_binding",
+                "candidate_source", "observed_title",
+                "terminal_adapter_error", "prior_binding",
             )
             if (
                 bound_resolution.get("manager") != resolution.get("manager")
@@ -711,6 +962,9 @@ def resume_this_session(
             "workstream_id", "candidate_source",
         )
     }
+    context["this_session_resolution"]["terminal_adapter_error"] = resolution.get(
+        "terminal_adapter_error"
+    )
     context["resume_binding"] = binding
     context["tab_binding"] = tab_result
     return context
