@@ -12,15 +12,20 @@ prior provider session, inferred tab, changed binding, handoff, or refusal is
 cold.
 One bare continuation nudge may select that sole warm retained workstream. An explicit different handle or multiple possible retained workstreams is cold.
 
-For literal `resume this session`, run this as the first functional command:
+For literal `resume this session` or `/goal resume this session`, first run:
 
 ```sh
 python3 "<absolute directory of this SKILL.md>/scripts/workstream_this_session.py"
 ```
 
-It requires exact namespaced cmux/HerdR identity (or cmux's bounded controlling-TTY resolver) and one matching persisted binding/title token; never focus, cwd, chat, or memory. The candidate is not authority: ordinary resume runs once and
-must return `full` before an idempotent successor binding and optional title
-update. Missing/ambiguous context refuses; adapter failure cannot downgrade.
+CLI: `workstreamctl resume-this-session`. It requires exact namespaced cmux/HerdR
+identity (HerdR: `HERDR_ENV=1`; or cmux's bounded controlling-TTY resolver) and
+one persisted binding or strict final ` · TEAM-#` title suffix; never accept an
+issue-like prose token, and never focus, cwd, chat, or memory. The candidate is
+not authority: ordinary resume runs once and must return `full`. Only then may
+a stable terminal readback commit the successor binding/title. Concurrent
+rename withholds binding instead of overwriting the human title.
+Missing/ambiguous context refuses; after full, adapter failure cannot downgrade.
 
 For a warm `continue`/`execute` nudge, do not rerun resume merely to reconfirm authority. Reconcile Git/Shipyard and continue authorized implementation or independently fenced exact-head Shipyard delivery handoff/landing. Shipyard delivery handoff means exact-head custody submission to Shipyard under its own fences and is allowed; agent/session handoff means transferring workstream execution authority to another agent/session and requires live recovery and certification. On
 narrow Linear read/sync failure: append material changes to the existing durable local material-delta journal; continue independently authorized work only without claiming reconciled tracking authority.
@@ -64,10 +69,10 @@ terminal identity:
 python3 "<absolute directory of this SKILL.md>/scripts/workstream_tab.py" GEN-123 --project-name "<exact recovered project_name>"
 ```
 
-Preserve custom title; append the handle once. For a
-manager-generated title, add `--automatic-title` with its exact previously
-observed manager value; never infer it from cwd, shell, or title shape. Missing
-needed provenance or an unavailable/unresolved adapter is an optional no-op,
+Preserve custom title; append the handle once. Unknown titles are preserved;
+only exact `--automatic-title` proves manager generation—never infer it from
+cwd, shell, or title shape. Missing needed
+provenance or an unavailable/unresolved adapter is an optional no-op,
 never silently skipped (report it), and never downgrades
 `resume_authority: full`. Conflicts/readback refusals withhold title success but
 do not erase authority. Visible tabs never grant authority.

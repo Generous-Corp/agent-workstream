@@ -47,13 +47,17 @@ Resume GEN-123. Reconcile the durable graph with live repository and landing
 state before editing, then continue the recorded next action.
 ```
 
-When the exact cmux or HerdR tab already carries a single token or namespaced
+When the exact cmux or HerdR tab already carries a strict final ` · TEAM-#`
+suffix or namespaced
 binding, the shorter request `Resume this session` runs the same authoritative
 resume once. Complete injected terminal identity is preferred; cmux may instead
-use its bounded controlling-TTY ancestor resolver. Missing, conflicting, or
+use its bounded controlling-TTY ancestor resolver. HerdR selection additionally
+requires its explicit inherited `HERDR_ENV=1` flag. Missing, conflicting, or
 ambiguous identity refuses with a request for the explicit token—never a focus,
-cwd, chat, or memory guess. A successful resume records the new provider
-session as an idempotent local successor and preserves or appends the tab token.
+cwd, chat, prose-token, or memory guess. After full recovery, a stable terminal
+readback records the new provider session as an idempotent local successor and
+preserves or appends the tab token. Concurrent rename or adapter loss withholds
+that optional binding without erasing recovered Linear authority.
 This convenience installs no hook or background process.
 
 If you use [cmux](https://cmux.com/), the token can also be carried in a tab

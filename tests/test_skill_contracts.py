@@ -234,7 +234,9 @@ class SkillContractTests(unittest.TestCase):
         codex = json.loads((plugin / ".codex-plugin/plugin.json").read_text())
         claude = json.loads((plugin / ".claude-plugin/plugin.json").read_text())
         self.assertEqual(codex["version"], claude["version"])
-        self.assertEqual(codex["version"], "0.4.78")
+        self.assertEqual(codex["version"], "0.4.79")
+        self.assertEqual(codex["skills"], claude["skills"])
+        self.assertEqual(codex["skills"], "./skills/")
         shim = plugin / "skills/workstream-resume/scripts/workstream_resume.py"
         target = plugin / "skills/workstream-ledger/scripts/workstream_resume.py"
         self.assertTrue(shim.is_file())
@@ -245,6 +247,9 @@ class SkillContractTests(unittest.TestCase):
     def test_literal_this_session_contract_is_fail_closed_and_nonambient(self):
         resume = " ".join(self.resume_skill().split())
         self.assertIn("For literal `resume this session`", resume)
+        self.assertIn("`/goal resume this session`", resume)
+        self.assertIn("`workstreamctl resume-this-session`", resume)
+        self.assertIn("strict final ` · TEAM-#` title suffix", resume)
         self.assertIn("scripts/workstream_this_session.py", resume)
         self.assertIn("never focus, cwd, chat, or memory", resume)
         self.assertIn("ordinary resume runs once", resume)
@@ -266,7 +271,7 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("same explicit token plus inherited terminal identity", resume)
         self.assertIn("exact namespaced cmux/HerdR identity", resume)
         self.assertIn("bounded controlling-TTY resolver", resume)
-        self.assertIn("one matching persisted binding/title token", resume)
+        self.assertIn("one persisted binding or strict final ` · TEAM-#` title suffix", resume)
 
     def test_deferred_audit_detail_requires_exact_compact_hydration(self):
         resume = " ".join(self.resume_skill().split())

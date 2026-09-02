@@ -6,7 +6,9 @@ install hooks, MCP servers, monitors, daemons, or background workers.
 
 The optional `resume this session` helper is invoked by an agent, reads one
 exact namespaced cmux/HerdR target (or cmux's bounded controlling-TTY result),
-and stores only a local successor binding after full Linear recovery. It is not
+accepts only an exact local binding or strict final ` · TEAM-#` title suffix,
+and stores only a readback-fenced local successor binding after full Linear
+recovery. It is not
 a monitor, scheduler, or ambient hook.
 
 ## Why keep the plugin thin?
