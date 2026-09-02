@@ -1131,6 +1131,56 @@ class LegacyProcessedCompatibilityTests(unittest.TestCase):
         self.assertEqual(events[0]["promotion_state"], "staged")
         self.assertEqual(events[0]["promotion"], promotion)
 
+    def test_schema_two_classification_hint_leaves_staged_promotion_visible(self):
+        capture = self.capture("wsi_schema_two")
+        promotion = self.promotion(capture)
+        classification = {
+            **self.legacy(
+                "wsi_schema_two", "no-material-delta", promoted_issue=None,
+            ),
+            "schema_version": 2,
+            "classification_source": "reviewed_agent_classification",
+        }
+        comments = [
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture)},
+            {"body": MODULE.comment_body(MODULE.PROMOTION_MARKER, promotion)},
+            {"body": MODULE.comment_body(MODULE.PROCESSED_MARKER, classification)},
+        ]
+        events = self.recover(
+            [{"number": self.issue, "url": "i", "title": "ingress"}],
+            {self.issue: comments},
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["promotion_state"], "staged")
+        self.assertEqual(
+            events[0]["classification_hint"]["dispositions"],
+            ["no-material-delta"],
+        )
+
+    def test_conflicting_legacy_hints_leave_staged_promotion_visible(self):
+        capture = self.capture("wsi_conflicting_hints")
+        promotion = self.promotion(capture)
+        comments = [
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture)},
+            {"body": MODULE.comment_body(MODULE.PROMOTION_MARKER, promotion)},
+            {"body": MODULE.comment_body(MODULE.PROCESSED_MARKER, self.legacy(
+                "wsi_conflicting_hints", "promoted"))},
+            {"body": MODULE.comment_body(MODULE.PROCESSED_MARKER, self.legacy(
+                "wsi_conflicting_hints", "superseded", promoted_issue=None))},
+            {"body": MODULE.comment_body(
+                MODULE.PROCESSED_MARKER, ["malformed", "hint"])},
+        ]
+        events = self.recover(
+            [{"number": self.issue, "url": "i", "title": "ingress"}],
+            {self.issue: comments},
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["promotion_state"], "staged")
+        self.assertEqual(events[0]["classification_hint"]["dispositions"], [
+            "promoted", "superseded",
+        ])
+        self.assertTrue(events[0]["classification_hint"]["ambiguous"])
+
     def test_legacy_orphan_and_cross_route_markers_establish_no_route(self):
         capture = self.capture("wsi_cross")
         issue_seven = [
@@ -1186,11 +1236,39 @@ class LegacyProcessedCompatibilityTests(unittest.TestCase):
                 {7: issue_seven, 8: issue_eight},
             )
 
-    def test_partial_float_and_invalid_value_legacy_lookalikes_fail_closed(self):
+    def test_receipt_claim_predicate_separates_authority_from_classification_hints(self):
+        classification_only = [
+            self.legacy("wsi_hint"),
+            {**self.legacy("wsi_hint"), "schema_version": 1.0},
+            {**self.legacy("wsi_hint", "superseded"), "unexpected": "metadata"},
+            {**self.legacy("wsi_hint", "no-material-delta"),
+             "material_revision": 1},
+        ]
+        receipt_claims = [
+            {**self.legacy("wsi_receipt"), "promotion_id": "wsp_bad"},
+            {**self.legacy("wsi_receipt"), "material_event_id": "wsd_bad"},
+            {**self.legacy("wsi_receipt"), "material_revision": 1},
+            {**self.legacy("wsi_receipt"), "material_remote_id": "linear-1"},
+        ]
+        self.assertTrue(all(
+            not MODULE._claims_processed_promotion_receipt(item)
+            for item in classification_only
+        ))
+        self.assertTrue(all(
+            MODULE._claims_processed_promotion_receipt(item) for item in receipt_claims
+        ))
+
+    def test_partial_float_and_invalid_receipt_claims_fail_closed(self):
         variants = {
             "partial": {**self.legacy("wsi_bad"), "promotion_id": "wsp_bad"},
-            "float": {**self.legacy("wsi_bad"), "schema_version": 1.0},
-            "invalid": {**self.legacy("wsi_bad"), "promoted_issue": 37},
+            "float": {
+                **self.legacy("wsi_bad"), "schema_version": 1.0,
+                "material_revision": 1,
+            },
+            "invalid": {
+                **self.legacy("wsi_bad"), "promoted_issue": 37,
+                "material_remote_id": "linear-1",
+            },
         }
         capture = self.capture("wsi_bad")
         for name, marker in variants.items():
@@ -1202,7 +1280,7 @@ class LegacyProcessedCompatibilityTests(unittest.TestCase):
                     {"body": MODULE.comment_body(MODULE.PROCESSED_MARKER, marker)},
                 ], event_id="wsi_bad", repo=self.repo, issue=self.issue)
 
-    def test_conflicting_legacy_and_modern_forms_refuse_before_linear_readback(self):
+    def test_legacy_hint_does_not_displace_modern_receipt_claim(self):
         capture = self.capture("wsi_conflict")
         promotion = self.promotion(capture)
         delta = MODULE.promotion_delta(promotion)
@@ -1220,10 +1298,35 @@ class LegacyProcessedCompatibilityTests(unittest.TestCase):
                 MODULE.PROCESSED_MARKER, self.legacy("wsi_conflict"))},
             {"body": MODULE.comment_body(MODULE.PROCESSED_MARKER, modern)},
         ]
-        with self.assertRaisesRegex(ValueError, "conflicting_processed:wsi_conflict"):
-            self.recover(
-                [{"number": self.issue, "url": "i", "title": "ingress"}],
-                {self.issue: comments},
+        state = MODULE.reduce_ingress_comments(
+            comments, event_id="wsi_conflict", repo=self.repo, issue=self.issue,
+        )
+        self.assertEqual(state["processed"], modern)
+
+    def test_conflicting_modern_receipt_claims_still_fail_closed(self):
+        capture = self.capture("wsi_receipt_conflict")
+        promotion = self.promotion(capture)
+        delta = MODULE.promotion_delta(promotion)
+        first = {
+            "schema_version": 1, "event_id": "wsi_receipt_conflict",
+            "processed_at": "2026-08-29T01:02:00Z", "disposition": "promoted",
+            "promoted_issue": "GEN-37", "promotion_id": promotion["promotion_id"],
+            "material_event_id": delta.event_id, "material_revision": 1,
+            "material_remote_id": "linear-1",
+        }
+        second = {**first, "material_remote_id": "linear-forged"}
+        comments = [
+            {"body": MODULE.comment_body(MODULE.CAPTURE_MARKER, capture)},
+            {"body": MODULE.comment_body(MODULE.PROMOTION_MARKER, promotion)},
+            {"body": MODULE.comment_body(MODULE.PROCESSED_MARKER, first)},
+            {"body": MODULE.comment_body(MODULE.PROCESSED_MARKER, second)},
+        ]
+        with self.assertRaisesRegex(
+            ValueError, "conflicting_processed:wsi_receipt_conflict"
+        ):
+            MODULE.reduce_ingress_comments(
+                comments, event_id="wsi_receipt_conflict",
+                repo=self.repo, issue=self.issue,
             )
 
     def test_malformed_capture_invalid_escape_remains_quarantined(self):
