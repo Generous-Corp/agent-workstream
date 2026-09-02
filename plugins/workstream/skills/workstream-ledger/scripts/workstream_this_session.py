@@ -357,23 +357,68 @@ def _cmux_target_identity(
     caller = value.get("caller")
     if not isinstance(caller, dict):
         raise ThisSessionError("session_target_unresolved:cmux")
-    if (
-        identity["target_id"]
-        not in {caller.get("surface_id"), caller.get("surface_ref")}
-        or identity["workspace_id"]
-        not in {caller.get("workspace_id"), caller.get("workspace_ref")}
-        or not any(
-            isinstance(caller.get(field), str) and caller[field]
-            for field in ("pane_id", "pane_ref")
-        )
-    ):
+
+    def aliases(*fields: str) -> set[str]:
+        return {
+            caller[field] for field in fields
+            if isinstance(caller.get(field), str) and caller[field]
+        }
+
+    requested_workspace = identity["workspace_id"]
+    caller_workspaces = aliases("workspace_id", "workspace_ref")
+    workspace_value = _run_json(
+        runner, [*prefix, "rpc", "workspace.list", "{}"],
+        environment=environ, reason="session_target_unresolved:cmux",
+    )
+    workspaces = workspace_value.get("workspaces")
+    if not isinstance(workspaces, list) or not caller_workspaces:
         raise ThisSessionError("session_target_identity_mismatch:cmux")
-    identity["target_id"] = _identity(
-        caller.get("surface_id"), "cmux_surface_id",
+    workspace_matches = []
+    for row in workspaces:
+        if not isinstance(row, dict):
+            continue
+        row_aliases = {row.get("id"), row.get("ref")}
+        if (
+            requested_workspace in row_aliases
+            and caller_workspaces <= row_aliases
+            and all(isinstance(row.get(field), str) and row[field]
+                    for field in ("id", "ref"))
+        ):
+            workspace_matches.append(row)
+    if len(workspace_matches) != 1:
+        raise ThisSessionError("session_target_identity_mismatch:cmux")
+    workspace_id = workspace_matches[0]["id"]
+
+    requested_target = identity["target_id"]
+    caller_surfaces = aliases("surface_id", "surface_ref")
+    caller_panes = aliases("pane_id", "pane_ref")
+    surface_value = _run_json(
+        runner, [*prefix, "rpc", "surface.list", json.dumps({
+            "workspace_id": workspace_id,
+        }, separators=(",", ":"))], environment=environ,
+        reason="session_target_unresolved:cmux",
     )
-    identity["workspace_id"] = _identity(
-        caller.get("workspace_id"), "cmux_workspace_id",
-    )
+    surfaces = surface_value.get("surfaces")
+    if not isinstance(surfaces, list) or not caller_surfaces or not caller_panes:
+        raise ThisSessionError("session_target_identity_mismatch:cmux")
+    surface_matches = []
+    for row in surfaces:
+        if not isinstance(row, dict):
+            continue
+        row_aliases = {row.get("id"), row.get("ref")}
+        pane_aliases = {row.get("pane_id"), row.get("pane_ref")}
+        if (
+            requested_target in row_aliases
+            and caller_surfaces <= row_aliases
+            and caller_panes <= pane_aliases
+            and all(isinstance(row.get(field), str) and row[field]
+                    for field in ("id", "ref", "pane_id", "pane_ref"))
+        ):
+            surface_matches.append(row)
+    if len(surface_matches) != 1:
+        raise ThisSessionError("session_target_identity_mismatch:cmux")
+    identity["target_id"] = surface_matches[0]["id"]
+    identity["workspace_id"] = workspace_id
 
 
 def _herdr_title(

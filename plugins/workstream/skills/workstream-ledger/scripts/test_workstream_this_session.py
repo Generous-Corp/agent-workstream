@@ -518,6 +518,41 @@ class ThisSessionTests(unittest.TestCase):
         self.assertTrue(any("surface-resolved" in call for call in identify))
         self.assertTrue(any("workspace-resolved" in call for call in identify))
 
+    def test_cmux_ancestor_uuids_authenticate_against_ref_only_caller(self):
+        workspace_id = "5763BFC4-F0AC-4EE6-BDA9-76D3DA25F0AC"
+        surface_id = "C79BBE38-546F-41A3-B1F9-7C5D66C526F4"
+        fake = FakeCmux(
+            "Linear · GEN-37", surface=surface_id, surface_ref="surface:2",
+            workspace=workspace_id, workspace_ref="workspace:1",
+            pane="9058DC8D-9EA7-426D-94C8-7D649EC97476",
+            pane_ref="pane:1",
+        )
+
+        def runner(argv, **kwargs):
+            if "agent.resolve_delivery_target" in argv:
+                return subprocess.CompletedProcess(argv, 0, json.dumps({
+                    "surface_id": surface_id, "workspace_id": workspace_id,
+                }), "")
+            result = fake(argv, **kwargs)
+            if "identify" in argv and "--workspace" in argv:
+                value = json.loads(result.stdout)
+                # Current cmux 0.501 production output authenticates the
+                # caller with refs even when the exact selector was a UUID.
+                value["caller"] = {
+                    "surface_ref": "surface:2", "workspace_ref": "workspace:1",
+                    "pane_ref": "pane:1", "window_ref": "window:1",
+                }
+                result.stdout = json.dumps(value)
+            return result
+
+        result = session.resolve_this_session(
+            environ={}, runner=runner, which=lambda _: "/opt/cmux",
+            binding_path=self.db, pid_chain=[10], socket_candidates=[],
+        )
+        self.assertEqual(result["workstream_id"], "GEN-37")
+        self.assertEqual(result["workspace_id"], workspace_id)
+        self.assertEqual(result["target_id"], surface_id)
+
     def test_cmux_ancestor_disagreement_refuses_before_title_or_resume(self):
         fake = FakeCmux("Linear · GEN-37")
         counter = 0
@@ -585,14 +620,19 @@ class ThisSessionTests(unittest.TestCase):
         env = self.cmux_env("surface-bound-unavailable")
         fake = FakeCmux("Linear", surface="surface-bound-unavailable")
         self.seed(fake, env=env)
+        workspace_reads = 0
 
         def terminal_runner(argv, **kwargs):
-            if (
-                "rpc" in argv
-                and argv[argv.index("rpc") + 1] in {
-                    "workspace.list", "surface.list",
-                }
-            ) or "list-pane-surfaces" in argv:
+            nonlocal workspace_reads
+            if "rpc" in argv and argv[argv.index("rpc") + 1] == "workspace.list":
+                workspace_reads += 1
+                # Identity normalization succeeds; only the later optional
+                # title probe is unavailable on each resolution pass.
+                if workspace_reads % 2 == 0:
+                    return subprocess.CompletedProcess(
+                        argv, 1, "", "unavailable",
+                    )
+            if "list-pane-surfaces" in argv:
                 return subprocess.CompletedProcess(argv, 1, "", "unavailable")
             return fake(argv, **kwargs)
 
@@ -676,10 +716,16 @@ class ThisSessionTests(unittest.TestCase):
     def test_unavailable_cmux_title_without_binding_refuses_before_resume(self):
         env = self.cmux_env("surface-unbound-unavailable")
         fake = FakeCmux("Linear", surface="surface-unbound-unavailable")
+        workspace_reads = 0
 
         def terminal_runner(argv, **kwargs):
+            nonlocal workspace_reads
             if "rpc" in argv and argv[argv.index("rpc") + 1] == "workspace.list":
-                return subprocess.CompletedProcess(argv, 1, "", "unavailable")
+                workspace_reads += 1
+                if workspace_reads % 2 == 0:
+                    return subprocess.CompletedProcess(
+                        argv, 1, "", "unavailable",
+                    )
             return fake(argv, **kwargs)
 
         calls = []
@@ -1192,9 +1238,10 @@ class ThisSessionTests(unittest.TestCase):
             nonlocal surface_reads
             if "rpc" in argv and argv[argv.index("rpc") + 1] == "surface.list":
                 surface_reads += 1
-                # The fifth resolution is the validator inside the immediate
-                # SQLite transaction, after the candidate row is staged.
-                if surface_reads == 5:
+                # Each resolution now has one identity-normalization read and
+                # one title read. The tenth is the title validator inside the
+                # immediate SQLite transaction after the row is staged.
+                if surface_reads == 10:
                     fake.title = "Other · GEN-38"
             return fake(argv, **kwargs)
 
