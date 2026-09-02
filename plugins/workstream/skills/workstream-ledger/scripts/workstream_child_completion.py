@@ -111,7 +111,19 @@ def _validate_pending_finalizer(
     if _digest(frontiers) != fences.get("frontiers_sha256"):
         raise ChildCompletionError("child_completion_recovery_fences_tampered")
     root = snapshot.get("root") or {}
-    if _digest(_native_child(root)) != frontiers.get("native_root_sha256"):
+    observed_root = _native_child(root)
+    expected_root = (fences.get("native_root_before")
+                     or fences.get("native_root") or {})
+    immutable_root = {
+        key: value for key, value in observed_root.items() if key != "updatedAt"
+    }
+    expected_immutable_root = {
+        key: value for key, value in expected_root.items() if key != "updatedAt"
+    }
+    if (immutable_root != expected_immutable_root
+            or not isinstance(observed_root.get("updatedAt"), str)
+            or not observed_root["updatedAt"]
+            or observed_root.get("updatedAt") == expected_root.get("updatedAt")):
         raise ChildCompletionError("child_completion_recovery_root_drift")
     child_id = fences.get("child_issue_id")
     child = next((item for item in snapshot.get("children", [])
@@ -305,6 +317,7 @@ def build_child_completion_transaction(
             "frontiers": frontiers, "frontiers_sha256": _digest(frontiers),
             "child_issue_id": child["id"],
             "completed_state": completed_state,
+            "native_root_before": _native_child(root),
             "native_child_before": _native_child(child),
             "native_child_after": _native_child(target),
         },
