@@ -567,6 +567,11 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.78 accepts an authenticated direct-child handle for resume and audit,
+but derives all execution authority from its actual root. The child survives as
+a validated focus selector, including bounded hydration routes; nonexistent,
+unowned, nested, stale, or identity-drifted children refuse without mutation.
+
 Version 0.4.77 authenticates generation-transition tokens as part of the shared
 ledger serialization frontier. If response-loss retries left several canonical
 copies of the exact same intent along one deterministic collision chain, the
