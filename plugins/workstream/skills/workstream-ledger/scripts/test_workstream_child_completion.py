@@ -38,9 +38,30 @@ def gated_state():
     return state
 
 
-def transaction(state=None):
+def completion_snapshot():
+    snap = fixture.snapshot()
+    snap["root"].update({
+        "id": fixture.ROOT_ID, "status_type": "started",
+        "status": "In Progress", "state_id": "started",
+        "state": {"id": "started", "name": "In Progress", "type": "started"},
+        "title": "Root", "description": "Root description", "updatedAt": "before",
+        "archivedAt": None, "parent": None, "project": {"id": "project"},
+        "team": {"id": "team", "organization": {"id": "workspace"}},
+        "assignee": None,
+    })
+    snap["children"][0].update({
+        "title": "Child", "description": "Child description",
+        "url": "https://linear.test/GEN-92", "updatedAt": "before",
+        "archivedAt": None,
+        "state": {"id": "started", "name": "In Progress", "type": "started"},
+    })
+    return snap
+
+
+def transaction(state=None, snap=None):
+    snap = snap or completion_snapshot()
     return build_child_completion_transaction(
-        fixture.snapshot(), state or gated_state(), root_token="GEN-91",
+        snap, state or gated_state(), root_token="GEN-91",
         child_token="GEN-92", evidence_contract=fixture.evidence_contract(),
         authenticated_source=fixture.SOURCE,
         authenticated_route=fixture.ROUTE,
@@ -142,6 +163,28 @@ class ChildCompletionTests(unittest.TestCase):
         state.events[-1]["value"]["minimum_writer_version"] = "0.4.81"
         with self.assertRaisesRegex(ChildCompletionError, "fleet_gate_required"):
             transaction(state)
+
+    def test_planned_or_archived_native_issue_refuses(self):
+        snap = completion_snapshot()
+        snap["children"][0]["status_type"] = "planned"
+        snap["children"][0]["state"]["type"] = "planned"
+        with self.assertRaisesRegex(ChildCompletionError, "started_native"):
+            transaction(snap=snap)
+        snap = completion_snapshot()
+        snap["root"]["archivedAt"] = "2026-09-02T10:02:00Z"
+        with self.assertRaisesRegex(ChildCompletionError, "unarchived"):
+            transaction(snap=snap)
+
+    def test_native_fence_binds_preserved_fields_and_full_state(self):
+        tx = transaction()
+        native = tx["native_child_before"]
+        self.assertEqual(native["title"], "Child")
+        self.assertEqual(native["description"], "Child description")
+        self.assertEqual(native["url"], "https://linear.test/GEN-92")
+        self.assertEqual(native["updatedAt"], "before")
+        self.assertEqual(native["state"]["type"], "started")
+        self.assertIn("native_root_sha256", tx["frontiers"])
+        self.assertIn("dependency_graph_sha256", tx["frontiers"])
 
 
 if __name__ == "__main__":

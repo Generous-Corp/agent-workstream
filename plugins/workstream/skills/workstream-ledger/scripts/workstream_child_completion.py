@@ -24,8 +24,9 @@ from workstream_linear_events import (
     pending_ledger_reservations, reduce_event_comments,
 )
 from workstream_linear_checkpoints import reduce_checkpoint_comments
+from workstream_child_dependencies import LinearChildDependencyAdapter
 from workstream_linear_projection import (
-    LinearProjectionAdapter, build_projection_event,
+    LinearProjectionAdapter, build_projection_event, reduce_projection_comments,
 )
 from workstream_plan import plan_payload
 from workstream_projection import (
@@ -53,11 +54,47 @@ def _digest(value: Any) -> str:
 def _native_child(child: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": child.get("id"), "identifier": child.get("identifier"),
-        "parent": child.get("parent"), "team": child.get("team"),
-        "project": child.get("project"), "assignee": child.get("assignee"),
+        "title": child.get("title"), "description": child.get("description"),
+        "url": child.get("url"), "archivedAt": child.get("archivedAt"),
+        "updatedAt": child.get("updatedAt"),
+        "parent": deepcopy(child.get("parent")),
+        "team": deepcopy(child.get("team")),
+        "project": deepcopy(child.get("project")),
+        "assignee": deepcopy(child.get("assignee")),
+        "state": deepcopy(child.get("state")),
         "state_id": child.get("state_id"), "status": child.get("status"),
         "status_type": child.get("status_type"),
     }
+
+
+def _state_type(issue: dict[str, Any]) -> str:
+    return str(issue.get("status_type") or (issue.get("state") or {}).get("type")
+               or "").lower()
+
+
+def _post_child_valid(
+    observed: dict[str, Any], before: dict[str, Any],
+    completed_state: dict[str, str], returned: dict[str, Any] | None = None,
+) -> bool:
+    mutable = {"state", "state_id", "status", "status_type", "updatedAt"}
+    preserved = {key: value for key, value in before.items() if key not in mutable}
+    observed_preserved = {
+        key: value for key, value in observed.items() if key not in mutable
+    }
+    expected_state = {
+        key: completed_state[key] for key in ("id", "name", "type")
+    }
+    return bool(
+        observed_preserved == preserved
+        and observed.get("state") == expected_state
+        and observed.get("state_id") == completed_state["id"]
+        and observed.get("status") == completed_state["name"]
+        and str(observed.get("status_type", "")).lower() == "completed"
+        and isinstance(observed.get("updatedAt"), str)
+        and observed["updatedAt"]
+        and observed["updatedAt"] != before.get("updatedAt")
+        and (returned is None or observed == returned)
+    )
 
 
 def _eligible_fleet_gate(
@@ -102,6 +139,27 @@ def build_child_completion_transaction(
     if len(children) != 1:
         raise ChildCompletionError("child_identity_not_unique")
     child = children[0]
+    root = snapshot.get("root") or {}
+    if root.get("archivedAt") is not None or child.get("archivedAt") is not None:
+        raise ChildCompletionError("active_unarchived_root_and_child_required")
+    if _state_type(root) != "started" or _state_type(child) != "started":
+        raise ChildCompletionError("started_native_root_and_child_required")
+    root_route = {
+        "workspace_id": (((root.get("team") or {}).get("organization") or {}).get("id")),
+        "team_id": (root.get("team") or {}).get("id"),
+        "project_id": (root.get("project") or {}).get("id"),
+        "root_issue_id": root.get("id"),
+    }
+    if (
+        root_route != authenticated_route
+        or str(root.get("identifier", "")).upper() != root_token
+        or root.get("parent") is not None
+        or (child.get("state") or {}).get("id") != child.get("state_id")
+        or (child.get("state") or {}).get("name") != child.get("status")
+        or str((child.get("state") or {}).get("type", "")).lower()
+        != str(child.get("status_type", "")).lower()
+    ):
+        raise ChildCompletionError("native_root_or_child_readback_mismatch")
     if str(child.get("status_type", "")).lower() == "completed":
         raise ChildCompletionError("child_already_completed_use_replay")
     prospective = deepcopy(snapshot)
@@ -148,6 +206,12 @@ def build_child_completion_transaction(
         "projection_revision": state.revision,
         "projection_event_ids": [item["event_id"] for item in state.events],
         "fleet_gate": fleet,
+        "native_root_sha256": _digest(_native_child(root)),
+        "dependency_graph_sha256": _digest(snapshot.get("dependency_graph")),
+        "resolved_relations_sha256": _digest({
+            "relations": snapshot.get("relations"),
+            "relation_targets": snapshot.get("relation_targets"),
+        }),
     }
     intent_sha = _digest(event)
     reservation = {
@@ -174,10 +238,12 @@ def build_child_completion_transaction(
         "child_issue_id": child["id"], "completed_state": completed_state,
         "native_child_before": _native_child(child),
         "native_child_after": _native_child(target),
+        "native_root": _native_child(root),
         "prospective_child_closure": deepcopy(event["value"]),
         "intent_event": event, "intent_sha256": intent_sha,
         "frontiers": frontiers, "frontiers_sha256": _digest(frontiers),
         "reservation": reservation,
+        "reservation_root_updated_at": root.get("updatedAt"),
         "reservation_slot_id": ledger_boundary_slot_id(
             root_token, root_material_revision, root_serialization_frontier,
             authenticated_route,
@@ -243,7 +309,17 @@ query WorkstreamCompletedState($teamId: String!, $stateId: String!) {
 """
 CHILD_UPDATE = """
 mutation WorkstreamChildCompletion($issueId: String!, $input: IssueUpdateInput!) {
-  issueUpdate(id: $issueId, input: $input) { success issue { id state { id name type } } }
+  issueUpdate(id: $issueId, input: $input) {
+    success
+    issue {
+      id identifier title description url archivedAt updatedAt
+      parent { id identifier }
+      project { id }
+      team { id organization { id } }
+      assignee { id }
+      state { id name type }
+    }
+  }
 }
 """
 
@@ -270,17 +346,55 @@ class LiveCompletionAdapter:
     def __init__(self, client: Any, *, transaction: dict[str, Any], token: str,
                  route: dict[str, str], projection: LinearProjectionAdapter,
                  graph: LinearGraphQLTransport, comments: LinearCommentEventAdapter,
-                 resume_args: list[str]):
+                 resume_args: list[str], source: dict[str, str]):
         self.client, self.transaction, self.token = client, transaction, token
         self.route, self.projection, self.graph, self.comments = route, projection, graph, comments
         self.resume_args = resume_args
+        self.source = source
+        self.post_update_native: dict[str, Any] | None = None
 
     def surface(self) -> dict[str, Any]:
         graph, comments = stable_live_readback(
             self.graph, self.comments, self.token, include_description=True,
             include_child_comments=True,
         )
-        state = self.projection.state()
+        state = reduce_projection_comments(
+            comments, workstream_id=self.token,
+            expected_plan_revision=self.transaction["reservation"]["plan_revision"],
+            authenticated_route=self.route,
+        )
+        bound_graph = bind_projection_plan_generation(
+            graph, comments, workstream_id=self.token,
+            requested_plan_revision=self.source["sha256"],
+            authenticated_route=self.route,
+        )
+        bound_graph = add_live_child_material_history(
+            bound_graph, authenticated_route=self.route, root_comments=comments,
+            proposal_plan_revision=self.source["sha256"],
+        )
+        dependencies = LinearChildDependencyAdapter(
+            self.client, workspace_id=self.route["workspace_id"],
+            team_id=self.route["team_id"], project_id=self.route["project_id"],
+            root_issue_id=self.route["root_issue_id"],
+            root_identifier=self.token, plan_revision=self.source["sha256"],
+        ).read_authorized_graph_for_snapshot(
+            bound_graph, comments,
+            generation_selector_plan_revision=bound_graph["root"].get(
+                "description_plan_revision", bound_graph["root"].get("plan_revision")
+            ),
+            reread=lambda: stable_live_readback(
+                self.graph, self.comments, self.token, include_description=True,
+                include_child_comments=True,
+            ),
+        )
+        bound_graph["dependency_graph"] = dependencies
+        live_snapshot = add_material_history(
+            bound_graph, comments, self.token, authenticated_route=self.route,
+            authenticated_source=self.source,
+            relation_target_resolver=lambda relations: read_relation_targets(
+                self.client, relations,
+            ),
+        )
         active = _active_heads(state)
         closure = active.get(("child_closure", self.transaction["intent_event"]["key"]))
         child = next((item for item in graph.get("children", [])
@@ -307,6 +421,29 @@ class LiveCompletionAdapter:
         original_projection_ids = self.transaction["frontiers"][
             "projection_event_ids"
         ]
+        root_native = _native_child(graph.get("root") or {})
+        expected_root = self.transaction["native_root"]
+        root_preserved = {
+            key: value for key, value in root_native.items() if key != "updatedAt"
+        } == {
+            key: value for key, value in expected_root.items() if key != "updatedAt"
+        }
+        reservation_receipts = [item for item in comments
+                                if item.get("id") == self.transaction[
+                                    "reservation_slot_id"
+                                ]]
+        root_clock_valid = (
+            isinstance(root_native.get("updatedAt"), str)
+            and root_native.get("updatedAt")
+            and (not reservation_present or root_native.get("updatedAt")
+                 != expected_root.get("updatedAt"))
+        )
+        native_valid = (
+            native == expected_native if not completed else _post_child_valid(
+                native, self.transaction["native_child_before"],
+                self.transaction["completed_state"], self.post_update_native,
+            )
+        )
         if (
             _digest(base_comments) != self.transaction["frontiers"]["root"][
                 "comments_sha256"
@@ -314,7 +451,14 @@ class LiveCompletionAdapter:
             or _digest(child_comments) != self.transaction["frontiers"]["child"][
                 "comments_sha256"
             ]
-            or native != expected_native
+            or not native_valid
+            or not root_preserved or not root_clock_valid
+            or _digest(live_snapshot.get("dependency_graph"))
+            != self.transaction["frontiers"]["dependency_graph_sha256"]
+            or _digest({
+                "relations": live_snapshot.get("relations"),
+                "relation_targets": live_snapshot.get("relation_targets"),
+            }) != self.transaction["frontiers"]["resolved_relations_sha256"]
             or [item["event_id"] for item in state.events][
                 :len(original_projection_ids)
             ] != original_projection_ids
@@ -361,6 +505,15 @@ class LiveCompletionAdapter:
         }).get("issueUpdate")
         if not isinstance(result, dict) or result.get("success") is not True:
             raise ChildCompletionError("child_completion_update_unproven")
+        issue = result.get("issue")
+        if not isinstance(issue, dict):
+            raise ChildCompletionError("child_completion_update_readback_missing")
+        normalized = deepcopy(issue)
+        state = normalized.get("state") or {}
+        normalized["state_id"] = state.get("id")
+        normalized["status"] = state.get("name")
+        normalized["status_type"] = state.get("type")
+        self.post_update_native = _native_child(normalized)
 
     def append_closure(self, event: dict[str, Any]) -> None:
         self.projection.append(
@@ -435,6 +588,21 @@ def run(argv: list[str]) -> dict[str, Any]:
         graph, authenticated_route=route, root_comments=comments,
         proposal_plan_revision=source["sha256"],
     )
+    dependency_adapter = LinearChildDependencyAdapter(
+        client, workspace_id=route["workspace_id"], team_id=route["team_id"],
+        project_id=route["project_id"], root_issue_id=route["root_issue_id"],
+        root_identifier=token, plan_revision=source["sha256"],
+    )
+    graph["dependency_graph"] = dependency_adapter.read_authorized_graph_for_snapshot(
+        graph, comments,
+        generation_selector_plan_revision=graph["root"].get(
+            "description_plan_revision", graph["root"].get("plan_revision")
+        ),
+        reread=lambda: stable_live_readback(
+            graph_adapter, comments_adapter, token, include_description=True,
+            include_child_comments=True,
+        ),
+    )
     snapshot = add_material_history(
         graph, comments, token, authenticated_route=route,
         authenticated_source=source,
@@ -442,7 +610,10 @@ def run(argv: list[str]) -> dict[str, Any]:
             client, relations,
         ),
     )
-    state = projection.state()
+    state = reduce_projection_comments(
+        comments, workstream_id=token,
+        expected_plan_revision=source["sha256"], authenticated_route=route,
+    )
     evidence = json.loads(open(args.evidence_contract, encoding="utf-8").read())
     completed_state = _completed_state(client, route, args.completed_state_id)
     current = prepare_child_completion(
@@ -559,7 +730,7 @@ def run(argv: list[str]) -> dict[str, Any]:
     adapter = LiveCompletionAdapter(
         client, transaction=transaction, token=token, route=route,
         projection=projection, graph=graph_adapter, comments=comments_adapter,
-        resume_args=resume_args,
+        resume_args=resume_args, source=source,
     )
     return apply_child_completion(adapter, transaction, apply=True)
 

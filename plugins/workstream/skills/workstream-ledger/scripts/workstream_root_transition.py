@@ -28,7 +28,7 @@ from workstream_linear import (
 )
 from workstream_linear_events import (
     COMMENT_CREATE_CAPABILITY_QUERY, COMMENT_CREATE_MUTATION,
-    LinearCommentEventAdapter,
+    LinearCommentEventAdapter, assert_no_pending_ledger_reservation,
 )
 from workstream_linear_projection import (
     reduce_projection_comments, select_plan_generation, TOMBSTONE,
@@ -845,6 +845,17 @@ class RootTransitionTransport:
             after = {"state": state}
         else:
             raise RootTransitionError("unknown_root_transition")
+        selected = select_plan_generation(
+            comments, workstream_id=self.token,
+            description_plan_revision=(snapshot.get("root") or {}).get(
+                "plan_revision"
+            ), authenticated_route=self.authority,
+        )
+        assert_no_pending_ledger_reservation(
+            comments, workstream_id=self.token,
+            authenticated_route=self.authority,
+            current_plan_revision=selected["plan_revision"],
+        )
         snapshot_digest = snapshot_sha256(snapshot)
         frontier = comment_frontier_sha256(comments)
         intent = {
@@ -1002,6 +1013,17 @@ class RootTransitionTransport:
             if self.after_reservation_created is not None:
                 self.after_reservation_created()
             immediate, immediate_comments = self._read()
+            selected = select_plan_generation(
+                immediate_comments, workstream_id=self.token,
+                description_plan_revision=(immediate.get("root") or {}).get(
+                    "plan_revision"
+                ), authenticated_route=self.authority,
+            )
+            assert_no_pending_ledger_reservation(
+                immediate_comments, workstream_id=self.token,
+                authenticated_route=self.authority,
+                current_plan_revision=selected["plan_revision"],
+            )
             immediate_authorization = self._authorize(
                 immediate, immediate_comments,
             )
