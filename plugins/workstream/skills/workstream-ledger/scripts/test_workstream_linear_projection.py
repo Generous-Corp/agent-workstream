@@ -6186,11 +6186,18 @@ class ProjectionTests(unittest.TestCase):
             authority,
             f"owner={evidence['value'].get('repository_key')} primary={current_scope.get('primary_repository')} repos={[repository_key(r) for r in current_scope['repositories']]} heads={[r.get('exact_head') for r in current_scope['repositories']]}",
         )
-        self.assertIsNone(
+        self.assertEqual(
             workstream_projection.validated_nonprimary_backfill_authority(
                 evidence, current_scope, events, events,
             ),
-            "mutable carried receipt cannot self-authenticate provider evidence",
+            authority,
+            "an exact authenticated history event must replay after admission",
+        )
+        self.assertIn(
+            evidence["event_id"],
+            closure_bound_historical_evidence(
+                events, current_scope, projection_history=events,
+            ),
         )
         for field, forged in (
             ("provider_repository_id", "WRONG_PROVIDER"),
@@ -6207,8 +6214,7 @@ class ProjectionTests(unittest.TestCase):
             )
             mutated_evidence["value"]["nonprimary_backfill_authority"][field] = forged
             mutated_authority = workstream_projection.validated_nonprimary_backfill_authority(
-                mutated_evidence, current_scope, mutated, mutated,
-                trusted_receipt=trusted_receipt,
+                mutated_evidence, current_scope, mutated, events,
             )
             self.assertIsNone(mutated_authority, field)
         evidence["value"]["nonprimary_backfill_authority"][

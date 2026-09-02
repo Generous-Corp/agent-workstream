@@ -43,10 +43,28 @@ def validated_nonprimary_backfill_authority(
     }
     if not isinstance(receipt, dict) or set(receipt) != fields:
         return None
-    # Provider/PR/check/merge claims are not authenticated by their syntax or
-    # by a copy carried inside the mutable child contract.  Replay therefore
-    # requires an independently authenticated receipt supplied by the caller.
-    if not isinstance(trusted_receipt, dict) or trusted_receipt != receipt:
+    # Provider/PR/check/merge claims are not authenticated by syntax or by a
+    # copy carried in a not-yet-admitted child contract.  Preparation must
+    # therefore supply the independently reviewed receipt.  Ordinary replay
+    # may instead consume the exact event already present in the caller's
+    # authenticated append-only projection history; all contextual anchors
+    # and repository fences below are still revalidated.
+    trusted_for_admission = (
+        isinstance(trusted_receipt, dict) and trusted_receipt == receipt
+    )
+    event_id = event.get("event_id") if isinstance(event, dict) else None
+    persisted_candidates = [
+        item
+        for item in [*(projection_events or []), *(projection_history or [])]
+        if isinstance(item, dict)
+        and isinstance(event_id, str)
+        and event_id
+        and item.get("event_id") == event_id
+    ]
+    replaying_admitted_event = bool(persisted_candidates) and all(
+        _digest(item) == _digest(event) for item in persisted_candidates
+    )
+    if not trusted_for_admission and not replaying_admitted_event:
         return None
     repository = next((
         item for item in current_scope.get("repositories", [])

@@ -3014,13 +3014,12 @@ def prepare_terminal_child_repairs(
             except ProjectionHistoryError as error:
                 raise LinearProjectionError(str(error)) from error
             if carried_authorities[-1] is None:
-                backfill = contract.get("nonprimary_backfill_authority")
-                if isinstance(backfill, dict):
-                    carried_authorities[-1] = {
-                        "child_identifier": child_id,
-                        "repository_key": backfill.get("repository_key"),
-                        "exact_head": backfill.get("to_exact_head"),
-                    }
+                carried_authorities[-1] = (
+                    validated_nonprimary_backfill_authority(
+                        event, current_scope, list(state.events),
+                        state.snapshot.get("projection_history") or [],
+                    )
+                )
         owners = {
             (contract["repository_key"], contract["exact_head"])
             for contract in contracts
@@ -3372,14 +3371,10 @@ def _require_repairs_for_changed_child_closures(
                 except ProjectionHistoryError as error:
                     raise LinearProjectionError(str(error)) from error
                 if authority is None:
-                    candidate = event["value"].get(
-                        "nonprimary_backfill_authority"
+                    authority = validated_nonprimary_backfill_authority(
+                        event, desired_scope, list(active.values()),
+                        projection_history,
                     )
-                    if isinstance(candidate, dict):
-                        authority = {
-                            "repository_key": candidate.get("repository_key"),
-                            "exact_head": candidate.get("to_exact_head"),
-                        }
                 if (
                     authority is None
                     or authority["repository_key"] != closure.get("repository_key")

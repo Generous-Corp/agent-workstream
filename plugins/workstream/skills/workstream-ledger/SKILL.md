@@ -895,6 +895,20 @@ head, receipts, owner, and repository remain immutable. The carry proof is
 persisted on the new evidence event, so the later closure repair and ordinary
 resume can revalidate it against the predecessor history. Missing, ambiguous,
 mutated, unclosed, late, or frontier-drifted evidence refuses before mutation.
+For the exceptional legacy case where a non-primary repository advanced before
+its terminal evidence was projected, a reviewed
+`terminal_child_evidence_seed_nonprimary_backfill` may bind the old scope and
+disposition events to one exact new evidence head. The caller must first
+authenticate the repository ID, PR number and exact head, merged disposition
+and merge SHA, and required-check result through the repository provider; the
+projection client does not contact or impersonate that provider. Store
+`checks_sha256` as the SHA-256 of the caller's retained canonical JSON check
+receipt (sorted object keys and a deterministic check-record order). The seed
+write requires that reviewed receipt and the current input frontier. Later
+repair and resume trust only the exact admitted append-only evidence event and
+revalidate its scope/disposition digests, repository identity, owner, and old
+and new heads. A copied but unadmitted receipt, changed history event, ambiguous
+event ID, or mismatched anchor refuses.
 When the reviewed seed also advances the primary repository head, a seed owned
 by that primary repository follows the primary transition contract. A seed
 owned by another participating repository is allowed only through the reviewed
