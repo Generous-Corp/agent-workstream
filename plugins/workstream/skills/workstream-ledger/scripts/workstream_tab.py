@@ -69,7 +69,10 @@ def terminal_namespace_sha256(manager: str, provenance: Mapping[str, str]) -> st
 
 def terminal_manager(environ: Mapping[str, str]) -> str | None:
     """Detect one terminal adapter from the same provenance fields everywhere."""
-    herdr_present = environ.get("HERDR_ENV") == "1" or any(
+    herdr_enabled = environ.get("HERDR_ENV") == "1"
+    # Treat every injected HerdR field as context for ambiguity detection, but
+    # never grant adapter selection without HerdR's explicit environment flag.
+    herdr_present = environ.get("HERDR_ENV") is not None or any(
         environ.get(key) for key in (
             "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_SOCKET_PATH",
         )
@@ -79,7 +82,7 @@ def terminal_manager(environ: Mapping[str, str]) -> str | None:
     ))
     if herdr_present and cmux_present:
         raise TabTitleError("terminal_context_ambiguous")
-    if herdr_present:
+    if herdr_enabled:
         return "herdr"
     if cmux_present:
         return "cmux"

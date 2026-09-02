@@ -189,6 +189,74 @@ class ThisSessionTests(unittest.TestCase):
             self.db, resolution, environ=env, created_at="2026-09-01T00:00:00Z",
         )
 
+    def two_event_chain(self, name):
+        self.db = Path(self.temp.name) / f"chain-{name}.sqlite3"
+        surface = f"surface-chain-{name}"
+        env = self.cmux_env(surface)
+        fake = FakeCmux("Linear", surface=surface)
+        first = self.seed(fake, env=env, provider_session="old-session")
+        resolution = session.resolve_this_session(
+            environ=env, runner=fake, which=lambda _: "/opt/cmux",
+            binding_path=self.db,
+        )
+        second = session.record_successor_binding(
+            self.db, resolution,
+            environ=dict(env, CODEX_SESSION_ID="new-session"),
+            created_at="2026-09-01T01:00:00Z",
+        )
+        return env, fake, resolution, first, second
+
+    @staticmethod
+    def replace_event(connection, event_id, mutate):
+        event = list(connection.execute(
+            "SELECT manager,namespace_sha256,workspace_id,target_id,"
+            "workstream_id,provider,provider_session_id,predecessor_event_id,"
+            "predecessor_provider_session_id,created_at "
+            "FROM terminal_binding_events_v1 WHERE event_id=?", (event_id,),
+        ).fetchone())
+        mutate(event)
+        replacement_id = session._event_digest(tuple(event))
+        connection.execute(
+            "INSERT INTO terminal_binding_events_v1 VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (replacement_id, *event),
+        )
+        connection.execute(
+            "UPDATE terminal_bindings_v1 SET current_event_id=?,updated_at=? "
+            "WHERE current_event_id=?",
+            (replacement_id, event[9], event_id),
+        )
+        connection.execute(
+            "DELETE FROM terminal_binding_events_v1 WHERE event_id=?",
+            (event_id,),
+        )
+        return replacement_id
+
+    def assert_chain_refusal(self, env, fake, expected):
+        fake.title = "Conflicting title · GEN-38"
+        resume_calls = []
+        before_renames = len([
+            call for call in fake.calls if "rename-tab" in call
+        ])
+        connection = sqlite3.connect(self.db)
+        before = tuple(connection.iterdump())
+        connection.close()
+        with self.assertRaisesRegex(session.ThisSessionError, expected):
+            session.resume_this_session(
+                environ=env, runner=full_resume_runner(resume_calls),
+                terminal_runner=fake, which=lambda _: "/opt/cmux",
+                binding_path=self.db, resume_script=Path("resume.py"),
+                created_at="2026-09-02T00:00:00Z",
+            )
+        self.assertEqual(resume_calls, [])
+        self.assertEqual(fake.title, "Conflicting title · GEN-38")
+        self.assertEqual(len([
+            call for call in fake.calls if "rename-tab" in call
+        ]), before_renames)
+        connection = sqlite3.connect(self.db)
+        after = tuple(connection.iterdump())
+        connection.close()
+        self.assertEqual(after, before)
+
     @staticmethod
     def resolution(*, title="Linear · GEN-37", binding=None):
         provenance = {
@@ -583,7 +651,7 @@ class ThisSessionTests(unittest.TestCase):
                 pid_chain=[10], socket_candidates=[],
             )
 
-    def test_resume_binding_without_provider_session_is_optional(self):
+    def test_initial_binding_without_provider_session_is_anonymous_but_usable(self):
         env = self.cmux_env()
         del env["CODEX_SESSION_ID"]
         fake = FakeCmux("Linear · GEN-37")
@@ -594,6 +662,40 @@ class ThisSessionTests(unittest.TestCase):
         )
         self.assertEqual(result["resume_authority"], "full")
         self.assertIsNone(result["resume_binding"]["provider_session_id"])
+        self.assertEqual(result["resume_binding"]["writes_performed"], 1)
+
+    def test_missing_current_session_never_erases_known_provider_binding(self):
+        env = self.cmux_env("surface-no-provider-session")
+        del env["CODEX_SESSION_ID"]
+        fake = FakeCmux("Linear", surface="surface-no-provider-session")
+        seeded = self.seed(fake, env=env, provider_session="01a01d46-known")
+        result = session.resume_this_session(
+            environ=env, runner=full_resume_runner([]), terminal_runner=fake,
+            which=lambda _: "/opt/cmux", binding_path=self.db,
+            resume_script=Path("resume.py"),
+            created_at="2026-09-02T02:00:00Z",
+        )
+        self.assertEqual(result["resume_authority"], "full")
+        self.assertEqual(result["tab_binding"]["status"], "updated")
+        self.assertEqual(fake.title, "Linear · GEN-37")
+        self.assertEqual(result["resume_binding"], {
+            "status": "unavailable",
+            "reason": "provider_session_identity_unavailable",
+            "event_id": seeded["event_id"], "provider": None,
+            "provider_session_id": None, "preserved_provider": "codex",
+            "preserved_provider_session_id": "01a01d46-known",
+            "predecessor_provider_session_id": "01a01d46-known",
+            "writes_performed": 0,
+        })
+        connection = sqlite3.connect(self.db)
+        self.assertEqual(connection.execute(
+            "SELECT count(*) FROM terminal_binding_events_v1"
+        ).fetchone()[0], 1)
+        self.assertEqual(connection.execute(
+            "SELECT provider,provider_session_id,current_event_id "
+            "FROM terminal_bindings_v1"
+        ).fetchone(), ("codex", "01a01d46-known", seeded["event_id"]))
+        connection.close()
 
     def test_tab_adapter_failure_cannot_downgrade_full_resume(self):
         env = self.cmux_env()
@@ -779,23 +881,28 @@ class ThisSessionTests(unittest.TestCase):
         )
         self.assertNotEqual(first["namespace_sha256"], second["namespace_sha256"])
 
-    def test_herdr_provenance_without_flag_is_used_by_resolver_and_adapter(self):
-        env = self.herdr_env("/tmp/herdr-m5.sock")
-        del env["HERDR_ENV"]
-        fake = FakeHerdr("Linear · GEN-37")
-        result = session.resume_this_session(
-            environ=env, runner=full_resume_runner([]), terminal_runner=fake,
-            which=lambda _: None, binding_path=self.db,
-            resume_script=Path("resume.py"),
-            created_at="2026-09-01T01:00:00Z",
-        )
-        self.assertEqual(result["resume_authority"], "full")
-        self.assertEqual(result["this_session_resolution"]["manager"], "herdr")
-        self.assertEqual(result["tab_binding"]["manager"], "herdr")
-        self.assertEqual(
-            result["tab_binding"]["session_namespace_sha256"],
-            result["this_session_resolution"]["namespace_sha256"],
-        )
+    def test_herdr_provenance_requires_explicit_environment_flag(self):
+        for flag in (None, "0"):
+            with self.subTest(flag=flag):
+                env = self.herdr_env("/tmp/herdr-m5.sock")
+                if flag is None:
+                    del env["HERDR_ENV"]
+                else:
+                    env["HERDR_ENV"] = flag
+                fake = FakeHerdr("Linear · GEN-37")
+                resume_calls = []
+                with self.assertRaisesRegex(
+                    session.ThisSessionError,
+                    "session_context_unavailable:cmux_cli",
+                ):
+                    session.resume_this_session(
+                        environ=env, runner=full_resume_runner(resume_calls),
+                        terminal_runner=fake, which=lambda _: None,
+                        binding_path=self.db, resume_script=Path("resume.py"),
+                    )
+                self.assertEqual(resume_calls, [])
+                self.assertEqual(fake.calls, [])
+                self.assertFalse(self.db.exists())
 
     def test_mixed_cmux_and_herdr_provenance_refuses(self):
         env = dict(self.herdr_env(), CMUX_SURFACE_ID="surface-old")
@@ -995,6 +1102,156 @@ class ThisSessionTests(unittest.TestCase):
         after = tuple(connection.iterdump())
         connection.close()
         self.assertEqual(after, before)
+
+    def test_binding_chain_refuses_missing_predecessor_without_fallback_or_writes(self):
+        env, fake, _, _, second = self.two_event_chain("missing-predecessor")
+        connection = sqlite3.connect(self.db)
+        self.replace_event(
+            connection, second["event_id"],
+            lambda event: event.__setitem__(7, "wsb_00000000000000000000000000000000"),
+        )
+        connection.commit()
+        connection.close()
+        self.assert_chain_refusal(
+            env, fake, "session_binding_history_incomplete",
+        )
+
+    def test_binding_chain_refuses_cycle_without_fallback_or_writes(self):
+        env, fake, _, _, second = self.two_event_chain("cycle")
+        connection = sqlite3.connect(self.db)
+        connection.execute(
+            "UPDATE terminal_binding_events_v1 SET predecessor_event_id=?,"
+            "predecessor_provider_session_id=? WHERE event_id=?",
+            (second["event_id"], "new-session", second["event_id"]),
+        )
+        connection.commit()
+        connection.close()
+        self.assert_chain_refusal(env, fake, "session_binding_history_cycle")
+
+    def test_binding_chain_refuses_ambiguous_predecessor_without_selection(self):
+        env, fake, _, first, _ = self.two_event_chain("ambiguous")
+        connection = sqlite3.connect(self.db)
+        connection.executescript("""
+            ALTER TABLE terminal_binding_events_v1 RENAME TO original_events;
+            CREATE TABLE terminal_binding_events_v1 AS
+                SELECT * FROM original_events;
+        """)
+        connection.execute(
+            "INSERT INTO terminal_binding_events_v1 "
+            "SELECT * FROM original_events WHERE event_id=?",
+            (first["event_id"],),
+        )
+        connection.execute("DROP TABLE original_events")
+        connection.commit()
+        connection.close()
+        self.assert_chain_refusal(
+            env, fake, "session_binding_history_ambiguous",
+        )
+
+    def test_binding_chain_refuses_cross_key_predecessor_with_valid_digests(self):
+        env, fake, _, first, second = self.two_event_chain("cross-key")
+        connection = sqlite3.connect(self.db)
+        foreign_first_id = self.replace_event(
+            connection, first["event_id"],
+            lambda event: event.__setitem__(3, "surface-foreign"),
+        )
+        self.replace_event(
+            connection, second["event_id"],
+            lambda event: event.__setitem__(7, foreign_first_id),
+        )
+        connection.commit()
+        connection.close()
+        self.assert_chain_refusal(
+            env, fake, "session_binding_history_mismatch",
+        )
+
+    def test_binding_chain_refuses_hash_invalid_predecessor_without_writes(self):
+        env, fake, _, first, _ = self.two_event_chain("hash-invalid")
+        connection = sqlite3.connect(self.db)
+        connection.execute(
+            "UPDATE terminal_binding_events_v1 SET created_at=? WHERE event_id=?",
+            ("2026-09-01T00:00:01Z", first["event_id"]),
+        )
+        connection.commit()
+        connection.close()
+        self.assert_chain_refusal(
+            env, fake, "session_binding_event_digest_mismatch",
+        )
+
+    def test_binding_chain_refuses_predecessor_session_drift_with_valid_digest(self):
+        env, fake, _, _, second = self.two_event_chain("session-drift")
+        connection = sqlite3.connect(self.db)
+        self.replace_event(
+            connection, second["event_id"],
+            lambda event: event.__setitem__(8, "different-old-session"),
+        )
+        connection.commit()
+        connection.close()
+        self.assert_chain_refusal(
+            env, fake, "session_binding_predecessor_session_mismatch",
+        )
+
+    def test_binding_chain_refuses_persisted_provider_session_downgrade(self):
+        env, fake, _, _, second = self.two_event_chain("provider-downgrade")
+        connection = sqlite3.connect(self.db)
+
+        def erase_provider(event):
+            event[5] = None
+            event[6] = None
+
+        self.replace_event(connection, second["event_id"], erase_provider)
+        connection.execute(
+            "UPDATE terminal_bindings_v1 SET provider=NULL,"
+            "provider_session_id=NULL"
+        )
+        connection.commit()
+        connection.close()
+        self.assert_chain_refusal(
+            env, fake, "session_binding_history_invalid",
+        )
+
+    def test_binding_chain_refuses_reverse_chronology_with_valid_digests(self):
+        env, fake, _, first, second = self.two_event_chain("chronology")
+        connection = sqlite3.connect(self.db)
+        later_first_id = self.replace_event(
+            connection, first["event_id"],
+            lambda event: event.__setitem__(9, "2026-09-01T02:00:00Z"),
+        )
+        self.replace_event(
+            connection, second["event_id"],
+            lambda event: event.__setitem__(7, later_first_id),
+        )
+        connection.commit()
+        connection.close()
+        self.assert_chain_refusal(
+            env, fake, "session_binding_history_chronology_mismatch",
+        )
+
+    def test_record_successor_refuses_time_before_current_tip_without_writes(self):
+        env, _, resolution, _, _ = self.two_event_chain("record-chronology")
+        connection = sqlite3.connect(self.db)
+        before = tuple(connection.iterdump())
+        connection.close()
+        with self.assertRaisesRegex(
+            session.ThisSessionError,
+            "session_binding_history_chronology_mismatch",
+        ):
+            session.record_successor_binding(
+                self.db, resolution,
+                environ=dict(env, CODEX_SESSION_ID="third-session"),
+                created_at="2026-09-01T00:59:59Z",
+            )
+        connection = sqlite3.connect(self.db)
+        after = tuple(connection.iterdump())
+        connection.close()
+        self.assertEqual(after, before)
+
+    def test_binding_chain_validation_is_bounded_and_refuses_over_budget(self):
+        env, fake, _, _, _ = self.two_event_chain("over-budget")
+        with mock.patch.object(session, "MAX_BINDING_CHAIN_EVENTS", 1):
+            self.assert_chain_refusal(
+                env, fake, "session_binding_history_over_budget",
+            )
 
     def test_binding_namespace_must_match_full_terminal_provenance(self):
         env = self.cmux_env("surface-provenance")

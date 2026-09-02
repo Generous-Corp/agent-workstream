@@ -18,8 +18,8 @@ For literal `resume this session` or `/goal resume this session`, first run:
 python3 "<absolute directory of this SKILL.md>/scripts/workstream_this_session.py"
 ```
 
-CLI: `workstreamctl resume-this-session`. It requires exact
-namespaced cmux/HerdR identity (or cmux's bounded controlling-TTY resolver) and
+CLI: `workstreamctl resume-this-session`. It requires exact namespaced cmux/HerdR
+identity (HerdR: `HERDR_ENV=1`; or cmux's bounded controlling-TTY resolver) and
 one persisted binding or strict final ` · TEAM-#` title suffix; never accept an
 issue-like prose token, and never focus, cwd, chat, or memory. The candidate is
 not authority: ordinary resume runs once and must return `full`. Only then may

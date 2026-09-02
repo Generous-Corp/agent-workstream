@@ -457,22 +457,39 @@ class WorkstreamTabTests(unittest.TestCase):
                     )
                 self.assertNotIn("rename-tab", [call[1] for call in fake.calls])
 
-    def test_terminal_manager_detection_is_shared_and_ambiguous_fails(self):
-        herdr_without_flag = self.herdr_env()
-        herdr_without_flag.pop("HERDR_ENV")
-        result = tab.apply_title(
-            "GEN-37", environ=herdr_without_flag, runner=FakeHerdr(),
-            which=lambda _: None,
-        )
-        self.assertEqual(result["manager"], "herdr")
+    def test_terminal_manager_requires_herdr_flag_and_mixed_context_refuses(self):
+        for flag in (None, "0"):
+            with self.subTest(flag=flag):
+                untrusted = self.herdr_env()
+                if flag is None:
+                    untrusted.pop("HERDR_ENV")
+                else:
+                    untrusted["HERDR_ENV"] = flag
+                fake = FakeHerdr()
+                result = tab.apply_title(
+                    "GEN-37", environ=untrusted, runner=fake,
+                    which=lambda _: None,
+                )
+                self.assertEqual(result["status"], "unavailable")
+                self.assertEqual(result["reason"], "not_in_cmux_surface")
+                self.assertEqual(fake.calls, [])
 
-        ambiguous = dict(herdr_without_flag, CMUX_SURFACE_ID="surface:7")
+                ambiguous = dict(untrusted, CMUX_SURFACE_ID="surface:7")
+                with self.assertRaisesRegex(
+                    tab.TabTitleError, "terminal_context_ambiguous",
+                ):
+                    tab.apply_title(
+                        "GEN-37", environ=ambiguous, runner=fake,
+                        which=lambda _: None,
+                    )
+
         with self.assertRaisesRegex(
             tab.TabTitleError, "terminal_context_ambiguous",
         ):
             tab.apply_title(
-                "GEN-37", environ=ambiguous, runner=FakeHerdr(),
-                which=lambda _: None,
+                "GEN-37",
+                environ=dict(self.herdr_env(), CMUX_SURFACE_ID="surface:7"),
+                runner=FakeHerdr(), which=lambda _: None,
             )
 
     def test_post_rename_readback_unavailable_remains_fatal(self):

@@ -28,6 +28,7 @@ RESUME_TIMEOUT_SECONDS = 60
 # paths use the explicitly named budget above.
 TIMEOUT_SECONDS = TERMINAL_TIMEOUT_SECONDS
 MAX_IDENTITY_BYTES = 4096
+MAX_BINDING_CHAIN_EVENTS = 4096
 
 
 class ThisSessionError(RuntimeError):
@@ -73,6 +74,21 @@ def state_path(environ: Mapping[str, str]) -> Path:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _binding_timestamp(value: object, name: str) -> datetime:
+    raw = _identity(value, name)
+    if not raw.endswith("Z"):
+        raise ThisSessionError(f"session_binding_history_invalid:{name}")
+    try:
+        parsed = datetime.fromisoformat(raw[:-1] + "+00:00")
+    except ValueError as error:
+        raise ThisSessionError(
+            f"session_binding_history_invalid:{name}"
+        ) from error
+    if parsed.tzinfo != timezone.utc:
+        raise ThisSessionError(f"session_binding_history_invalid:{name}")
+    return parsed
 
 
 def _terminal_identity(environ: Mapping[str, str]) -> dict[str, Any] | None:
@@ -478,6 +494,112 @@ def _validate_binding_identity(identity: dict[str, Any]) -> None:
         raise ThisSessionError("session_binding_provenance_mismatch")
 
 
+def _event_digest(event: tuple[Any, ...]) -> str:
+    payload = {
+        "schema_version": SCHEMA_VERSION, "manager": event[0],
+        "namespace_sha256": event[1], "workspace_id": event[2],
+        "target_id": event[3], "workstream_id": event[4],
+        "provider": event[5], "provider_session_id": event[6],
+        "predecessor_event_id": event[7],
+        "predecessor_provider_session_id": event[8],
+        "created_at": event[9],
+    }
+    return "wsb_" + hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()[:32]
+
+
+def _validate_binding_event_chain(
+    connection: sqlite3.Connection, *, current_event_id: str,
+    identity: dict[str, Any], token: str, current_provider: str | None,
+    current_session_id: str | None, current_updated_at: str,
+) -> None:
+    """Validate one bounded immutable predecessor chain back to genesis."""
+    event_id = current_event_id
+    seen: set[str] = set()
+    successor_time: datetime | None = None
+    expected_session: str | None = None
+    check_expected_session = False
+    for depth in range(MAX_BINDING_CHAIN_EVENTS):
+        if event_id in seen:
+            raise ThisSessionError("session_binding_history_cycle")
+        seen.add(event_id)
+        try:
+            events = connection.execute(
+                "SELECT manager,namespace_sha256,workspace_id,target_id,"
+                "workstream_id,provider,provider_session_id,"
+                "predecessor_event_id,predecessor_provider_session_id,created_at "
+                "FROM terminal_binding_events_v1 WHERE event_id=?",
+                (event_id,),
+            ).fetchall()
+        except sqlite3.OperationalError as error:
+            if "no such table: terminal_binding_events_v1" in str(error):
+                raise ThisSessionError(
+                    "session_binding_history_incomplete"
+                ) from error
+            raise
+        if not events:
+            raise ThisSessionError("session_binding_history_incomplete")
+        if len(events) != 1:
+            raise ThisSessionError("session_binding_history_ambiguous")
+        event = events[0]
+        if event[:5] != (
+            identity["manager"], identity["namespace_sha256"],
+            identity["workspace_id"], identity["target_id"], token,
+        ):
+            raise ThisSessionError("session_binding_history_mismatch")
+        provider, session_id = event[5:7]
+        if (
+            provider not in {None, "codex", "claude"}
+            or (provider is None) != (session_id is None)
+        ):
+            raise ThisSessionError("session_binding_history_invalid")
+        try:
+            if session_id is not None:
+                _identity(session_id, "binding_provider_session_id")
+            event_time = _binding_timestamp(
+                event[9], "binding_event_created_at",
+            )
+            if event[7] is not None:
+                _identity(event[7], "binding_predecessor_event_id")
+            if event[8] is not None:
+                _identity(
+                    event[8], "binding_predecessor_provider_session_id",
+                )
+        except ThisSessionError as error:
+            raise ThisSessionError("session_binding_history_invalid") from error
+        if depth == 0 and (
+            provider != current_provider or session_id != current_session_id
+            or event[9] != current_updated_at
+        ):
+            raise ThisSessionError("session_binding_history_mismatch")
+        if check_expected_session and session_id != expected_session:
+            raise ThisSessionError("session_binding_predecessor_session_mismatch")
+        if successor_time is not None and event_time > successor_time:
+            raise ThisSessionError("session_binding_history_chronology_mismatch")
+        predecessor = event[7]
+        # Anonymous ownership is valid only for the first binding on an
+        # unowned terminal. Once a predecessor exists, losing the provider
+        # session would erase successor provenance and must fail closed.
+        if provider is None and predecessor is not None:
+            raise ThisSessionError("session_binding_history_invalid")
+        if predecessor in seen:
+            raise ThisSessionError("session_binding_history_cycle")
+        if event_id != _event_digest(event):
+            raise ThisSessionError("session_binding_event_digest_mismatch")
+        if predecessor is None:
+            if event[8] is not None:
+                raise ThisSessionError(
+                    "session_binding_predecessor_session_mismatch"
+                )
+            return
+        successor_time = event_time
+        expected_session = event[8]
+        check_expected_session = True
+        event_id = predecessor
+    raise ThisSessionError("session_binding_history_over_budget")
+
+
 def _validated_binding_row(
     connection: sqlite3.Connection, row: tuple[Any, ...],
     identity: dict[str, Any],
@@ -485,8 +607,8 @@ def _validated_binding_row(
     try:
         token, provider, session_id, event_id, updated_at, namespace = row
         canonical_token = workstream_tab.canonical_token(token)
-        _identity(event_id, "binding_event_id")
-        _identity(updated_at, "binding_updated_at")
+        event_id = _identity(event_id, "binding_event_id")
+        _binding_timestamp(updated_at, "binding_updated_at")
         namespace = _identity(namespace, "binding_namespace_sha256")
         if (
             len(namespace) != 64
@@ -505,48 +627,11 @@ def _validated_binding_row(
         workstream_tab.TabTitleError,
     ) as error:
         raise ThisSessionError("session_binding_history_invalid") from error
-    try:
-        events = connection.execute(
-            "SELECT manager,namespace_sha256,workspace_id,target_id,workstream_id,"
-            "provider,provider_session_id,predecessor_event_id,"
-            "predecessor_provider_session_id,created_at "
-            "FROM terminal_binding_events_v1 WHERE event_id=?",
-            (event_id,),
-        ).fetchall()
-    except sqlite3.OperationalError as error:
-        if "no such table: terminal_binding_events_v1" in str(error):
-            raise ThisSessionError("session_binding_history_incomplete") from error
-        raise
-    if len(events) != 1:
-        raise ThisSessionError("session_binding_history_incomplete")
-    event = events[0]
-    expected_prefix = (
-        identity["manager"], namespace, identity["workspace_id"],
-        identity["target_id"], token, provider, session_id,
+    _validate_binding_event_chain(
+        connection, current_event_id=event_id, identity=identity, token=token,
+        current_provider=provider, current_session_id=session_id,
+        current_updated_at=updated_at,
     )
-    if event[:7] != expected_prefix or event[9] != updated_at:
-        raise ThisSessionError("session_binding_history_mismatch")
-    try:
-        if event[7] is not None:
-            _identity(event[7], "binding_predecessor_event_id")
-        if event[8] is not None:
-            _identity(event[8], "binding_predecessor_provider_session_id")
-    except ThisSessionError as error:
-        raise ThisSessionError("session_binding_history_invalid") from error
-    payload = {
-        "schema_version": SCHEMA_VERSION, "manager": event[0],
-        "namespace_sha256": event[1], "workspace_id": event[2],
-        "target_id": event[3], "workstream_id": event[4],
-        "provider": event[5], "provider_session_id": event[6],
-        "predecessor_event_id": event[7],
-        "predecessor_provider_session_id": event[8],
-        "created_at": event[9],
-    }
-    expected_event_id = "wsb_" + hashlib.sha256(json.dumps(
-        payload, sort_keys=True, separators=(",", ":"),
-    ).encode()).hexdigest()[:32]
-    if event_id != expected_event_id:
-        raise ThisSessionError("session_binding_event_digest_mismatch")
     return {
         "workstream_id": token, "provider": provider,
         "provider_session_id": session_id, "event_id": event_id,
@@ -732,6 +817,7 @@ def record_successor_binding(
     _validate_binding_identity(resolution)
     provider, session_id = _provider_session(environ)
     created_at = _identity(created_at, "created_at")
+    created_time = _binding_timestamp(created_at, "created_at")
     key = tuple(resolution[field] for field in (
         "manager", "namespace_sha256", "workspace_id", "target_id",
     ))
@@ -754,6 +840,28 @@ def record_successor_binding(
         )
         if prior is not None and prior["workstream_id"] != token:
             raise ThisSessionError("session_binding_conflict")
+        if (
+            prior is not None
+            and prior["provider_session_id"] is not None
+            and session_id is None
+        ):
+            if validate_terminal is not None:
+                validate_terminal()
+            connection.commit()
+            return {
+                "status": "unavailable",
+                "reason": "provider_session_identity_unavailable",
+                "event_id": prior["event_id"], "provider": provider,
+                "provider_session_id": session_id,
+                "preserved_provider": prior["provider"],
+                "preserved_provider_session_id": prior[
+                    "provider_session_id"
+                ],
+                "predecessor_provider_session_id": prior[
+                    "provider_session_id"
+                ],
+                "writes_performed": 0,
+            }
         if prior is not None and (
             prior["provider"], prior["provider_session_id"]
         ) == (provider, session_id):
@@ -768,6 +876,10 @@ def record_successor_binding(
                 "predecessor_provider_session_id": None,
                 "writes_performed": 0,
             }
+        if prior is not None and created_time < _binding_timestamp(
+            prior["updated_at"], "binding_updated_at",
+        ):
+            raise ThisSessionError("session_binding_history_chronology_mismatch")
         event_payload = {
             "schema_version": SCHEMA_VERSION, "manager": key[0],
             "namespace_sha256": key[1], "workspace_id": key[2],
@@ -801,6 +913,11 @@ def record_successor_binding(
         )
         if observed_event != expected_event:
             raise ThisSessionError("session_binding_event_collision")
+        _validate_binding_event_chain(
+            connection, current_event_id=event_id, identity=resolution,
+            token=token, current_provider=provider,
+            current_session_id=session_id, current_updated_at=created_at,
+        )
         connection.execute(
             "INSERT INTO terminal_bindings_v1 VALUES (?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(manager,namespace_sha256,workspace_id,target_id) DO UPDATE SET "
