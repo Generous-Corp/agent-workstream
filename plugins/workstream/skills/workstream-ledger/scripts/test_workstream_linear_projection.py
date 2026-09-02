@@ -6106,6 +6106,50 @@ class ProjectionTests(unittest.TestCase):
         ):
             closure_bound_historical_evidence(events, strict["scope"])
 
+    def test_nonprimary_backfill_crosses_preseed_history_with_tamper_control(self):
+        _client, _adapter, _source, _graph, strict, new_head = (
+            self.closed_children_then_head_transition_fixture()
+        )
+        events = deepcopy(strict["projection_events"])
+        evidence = next(
+            event for event in events
+            if event["kind"] == "evidence_contract"
+            and event["value"].get("owning_child") == "GEN-70"
+        )
+        old_head = evidence["value"]["exact_head"]
+        evidence["value"]["nonprimary_backfill_authority"] = {
+            "repository_key": evidence["value"]["repository_key"],
+            "to_exact_head": old_head,
+        }
+        closure = next(
+            event for event in events
+            if (event["kind"], event["key"]) == ("child_closure", "GEN-70")
+        )
+        closure["value"]["evidence_heads"] = [{
+            **head,
+            "value_sha256": canonical_digest(evidence["value"]),
+        } for head in closure["value"]["evidence_heads"]]
+        closure["value"]["evidence_receipts_sha256"] = evidence_receipts_sha256(
+            [evidence["value"]]
+        )
+        current_scope = deepcopy(strict["scope"])
+        primary = next(
+            repository for repository in current_scope["repositories"]
+            if repository_key(repository) == current_scope["primary_repository"]
+        )
+        primary["exact_head"] = new_head
+        self.assertTrue(
+            closure_bound_historical_evidence(events, current_scope)
+        )
+        evidence["value"]["nonprimary_backfill_authority"][
+            "repository_key"
+        ] = "github.com:id:forged"
+        with self.assertRaisesRegex(
+            ProjectionHistoryError,
+            r"closure_history_(repository|evidence_set)_mismatch:GEN-70",
+        ):
+            closure_bound_historical_evidence(events, current_scope)
+
     def test_current_head_closure_cannot_precede_its_evidence(self):
         _client, _adapter, _source, _graph, strict, _new_head = (
             self.closed_children_then_head_transition_fixture()
