@@ -951,38 +951,18 @@ prose.
 
 ### Fresh-session resume
 
-If `workstream-resume` returned the bounded authoritative snapshot in the
-current turn, retain it and do not repeat initial recovery. The same applies on
-a later warm turn when exact same-provider-session retained-full bindings
-satisfy `workstream-resume` warm classification.
-
-When a new agent receives `ABC-123` (or its Linear URL/tab title), with or
-without continuation instructions, the first action is the default bounded
-resume helper:
+Follow the authoritative `workstream-resume` skill for fresh-session recovery.
+After workstream-resume has returned a bounded authoritative snapshot, retain it;
+do not repeat recovery on a later warm turn when exact same-provider-session
+retained-full bindings satisfy `workstream-resume` warm classification.
 
 ```sh
 python3 "<absolute directory of the SKILL.md loaded for this turn>/scripts/workstream_resume.py" ABC-123
 ```
 
-Substitute the runtime-supplied loaded skill path directly. Do not search the
-filesystem, inspect cwd/environment, probe `PATH`, or execute the placeholder
-or an unset variable. Run it before reading repository instructions, memory,
-local worktree lists, or PR state: the result identifies the repositories and
-nonterminal work that are actually in scope. Do not probe `workstreamctl` on `PATH`; it is a
-repository-local convenience command and plugin installation does not add a
-global executable. The initial recovery command always omits
-`--include-history`, even when the request ultimately includes audit or closure.
-The default validates the complete history and returns the actionable current
-view. Run a second full-history invocation only when actually beginning that
-later audit or closure pass.
-
-The helper obtains one root snapshot plus its nonterminal children from Linear.
-The resolver extracts exactly one distinct
-token from a bare token, Linear URL, natural-language request, or copied tab
-title. It validates the context URL, exact plan revision, root revision, child
-uniqueness, and root/child next actions, then enforces both item and byte caps
-while excluding terminal children. A tab title is only a token carrier; no
-agent may resume from a cwd, stale transcript, or title metadata alone.
+The command, exact-one-token rule, same-process waiting across nonterminal tool
+yields, fail-closed historical-state rule, and immediate tab-adapter result all
+live in `workstream-resume`; do not duplicate or weaken them here.
 
 The current paginated Linear transport obtains the issue graph and reads the
 root comment connection once to reduce append-only material events, remote
