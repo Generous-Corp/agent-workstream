@@ -4793,6 +4793,7 @@ def main() -> int:
         seed_input_frontier = (
             seed_head_transition
             or manifest.get("terminal_child_evidence_seed_predecessor")
+            or manifest.get("terminal_child_evidence_seed_nonprimary_backfill")
             or {}
         ).get("input_frontier_sha256")
         if seed_input_frontier is not None and (

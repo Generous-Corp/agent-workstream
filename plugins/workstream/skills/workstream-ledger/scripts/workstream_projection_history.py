@@ -280,6 +280,16 @@ def closure_bound_historical_evidence(
                 selected_transition_tip_event_id,
                 authorized_prepared_transition_event_id,
             )
+            if authority is None:
+                backfill = event.get("value", {}).get(
+                    "nonprimary_backfill_authority"
+                )
+                if isinstance(backfill, dict):
+                    authority = {
+                        "child_identifier": event["value"].get("owning_child"),
+                        "repository_key": backfill.get("repository_key"),
+                        "exact_head": backfill.get("to_exact_head"),
+                    }
             if authority is not None:
                 carried[event["event_id"]] = authority
     return _closure_bound_single_generation(
