@@ -1492,6 +1492,19 @@ class ThisSessionTests(unittest.TestCase):
         self.assertFalse(self.db.exists())
         self.assertNotIn("rename-tab", [item for call in fake.calls for item in call])
 
+        self.assertEqual(
+            session._resume_refusal_reason(
+                "workstream resume refused: resume_context_over_budget:46879>24576\n"
+            ),
+            "resume_context_over_budget:46879>24576",
+        )
+        self.assertEqual(
+            session._resume_refusal_reason(
+                "workstream resume refused: resume_context_over_item_budget:300>256\n"
+            ),
+            "resume_context_over_item_budget:300>256",
+        )
+
     def test_resume_refusal_does_not_forward_arbitrary_stderr(self):
         fake = FakeCmux("Linear · GEN-37")
 
@@ -1511,6 +1524,13 @@ class ThisSessionTests(unittest.TestCase):
         self.assertNotIn("secret", str(observed.exception))
         self.assertFalse(self.db.exists())
         self.assertNotIn("rename-tab", [item for call in fake.calls for item in call])
+        for unsafe in (
+            "workstream resume refused: secret=ghp_ABC123\n",
+            "workstream resume refused: projection_error:ghp_ABC123\n",
+            "workstream resume refused: completed_owned_child_closure_missing:GEN-0\n",
+        ):
+            with self.subTest(unsafe=unsafe):
+                self.assertIsNone(session._resume_refusal_reason(unsafe))
 
     def test_title_change_between_resolution_and_resume_refuses_without_mutation(self):
         initial = self.resolution()
