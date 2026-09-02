@@ -17,6 +17,7 @@ from workstream_generation import (
 )
 from workstream_delta import Delta
 from workstream_linear_checkpoints import encode_checkpoint_comment
+from workstream_linear import LinearRateLimitedError
 from workstream_linear_events import encode_event_comment, ledger_boundary_slot_id
 import workstream_linear_events as linear_events_module
 from workstream_linear_projection import (
@@ -3490,6 +3491,29 @@ class ResumeTests(unittest.TestCase):
             ), mock.patch.object(MODULE.sys, "stderr", stderr):
                 self.assertEqual(MODULE.main(), 2)
         self.assertIn("snapshot_input_requires_inspection_only", stderr.getvalue())
+
+    def test_live_cli_surfaces_rate_limit_as_one_safe_machine_reason(self):
+        stderr = io.StringIO()
+        with mock.patch.object(
+            MODULE.sys, "argv", ["workstream_resume.py", "GEN-37"]
+        ), mock.patch.object(
+            MODULE, "resolve_linear_route", return_value=({
+                "workspace_id": "workspace", "team_id": "team",
+                "project_id": "project",
+            }, None),
+        ), mock.patch.object(
+            MODULE, "load_linear_api_key", return_value="secret-token"
+        ), mock.patch.object(
+            MODULE, "resolve_authenticated_resume_target",
+            side_effect=LinearRateLimitedError(http_status=400),
+        ), mock.patch.object(MODULE.sys, "stderr", stderr):
+            self.assertEqual(MODULE.main(), 2)
+
+        self.assertEqual(
+            stderr.getvalue(),
+            "workstream resume refused: linear_rate_limited\n",
+        )
+        self.assertNotIn("secret-token", stderr.getvalue())
 
     def test_snapshot_cli_accepts_explicit_inspection_only(self):
         with tempfile.TemporaryDirectory() as directory:

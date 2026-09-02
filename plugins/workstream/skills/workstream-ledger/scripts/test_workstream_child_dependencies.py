@@ -13,6 +13,7 @@ from workstream_generation import strict_candidate_loader
 from workstream_child_dependencies import (
     authorized_dependency_graph, ChildDependencyError, DependencyGraph,
     LinearChildDependencyAdapter, dependency_relation_id,
+    RELATION_READ_BATCH_SIZE, RELATION_READ_PAGE_SIZE,
     reduce_dependency_readback, validate_authorized_dependency_graph_surface,
     validate_dependency_graph_summary,
 )
@@ -79,6 +80,14 @@ class FakeLinear:
         self.before_comment_read = None
         self.lose_next_create_response = False
         self.page_size = 250
+        self.relation_batch_reads = 0
+        self.before_relation_batch_read = None
+        self.relation_continuation_reads = 0
+        self.before_relation_continuation_read = None
+        self.relation_slot_reads = 0
+        self.before_relation_slot_read = None
+        self.hidden_inverse_relation_ids = set()
+        self.unrelated_relation_slots = []
         self.root_plan_revision = PLAN
         self.root_title = "Root"
         self.root_updated_at = "now"
@@ -166,6 +175,11 @@ class FakeLinear:
             relation["relatedIssue"]["id"] == identity["id"] if inverse
             else relation["issue"]["id"] == identity["id"]
         )]
+        if inverse:
+            records = [
+                relation for relation in records
+                if relation["id"] not in self.hidden_inverse_relation_ids
+            ]
         start = int(after or 0)
         nodes = records[start:start + self.page_size]
         end = start + len(nodes)
@@ -173,6 +187,32 @@ class FakeLinear:
 
     def execute(self, query, variables):
         self.calls.append((query, variables))
+        if "query WorkstreamChildRelationFirstPages" in query:
+            self.relation_batch_reads += 1
+            if self.before_relation_batch_read:
+                self.before_relation_batch_read(self)
+            result = {}
+            for alias, identifier in variables.items():
+                issue, relations, relations_more, relations_cursor = (
+                    self.relation_page(identifier, False, None)
+                )
+                _issue, inverse, inverse_more, inverse_cursor = (
+                    self.relation_page(identifier, True, None)
+                )
+                result[alias] = {
+                    "id": issue["id"], "identifier": issue["identifier"],
+                    "parent": issue["parent"], "team": issue["team"],
+                    "project": issue["project"],
+                    "relations": {"nodes": relations, "pageInfo": {
+                        "hasNextPage": relations_more,
+                        "endCursor": relations_cursor,
+                    }},
+                    "inverseRelations": {"nodes": inverse, "pageInfo": {
+                        "hasNextPage": inverse_more,
+                        "endCursor": inverse_cursor,
+                    }},
+                }
+            return result
         if "query WorkstreamRoute" in query:
             return {
                 "team": self.team(),
@@ -198,6 +238,9 @@ class FakeLinear:
                              "pageInfo": {"hasNextPage": False, "endCursor": None}},
             }}
         if "query WorkstreamChildRelations" in query or "query WorkstreamChildInverseRelations" in query:
+            self.relation_continuation_reads += 1
+            if self.before_relation_continuation_read:
+                self.before_relation_continuation_read(self)
             inverse = "InverseRelations" in query
             issue, nodes, more, cursor = self.relation_page(
                 variables["issueId"], inverse, variables.get("after"),
@@ -226,10 +269,14 @@ class FakeLinear:
                 }]},
             }
         if "query WorkstreamChildDependencySlots" in query:
+            self.relation_slot_reads += 1
+            if self.before_relation_slot_read:
+                self.before_relation_slot_read(self)
             start = int(variables.get("after") or 0)
-            nodes = self.relations[start:start + self.page_size]
+            all_slots = [*self.relations, *self.unrelated_relation_slots]
+            nodes = all_slots[start:start + self.page_size]
             end = start + len(nodes)
-            more = end < len(self.relations)
+            more = end < len(all_slots)
             return {"issueRelations": {
                 "nodes": nodes,
                 "pageInfo": {
@@ -823,11 +870,15 @@ class ChildDependencyTests(unittest.TestCase):
             self.apply(fake)
         relation_queries = [
             query for query, _ in fake.calls
-            if "WorkstreamChildRelations" in query
-            or "WorkstreamChildInverseRelations" in query
+            if "WorkstreamChildRelationFirstPages" in query
         ]
         self.assertTrue(relation_queries)
         self.assertTrue(all("includeArchived: true" in query for query in relation_queries))
+        self.assertTrue(all("parent { id }" in query for query in relation_queries))
+        self.assertFalse(any(
+            "WorkstreamChildDependencySlots" in query
+            for query, _variables in fake.calls
+        ))
         self.assertFalse(any(
             "issueRelationCreate" in query or "commentCreate" in query
             for query, _ in fake.calls
@@ -865,8 +916,94 @@ class ChildDependencyTests(unittest.TestCase):
             self.relation(A, "blocks", B), self.relation(A, "blocks", C),
         ], original)
         self.assertEqual(replay["writes"], 0)
-        self.assertTrue(any(variables.get("after") == "1" for query, variables in fake.calls
-                            if "WorkstreamChildRelations" in query))
+        batch_queries = [
+            (query, variables) for query, variables in fake.calls
+            if "WorkstreamChildRelationFirstPages" in query
+        ]
+        self.assertTrue(batch_queries)
+        self.assertTrue(any(
+            variables.get("after") == "1"
+            for query, variables in fake.calls
+            if "WorkstreamChildRelations" in query
+            or "WorkstreamChildInverseRelations" in query
+        ))
+
+    def test_relation_first_page_cost_is_bounded_and_independent_within_batch(self):
+        for count in (1, RELATION_READ_BATCH_SIZE, RELATION_READ_BATCH_SIZE + 1):
+            with self.subTest(owned_children=count):
+                identities = [
+                    {
+                        "issue_id": f"20000000-0000-4000-8000-{index:012d}",
+                        "identifier": f"GEN-{100 + index}",
+                    }
+                    for index in range(count)
+                ]
+                fake = FakeLinear()
+                fake.children = [fake.child(identity) for identity in identities]
+                owned = {item["issue_id"]: item for item in identities}
+
+                surfaces = self.adapter(fake)._relations(owned)
+
+                batch_queries = [
+                    (query, variables) for query, variables in fake.calls
+                    if "WorkstreamChildRelationFirstPages" in query
+                ]
+                expected_requests = (
+                    count + RELATION_READ_BATCH_SIZE - 1
+                ) // RELATION_READ_BATCH_SIZE
+                self.assertEqual(len(batch_queries), expected_requests)
+                self.assertTrue(all(
+                    len(variables) <= RELATION_READ_BATCH_SIZE
+                    and f"first: {RELATION_READ_PAGE_SIZE}" in query
+                    for query, variables in batch_queries
+                ))
+                self.assertEqual(set(surfaces), set(owned))
+                self.assertFalse(any(
+                    "WorkstreamChildRelations" in query
+                    or "WorkstreamChildInverseRelations" in query
+                    or "WorkstreamChildDependencySlots" in query
+                    for query, _variables in fake.calls
+                ))
+
+    def test_mid_pagination_foreign_churn_cannot_hide_owned_relation(self):
+        foreign_blocker = {
+            "issue_id": "70000000-0000-4000-8000-000000000001",
+            "identifier": "OTHER-1",
+        }
+        foreign_blocked = {
+            "issue_id": "70000000-0000-4000-8000-000000000002",
+            "identifier": "OTHER-2",
+        }
+        fake = FakeLinear()
+        fake.page_size = 1
+        fake.relations = [fake.native_relation(A, B), fake.native_relation(A, C)]
+        injected = False
+
+        def inject_foreign_relation(client):
+            nonlocal injected
+            if not injected:
+                injected = True
+                client.relations.insert(
+                    0, client.native_relation(foreign_blocker, foreign_blocked),
+                )
+
+        fake.before_relation_continuation_read = inject_foreign_relation
+        owned = {item["issue_id"]: item for item in (A, B, C)}
+
+        surfaces = self.adapter(fake)._relations(owned)
+
+        self.assertTrue(injected)
+        self.assertEqual(
+            {relation["id"] for relation in surfaces[CHILD_A_ID]["relations"]},
+            {
+                dependency_relation_id(authority=AUTHORITY, blocker=A, blocked=B),
+                dependency_relation_id(authority=AUTHORITY, blocker=A, blocked=C),
+            },
+        )
+        self.assertFalse(any(
+            "WorkstreamChildDependencySlots" in query
+            for query, _variables in fake.calls
+        ))
 
     def test_each_frontier_advance_before_create_refuses_zero_write(self):
         mutations = {
@@ -905,6 +1042,31 @@ class ChildDependencyTests(unittest.TestCase):
             self.apply(fake, [self.relation(B, "blocks", C)], frontier)
         self.assertFalse(any("issueRelationCreate" in query for query, _ in fake.calls))
 
+    def test_same_count_graph_replacement_during_stability_read_refuses(self):
+        fake = FakeLinear()
+        self.apply(fake)
+        fake.calls.clear()
+        fake.relation_batch_reads = 0
+        replaced = False
+
+        def replace_relation(client):
+            nonlocal replaced
+            if client.relation_batch_reads == 2 and not replaced:
+                replaced = True
+                client.relations[:] = [client.native_relation(A, C)]
+
+        fake.before_relation_batch_read = replace_relation
+        with self.assertRaisesRegex(
+            ChildDependencyError,
+            "dependency_graph_frontier_changed_during_read",
+        ):
+            self.adapter(fake).read_authorized_graph()
+        self.assertTrue(replaced)
+        self.assertFalse(any(
+            "issueRelationCreate" in query or "commentCreate" in query
+            for query, _ in fake.calls
+        ))
+
     def test_self_duplicate_conflict_and_wrong_type_refuse_before_write(self):
         cases = [
             ([self.relation(A, "blocks", A)], "self_dependency"),
@@ -939,6 +1101,75 @@ class ChildDependencyTests(unittest.TestCase):
                 with self.assertRaisesRegex(LinearTransportError, error):
                     self.apply(fake, children=children)
                 self.assertFalse(any("issueRelationCreate" in query for query, _ in fake.calls))
+
+    def test_batched_relation_endpoints_cross_root_or_unowned_refuse_before_write(self):
+        unowned = {
+            "issue_id": "20000000-0000-4000-8000-000000000099",
+            "identifier": "GEN-99",
+        }
+        cases = {
+            "cross_root_dependency:blocked": lambda fake: fake.relations.append({
+                **fake.native_relation(A, B),
+                "relatedIssue": fake.child(
+                    B, parent_id="90000000-0000-4000-8000-000000000009",
+                ),
+            }),
+            "cross_root_dependency": lambda fake: fake.relations.append(
+                fake.native_relation(A, unowned)
+            ),
+        }
+        for error, arrange in cases.items():
+            with self.subTest(error=error):
+                fake = FakeLinear()
+                arrange(fake)
+                with self.assertRaisesRegex(ChildDependencyError, error):
+                    self.apply(fake)
+                self.assertTrue(any(
+                    "WorkstreamChildRelationFirstPages" in query
+                    for query, _variables in fake.calls
+                ))
+                self.assertFalse(any(
+                    "WorkstreamChildDependencySlots" in query
+                    for query, _variables in fake.calls
+                ))
+                self.assertFalse(any(
+                    "issueRelationCreate" in query or "commentCreate" in query
+                    for query, _variables in fake.calls
+                ))
+
+    def test_batched_read_preserves_actual_missing_inverse_refusal(self):
+        fake = FakeLinear()
+        relation = fake.native_relation(A, B)
+        fake.relations.append(relation)
+        fake.hidden_inverse_relation_ids.add(relation["id"])
+
+        with self.assertRaisesRegex(ChildDependencyError, "inverse_missing"):
+            self.apply(fake)
+        self.assertFalse(any(
+            "WorkstreamChildDependencySlots" in query
+            or "issueRelationCreate" in query
+            or "commentCreate" in query
+            for query, _variables in fake.calls
+        ))
+
+    def test_authorized_read_never_scans_large_unrelated_global_inventory(self):
+        fake = FakeLinear()
+        self.apply(fake)
+        fake.calls.clear()
+        fake.relation_batch_reads = 0
+        fake.unrelated_relation_slots = [
+            {"id": f"90000000-0000-4000-8000-{index:012d}"}
+            for index in range(1000)
+        ]
+
+        surface = self.adapter(fake).read_authorized_graph()
+
+        self.assertEqual(len(surface["relations"]), 1)
+        self.assertEqual(fake.relation_batch_reads, 2)
+        self.assertFalse(any(
+            "WorkstreamChildDependencySlots" in query
+            for query, _variables in fake.calls
+        ))
 
     def test_generation_genesis_keeps_single_generation_child_protection(self):
         fake = FakeLinear()

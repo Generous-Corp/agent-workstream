@@ -1504,6 +1504,12 @@ class ThisSessionTests(unittest.TestCase):
             ),
             "resume_context_over_item_budget:300>256",
         )
+        self.assertEqual(
+            session._resume_refusal_reason(
+                "workstream resume refused: linear_rate_limited\n"
+            ),
+            "linear_rate_limited",
+        )
 
     def test_resume_refusal_does_not_forward_arbitrary_stderr(self):
         fake = FakeCmux("Linear · GEN-37")

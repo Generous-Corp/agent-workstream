@@ -567,6 +567,12 @@ live Linear mutation is part of the test suite. A local journal still proves
 process-restart replay on that machine only, not recovery after the machine
 disappears.
 
+Version 0.4.81 bounds Linear request amplification during projection previews
+and dependency-graph readback, and reports provider throttling as the precise
+retryable `linear_rate_limited` transport condition without automatic retries
+or response-body disclosure. Live projection writes retain their per-append
+concurrency fences.
+
 Version 0.4.80 surfaces one bounded machine-readable refusal reason when
 literal `resume this session` cannot recover full authority, and authenticates
 exceptional non-primary terminal evidence against a stable exact GitHub
