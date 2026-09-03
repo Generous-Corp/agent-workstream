@@ -810,6 +810,19 @@ def run(argv: list[str]) -> dict[str, Any]:
         comments_for_build = [item for item in comments if item.get("id") != slot]
         serialization_frontier = reservation["frontier_ids"]
         created_at = reservation["intent_event"]["created_at"]
+        # Creating the reservation comment advances the Linear root's
+        # updatedAt clock. Reconstruct the reviewed pre-reservation clock for
+        # deterministic transaction replay; the live adapter still requires
+        # and verifies the post-reservation clock transition before mutation.
+        reviewed_root = (
+            (reservation.get("intent_fences") or {}).get("native_root_before")
+        )
+        if isinstance(reviewed_root, dict) and isinstance(
+            reviewed_root.get("updatedAt"), str
+        ):
+            snapshot = deepcopy(snapshot)
+            snapshot["root"] = deepcopy(snapshot.get("root") or {})
+            snapshot["root"]["updatedAt"] = reviewed_root["updatedAt"]
     transaction = build_child_completion_transaction(
         snapshot, state, root_token=token, child_token=child_token,
         evidence_contract=evidence, authenticated_source=source,
