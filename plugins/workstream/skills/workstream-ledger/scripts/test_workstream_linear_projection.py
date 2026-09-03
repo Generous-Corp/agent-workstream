@@ -61,7 +61,7 @@ from workstream_projection import (
 from workstream_successor import choose_disposition
 from workstream_scope import repository_key
 from workstream_projection_history import (
-    closure_bound_historical_evidence, ProjectionHistoryError,
+    _digest, closure_bound_historical_evidence, ProjectionHistoryError,
 )
 from workstream_github_backfill import GitHubBackfillReceiptReader
 from workstream_closure import review as closure_review
@@ -6342,6 +6342,45 @@ class ProjectionTests(unittest.TestCase):
             "closure_history_repository_mismatch:GEN-70",
         ):
             closure_bound_historical_evidence(events, strict["scope"])
+
+    def test_evidence_bound_closure_may_follow_scope_head_transition(self):
+        """An already-authenticated child receipt can close after a scope move."""
+        _client, _adapter, _source, _graph, strict, new_head = (
+            self.closed_children_then_head_transition_fixture()
+        )
+        events = deepcopy(strict["projection_events"])
+        evidence = next(
+            event for event in events
+            if event["kind"] == "evidence_contract"
+            and event["value"].get("owning_child") == "GEN-70"
+        )
+        closure_head = "a" * 40
+        closure = next(
+            event for event in events
+            if (event["kind"], event["key"]) == ("child_closure", "GEN-70")
+        )
+        closure["value"]["evidence_heads"][0]["value_sha256"] = (
+            _digest(evidence["value"])
+        )
+        closure["value"]["exact_head"] = closure_head
+        closure_index = events.index(closure)
+        scope_index = max(
+            index for index, event in enumerate(events)
+            if (event["kind"], event["key"]) == ("scope", "root")
+        )
+        evidence_index = events.index(evidence)
+        events.pop(evidence_index)
+        if evidence_index < scope_index:
+            scope_index -= 1
+        events.insert(scope_index + 1, evidence)
+        scope_index += 1
+        closure_index = events.index(closure)
+        events.pop(closure_index)
+        if closure_index < scope_index:
+            scope_index -= 1
+        events.insert(scope_index + 1, closure)
+        historical = closure_bound_historical_evidence(events, strict["scope"])
+        self.assertIn(evidence["event_id"], historical)
 
     def test_nonprimary_backfill_crosses_preseed_history_with_tamper_control(self):
         _client, _adapter, _source, _graph, strict, new_head = (
