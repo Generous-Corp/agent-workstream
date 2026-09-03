@@ -24,7 +24,9 @@ from workstream_linear_events import (
     pending_ledger_reservations, reduce_event_comments,
 )
 from workstream_linear_checkpoints import reduce_checkpoint_comments
-from workstream_child_dependencies import LinearChildDependencyAdapter
+from workstream_child_dependencies import (
+    LinearChildDependencyAdapter, dependency_root_readback_sha256,
+)
 from workstream_linear_projection import (
     LinearProjectionAdapter, build_projection_event, reduce_projection_comments,
 )
@@ -243,14 +245,18 @@ def build_child_completion_transaction(
         "project_id": (root.get("project") or {}).get("id"),
         "root_issue_id": root.get("id"),
     }
+    child_state = child.get("state")
+    child_state_mismatch = isinstance(child_state, dict) and (
+        child_state.get("id") != child.get("state_id")
+        or child_state.get("name") != child.get("status")
+        or str(child_state.get("type", "")).lower()
+        != str(child.get("status_type", "")).lower()
+    )
     if (
         root_route != authenticated_route
         or str(root.get("identifier", "")).upper() != root_token
         or root.get("parent") is not None
-        or (child.get("state") or {}).get("id") != child.get("state_id")
-        or (child.get("state") or {}).get("name") != child.get("status")
-        or str((child.get("state") or {}).get("type", "")).lower()
-        != str(child.get("status_type", "")).lower()
+        or child_state_mismatch
     ):
         raise ChildCompletionError("native_root_or_child_readback_mismatch")
     if str(child.get("status_type", "")).lower() == "completed":
@@ -806,6 +812,23 @@ def run(argv: list[str]) -> dict[str, Any]:
         comments_for_build = [item for item in comments if item.get("id") != slot]
         serialization_frontier = reservation["frontier_ids"]
         created_at = reservation["intent_event"]["created_at"]
+        # Creating the reservation comment advances the Linear root's
+        # updatedAt clock. Reconstruct the reviewed pre-reservation clock for
+        # deterministic transaction replay; the live adapter still requires
+        # and verifies the post-reservation clock transition before mutation.
+        reviewed_root = (
+            (reservation.get("intent_fences") or {}).get("native_root_before")
+        )
+        if isinstance(reviewed_root, dict) and isinstance(
+            reviewed_root.get("updatedAt"), str
+        ):
+            snapshot = deepcopy(snapshot)
+            snapshot["root"] = deepcopy(snapshot.get("root") or {})
+            snapshot["root"]["updatedAt"] = reviewed_root["updatedAt"]
+            if isinstance(snapshot.get("dependency_graph"), dict):
+                snapshot["dependency_graph"]["root_readback_sha256"] = (
+                    dependency_root_readback_sha256(reviewed_root)
+                )
     transaction = build_child_completion_transaction(
         snapshot, state, root_token=token, child_token=child_token,
         evidence_contract=evidence, authenticated_source=source,
