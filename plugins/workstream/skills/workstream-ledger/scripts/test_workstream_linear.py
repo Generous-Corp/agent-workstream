@@ -309,6 +309,29 @@ class LinearTransportTests(unittest.TestCase):
         self.assertEqual(result, {"ok": True})
         self.assertIs(urlopen.call_args.kwargs["context"], context)
 
+    def test_http_client_deadline_refuses_before_request(self):
+        with mock.patch("workstream_linear.time.monotonic", return_value=10.0), \
+             mock.patch("workstream_linear.urllib.request.urlopen") as urlopen, \
+             self.assertRaises(LinearTransportError) as raised:
+            HttpGraphQLClient("token", deadline=9.0).execute("query { ok }", {})
+
+        self.assertEqual(str(raised.exception), "linear_operation_timeout")
+        urlopen.assert_not_called()
+
+    def test_http_client_deadline_bounds_request_timeout(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        with mock.patch("workstream_linear.time.monotonic", return_value=10.0), \
+             mock.patch("workstream_linear.urllib.request.urlopen", return_value=response) as urlopen, \
+             mock.patch("workstream_linear.json.load", return_value={"data": {"ok": True}}):
+            result = HttpGraphQLClient("token", deadline=12.5).execute(
+                "query { ok }", {},
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 2.5)
+
     @staticmethod
     def _http_error(status, body):
         response = mock.Mock()
