@@ -2195,6 +2195,7 @@ def validate_snapshot(
 
 
 DEFAULT_RESUME_MAX_BYTES = 24 * 1024
+DEFAULT_RESUME_MAX_ITEMS = 512
 
 _VERBOSE_CURRENT_TEXT_KEYS = {
     "blocker", "blockers", "body", "cons", "context", "decision",
@@ -2680,7 +2681,7 @@ def _fixed_frontier_authority_envelope(
 
 def compact_context(
     snapshot: dict[str, Any], token: str, max_bytes: int = DEFAULT_RESUME_MAX_BYTES,
-    max_items: int = 100, *, require_projection_authority: bool = False,
+    max_items: int = DEFAULT_RESUME_MAX_ITEMS, *, require_projection_authority: bool = False,
     include_history: bool = False,
     require_dependency_graph: bool | None = None,
     expected_missing_terminal_closures: frozenset[str] = frozenset(),
@@ -3131,7 +3132,13 @@ def main() -> int:
     parser.add_argument("--linear-project-id", help="explicit immutable Linear project ID")
     parser.add_argument("--linear-endpoint", default="https://api.linear.app/graphql")
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_RESUME_MAX_BYTES)
-    parser.add_argument("--max-items", type=int, default=100)
+    parser.add_argument(
+        "--max-items", type=int, default=DEFAULT_RESUME_MAX_ITEMS,
+        help=(
+            "maximum validated context items (default: %(default)s); increase for "
+            "large append-only histories without weakening the byte budget"
+        ),
+    )
     parser.add_argument(
         "--include-history", action="store_true",
         help="include complete validated material/projection history instead of digests and counts",
