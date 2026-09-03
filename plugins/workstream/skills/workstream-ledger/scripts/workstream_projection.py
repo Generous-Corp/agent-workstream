@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -4677,6 +4678,10 @@ def main() -> int:
     )
     parser.add_argument("--config")
     parser.add_argument("--linear-endpoint", default="https://api.linear.app/graphql")
+    parser.add_argument(
+        "--operation-timeout", type=float, default=120.0,
+        help="maximum seconds for the complete authenticated projection operation",
+    )
     github_auth = parser.add_mutually_exclusive_group()
     github_auth.add_argument("--github-token-command")
     github_auth.add_argument(
@@ -4716,7 +4721,12 @@ def main() -> int:
         api_key = load_linear_api_key()
         if not api_key:
             raise LinearProjectionError("linear_auth_unavailable")
-        client = HttpGraphQLClient(api_key, args.linear_endpoint)
+        if args.operation_timeout <= 0:
+            raise LinearProjectionError("projection_operation_timeout_invalid")
+        client = HttpGraphQLClient(
+            api_key, args.linear_endpoint,
+            deadline=time.monotonic() + args.operation_timeout,
+        )
         route, _ = resolve_linear_route(config_path=args.config)
         route = resolve_authenticated_issue_route(client, token, route)
         transport = LinearGraphQLTransport(

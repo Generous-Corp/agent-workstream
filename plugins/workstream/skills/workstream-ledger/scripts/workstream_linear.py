@@ -16,6 +16,7 @@ import json
 import hashlib
 import re
 import ssl
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -73,14 +74,22 @@ class HttpGraphQLClient:
         endpoint: str = "https://api.linear.app/graphql",
         *,
         ssl_context: ssl.SSLContext | None = None,
+        deadline: float | None = None,
     ):
         if not token:
             raise ValueError("Linear API token is required")
         self.token = token
         self.endpoint = endpoint
         self.ssl_context = ssl_context or default_ssl_context()
+        self.deadline = deadline
 
     def execute(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        timeout = 20.0
+        if self.deadline is not None:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise LinearTransportError("linear_operation_timeout")
+            timeout = min(timeout, remaining)
         body = json.dumps({"query": query, "variables": variables}).encode()
         request = urllib.request.Request(
             self.endpoint, data=body,
@@ -88,9 +97,13 @@ class HttpGraphQLClient:
         )
         try:
             with urllib.request.urlopen(
-                request, timeout=20, context=self.ssl_context
+                request, timeout=timeout, context=self.ssl_context
             ) as response:
                 payload = json.load(response)
+        except TimeoutError as exc:
+            if self.deadline is not None and time.monotonic() >= self.deadline:
+                raise LinearTransportError("linear_operation_timeout") from exc
+            raise LinearTransportError("linear_request_timeout") from exc
         except urllib.error.HTTPError as exc:
             error_body = b""
             try:
