@@ -20,6 +20,7 @@ from workstream_generation import (
     _gen14_recorded_repair_head,
     build_retirement_proof, generation_quarantine_metadata, main, parser,
     prepare_generation_operator_contract,
+    prepare_same_generation_reopen_contract,
     validate_activation_operator_contract,
     encode_generation_reservation,
     encode_generation_finalization, generation_finalization_slot_id,
@@ -1262,6 +1263,34 @@ class GenerationTransitionTests(unittest.TestCase):
             remote_head="e" * 40,
             started_state=STARTED_STATE,
         )
+
+    def test_same_generation_reopen_prepares_only_for_terminal_root_with_open_child(self):
+        self.client.graph_status = "Done"
+        self.client.graph_status_type = "completed"
+        self.client.children = [{
+            "id": "child-id", "identifier": "GEN-92", "parent": {"id": AUTHORITY["root_issue_id"]},
+            "archivedAt": None, "status": "In Progress", "status_type": "started",
+            "state": {"id": "child-state", "name": "In Progress", "type": "started"},
+            "state_id": "child-state", "project": {"id": "project"},
+            "team": {"id": "team", "organization": {"id": "workspace"}},
+            "assignee": None,
+        }]
+        graph = {
+            "root": self.client.root_issue(), "children": deepcopy(self.client.children),
+            "decisions": [], "provenance": [], "child_comments": {},
+        }
+        contract = prepare_same_generation_reopen_contract(
+            comments=deepcopy(self.client.comments), graph=graph,
+            workstream_id=WORKSTREAM, authority=AUTHORITY,
+            description_plan_revision=OLD,
+            target_source={"identity": f"https://example.test/{OLD}", "sha256": OLD},
+            created_at="2026-08-31T23:00:00Z", remote_head="e" * 40,
+            started_state=STARTED_STATE,
+        )
+        self.assertEqual(contract["projection_preview"]["phase"], "activation_ready")
+        self.assertEqual(contract["generation"]["from_plan_revision"], OLD)
+        self.assertEqual(contract["generation"]["target_plan_revision"], OLD)
+        self.assertEqual(contract["retirement_proof"]["kind"], "same_generation_native_reopen")
 
     def test_prepare_emits_complete_zero_write_operator_contract(self):
         writes = len(self.client.mutations)
