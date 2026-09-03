@@ -2180,6 +2180,43 @@ class ResumeTests(unittest.TestCase):
             ".dependency_graph",
         )
 
+    def test_bounded_envelope_does_not_copy_large_dependency_graph(self):
+        """A large authenticated graph must not strand ordinary resume."""
+        snapshot = self.snapshot()
+        snapshot["children"][1]["status"] = "In Progress"
+        snapshot["children"][1]["next_action"] = "Continue"
+        snapshot = self.full_authority_snapshot(snapshot)
+        graph = copy.deepcopy(snapshot["dependency_graph"])
+        graph["authorization_batches"] = [{
+            "batch_id": f"batch-{index}",
+            "event_id": f"event-{index}",
+            "relation_ids": [f"relation-{index}-{inner}" for inner in range(8)],
+            "opaque_receipt": "x" * 4096,
+        } for index in range(256)]
+        context = MODULE.compact_context(
+            snapshot, "GEN-37", max_bytes=8 * 1024 * 1024,
+            require_projection_authority=False,
+        )
+        context["dependency_graph"] = graph
+        bounded = MODULE._bounded_authority_envelope(
+            context, text_limit=96,
+        )
+        encoded = MODULE._default_output_bytes(bounded)
+        self.assertLessEqual(len(encoded), MODULE.DEFAULT_RESUME_MAX_BYTES)
+        graph_view = bounded["execution_frontier"]["child_dependency_graph"]
+        self.assertEqual(
+            graph_view["authorization_batches_count"],
+            len(graph["authorization_batches"]),
+        )
+        self.assertEqual(
+            graph_view["authorization_batches_sha256"],
+            hashlib.sha256(json.dumps(
+                graph["authorization_batches"], ensure_ascii=False,
+                sort_keys=True, separators=(",", ":"),
+            ).encode()).hexdigest(),
+        )
+        self.assertNotIn("opaque_receipt", json.dumps(bounded))
+
     def test_hydration_route_does_not_infer_child_from_verbose_content(self):
         snapshot = self.snapshot()
         snapshot["children"] = snapshot["children"][:1]

@@ -2371,6 +2371,40 @@ def _bounded_authority_envelope(
         if isinstance(summary, dict) and identifier in ownership:
             summary["repository_key"] = ownership[identifier]
         children.append(summary)
+    # The dependency graph is authenticated input, but it can contain a very
+    # large append-only authorization surface.  Never copy that recursive
+    # object into the bounded envelope: preserve its validated authority
+    # selectors and a digest-bound relation frontier instead.  The full graph
+    # remains hydratable through the deferred audit route.
+    dependency_graph = context.get("dependency_graph") or {}
+    graph_authority = {
+        key: dependency_graph.get(key)
+        for key in (
+            "authority", "plan_revision", "route", "revision", "sha256",
+            "observed_frontier", "root_readback_sha256",
+        )
+        if dependency_graph.get(key) is not None
+    }
+    graph_relations = [
+        _bounded_semantic({
+            key: item.get(key)
+            for key in ("id", "type", "kind", "blocker", "blocked", "target")
+            if isinstance(item, dict) and item.get(key) is not None
+        }, text_limit=text_limit)
+        for item in dependency_graph.get("relations", [])
+        if isinstance(item, dict)
+    ]
+    graph_batches = dependency_graph.get("authorization_batches", [])
+    bounded_dependency_graph = {
+        **graph_authority,
+        "relations": graph_relations,
+        "authorization_batches_count": len(graph_batches),
+        "authorization_batches_sha256": hashlib.sha256(json.dumps(
+            graph_batches, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode()).hexdigest(),
+        "full_graph_hydration_required": True,
+    }
     frontier = {
         "root": _bounded_semantic({
             key: context.get(key) for key in (
@@ -2395,7 +2429,7 @@ def _bounded_authority_envelope(
         # Keep its already-validated semantic surface in every executable
         # representation; consumers must hydrate before mutation, but should
         # never mistake an omitted graph for an empty graph.
-        "child_dependency_graph": deepcopy(context.get("dependency_graph")),
+        "child_dependency_graph": bounded_dependency_graph,
         "checkpoint": _bounded_semantic(
             context.get("latest_checkpoint"), text_limit=text_limit,
         ),
