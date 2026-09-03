@@ -4244,6 +4244,16 @@ def reconcile_required_projection(
     )
 
     for item in write_items:
+        # Existing authorization events are immutable historical records.
+        # Reconciliation may carry an exact active event forward, but must not
+        # rebuild an older schema through today's strict writer. Any changed
+        # or newly supplied value still goes through the strict validator.
+        current = active_heads.get((item["kind"], item["key"]))
+        if isinstance(current, dict) and current.get("value") == item["value"]:
+            # Exact active values were already authenticated by the complete
+            # remote readback. Carry them without rebuilding, which preserves
+            # immutable historical schemas and event IDs.
+            continue
         build_projection_event(
             workstream_id=adapter.workstream_id,
             kind=item["kind"], key=item["key"], value=item["value"],

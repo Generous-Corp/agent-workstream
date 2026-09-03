@@ -467,6 +467,7 @@ def _closure_bound_single_generation(
                 f"closure_history_scope_missing:{child_id}"
             )
         historical_scope = scope_event["value"]
+        scope_index = event_indexes[scope_event["event_id"]]
         try:
             validate_scope(
                 historical_scope,
@@ -502,7 +503,11 @@ def _closure_bound_single_generation(
             ],
             key=lambda event: (event["key"], event["event_id"]),
         )
-        carried_closure = bool(before_evidence) and all(
+        evidence_indexes = {
+            event["event_id"]: event_indexes[event["event_id"]]
+            for event in before_evidence
+        }
+        carried_bound_closure = bool(before_evidence) and all(
             event["event_id"] in carried
             and carried[event["event_id"]]["child_identifier"] == child_id
             and carried[event["event_id"]]["repository_key"]
@@ -511,7 +516,18 @@ def _closure_bound_single_generation(
             == closure.get("exact_head")
             for event in before_evidence
         )
-        if carried_closure:
+        evidence_bound_closure = bool(before_evidence) and all(
+            event["value"].get("owning_child") == child_id
+            and event["value"].get("repository_key") == closure.get(
+                "repository_key"
+            )
+            and event["value"].get("exact_head") == closure.get("exact_head")
+            for event in before_evidence
+        ) and (
+            carried_bound_closure
+            or all(index > scope_index for index in evidence_indexes.values())
+        )
+        if evidence_bound_closure:
             historical_repository = dict(current_repository)
             historical_repository["exact_head"] = closure.get("exact_head")
         elif (
