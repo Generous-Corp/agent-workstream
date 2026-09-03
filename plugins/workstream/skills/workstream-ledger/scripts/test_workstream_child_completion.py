@@ -175,6 +175,12 @@ class ChildCompletionTests(unittest.TestCase):
         with self.assertRaisesRegex(ChildCompletionError, "unarchived"):
             transaction(snap=snap)
 
+    def test_normalized_child_state_without_nested_state_is_accepted(self):
+        snap = completion_snapshot()
+        snap["children"][0].pop("state")
+        tx = transaction(snap=snap)
+        self.assertEqual(tx["completed_state"]["type"], "completed")
+
     def test_native_fence_binds_preserved_fields_and_full_state(self):
         tx = transaction()
         native = tx["native_child_before"]

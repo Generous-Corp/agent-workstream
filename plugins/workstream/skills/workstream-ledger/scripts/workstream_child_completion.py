@@ -243,14 +243,18 @@ def build_child_completion_transaction(
         "project_id": (root.get("project") or {}).get("id"),
         "root_issue_id": root.get("id"),
     }
+    child_state = child.get("state")
+    child_state_mismatch = isinstance(child_state, dict) and (
+        child_state.get("id") != child.get("state_id")
+        or child_state.get("name") != child.get("status")
+        or str(child_state.get("type", "")).lower()
+        != str(child.get("status_type", "")).lower()
+    )
     if (
         root_route != authenticated_route
         or str(root.get("identifier", "")).upper() != root_token
         or root.get("parent") is not None
-        or (child.get("state") or {}).get("id") != child.get("state_id")
-        or (child.get("state") or {}).get("name") != child.get("status")
-        or str((child.get("state") or {}).get("type", "")).lower()
-        != str(child.get("status_type", "")).lower()
+        or child_state_mismatch
     ):
         raise ChildCompletionError("native_root_or_child_readback_mismatch")
     if str(child.get("status_type", "")).lower() == "completed":
