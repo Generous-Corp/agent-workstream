@@ -360,6 +360,104 @@ def build_authenticated_retirement_proof(
     return {**proof, "declaration_sha256": _digest(proof)}
 
 
+def prepare_same_generation_reopen_contract(
+    *, comments: list[dict[str, Any]], graph: dict[str, Any],
+    workstream_id: str, authority: dict[str, Any],
+    description_plan_revision: str | None, target_source: dict[str, str],
+    created_at: str, remote_head: str, started_state: dict[str, str],
+) -> dict[str, Any]:
+    """Prepare a fenced native reopen for an unchanged structured generation."""
+    from workstream_projection import _active_heads, projection_review_contract
+
+    selected = select_plan_generation(
+        comments, workstream_id=workstream_id,
+        description_plan_revision=description_plan_revision,
+        authenticated_route=authority,
+    )
+    plan_revision = selected["plan_revision"]
+    if plan_revision != target_source["sha256"]:
+        raise WorkstreamGenerationError("generation_target_already_active")
+    root = graph.get("root") or {}
+    native_type = str((root.get("state") or {}).get("type", "")).lower()
+    if native_type not in {"completed", "cancelled", "canceled"}:
+        raise WorkstreamGenerationError("same_generation_reopen_requires_terminal_root")
+    active_children = [
+        child for child in graph.get("children", [])
+        if str((child.get("state") or {}).get("type", "")).lower() == "started"
+        or str(child.get("status_type", "")).lower() == "started"
+    ]
+    if not active_children:
+        raise WorkstreamGenerationError("same_generation_reopen_requires_open_child")
+    state = reduce_projection_comments(
+        comments, workstream_id=workstream_id,
+        expected_plan_revision=plan_revision,
+        authenticated_route=authority, authenticated_source=target_source,
+    )
+    heads = {
+        identity: event for identity, event in _active_heads(state).items()
+        if identity[0] not in {
+            "generation_genesis", "generation_candidate_seal",
+            "generation_transition", "generation_abort",
+        }
+    }
+    projection = [
+        {"kind": kind, "key": key, "value": deepcopy(event["value"])}
+        for (kind, key), event in sorted(heads.items())
+    ]
+    manifest = {
+        **projection_review_contract(state), "projection": projection,
+        "retirements": [],
+    }
+    material = reduce_event_comments(comments, workstream_id=workstream_id)
+    retirement = {
+        "schema_version": 1, "kind": "same_generation_native_reopen",
+        "predecessor_plan_revision": plan_revision, "observed_at": created_at,
+        "activation_epoch": selected["activation_epoch"],
+        "authority": deepcopy(authority), "material_revision": material.revision,
+        "projection": projection_review_contract(state),
+        "active_children": sorted(
+            str(child.get("identifier", "")).upper() for child in active_children
+        ),
+    }
+    retirement["declaration_sha256"] = _digest(retirement)
+    contract = {
+        "schema_version": 1, "workstream_id": workstream_id,
+        "created_at": created_at, "authenticated_route": deepcopy(authority),
+        "source": deepcopy(target_source),
+        "native_transition": {"operation": "reopen", "target_state": deepcopy(started_state)},
+        "remote_head": remote_head,
+        "generation": {
+            "from_plan_revision": plan_revision, "target_plan_revision": plan_revision,
+            "activation_epoch": selected["activation_epoch"],
+            "previous_control_event_id": selected["transition_tip_event_id"],
+        },
+        "frontiers": {
+            "material_revision": material.revision,
+            "predecessor_projection": projection_review_contract(state),
+            "target_projection": projection_review_contract(state),
+            "predecessor_checkpoint_event_ids": [],
+        },
+        "retirement_proof": retirement,
+        "projection_preview": {
+            "apply": False, "writes_performed": 0,
+            "invocation": {"remote_head": remote_head, "created_at": created_at,
+                           "source": deepcopy(target_source)},
+            "manifest": manifest,
+            "active_key_accounting": {
+                "carried": [
+                    {"kind": kind, "key": key, "event_id": event["event_id"],
+                     "mode": "same_generation_exact_value"}
+                    for (kind, key), event in sorted(heads.items())
+                ],
+                "staged": [], "computed": [],
+            },
+            "terminal_child_stage": None, "phase": "activation_ready",
+            "next_gate": {"activation_ready": "preview_generation_activation"},
+        },
+    }
+    return {**contract, "contract_sha256": _digest(contract)}
+
+
 def prepare_generation_operator_contract(
     *, comments: list[dict[str, Any]], graph: dict[str, Any],
     workstream_id: str, authority: dict[str, str],
@@ -408,7 +506,12 @@ def prepare_generation_operator_contract(
     predecessor_plan = selected["plan_revision"]
     target_plan = target_source["sha256"]
     if predecessor_plan == target_plan:
-        raise WorkstreamGenerationError("generation_target_already_active")
+        return prepare_same_generation_reopen_contract(
+            comments=comments, graph=graph, workstream_id=workstream_id,
+            authority=authority, description_plan_revision=description_plan_revision,
+            target_source=target_source, created_at=created_at,
+            remote_head=remote_head, started_state=started_state,
+        )
     epoch = (
         selected["activation_epoch"]
         if selected["activation_epoch"] is not None else -1

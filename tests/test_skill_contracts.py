@@ -234,7 +234,7 @@ class SkillContractTests(unittest.TestCase):
         codex = json.loads((plugin / ".codex-plugin/plugin.json").read_text())
         claude = json.loads((plugin / ".claude-plugin/plugin.json").read_text())
         self.assertEqual(codex["version"], claude["version"])
-        self.assertEqual(codex["version"], "0.4.84")
+        self.assertEqual(codex["version"], "0.4.85")
         self.assertEqual(codex["skills"], claude["skills"])
         self.assertEqual(codex["skills"], "./skills/")
         shim = plugin / "skills/workstream-resume/scripts/workstream_resume.py"
