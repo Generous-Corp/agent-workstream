@@ -3302,7 +3302,7 @@ class ResumeTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 generation_cli_module.WorkstreamGenerationError,
-                "generation_target_already_active",
+        "same_generation_reopen_requires_open_child",
             ):
                 prepare_operator_contract()
 
