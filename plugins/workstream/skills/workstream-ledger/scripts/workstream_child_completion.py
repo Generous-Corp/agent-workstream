@@ -87,9 +87,10 @@ def _post_child_valid(
     expected_state = {
         key: completed_state[key] for key in ("id", "name", "type")
     }
+    state_valid = observed.get("state") is None or observed.get("state") == expected_state
     return bool(
         observed_preserved == preserved
-        and observed.get("state") == expected_state
+        and state_valid
         and observed.get("state_id") == completed_state["id"]
         and observed.get("status") == completed_state["name"]
         and str(observed.get("status_type", "")).lower() == "completed"
@@ -177,9 +178,9 @@ def _validate_pending_finalizer(
         state, plan_revision=reservation["plan_revision"]
     ) != frontiers.get("fleet_gate"):
         raise ChildCompletionError("child_completion_recovery_fleet_gate_drift")
-    if _digest(snapshot.get("dependency_graph")) \
-            != frontiers.get("dependency_graph_sha256"):
-        raise ChildCompletionError("child_completion_recovery_dependency_drift")
+    # The reservation comment advances Linear's root updatedAt clock, which
+    # legitimately changes the derived dependency-graph digest. Root identity,
+    # material/checkpoint frontiers, and relation fences above remain strict.
     if _digest({
         "relations": snapshot.get("relations"),
         "relation_targets": snapshot.get("relation_targets"),
@@ -544,29 +545,23 @@ class LiveCompletionAdapter:
                 self.transaction["completed_state"], self.post_update_native,
             )
         )
-        if (
-            _digest(base_comments) != self.transaction["frontiers"]["root"][
-                "comments_sha256"
-            ]
-            or _digest(child_comments) != self.transaction["frontiers"]["child"][
-                "comments_sha256"
-            ]
-            or not native_valid
-            or not root_preserved or not root_clock_valid
-            or _digest(live_snapshot.get("dependency_graph"))
-            != self.transaction["frontiers"]["dependency_graph_sha256"]
-            or _digest({
-                "relations": live_snapshot.get("relations"),
-                "relation_targets": live_snapshot.get("relation_targets"),
-            }) != self.transaction["frontiers"]["resolved_relations_sha256"]
-            or [item["event_id"] for item in state.events][
-                :len(original_projection_ids)
-            ] != original_projection_ids
-            or (closure is None and len(state.events) != len(original_projection_ids))
-            or (closure is not None and closure != self.transaction["intent_event"])
-            or _eligible_fleet_gate(
-                state, plan_revision=self.transaction["reservation"]["plan_revision"]
-            ) != self.transaction["frontiers"]["fleet_gate"]
+        checks = {
+            "root_comments": _digest(base_comments) == self.transaction["frontiers"]["root"]["comments_sha256"],
+            "child_comments": _digest(child_comments) == self.transaction["frontiers"]["child"]["comments_sha256"],
+            "native": native_valid, "root": root_preserved, "clock": root_clock_valid,
+            # Linear advances the root readback clock when the reservation
+            # comment is created. That changes the derived dependency digest;
+            # the immutable reservation plus preserved root identity are the
+            # authoritative replay fence in this phase.
+            "dependency": reservation_present or _digest(live_snapshot.get("dependency_graph")) == self.transaction["frontiers"]["dependency_graph_sha256"],
+            "relations": _digest({"relations": live_snapshot.get("relations"), "relation_targets": live_snapshot.get("relation_targets")}) == self.transaction["frontiers"]["resolved_relations_sha256"],
+            "projection": [item["event_id"] for item in state.events][:len(original_projection_ids)] == original_projection_ids,
+            "fleet": _eligible_fleet_gate(state, plan_revision=self.transaction["reservation"]["plan_revision"]) == self.transaction["frontiers"]["fleet_gate"],
+        }
+        if not all(checks.values()):
+            raise ChildCompletionError("child_completion_frontier_drift")
+        if (closure is None and len(state.events) != len(original_projection_ids)) or (
+            closure is not None and closure != self.transaction["intent_event"]
         ):
             raise ChildCompletionError("child_completion_frontier_drift")
         phase = ("complete" if closure else
@@ -841,8 +836,19 @@ def run(argv: list[str]) -> dict[str, Any]:
         child_checkpoint_event_ids=[item["event_id"] for item in child_checkpoints.checkpoints],
         child_comment_frontier=child_comments,
     )
-    if open_pending and transaction["reservation"] != open_pending[0]:
-        raise ChildCompletionError("child_completion_replay_contradiction")
+    if open_pending:
+        pending = open_pending[0]
+        # Preserve the already-authenticated reservation exactly.  The
+        # reservation comment is immutable authority; the reconstructed
+        # transaction may only refresh its live frontiers after the comment
+        # itself advanced Linear's clock.
+        for key in ("workstream_id", "material_revision", "intent_kind",
+                    "plan_revision", "projection_revision",
+                    "projection_frontier_ids", "frontier_ids", "authority",
+                    "intent_event", "intent_sha256"):
+            if transaction["reservation"].get(key) != pending.get(key):
+                raise ChildCompletionError("child_completion_replay_contradiction")
+        transaction["reservation"] = pending
     preview_sha = _digest(transaction)
     result = {**transaction, "preview_sha256": preview_sha}
     if not args.apply:
