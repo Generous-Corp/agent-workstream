@@ -1,0 +1,18 @@
+{
+  "slice_id": "gen-93-successor-adoption",
+  "owning_child": "GEN-93",
+  "repository": "github.com/danielraffel/shipyard",
+  "repository_key": "github.com:id:R_kgDOR9hrGw",
+  "plan_revision": "2fcce119a856ca34e509c7fe45a8f03f1a0d982c9c4d77047600805c0fcb261f",
+  "exact_head": "614af5ff6e8775db3bfe0e424dd0b7fbe8eb4779",
+  "layers": {
+    "architecture": {"status":"required","owned_seam":"lease-backed successor adoption","trust_boundary":"prior-owner death, expiry, or release proof plus repository, PR, exact-head, root, and lease-generation fences","allowed_side_effects":["append ownership receipt","atomic attach or successor transition"],"receipts":[{"kind":"review","passed":true,"repository_key":"github.com:id:R_kgDOR9hrGw","exact_head":"614af5ff6e8775db3bfe0e424dd0b7fbe8eb4779","proof":"PR #528 corrective scope documents successor ownership recovery and receipt authenticator"}]},
+    "logic": {"status":"required","methods":["unit","oracle"],"receipts":[{"kind":"test","passed":true,"repository_key":"github.com:id:R_kgDOR9hrGw","exact_head":"614af5ff6e8775db3bfe0e424dd0b7fbe8eb4779","proof":"PR #528 Linux, macOS ARM64, Windows, and Python helper checks passed"}]},
+    "component": {"status":"required","uses_fakes":true,"fake_scope":"external_edge_only","receipts":[{"kind":"test","passed":true,"repository_key":"github.com:id:R_kgDOR9hrGw","exact_head":"614af5ff6e8775db3bfe0e424dd0b7fbe8eb4779","proof":"PR #528 cross-platform custody successor receipt authenticator check passed"}]},
+    "adapter": {"status":"required","mode":"contract_fake","receipts":[{"kind":"test","passed":true,"repository_key":"github.com:id:R_kgDOR9hrGw","exact_head":"614af5ff6e8775db3bfe0e424dd0b7fbe8eb4779","proof":"PR #528 makes the successor receipt authenticator available on non-Unix platforms"}]},
+    "e2e": {"status":"required","bounded_scope":"PR #528 corrective successor-recovery acceptance","receipts":[{"kind":"e2e","passed":true,"repository_key":"github.com:id:R_kgDOR9hrGw","exact_head":"614af5ff6e8775db3bfe0e424dd0b7fbe8eb4779","proof":"PR #528 merged as e48a764a0af79cd15441da87233079f1f9cf3bfa with all required checks green"}]},
+    "visual": {"status":"not_applicable","reason":"No visual output in this infrastructure slice"},
+    "operational": {"status":"required","receipts":[{"kind":"operational","passed":true,"repository_key":"github.com:id:R_kgDOR9hrGw","exact_head":"614af5ff6e8775db3bfe0e424dd0b7fbe8eb4779","proof":"PR #528 skill-sync, cargo check --lib, clippy -D warnings, fmt --check, and diff-check passed"}]},
+    "negative_control": {"status":"required","failure_detected":true,"receipts":[{"kind":"planted-refusal","passed":true,"repository_key":"github.com:id:R_kgDOR9hrGw","exact_head":"614af5ff6e8775db3bfe0e424dd0b7fbe8eb4779","proof":"PR #527 failed version/skill-sync and Windows checks; corrective PR #528 refused that stale proof and passed"}]}
+  }
+}

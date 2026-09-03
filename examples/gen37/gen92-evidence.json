@@ -1,0 +1,18 @@
+{
+  "slice_id": "gen-92-custody-inventory",
+  "owning_child": "GEN-92",
+  "repository": "github.com/danielraffel/shipyard",
+  "repository_key": "github.com:id:R_kgDOR9hrGw",
+  "plan_revision": "2fcce119a856ca34e509c7fe45a8f03f1a0d982c9c4d77047600805c0fcb261f",
+  "exact_head": "a0146735413aaa0c90db7f4846b844bfbe220b3a",
+  "layers": {
+    "architecture": {"status":"required","owned_seam":"protected remote custody inventory","trust_boundary":"exact custody host selected by source ledger active rebind; Linear correlation is hint-only","allowed_side_effects":["read-only remote inventory","bounded local correlation hints"],"receipts":[{"kind":"review","passed":true,"repository_key":"github.com:id:R_kgDOR9hrGw","exact_head":"a0146735413aaa0c90db7f4846b844bfbe220b3a","proof":"PR #525 summary defines protected-host and no-follow trust boundary"}]},
+    "logic": {"status":"required","methods":["unit","oracle"],"receipts":[{"kind":"test","passed":true,"repository_key":"github.com:id:R_kgDOR9hrGw","exact_head":"a0146735413aaa0c90db7f4846b844bfbe220b3a","proof":"PR #525 Linux, macOS ARM64, Windows, and Python helper checks passed"}]},
+    "component": {"status":"required","uses_fakes":true,"fake_scope":"external_edge_only","receipts":[{"kind":"test","passed":true,"repository_key":"github.com:id:R_kgDOR9hrGw","exact_head":"a0146735413aaa0c90db7f4846b844bfbe220b3a","proof":"PR #525 custody_transport and custody_inventory checks passed"}]},
+    "adapter": {"status":"required","mode":"contract_fake","receipts":[{"kind":"test","passed":true,"repository_key":"github.com:id:R_kgDOR9hrGw","exact_head":"a0146735413aaa0c90db7f4846b844bfbe220b3a","proof":"PR #525 protected-host/inbox authentication contract is covered"}]},
+    "e2e": {"status":"required","bounded_scope":"PR #525 protected remote inventory acceptance","receipts":[{"kind":"e2e","passed":true,"repository_key":"github.com:id:R_kgDOR9hrGw","exact_head":"a0146735413aaa0c90db7f4846b844bfbe220b3a","proof":"PR #525 merged as 9e4057806020d772cac2aa763c3740f0850e6f86 with all required checks green"}]},
+    "visual": {"status":"not_applicable","reason":"No visual output in this infrastructure slice"},
+    "operational": {"status":"required","receipts":[{"kind":"operational","passed":true,"repository_key":"github.com:id:R_kgDOR9hrGw","exact_head":"a0146735413aaa0c90db7f4846b844bfbe220b3a","proof":"PR #525 shipyard/steward-handoff check passed"}]},
+    "negative_control": {"status":"required","failure_detected":true,"receipts":[{"kind":"planted-refusal","passed":true,"repository_key":"github.com:id:R_kgDOR9hrGw","exact_head":"a0146735413aaa0c90db7f4846b844bfbe220b3a","proof":"PR #525 specifies pending/claimed uncertain and cancelled/superseded/missing/contradictory refused"}]}
+  }
+}
