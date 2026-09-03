@@ -744,7 +744,19 @@ def add_child_material_history(
         for child in snapshot.get("children", [])
         if not _is_terminal(child)
     }
-    if set(child_comments) != nonterminal_tokens:
+    # The live transport may include terminal-child comments for closure
+    # evidence. They are intentionally not reduced into the active material
+    # history, but their presence must not make an otherwise complete resume
+    # look incomplete. Still reject missing active children and unknown keys.
+    all_child_tokens = {
+        str(child.get("identifier", "")).upper()
+        for child in snapshot.get("children", [])
+    }
+    supplied_tokens = {str(token).upper() for token in child_comments}
+    if (
+        not nonterminal_tokens.issubset(supplied_tokens)
+        or not supplied_tokens.issubset(all_child_tokens)
+    ):
         raise ResumeError("incomplete_child_comment_collection")
     plan_revision = (snapshot.get("root") or {}).get("plan_revision")
     # Ordinary resume classifies proposals against the active plan. Projection

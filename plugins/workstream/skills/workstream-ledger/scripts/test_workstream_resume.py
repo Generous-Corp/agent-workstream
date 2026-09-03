@@ -1135,6 +1135,21 @@ class ResumeTests(unittest.TestCase):
                 snapshot, {}, authenticated_route=route,
             )
 
+    def test_terminal_child_comments_are_allowed_in_complete_collection(self):
+        route = {
+            "workspace_id": "workspace", "team_id": "team",
+            "project_id": "project", "root_issue_id": "root-uuid",
+        }
+        snapshot = self.live_snapshot(self.snapshot(), route)
+        snapshot["child_comments"]["GEN-39"] = [{"id": "terminal-comment"}]
+        enriched = MODULE.add_child_material_history(
+            snapshot, snapshot["child_comments"], authenticated_route=route,
+        )
+        self.assertEqual(
+            [child["identifier"] for child in enriched["children"]],
+            ["GEN-38", "GEN-39"],
+        )
+
     def test_root_event_in_child_log_cannot_overwrite_child_state(self):
         route = {
             "workspace_id": "workspace", "team_id": "team",
