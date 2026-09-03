@@ -24,7 +24,9 @@ from workstream_linear_events import (
     pending_ledger_reservations, reduce_event_comments,
 )
 from workstream_linear_checkpoints import reduce_checkpoint_comments
-from workstream_child_dependencies import LinearChildDependencyAdapter
+from workstream_child_dependencies import (
+    LinearChildDependencyAdapter, dependency_root_readback_sha256,
+)
 from workstream_linear_projection import (
     LinearProjectionAdapter, build_projection_event, reduce_projection_comments,
 )
@@ -823,6 +825,10 @@ def run(argv: list[str]) -> dict[str, Any]:
             snapshot = deepcopy(snapshot)
             snapshot["root"] = deepcopy(snapshot.get("root") or {})
             snapshot["root"]["updatedAt"] = reviewed_root["updatedAt"]
+            if isinstance(snapshot.get("dependency_graph"), dict):
+                snapshot["dependency_graph"]["root_readback_sha256"] = (
+                    dependency_root_readback_sha256(reviewed_root)
+                )
     transaction = build_child_completion_transaction(
         snapshot, state, root_token=token, child_token=child_token,
         evidence_contract=evidence, authenticated_source=source,
