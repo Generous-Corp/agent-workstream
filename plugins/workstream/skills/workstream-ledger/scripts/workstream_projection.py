@@ -3448,6 +3448,7 @@ def load_material_history_for_projection_reconcile(
     authenticated_route: dict[str, str], authenticated_source: dict[str, Any],
     remote_head: str | None = None,
     max_bytes: int = DEFAULT_RESUME_MAX_BYTES, max_items: int = 100,
+    allow_stale_source_repair: bool = False,
     relation_target_resolver: Callable[
         [list[dict[str, Any]]], dict[str, dict[str, Any]]
     ],
@@ -3465,6 +3466,12 @@ def load_material_history_for_projection_reconcile(
     """
     desired, reviewed_retirements = _reviewed_manifest(manifest)
     initial = adapter.state()
+    history_authenticated_source = authenticated_source
+    if allow_stale_source_repair and isinstance(initial.snapshot.get("source"), dict):
+        # Validate the pre-repair history against its own authenticated source;
+        # the reviewed manifest and final candidate are checked against the new
+        # source below.
+        history_authenticated_source = initial.snapshot["source"]
     reviewed_contract = {
         "expected_projection_revision": manifest["expected_projection_revision"],
         "expected_active_heads": sorted(
@@ -3624,7 +3631,7 @@ def load_material_history_for_projection_reconcile(
             candidate = add_material_history(
                 snapshot, candidate_comments, token,
                 authenticated_route=authenticated_route,
-                authenticated_source=authenticated_source,
+                authenticated_source=history_authenticated_source,
                 relation_target_resolver=relation_target_resolver,
                 permit_stale_lifecycle_for_reconcile=(
                     authority_sensitive_changes or bool(unresolved)
@@ -3684,7 +3691,7 @@ def load_material_history_for_projection_reconcile(
     try:
         return add_material_history(
             snapshot, comments, token, authenticated_route=authenticated_route,
-            authenticated_source=authenticated_source,
+            authenticated_source=history_authenticated_source,
             relation_target_resolver=relation_target_resolver,
         ), frozenset()
     except RelationReadbackError:
@@ -3697,7 +3704,7 @@ def load_material_history_for_projection_reconcile(
 
         return add_material_history(
             snapshot, comments, token, authenticated_route=authenticated_route,
-            authenticated_source=authenticated_source,
+            authenticated_source=history_authenticated_source,
             permit_stale_lifecycle_for_reconcile=True,
         ), frozenset(unresolved)
 
@@ -4966,6 +4973,7 @@ def main() -> int:
                 remote_head=args.remote_head,
                 max_bytes=args.max_bytes, max_items=args.max_items,
                 relation_target_resolver=resolver,
+                allow_stale_source_repair=args.allow_stale_source_repair,
             )
         )
 
