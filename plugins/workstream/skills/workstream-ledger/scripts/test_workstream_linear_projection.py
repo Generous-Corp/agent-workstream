@@ -10960,6 +10960,36 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(synced["projection"][0]["value"], source)
         self.assertEqual(source, {"identity": canonical, "sha256": "new"})
 
+    def test_structured_active_source_repair_requires_explicit_review_flag(self):
+        canonical = "https://github.com/acme/new/blob/main/PLAN.md"
+        manifest = {"projection": [{
+            "kind": "source", "key": "root", "value": {
+                "identity": canonical, "sha256": "new",
+            },
+        }]}
+        binding = {"mode": "structured_active", "selected": {}}
+        with self.assertRaisesRegex(
+            LinearProjectionError, "active_projection_source_mismatch",
+        ):
+            workstream_projection.synchronize_manifest_source(
+                manifest, f"Canonical plan: {canonical}",
+                {"identity": canonical, "sha256": "new"},
+                {"identity": "https://github.com/acme/old/blob/main/PLAN.md",
+                 "sha256": "old"},
+                generation_binding=binding,
+            )
+
+        synced, source = workstream_projection.synchronize_manifest_source(
+            manifest, f"Canonical plan: {canonical}",
+            {"identity": canonical, "sha256": "new"},
+            {"identity": "https://github.com/acme/old/blob/main/PLAN.md",
+             "sha256": "old"},
+            generation_binding=binding,
+            allow_structured_source_repair=True,
+        )
+        self.assertEqual(synced["projection"][0]["value"], source)
+        self.assertEqual(source, {"identity": canonical, "sha256": "new"})
+
     def test_manifest_source_sync_refreshes_same_live_document_without_explicit_item(self):
         exact = "https://github.com/acme/plans/blob/" + "a" * 40 + "/PLAN.md"
         manifest = {"projection": []}

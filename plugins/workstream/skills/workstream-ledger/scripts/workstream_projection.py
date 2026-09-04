@@ -335,6 +335,7 @@ def synchronize_manifest_source(
     projection_history: list[dict[str, Any]] | None = None,
     *, generation_binding: dict[str, Any] | None = None,
     expected_projection_contract: dict[str, Any] | None = None,
+    allow_structured_source_repair: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Bind one labeled issue plan to the desired structured source."""
     canonical = canonical_plan_url(description)
@@ -411,11 +412,17 @@ def synchronize_manifest_source(
                 "add the canonical source to the reviewed projection manifest"
             )
     if source_mode == "structured_active":
-        if live_source != {
+        desired_source = {
             "identity": supplied_identity,
             "sha256": authenticated_source.get("sha256"),
-        }:
-            raise LinearProjectionError("active_projection_source_mismatch")
+        }
+        if live_source != desired_source:
+            if (
+                not allow_structured_source_repair
+                or len(source_items) != 1
+                or source_items[0].get("value") != desired_source
+            ):
+                raise LinearProjectionError("active_projection_source_mismatch")
     source_identity = (
         supplied_identity
         if source_mode in {"inactive_candidate", "structured_active"}
@@ -4682,6 +4689,10 @@ def main() -> int:
         "--operation-timeout", type=float, default=120.0,
         help="maximum seconds for the complete authenticated projection operation",
     )
+    parser.add_argument(
+        "--allow-stale-source-repair", action="store_true",
+        help="allow an explicitly reviewed source item to replace a stale structured source",
+    )
     github_auth = parser.add_mutually_exclusive_group()
     github_auth.add_argument("--github-token-command")
     github_auth.add_argument(
@@ -4907,6 +4918,7 @@ def main() -> int:
             expected_projection_contract=projection_review_contract(
                 projection_state,
             ),
+            allow_structured_source_repair=args.allow_stale_source_repair,
         )
         manifest = prepare_terminal_child_source_transition(
             manifest, graph, projection_state,
