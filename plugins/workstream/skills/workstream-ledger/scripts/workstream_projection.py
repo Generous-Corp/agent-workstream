@@ -335,6 +335,7 @@ def synchronize_manifest_source(
     projection_history: list[dict[str, Any]] | None = None,
     *, generation_binding: dict[str, Any] | None = None,
     expected_projection_contract: dict[str, Any] | None = None,
+    allow_structured_source_repair: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Bind one labeled issue plan to the desired structured source."""
     canonical = canonical_plan_url(description)
@@ -411,11 +412,17 @@ def synchronize_manifest_source(
                 "add the canonical source to the reviewed projection manifest"
             )
     if source_mode == "structured_active":
-        if live_source != {
+        desired_source = {
             "identity": supplied_identity,
             "sha256": authenticated_source.get("sha256"),
-        }:
-            raise LinearProjectionError("active_projection_source_mismatch")
+        }
+        if live_source != desired_source:
+            if (
+                not allow_structured_source_repair
+                or len(source_items) != 1
+                or source_items[0].get("value") != desired_source
+            ):
+                raise LinearProjectionError("active_projection_source_mismatch")
     source_identity = (
         supplied_identity
         if source_mode in {"inactive_candidate", "structured_active"}
@@ -3441,6 +3448,7 @@ def load_material_history_for_projection_reconcile(
     authenticated_route: dict[str, str], authenticated_source: dict[str, Any],
     remote_head: str | None = None,
     max_bytes: int = DEFAULT_RESUME_MAX_BYTES, max_items: int = 100,
+    allow_stale_source_repair: bool = False,
     relation_target_resolver: Callable[
         [list[dict[str, Any]]], dict[str, dict[str, Any]]
     ],
@@ -3458,6 +3466,12 @@ def load_material_history_for_projection_reconcile(
     """
     desired, reviewed_retirements = _reviewed_manifest(manifest)
     initial = adapter.state()
+    history_authenticated_source = authenticated_source
+    if allow_stale_source_repair and isinstance(initial.snapshot.get("source"), dict):
+        # Validate the pre-repair history against its own authenticated source;
+        # the reviewed manifest and final candidate are checked against the new
+        # source below.
+        history_authenticated_source = initial.snapshot["source"]
     reviewed_contract = {
         "expected_projection_revision": manifest["expected_projection_revision"],
         "expected_active_heads": sorted(
@@ -3617,7 +3631,7 @@ def load_material_history_for_projection_reconcile(
             candidate = add_material_history(
                 snapshot, candidate_comments, token,
                 authenticated_route=authenticated_route,
-                authenticated_source=authenticated_source,
+                authenticated_source=history_authenticated_source,
                 relation_target_resolver=relation_target_resolver,
                 permit_stale_lifecycle_for_reconcile=(
                     authority_sensitive_changes or bool(unresolved)
@@ -3677,7 +3691,7 @@ def load_material_history_for_projection_reconcile(
     try:
         return add_material_history(
             snapshot, comments, token, authenticated_route=authenticated_route,
-            authenticated_source=authenticated_source,
+            authenticated_source=history_authenticated_source,
             relation_target_resolver=relation_target_resolver,
         ), frozenset()
     except RelationReadbackError:
@@ -3690,7 +3704,7 @@ def load_material_history_for_projection_reconcile(
 
         return add_material_history(
             snapshot, comments, token, authenticated_route=authenticated_route,
-            authenticated_source=authenticated_source,
+            authenticated_source=history_authenticated_source,
             permit_stale_lifecycle_for_reconcile=True,
         ), frozenset(unresolved)
 
@@ -4682,6 +4696,10 @@ def main() -> int:
         "--operation-timeout", type=float, default=120.0,
         help="maximum seconds for the complete authenticated projection operation",
     )
+    parser.add_argument(
+        "--allow-stale-source-repair", action="store_true",
+        help="allow an explicitly reviewed source item to replace a stale structured source",
+    )
     github_auth = parser.add_mutually_exclusive_group()
     github_auth.add_argument("--github-token-command")
     github_auth.add_argument(
@@ -4907,6 +4925,7 @@ def main() -> int:
             expected_projection_contract=projection_review_contract(
                 projection_state,
             ),
+            allow_structured_source_repair=args.allow_stale_source_repair,
         )
         manifest = prepare_terminal_child_source_transition(
             manifest, graph, projection_state,
@@ -4954,6 +4973,7 @@ def main() -> int:
                 remote_head=args.remote_head,
                 max_bytes=args.max_bytes, max_items=args.max_items,
                 relation_target_resolver=resolver,
+                allow_stale_source_repair=args.allow_stale_source_repair,
             )
         )
 
