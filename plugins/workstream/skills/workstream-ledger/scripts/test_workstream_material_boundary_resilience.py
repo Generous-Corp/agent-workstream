@@ -22,8 +22,8 @@ import hashlib
 import unittest
 
 from workstream_child_proposal import (
-    _canonical, activated_comments, build_proposal, PREFIX, proposal_id,
-    proposal_slot_id,
+    _canonical, activated_comments, build_proposal, encode_proposal, PREFIX,
+    proposal_id, proposal_slot_id,
 )
 
 
@@ -140,6 +140,112 @@ class BuildProposalRefusesBeforePublish(unittest.TestCase):
         )
         self.assertEqual(proposal["kind"], "event")
         self.assertEqual(proposal["record"]["payload"], VALID_PAYLOAD)
+
+
+class NoRemoteWriteBeforeValidation(unittest.TestCase):
+    """An invalid record must cost zero remote calls.
+
+    The publish path reserves an intent remotely before the activation-time
+    assertions run, so "it is rejected eventually" is not sufficient: rejection
+    has to happen before a transport exists. Proving that by construction --
+    a client factory that explodes if it is ever called -- is stronger than
+    counting mutations, because a client that was never built cannot have
+    written anything.
+    """
+
+    def _argv(self, payload_json):
+        return [
+            "GEN-37",
+            "--root-issue-id", "409c1423-f949-4655-9f5f-d3213d7b434f",
+            "--child-workstream-id", CHILD_TOKEN,
+            "--child-issue-id", CHILD_ISSUE_ID,
+            "--plan-revision", PLAN,
+            "--workspace-id", "11111111-1111-4111-8111-111111111111",
+            "--team-id", "33333333-3333-4333-8333-333333333333",
+            "--project-id", "44444444-4444-4444-8444-444444444444",
+            "--apply", "--kind", "material_boundary",
+            "--source", "agent_discovery",
+            "--payload-json", payload_json,
+            "--expected-revision", "4",
+            "--created-at", "2026-09-05T01:00:58Z",
+        ]
+
+    def test_invalid_record_never_constructs_a_client(self):
+        import json as _json
+        import workstream_child_event as child_event
+
+        def exploding_factory(*args, **kwargs):
+            raise AssertionError(
+                "a remote client was constructed for a record that is invalid"
+            )
+
+        with self.assertRaises(ValueError) as caught:
+            child_event.run(
+                self._argv(_json.dumps(MALFORMED_PAYLOAD)),
+                client_factory=exploding_factory,
+            )
+        self.assertIn("boundary_id", str(caught.exception))
+
+    def test_valid_record_does_reach_the_transport(self):
+        """Negative control: the guard stops invalid records, not all records.
+
+        Without this, removing the transport call entirely would satisfy the
+        test above while breaking every real write.
+        """
+        import json as _json
+        import workstream_child_event as child_event
+
+        reached = []
+
+        def recording_factory(*args, **kwargs):
+            reached.append((args, kwargs))
+            raise RuntimeError("stop once the transport boundary is reached")
+
+        with self.assertRaises(RuntimeError):
+            child_event.run(
+                self._argv(_json.dumps(VALID_PAYLOAD)),
+                client_factory=recording_factory,
+            )
+        self.assertEqual(len(reached), 1)
+
+
+class PublishBoundaryRefusesEvenWhenBuildProposalIsBypassed(unittest.TestCase):
+    """The publish boundary, not just the convenience constructor, is the guard.
+
+    ``build_proposal`` validates semantics, but a caller can hand-assemble a
+    proposal dict and publish it directly. The record only becomes unreadable
+    once it is *stored*, so the check has to hold at the encode/publish boundary
+    too -- otherwise the original defect returns through the side door.
+    """
+
+    def _hand_assembled(self, payload, *, event_id):
+        record = _record(payload, event_id=event_id)
+        return {
+            "schema_version": 1,
+            "kind": "event",
+            "child_workstream_id": CHILD_TOKEN,
+            "child_issue_id": CHILD_ISSUE_ID,
+            "plan_revision": PLAN,
+            "record": record,
+            "record_sha256": hashlib.sha256(_canonical(record)).hexdigest(),
+            "proposal_id": proposal_id("event", record),
+        }
+
+    def test_bypassing_caller_cannot_publish_a_malformed_record(self):
+        with self.assertRaises(ValueError) as caught:
+            encode_proposal(self._hand_assembled(
+                MALFORMED_PAYLOAD, event_id="wsd_bypass",
+            ))
+        message = str(caught.exception)
+        self.assertIn("wsd_bypass", message)
+        self.assertIn("boundary_id", message)
+
+    def test_bypassing_caller_can_still_publish_a_valid_record(self):
+        """Negative control: the boundary guard is not refusing everything."""
+        body = encode_proposal(self._hand_assembled(
+            VALID_PAYLOAD, event_id="wsd_bypass_ok",
+        ))
+        self.assertIn(PREFIX, body)
 
 
 class ReadPathQuarantinesInsteadOfRefusing(unittest.TestCase):
