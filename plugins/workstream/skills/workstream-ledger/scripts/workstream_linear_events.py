@@ -23,8 +23,8 @@ from typing import Any
 from workstream_checkpoint import CheckpointError, recover_generations
 from workstream_delta import (
     MATERIAL_REPAIR_KIND, Delta, MutationReceipt, RevisionConflict,
-    canonical_sha256, validate_material_event_semantics,
-    validate_reviewed_repair_event_shape,
+    canonical_sha256, material_semantic_field,
+    validate_material_event_semantics, validate_reviewed_repair_event_shape,
 )
 from workstream_linear import (
     GraphQLClient, HttpGraphQLClient, LinearTransportError, validate_issue_route,
@@ -975,15 +975,20 @@ def apply_material_semantic_repairs(
     controls = [event for event in raw.events if event.kind == MATERIAL_REPAIR_KIND]
     business = [event for event in raw.events if event.kind != MATERIAL_REPAIR_KIND]
     malformed: list[Delta] = []
+    malformed_fields: dict[str, str | None] = {}
     for event in business:
         try:
             validate_material_event_semantics(event)
-        except ValueError:
+        except ValueError as error:
             malformed.append(event)
+            malformed_fields[event.event_id] = material_semantic_field(error)
     if not controls:
         if malformed:
+            offender = malformed[0].event_id
+            field = malformed_fields.get(offender)
             raise LinearEventError(
-                f"malformed_material_boundary_unrepaired:{malformed[0].event_id}"
+                f"malformed_material_boundary_unrepaired:{offender}"
+                + (f":{field}" if field else "")
             )
         return raw
     if len(controls) != 1:
@@ -1671,7 +1676,15 @@ class LinearCommentEventAdapter:
             try:
                 validate_material_event_semantics(delta)
             except ValueError as error:
-                raise LinearEventError(str(error)) from error
+                # Name the caller's own record explicitly.  The same underlying
+                # message is raised when *stored* history fails to decode, and
+                # reporting it unattributed sends the reader to inspect a
+                # payload that was never the problem.
+                raise LinearEventError(
+                    "invalid_caller_material_event:"
+                    f"{delta.event_id}:"
+                    f"{material_semantic_field(error) or error}"
+                ) from error
             if delta.expected_revision != before.revision:
                 raise RevisionConflict(
                     f"expected revision {delta.expected_revision}, "

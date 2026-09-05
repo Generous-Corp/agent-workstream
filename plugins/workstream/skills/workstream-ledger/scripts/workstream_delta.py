@@ -61,6 +61,21 @@ def validate_material_event_semantics(delta: "Delta") -> None:
             raise ValueError("malformed_material_boundary:change")
 
 
+MATERIAL_SEMANTIC_PREFIX = "malformed_material_boundary:"
+
+
+def material_semantic_field(error: BaseException) -> str | None:
+    """Return the payload field a semantic rejection names, if it names one.
+
+    Reporting *which* field failed, rather than that something failed, sends a
+    reader to the offending value instead of to the wrong subsystem.
+    """
+    text = str(error)
+    if text.startswith(MATERIAL_SEMANTIC_PREFIX):
+        return text[len(MATERIAL_SEMANTIC_PREFIX):] or None
+    return None
+
+
 def interpret_material_event(delta: "Delta") -> tuple[tuple[str, dict[str, Any]], ...]:
     """Return the semantic changes represented by one validated event."""
     if delta.kind == MATERIAL_REPAIR_KIND:

@@ -562,7 +562,12 @@ class LinearCommentEventAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "malformed_material_boundary"):
             encode_event_comment(bad)
         client = FakeCommentClient()
-        with self.assertRaisesRegex(LinearEventError, "malformed_material_boundary"):
+        # The adapter attributes the rejection to the caller's own record and
+        # names the offending event and field, so it cannot be mistaken for a
+        # stored record that failed to decode.
+        with self.assertRaisesRegex(
+            LinearEventError, r"invalid_caller_material_event:bad:boundary_id",
+        ):
             LinearCommentEventAdapter(client, issue_id="GEN-37").apply(bad)
         self.assertFalse(any("commentCreate" in query for query, _ in client.calls))
 
