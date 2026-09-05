@@ -22,8 +22,8 @@ import hashlib
 import unittest
 
 from workstream_child_proposal import (
-    _canonical, activated_comments, build_proposal, PREFIX, proposal_id,
-    proposal_slot_id,
+    _canonical, activated_comments, build_proposal, encode_proposal, PREFIX,
+    proposal_id, proposal_slot_id,
 )
 
 
@@ -140,6 +140,45 @@ class BuildProposalRefusesBeforePublish(unittest.TestCase):
         )
         self.assertEqual(proposal["kind"], "event")
         self.assertEqual(proposal["record"]["payload"], VALID_PAYLOAD)
+
+
+class PublishBoundaryRefusesEvenWhenBuildProposalIsBypassed(unittest.TestCase):
+    """The publish boundary, not just the convenience constructor, is the guard.
+
+    ``build_proposal`` validates semantics, but a caller can hand-assemble a
+    proposal dict and publish it directly. The record only becomes unreadable
+    once it is *stored*, so the check has to hold at the encode/publish boundary
+    too -- otherwise the original defect returns through the side door.
+    """
+
+    def _hand_assembled(self, payload, *, event_id):
+        record = _record(payload, event_id=event_id)
+        return {
+            "schema_version": 1,
+            "kind": "event",
+            "child_workstream_id": CHILD_TOKEN,
+            "child_issue_id": CHILD_ISSUE_ID,
+            "plan_revision": PLAN,
+            "record": record,
+            "record_sha256": hashlib.sha256(_canonical(record)).hexdigest(),
+            "proposal_id": proposal_id("event", record),
+        }
+
+    def test_bypassing_caller_cannot_publish_a_malformed_record(self):
+        with self.assertRaises(ValueError) as caught:
+            encode_proposal(self._hand_assembled(
+                MALFORMED_PAYLOAD, event_id="wsd_bypass",
+            ))
+        message = str(caught.exception)
+        self.assertIn("wsd_bypass", message)
+        self.assertIn("boundary_id", message)
+
+    def test_bypassing_caller_can_still_publish_a_valid_record(self):
+        """Negative control: the boundary guard is not refusing everything."""
+        body = encode_proposal(self._hand_assembled(
+            VALID_PAYLOAD, event_id="wsd_bypass_ok",
+        ))
+        self.assertIn(PREFIX, body)
 
 
 class ReadPathQuarantinesInsteadOfRefusing(unittest.TestCase):
