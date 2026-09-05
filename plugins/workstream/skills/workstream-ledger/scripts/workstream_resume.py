@@ -809,11 +809,15 @@ def add_child_material_history(
         )
         if pending_proposals:
             child["pending_child_proposals"] = pending_proposals
+        quarantined: list[dict[str, Any]] = []
         if authorizations or origin_repairs:
             comments = authorized_child_comments(
                 comments, authorizations, origin_repairs,
                 child_workstream_id=token, child_issue_id=child["id"],
+                quarantine=quarantined,
             )
+        if quarantined:
+            child["quarantined_records"] = quarantined
         event_log = reduce_event_comments(comments, workstream_id=token)
         checkpoint_log = reduce_checkpoint_comments(comments, workstream_id=token)
         if not event_log.events and not checkpoint_log.checkpoints:
@@ -1173,6 +1177,10 @@ def _compact_child(child: dict[str, Any]) -> dict[str, Any]:
             "blocker", "review_condition", "material_event_revision",
             "checkpoint_recovery", "uncheckpointed_material_obligations",
             "pending_child_proposals", "reconciliation_blockers",
+            # A quarantined record is skipped so the rest of the workstream
+            # stays readable; it must still reach the reader, or the skip is
+            # silent and the workstream looks healthier than it is.
+            "quarantined_records",
         )
         if key in child
     }

@@ -14,7 +14,9 @@ import uuid
 from typing import Any
 
 from workstream_checkpoint import validate_checkpoint
-from workstream_delta import Delta
+from workstream_delta import (
+    Delta, material_semantic_field, validate_material_event_semantics,
+)
 from workstream_linear import LinearTransportError
 from workstream_linear_events import (
     COMMENT_CREATE_CAPABILITY_QUERY, COMMENT_CREATE_MUTATION, COMMENTS_QUERY,
@@ -46,7 +48,14 @@ def proposal_slot_id(child_issue_id: str, proposal: str) -> str:
     return str(uuid.UUID(bytes=bytes(raw)))
 
 
-def _validate_proposal_record(kind: str, record: Any) -> None:
+def _validate_proposal_record(kind: str, record: Any, *,
+                              strict_semantics: bool = False) -> None:
+    """Validate a proposal record's shape, and on writes also its semantics.
+
+    ``strict_semantics`` is the write boundary.  Decoding stored history stays
+    shape-only on purpose: a record that was accepted by an older writer must
+    remain readable, or one bad row makes the whole workstream unrecoverable.
+    """
     if not isinstance(record, dict):
         raise ValueError("invalid child proposal record")
     if kind == "event":
@@ -68,7 +77,22 @@ def _validate_proposal_record(kind: str, record: Any) -> None:
             or not isinstance(record.get("payload"), dict)
         ):
             raise ValueError("invalid child event proposal record")
-        Delta(**record)
+        delta = Delta(**record)
+        # On a write, semantics are checked before the proposal exists and so
+        # before any remote publish, because the encoder that enforces them runs
+        # again every time authorized history is replayed.  A record that cannot
+        # be re-encoded cannot be read back, so admitting one would strand every
+        # later read of this workstream.  The checkpoint branch below has always
+        # validated at this boundary; events did not, and that asymmetry is what
+        # let a malformed payload reach the ledger.
+        if strict_semantics:
+            try:
+                validate_material_event_semantics(delta)
+            except ValueError as error:
+                raise ValueError(
+                    "invalid_caller_material_event:"
+                    f"{delta.event_id}:{material_semantic_field(error) or error}"
+                ) from error
         return
     if kind == "checkpoint":
         validate_checkpoint(record)
@@ -78,7 +102,7 @@ def _validate_proposal_record(kind: str, record: Any) -> None:
 
 def build_proposal(kind: str, record: Any, *, child_workstream_id: str,
                    child_issue_id: str, plan_revision: str) -> dict[str, Any]:
-    _validate_proposal_record(kind, record)
+    _validate_proposal_record(kind, record, strict_semantics=True)
     value = {
         "schema_version": 1, "kind": kind,
         "child_workstream_id": child_workstream_id,
@@ -118,14 +142,18 @@ def _validate_proposal_identity(value: dict[str, Any]) -> None:
         raise ValueError("child proposal identity mismatch")
 
 
-def encode_proposal(value: dict[str, Any]) -> str:
+def encode_proposal(value: dict[str, Any], *,
+                    strict_semantics: bool = True) -> str:
     expected = {
         "schema_version", "proposal_id", "kind", "child_workstream_id",
         "child_issue_id", "plan_revision", "record", "record_sha256",
     }
     if set(value) != expected or value["schema_version"] != 1:
         raise ValueError("invalid child proposal")
-    _validate_proposal_record(value.get("kind"), value.get("record"))
+    _validate_proposal_record(
+        value.get("kind"), value.get("record"),
+        strict_semantics=strict_semantics,
+    )
     _validate_proposal_identity(value)
     if value["proposal_id"] != proposal_id(value["kind"], value["record"]):
         raise ValueError("invalid child proposal ID")
@@ -153,7 +181,10 @@ def decode_proposal(body: str) -> dict[str, Any] | None:
             envelope["sha256"], hashlib.sha256(_canonical(value)).hexdigest()
         ):
             raise ValueError
-        if encode_proposal(value) != body:
+        # Byte-integrity round trip only: decoding stored history must not
+        # apply the write-time semantic gate, or a record an older writer
+        # accepted becomes permanently unreadable.
+        if encode_proposal(value, strict_semantics=False) != body:
             raise ValueError
         return value
     except (binascii.Error, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -282,7 +313,17 @@ def _comments(client: Any, issue_id: str) -> list[dict[str, Any]]:
 
 def activated_comments(comments: list[dict[str, Any]],
                        authorizations: list[dict[str, Any]], *,
-                       child_workstream_id: str, child_issue_id: str) -> list[dict[str, Any]]:
+                       child_workstream_id: str, child_issue_id: str,
+                       quarantine: list[dict[str, Any]] | None = None,
+                       ) -> list[dict[str, Any]]:
+    """Materialize authorized proposals, quarantining any that cannot re-encode.
+
+    Replaying an authorized proposal runs it back through the strict new-write
+    encoder.  A record that fails there is undecodable history, not a defect in
+    the caller's request, so it is skipped and reported rather than raised: one
+    bad record must not make the whole workstream unreadable.  Callers pass
+    ``quarantine`` to surface the named verdicts.
+    """
     by_id = proposal_index(comments)
     synthetic: list[dict[str, Any]] = []
     for event in authorizations:
@@ -305,9 +346,26 @@ def activated_comments(comments: list[dict[str, Any]],
                     value.get("predecessor_event_id"),
                 )):
             raise LinearTransportError("activated_child_proposal_mismatch")
-        body = (encode_event_comment(Delta(**proposal["record"]))
-                if proposal["kind"] == "event"
-                else encode_checkpoint_comment(proposal["record"]))
+        try:
+            body = (encode_event_comment(Delta(**proposal["record"]))
+                    if proposal["kind"] == "event"
+                    else encode_checkpoint_comment(proposal["record"]))
+        except (ValueError, TypeError) as error:
+            record = proposal["record"]
+            verdict = {
+                "verdict": "quarantined_undecodable_record",
+                "origin": "preexisting_record",
+                "child_workstream_id": child_workstream_id,
+                "child_issue_id": child_issue_id,
+                "proposal_id": proposal["proposal_id"],
+                "mutation_kind": proposal["kind"],
+                "event_id": record.get("event_id"),
+                "field": material_semantic_field(error),
+                "reason": str(error),
+            }
+            if quarantine is not None:
+                quarantine.append(verdict)
+            continue
         synthetic.append({**comment, "body": body})
     return [*comments, *synthetic]
 
@@ -315,7 +373,7 @@ def activated_comments(comments: list[dict[str, Any]],
 def authorized_child_comments(
     comments: list[dict[str, Any]], authorizations: list[dict[str, Any]],
     origin_repairs: list[dict[str, Any]], *, child_workstream_id: str,
-    child_issue_id: str,
+    child_issue_id: str, quarantine: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Admit a sealed legacy prefix plus root-authorized synthetic proposals."""
     repairs = [
@@ -329,7 +387,7 @@ def authorized_child_comments(
         return activated_comments(
             comments, authorizations,
             child_workstream_id=child_workstream_id,
-            child_issue_id=child_issue_id,
+            child_issue_id=child_issue_id, quarantine=quarantine,
         )
     history = repairs[0]["value"]["child_history"]
     receipts = [
@@ -375,7 +433,7 @@ def authorized_child_comments(
     return activated_comments(
         comments, authorizations,
         child_workstream_id=child_workstream_id,
-        child_issue_id=child_issue_id,
+        child_issue_id=child_issue_id, quarantine=quarantine,
     )
 
 
